@@ -10,4 +10,4 @@ phases:
       # - There are no build commands
   build:
     commands:
-      - ls
+      - aws s3 cp application.py /var/app/current 
