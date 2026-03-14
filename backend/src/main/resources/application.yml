@@ -1,0 +1,44 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: kappara-trading
+
+trading:
+  simulation:
+    tick-interval-ms: 1000
+  risk:
+    max-var-percent: 2.0        # max VaR as % of NAV
+    max-net-delta: 50000        # max net delta in USD
+  instruments:
+    - symbol: AAPL
+      name: Apple Inc.
+      type: STOCK
+      seed-price: 180.0
+      volatility: 0.25
+      beta: 1.2
+    - symbol: MSFT
+      name: Microsoft Corp.
+      type: STOCK
+      seed-price: 380.0
+      volatility: 0.22
+      beta: 1.1
+    - symbol: TSLA
+      name: Tesla Inc.
+      type: STOCK
+      seed-price: 250.0
+      volatility: 0.45
+      beta: 1.8
+    - symbol: SPY
+      name: SPDR S&P 500 ETF
+      type: ETF
+      seed-price: 480.0
+      volatility: 0.15
+      beta: 1.0
+    - symbol: QQQ
+      name: Invesco QQQ Trust
+      type: ETF
+      seed-price: 415.0
+      volatility: 0.18
+      beta: 1.15
