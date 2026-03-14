@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kappara Trading System</title>
+  <link rel="stylesheet" href="css/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@stomp/stompjs@7/bundles/stomp.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <!-- Header -->
+  <header>
+    <div class="logo">KAPPARA <span>Trading System</span></div>
+    <div class="header-right">
+      <span id="conn-status" class="badge badge-red">DISCONNECTED</span>
+      <span id="clock"></span>
+    </div>
+  </header>
+
+  <!-- NAV / PnL Summary Bar -->
+  <div class="summary-bar">
+    <div class="summary-item">
+      <div class="label">Portfolio NAV</div>
+      <div class="value" id="nav">$0.00</div>
+    </div>
+    <div class="summary-item">
+      <div class="label">Unrealized P&amp;L</div>
+      <div class="value" id="upnl">$0.00</div>
+    </div>
+    <div class="summary-item">
+      <div class="label">Realized P&amp;L</div>
+      <div class="value" id="rpnl">$0.00</div>
+    </div>
+    <div class="summary-item">
+      <div class="label">VaR (95%, 1-day)</div>
+      <div class="value" id="var">$0.00</div>
+    </div>
+    <div class="summary-item">
+      <div class="label">Net Delta</div>
+      <div class="value" id="delta">$0.00</div>
+    </div>
+    <div class="summary-item">
+      <div class="label">Risk Status</div>
+      <div class="value" id="risk-status"><span class="badge badge-green">GREEN</span></div>
+    </div>
+  </div>
+
+  <!-- Main Grid -->
+  <div class="main-grid">
+
+    <!-- Left: Quotes -->
+    <section class="card" id="quotes-card">
+      <h2>Market Quotes</h2>
+      <table id="quotes-table">
+        <thead>
+          <tr><th>Symbol</th><th>Price</th><th>Bid</th><th>Ask</th><th>Change</th><th>Change %</th></tr>
+        </thead>
+        <tbody id="quotes-body"></tbody>
+      </table>
+      <canvas id="price-chart" height="120"></canvas>
+    </section>
+
+    <!-- Center Top: Positions -->
+    <section class="card" id="positions-card">
+      <h2>Open Positions</h2>
+      <table id="positions-table">
+        <thead>
+          <tr><th>Symbol</th><th>Qty</th><th>Avg Cost</th><th>Price</th><th>Mkt Val</th><th>Unr. PnL</th><th>Delta</th><th>Strategy</th></tr>
+        </thead>
+        <tbody id="positions-body"></tbody>
+      </table>
+    </section>
+
+    <!-- Right: Risk Gauge + Exposure -->
+    <section class="card" id="risk-card">
+      <h2>Risk Dashboard</h2>
+      <div class="risk-grid">
+        <div class="risk-item"><div class="label">VaR %</div><div class="bar-wrap"><div class="bar" id="var-bar"></div></div><div id="var-pct-val">0.00%</div></div>
+        <div class="risk-item"><div class="label">Net Delta</div><div class="bar-wrap"><div class="bar" id="delta-bar"></div></div><div id="delta-val">$0</div></div>
+        <div class="risk-item"><div class="label">Gross Exposure</div><div id="gross-exp">$0</div></div>
+        <div class="risk-item"><div class="label">Net Exposure</div><div id="net-exp">$0</div></div>
+      </div>
+      <canvas id="pnl-chart" height="110"></canvas>
+    </section>
+
+    <!-- Bottom Left: Algorithms -->
+    <section class="card" id="algo-card">
+      <h2>Algorithm Status</h2>
+      <div id="algo-list"></div>
+    </section>
+
+    <!-- Bottom Right: Trade Log -->
+    <section class="card" id="trades-card">
+      <h2>Trade Log</h2>
+      <table id="trades-table">
+        <thead>
+          <tr><th>Time</th><th>ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Strategy</th><th>Reason</th></tr>
+        </thead>
+        <tbody id="trades-body"></tbody>
+      </table>
+    </section>
+
+  </div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

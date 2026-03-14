@@ -1,0 +1,135 @@
+:root {
+  --bg: #0d0f14;
+  --surface: #141720;
+  --border: #252a38;
+  --text: #c9d1e0;
+  --muted: #5a6278;
+  --green: #00d68f;
+  --red: #ff4d6a;
+  --yellow: #ffc107;
+  --blue: #4e8ef7;
+  --accent: #7c5cbf;
+  --font: 'Courier New', Courier, monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 12px;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Header */
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.logo { font-size: 16px; font-weight: bold; color: var(--green); letter-spacing: 2px; }
+.logo span { color: var(--muted); font-size: 11px; margin-left: 6px; }
+.header-right { display: flex; gap: 12px; align-items: center; color: var(--muted); }
+
+/* Badges */
+.badge { padding: 2px 8px; border-radius: 3px; font-size: 10px; font-weight: bold; }
+.badge-green { background: rgba(0,214,143,0.15); color: var(--green); border: 1px solid var(--green); }
+.badge-yellow { background: rgba(255,193,7,0.15); color: var(--yellow); border: 1px solid var(--yellow); }
+.badge-red { background: rgba(255,77,106,0.15); color: var(--red); border: 1px solid var(--red); }
+
+/* Summary Bar */
+.summary-bar {
+  display: flex;
+  gap: 1px;
+  background: var(--border);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.summary-item {
+  flex: 1;
+  padding: 8px 12px;
+  background: var(--surface);
+}
+.summary-item .label { font-size: 10px; color: var(--muted); margin-bottom: 3px; }
+.summary-item .value { font-size: 14px; font-weight: bold; color: var(--text); }
+
+/* Main Grid */
+.main-grid {
+  display: grid;
+  grid-template-columns: 1fr 1.6fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 1px;
+  background: var(--border);
+  flex: 1;
+  overflow: hidden;
+}
+
+.card {
+  background: var(--surface);
+  padding: 10px 12px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.card h2 {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+  flex-shrink: 0;
+}
+
+/* Quotes spans */
+#quotes-card { grid-row: 1; grid-column: 1; }
+#positions-card { grid-row: 1; grid-column: 2; }
+#risk-card { grid-row: 1 / 3; grid-column: 3; }
+#algo-card { grid-row: 2; grid-column: 1; }
+#trades-card { grid-row: 2; grid-column: 2; }
+
+/* Tables */
+table { width: 100%; border-collapse: collapse; }
+th { color: var(--muted); font-weight: normal; text-align: right; padding: 3px 6px; font-size: 10px; white-space: nowrap; }
+th:first-child { text-align: left; }
+td { padding: 3px 6px; text-align: right; border-bottom: 1px solid rgba(37,42,56,0.5); white-space: nowrap; }
+td:first-child { text-align: left; font-weight: bold; }
+tr:hover td { background: rgba(255,255,255,0.02); }
+
+.pos { color: var(--green); }
+.neg { color: var(--red); }
+.neu { color: var(--text); }
+
+/* Risk Dashboard */
+.risk-grid { display: flex; flex-direction: column; gap: 10px; }
+.risk-item { display: flex; flex-direction: column; gap: 3px; }
+.bar-wrap { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+.bar { height: 100%; background: var(--green); border-radius: 3px; transition: width 0.3s, background 0.3s; }
+
+/* Algorithm cards */
+.algo-box {
+  background: rgba(255,255,255,0.02);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+}
+.algo-name { font-weight: bold; color: var(--blue); margin-bottom: 4px; }
+.algo-decision { display: flex; gap: 6px; align-items: center; margin-bottom: 3px; }
+.algo-reasoning { color: var(--muted); font-size: 10px; line-height: 1.4; }
+.algo-metrics { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.algo-metric { background: var(--border); padding: 2px 6px; border-radius: 2px; font-size: 10px; }
+
+/* Signal bar */
+.signal-bar-wrap { width: 100px; height: 4px; background: var(--border); border-radius: 2px; position: relative; }
+.signal-bar { position: absolute; height: 100%; border-radius: 2px; }
+.signal-center { position: absolute; left: 50%; width: 1px; height: 100%; background: var(--muted); }
