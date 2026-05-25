@@ -33,8 +33,9 @@
 #define SYS_ioctl	7	/* (int fd, int cmd, long arg)             */
 #define SYS_putmsg	8	/* (int fd, strbuf *c, strbuf *d, int fl)  */
 #define SYS_getmsg	9	/* (int fd, strbuf *c, strbuf *d, int *fl) */
+#define SYS_ls		10	/* (const char *path, char *out, size_t cap) */
 
-#define SYS_MAX		10
+#define SYS_MAX		11
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

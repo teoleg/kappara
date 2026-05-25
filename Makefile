@@ -21,6 +21,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/kernel/kmem.o \
         $(BUILD)/kernel/sched.o \
         $(BUILD)/kernel/streams.o \
+        $(BUILD)/kernel/vfs.o \
         $(BUILD)/kernel/stream_head.o \
         $(BUILD)/kernel/syscall.o \
         $(BUILD)/kernel/main.o
@@ -49,6 +50,7 @@ else ifeq ($(ARCH),arm)
         $(BUILD)/kernel/kmem.o \
         $(BUILD)/kernel/sched.o \
         $(BUILD)/kernel/streams.o \
+        $(BUILD)/kernel/vfs.o \
         $(BUILD)/kernel/stream_head.o \
         $(BUILD)/kernel/syscall.o
     ELF           := $(BUILD)/kernel-arm.elf

@@ -65,12 +65,12 @@ void streams_register(const char *name, struct streamtab *st);
 /* Look up a registered streamtab by name. */
 struct streamtab *streams_lookup(const char *name);
 
-/* Open a registered driver by name, returning a fresh fd or -1. */
-int  sys_open_impl(const char *name);
-int  sys_close_impl(int fd);
-long sys_read_impl(int fd, void *buf, size_t len);
-long sys_write_impl(int fd, const void *buf, size_t len);
-long sys_ioctl_impl(int fd, int cmd, long arg);
+/* sys_open / sys_close / sys_read / sys_write / sys_ioctl / sys_putmsg /
+ * sys_getmsg now live in include/kappara/vfs.h -- they dispatch via the
+ * VFS through each inode's file_ops vtable.  stream_fops is the
+ * file_ops the VFS picks up when an opened inode is a character
+ * special file whose i_private is a struct streamtab *. */
+extern struct file_ops stream_fops;
 
 /* ioctl commands.  SVR4 uses 'S' << 8 | n; we use plain ints for now. */
 #define I_PUSH		1	/* arg = const char *modname            */
@@ -89,10 +89,5 @@ struct strbuf {
 };
 
 #define RS_HIPRI	0x01	/* high-priority message flag */
-
-long sys_putmsg_impl(int fd, const struct strbuf *ctl,
-		     const struct strbuf *data, int flags);
-long sys_getmsg_impl(int fd, struct strbuf *ctl,
-		     struct strbuf *data, int *flagsp);
 
 #endif

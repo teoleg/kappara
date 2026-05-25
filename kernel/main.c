@@ -33,6 +33,7 @@
 #include "kappara/streams.h"
 #include "kappara/string.h"
 #include "kappara/syscall.h"
+#include "kappara/vfs.h"
 #include "kappara/timer.h"
 #include "kappara/trap.h"
 #include "kappara/uart.h"
@@ -182,11 +183,25 @@ static void syscall_demo(void)
 	long pid = do_syscall(SYS_getpid, 0, 0, 0);
 	kprintf("syscall: getpid -> %ld\n", pid);
 
-	/* STREAMS-over-syscalls: open the "loop" driver, write a payload,
+	/* sys_ls("/dev") via syscall -- prove path lookup works through SVC. */
+	char lsbuf[128];
+	long lsn = do_syscall(SYS_ls,
+			      (long)(uintptr_t)"/dev",
+			      (long)(uintptr_t)lsbuf,
+			      sizeof(lsbuf));
+	kprintf("syscall: ls /dev (%ld bytes):\n", lsn);
+	for (long i = 0; i < lsn; i++)
+		uart_putc(lsbuf[i]);
+
+	/* Non-existent path: sys_open should fail cleanly. */
+	long fmiss = do_syscall(SYS_open, (long)(uintptr_t)"/dev/nope", 0, 0);
+	kprintf("syscall: open(\"/dev/nope\") -> %ld (expect -1)\n", fmiss);
+
+	/* STREAMS-over-syscalls: open the "/dev/loop" driver, write a payload,
 	 * read it back.  Then I_PUSH "upper" and watch the same payload
 	 * come back uppercased.  Then I_POP and confirm lower-case again. */
-	long fd = do_syscall(SYS_open, (long)(uintptr_t)"loop", 0, 0);
-	kprintf("syscall: open(\"loop\") -> %ld\n", fd);
+	long fd = do_syscall(SYS_open, (long)(uintptr_t)"/dev/loop", 0, 0);
+	kprintf("syscall: open(\"/dev/loop\") -> %ld\n", fd);
 
 	char buf[32];
 	const char msg1[] = "hello stream";
@@ -215,7 +230,7 @@ static void syscall_demo(void)
 
 	/* ----- delay module + service procedure demo --------------------- */
 	kprintf("\n--- delay module (service-proc deferred I/O) ---\n");
-	fd = do_syscall(SYS_open, (long)(uintptr_t)"loop", 0, 0);
+	fd = do_syscall(SYS_open, (long)(uintptr_t)"/dev/loop", 0, 0);
 	do_syscall(SYS_ioctl, fd, I_PUSH, (long)(uintptr_t)"delay");
 
 	const char dmsg[] = "via delay";
@@ -234,7 +249,7 @@ static void syscall_demo(void)
 
 	/* ----- putmsg / getmsg demo ------------------------------------- */
 	kprintf("\n--- putmsg / getmsg (M_PROTO + M_DATA) ---\n");
-	fd = do_syscall(SYS_open, (long)(uintptr_t)"loop", 0, 0);
+	fd = do_syscall(SYS_open, (long)(uintptr_t)"/dev/loop", 0, 0);
 
 	const char ctlbytes[]  = "ctl-hdr";
 	const char databytes[] = "payload bytes here";
@@ -280,7 +295,11 @@ void kmain(void)
 	kmem_init();
 
 	streams_demo();
+	vfs_init();
 	streams_head_init();
+
+	kprintf("\n");
+	vfs_dump_tree(vfs_root());
 
 	sched_init();
 	syscall_demo();
