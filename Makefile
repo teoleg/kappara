@@ -23,6 +23,8 @@ OBJS := \
 	$(BUILD)/arch/aarch64/mmu.o \
 	$(BUILD)/kernel/printk.o \
 	$(BUILD)/kernel/pmm.o \
+	$(BUILD)/kernel/string.o \
+	$(BUILD)/kernel/kmem.o \
 	$(BUILD)/kernel/main.o
 
 ELF    := $(BUILD)/kernel8.elf
