@@ -20,6 +20,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/kernel/string.o \
         $(BUILD)/kernel/kmem.o \
         $(BUILD)/kernel/sched.o \
+        $(BUILD)/kernel/streams.o \
         $(BUILD)/kernel/main.o
     ELF           := $(BUILD)/kernel8.elf
     KERNEL        := $(BUILD)/kernel8.img
@@ -44,7 +45,8 @@ else ifeq ($(ARCH),arm)
         $(BUILD)/kernel/pmm.o \
         $(BUILD)/kernel/string.o \
         $(BUILD)/kernel/kmem.o \
-        $(BUILD)/kernel/sched.o
+        $(BUILD)/kernel/sched.o \
+        $(BUILD)/kernel/streams.o
     ELF           := $(BUILD)/kernel-arm.elf
     KERNEL        := $(BUILD)/kernel-arm.img
     QEMU          := qemu-system-arm

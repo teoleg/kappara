@@ -29,6 +29,8 @@
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
 #include "kappara/sched.h"
+#include "kappara/streams.h"
+#include "kappara/string.h"
 #include "kappara/timer.h"
 #include "kappara/trap.h"
 #include "kappara/uart.h"
@@ -60,6 +62,75 @@ static void demo(void *arg)
 	}
 }
 
+/*
+ * STREAMS smoke test.  Build a paired queue (rq/wq) backed by a
+ * trivial put procedure that simply enqueues messages on its own
+ * queue.  Send a single M_DATA message down the write side, then
+ * pull it back off via getq and verify the bytes survive.
+ */
+static int demo_putp(queue_t *q, mblk_t *mp)
+{
+	putq(q, mp);
+	return 0;
+}
+
+static struct module_info demo_minfo = {
+	.mi_idnum  = 42,
+	.mi_idname = "demo",
+	.mi_minpsz = 0,
+	.mi_maxpsz = 256,
+	.mi_hiwat  = 4096,
+	.mi_lowat  = 1024,
+};
+
+static struct qinit demo_rinit = {
+	.qi_putp = demo_putp, .qi_minfo = &demo_minfo
+};
+
+static struct qinit demo_winit = {
+	.qi_putp = demo_putp, .qi_minfo = &demo_minfo
+};
+
+static void streams_demo(void)
+{
+	streams_init();
+
+	queue_t *rq = kmalloc(sizeof(*rq));
+	queue_t *wq = kmalloc(sizeof(*wq));
+	queue_init_pair(rq, wq, &demo_rinit, &demo_winit);
+
+	static const char payload[] = "no soup for you, only streams";
+	const size_t plen = sizeof(payload) - 1;
+
+	mblk_t *mp = allocb(plen, 0);
+	kmemcpy(mp->b_wptr, payload, plen);
+	mp->b_wptr += plen;
+
+	kprintf("streams: msg built, dsize=%lu  (db_ref=%d type=0x%x)\n",
+		(unsigned long)msgdsize(mp),
+		mp->b_datap->db_ref, mp->b_datap->db_type);
+
+	wq->q_qinfo->qi_putp(wq, mp);
+	kprintf("streams: after putp, q_count=%lu q_flag=0x%x\n",
+		(unsigned long)wq->q_count, wq->q_flag);
+
+	mblk_t *got = getq(wq);
+	if (!got) {
+		kprintf("streams: getq returned NULL?\n");
+		return;
+	}
+	kprintf("streams: dequeued (%lu bytes): ",
+		(unsigned long)msgdsize(got));
+	for (unsigned char *p = got->b_rptr; p < got->b_wptr; p++)
+		uart_putc((char)*p);
+	uart_putc('\n');
+
+	freemsg(got);
+	kfree(rq);
+	kfree(wq);
+	kprintf("streams: demo complete\n");
+}
+
 void kmain(void)
 {
 	uart_init();
@@ -72,6 +143,9 @@ void kmain(void)
 	mmu_init();
 	pmm_init((uintptr_t)__kernel_end, AARCH64_RAM_END);
 	kmem_init();
+
+	streams_demo();
+
 	sched_init();
 	timer_init(100);
 
