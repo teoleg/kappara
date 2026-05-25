@@ -84,6 +84,7 @@
 #include "kappara/kmem.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
+#include "kappara/streams.h"
 #include "kappara/sched.h"
 
 extern void context_switch(void **save_sp, void *new_sp);
@@ -167,6 +168,8 @@ void kthread_yield(void)
 
 void sched_tick(void)
 {
+	/* Each tick: drain any deferred STREAMS work, then rotate. */
+	streams_run();
 	kthread_yield();
 }
 

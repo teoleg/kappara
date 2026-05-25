@@ -77,4 +77,22 @@ long sys_ioctl_impl(int fd, int cmd, long arg);
 #define I_POP		2	/* arg = 0                              */
 #define I_LIST		3	/* arg = char* buffer; fills with names */
 
+/*
+ * SVR4 strbuf -- (maxlen, len, buf) triple used by putmsg / getmsg.
+ *   putmsg:  len = bytes to send, maxlen ignored
+ *   getmsg:  maxlen = buffer capacity, len gets set to bytes returned
+ */
+struct strbuf {
+	int   maxlen;
+	int   len;
+	void *buf;
+};
+
+#define RS_HIPRI	0x01	/* high-priority message flag */
+
+long sys_putmsg_impl(int fd, const struct strbuf *ctl,
+		     const struct strbuf *data, int flags);
+long sys_getmsg_impl(int fd, struct strbuf *ctl,
+		     struct strbuf *data, int *flagsp);
+
 #endif

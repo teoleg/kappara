@@ -151,20 +151,22 @@ struct qinit {
 #define QFULL		(1u << 0)	/* hit hi water mark */
 #define QWANTR		(1u << 1)	/* reader is waiting */
 #define QWANTW		(1u << 2)	/* writer is waiting */
+#define QENAB		(1u << 3)	/* on the runqueue, srvp pending */
 
 struct queue {
 	struct qinit	*q_qinfo;	/* put / srv / open / close */
 	mblk_t		*q_first;	/* head of deferred message list */
 	mblk_t		*q_last;	/* tail of deferred message list */
 	struct queue	*q_next;	/* the queue downstream of this one */
-	struct queue	*q_link;	/* link in service-proc run list */
+	struct queue	*q_link;	/* OTHERQ pairing */
+	struct queue	*q_runlink;	/* next queue on the service runqueue */
 	void		*q_ptr;		/* module-private state */
 	size_t		 q_count;	/* bytes currently queued */
 	long		 q_minpsz;	/* per-queue copies of mi_* limits */
 	long		 q_maxpsz;
 	long		 q_hiwat;
 	long		 q_lowat;
-	unsigned	 q_flag;	/* QFULL / QWANT* */
+	unsigned	 q_flag;	/* QFULL / QWANT* / QENAB */
 };
 
 typedef struct queue queue_t;
@@ -191,6 +193,20 @@ void    queue_init_pair(queue_t *rq, queue_t *wq,
 void    putq(queue_t *q, mblk_t *mp);
 mblk_t *getq(queue_t *q);
 int     putnext(queue_t *q, mblk_t *mp);
+
+/*
+ * Service-procedure machinery.
+ *
+ *   qenable(q)     schedule q's qi_srvp to be called by streams_run.
+ *                  Idempotent: a queue already on the runqueue is not
+ *                  re-added.
+ *   streams_run()  drain the runqueue until empty.  Called from the
+ *                  timer-tick path and from sys_yield, so any module
+ *                  whose putp defers work via putq + qenable will see
+ *                  that work picked up the next time we're idle.
+ */
+void    qenable(queue_t *q);
+void    streams_run(void);
 
 /* Travel-direction sugar.  In SVR4 these are macros that exploit the
  * standard layout where read and write queues come allocated as a

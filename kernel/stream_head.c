@@ -179,6 +179,51 @@ static struct streamtab loop_streamtab = {
 	.st_wrinit = &loop_winit,
 };
 
+/* ---- The "delay" module ----------------------------------------------- */
+
+/*
+ * delay defers every message via putq + qenable; its srv proc later
+ * drains via getq + putnext.  This is the standard SVR4 module
+ * shape that exercises the service-procedure machinery -- modules
+ * that want flow control or batching live here.
+ */
+
+static int delay_putp(queue_t *q, mblk_t *mp)
+{
+	putq(q, mp);
+	qenable(q);
+	return 0;
+}
+
+static int delay_srvp(queue_t *q)
+{
+	mblk_t *mp;
+	while ((mp = getq(q)) != NULL)
+		putnext(q, mp);
+	return 0;
+}
+
+static struct module_info delay_minfo = {
+	.mi_idnum  = 102,
+	.mi_idname = "delay",
+	.mi_minpsz = 0,
+	.mi_maxpsz = 4096,
+	.mi_hiwat  = 16384,
+	.mi_lowat  = 8192,
+};
+
+static struct qinit delay_rinit = {
+	.qi_putp = delay_putp, .qi_srvp = delay_srvp, .qi_minfo = &delay_minfo
+};
+static struct qinit delay_winit = {
+	.qi_putp = delay_putp, .qi_srvp = delay_srvp, .qi_minfo = &delay_minfo
+};
+
+static struct streamtab delay_streamtab = {
+	.st_rdinit = &delay_rinit,
+	.st_wrinit = &delay_winit,
+};
+
 /* ---- The "upper" module ----------------------------------------------- */
 
 /* Read side: uppercases data on its way up, then forwards. */
@@ -226,6 +271,7 @@ void streams_head_init(void)
 {
 	streams_register("loop",  &loop_streamtab);
 	streams_register("upper", &upper_streamtab);
+	streams_register("delay", &delay_streamtab);
 
 	for (int i = 0; i < FD_MAX; i++) {
 		fd_table[i].f_used   = 0;
@@ -332,13 +378,127 @@ long sys_read_impl(int fd, void *buf, size_t len)
 	if (!mp)
 		return 0;	/* "would block" -- no blocking yet */
 
-	size_t avail   = msgdsize(mp);
-	size_t to_copy = (avail < len) ? avail : len;
-	kmemcpy(buf, mp->b_rptr, to_copy);
-
-	/* Partial reads not handled; consume the whole mblk. */
+	/*
+	 * Walk b_cont, concatenating fragments into the caller's buffer.
+	 * A message that's bigger than the requested length is truncated
+	 * (the rest is freed); the partial-read case where leftover bytes
+	 * remain on the queue is a TODO that needs putbq() to push the
+	 * tail back at the head of the deferred list.
+	 */
+	unsigned char *out = buf;
+	size_t copied = 0;
+	for (mblk_t *m = mp; m && copied < len; m = m->b_cont) {
+		size_t avail = (size_t)(m->b_wptr - m->b_rptr);
+		size_t room  = len - copied;
+		size_t n     = (avail < room) ? avail : room;
+		kmemcpy(out + copied, m->b_rptr, n);
+		copied += n;
+	}
 	freemsg(mp);
-	return (long)to_copy;
+	return (long)copied;
+}
+
+/* ---- sys_putmsg / sys_getmsg ----------------------------------------- */
+
+long sys_putmsg_impl(int fd, const struct strbuf *ctl,
+		     const struct strbuf *data, int flags)
+{
+	if (fd < 0 || fd >= FD_MAX || !fd_table[fd].f_used)
+		return -1;
+	struct stdata *sd = fd_table[fd].f_stream;
+	if (!sd->sd_wq->q_next)
+		return -1;
+
+	mblk_t *ctlmp = NULL;
+	mblk_t *datamp = NULL;
+
+	if (ctl && ctl->len > 0 && ctl->buf) {
+		ctlmp = allocb((size_t)ctl->len, 0);
+		if (!ctlmp)
+			return -1;
+		ctlmp->b_datap->db_type = (flags & RS_HIPRI) ? M_PROTO : M_PROTO;
+		kmemcpy(ctlmp->b_wptr, ctl->buf, (size_t)ctl->len);
+		ctlmp->b_wptr += ctl->len;
+	}
+	if (data && data->len > 0 && data->buf) {
+		datamp = allocb((size_t)data->len, 0);
+		if (!datamp) {
+			if (ctlmp) freemsg(ctlmp);
+			return -1;
+		}
+		/* db_type = M_DATA already from allocb. */
+		kmemcpy(datamp->b_wptr, data->buf, (size_t)data->len);
+		datamp->b_wptr += data->len;
+	}
+
+	mblk_t *head = ctlmp;
+	if (head)
+		head->b_cont = datamp;
+	else
+		head = datamp;
+	if (!head)
+		return 0;	/* nothing to send */
+
+	putnext(sd->sd_wq, head);
+	return 0;
+}
+
+long sys_getmsg_impl(int fd, struct strbuf *ctl,
+		     struct strbuf *data, int *flagsp)
+{
+	if (fd < 0 || fd >= FD_MAX || !fd_table[fd].f_used)
+		return -1;
+	struct stdata *sd = fd_table[fd].f_stream;
+
+	mblk_t *mp = getq(sd->sd_rq);
+	if (!mp)
+		return -1;	/* would block */
+
+	int out_flags = 0;
+
+	/* If the first mblk is M_PROTO it goes to the ctl buffer; data
+	 * (M_DATA) follows in b_cont. */
+	mblk_t *first  = mp;
+	mblk_t *second = mp->b_cont;
+	mblk_t *cptr   = NULL;
+	mblk_t *dptr   = NULL;
+
+	if (first->b_datap->db_type == M_PROTO) {
+		cptr = first;
+		dptr = second;
+		if (cptr->b_datap->db_type == M_PROTO)
+			out_flags = 0;	/* normal proto */
+	} else {
+		dptr = first;
+	}
+
+	if (ctl) {
+		if (cptr) {
+			size_t n = (size_t)(cptr->b_wptr - cptr->b_rptr);
+			if ((int)n > ctl->maxlen)
+				n = (size_t)ctl->maxlen;
+			kmemcpy(ctl->buf, cptr->b_rptr, n);
+			ctl->len = (int)n;
+		} else {
+			ctl->len = -1;
+		}
+	}
+	if (data) {
+		if (dptr) {
+			size_t n = (size_t)(dptr->b_wptr - dptr->b_rptr);
+			if ((int)n > data->maxlen)
+				n = (size_t)data->maxlen;
+			kmemcpy(data->buf, dptr->b_rptr, n);
+			data->len = (int)n;
+		} else {
+			data->len = -1;
+		}
+	}
+	if (flagsp)
+		*flagsp = out_flags;
+
+	freemsg(mp);
+	return 0;
 }
 
 /* ---- sys_ioctl: I_PUSH / I_POP ---------------------------------------- */

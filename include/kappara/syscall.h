@@ -31,8 +31,10 @@
 #define SYS_read	5	/* (int fd, void *buf, size_t len) -> n    */
 #define SYS_write	6	/* (int fd, const void *buf, size_t len)   */
 #define SYS_ioctl	7	/* (int fd, int cmd, long arg)             */
+#define SYS_putmsg	8	/* (int fd, strbuf *c, strbuf *d, int fl)  */
+#define SYS_getmsg	9	/* (int fd, strbuf *c, strbuf *d, int *fl) */
 
-#define SYS_MAX		8
+#define SYS_MAX		10
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

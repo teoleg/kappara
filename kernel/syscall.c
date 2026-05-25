@@ -47,6 +47,7 @@
 #include "kappara/printk.h"
 #include "kappara/sched.h"
 #include "kappara/stream_head.h"
+#include "kappara/streams.h"
 #include "kappara/syscall.h"
 
 typedef long (*syscall_fn)(long, long, long, long, long, long);
@@ -71,6 +72,9 @@ static long sys_getpid(long a0, long a1, long a2, long a3, long a4, long a5)
 static long sys_yield(long a0, long a1, long a2, long a3, long a4, long a5)
 {
 	(void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	/* Drain any deferred STREAMS work first; modules whose putp
+	 * just queues + qenables will see their srvp called here. */
+	streams_run();
 	kthread_yield();
 	return 0;
 }
@@ -105,6 +109,24 @@ static long sys_ioctl(long a0, long a1, long a2, long a3, long a4, long a5)
 	return sys_ioctl_impl((int)a0, (int)a1, a2);
 }
 
+static long sys_putmsg(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a4; (void)a5;
+	return sys_putmsg_impl((int)a0,
+			       (const struct strbuf *)(uintptr_t)a1,
+			       (const struct strbuf *)(uintptr_t)a2,
+			       (int)a3);
+}
+
+static long sys_getmsg(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a4; (void)a5;
+	return sys_getmsg_impl((int)a0,
+			       (struct strbuf *)(uintptr_t)a1,
+			       (struct strbuf *)(uintptr_t)a2,
+			       (int *)(uintptr_t)a3);
+}
+
 static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_log]    = sys_log,
 	[SYS_getpid] = sys_getpid,
@@ -114,6 +136,8 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_read]   = sys_read,
 	[SYS_write]  = sys_write,
 	[SYS_ioctl]  = sys_ioctl,
+	[SYS_putmsg] = sys_putmsg,
+	[SYS_getmsg] = sys_getmsg,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

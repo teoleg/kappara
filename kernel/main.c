@@ -153,6 +153,21 @@ static long do_syscall(long num, long a0, long a1, long a2)
 	return x0;
 }
 
+static long do_syscall_4(long num, long a0, long a1, long a2, long a3)
+{
+	register long x0 __asm__("x0") = a0;
+	register long x1 __asm__("x1") = a1;
+	register long x2 __asm__("x2") = a2;
+	register long x3 __asm__("x3") = a3;
+	register long x8 __asm__("x8") = num;
+	__asm__ volatile (
+		"svc	#0\n"
+		: "+r"(x0)
+		: "r"(x1), "r"(x2), "r"(x3), "r"(x8)
+		: "memory", "cc");
+	return x0;
+}
+
 static void print_buf(const char *label, const char *buf, long n)
 {
 	kprintf("%s (%ld bytes): ", label, n);
@@ -197,6 +212,58 @@ static void syscall_demo(void)
 
 	do_syscall(SYS_close, fd, 0, 0);
 	kprintf("syscall: close(%ld) done\n", fd);
+
+	/* ----- delay module + service procedure demo --------------------- */
+	kprintf("\n--- delay module (service-proc deferred I/O) ---\n");
+	fd = do_syscall(SYS_open, (long)(uintptr_t)"loop", 0, 0);
+	do_syscall(SYS_ioctl, fd, I_PUSH, (long)(uintptr_t)"delay");
+
+	const char dmsg[] = "via delay";
+	do_syscall(SYS_write, fd, (long)(uintptr_t)dmsg, sizeof(dmsg) - 1);
+
+	n = do_syscall(SYS_read, fd, (long)(uintptr_t)buf, sizeof(buf));
+	kprintf("syscall: immediate read = %ld bytes (queued in delay)\n", n);
+
+	/* Two yields: drain delay_wq, then delay_rq. */
+	do_syscall(SYS_yield, 0, 0, 0);
+	do_syscall(SYS_yield, 0, 0, 0);
+
+	n = do_syscall(SYS_read, fd, (long)(uintptr_t)buf, sizeof(buf));
+	print_buf("syscall: read after two yields", buf, n);
+	do_syscall(SYS_close, fd, 0, 0);
+
+	/* ----- putmsg / getmsg demo ------------------------------------- */
+	kprintf("\n--- putmsg / getmsg (M_PROTO + M_DATA) ---\n");
+	fd = do_syscall(SYS_open, (long)(uintptr_t)"loop", 0, 0);
+
+	const char ctlbytes[]  = "ctl-hdr";
+	const char databytes[] = "payload bytes here";
+	struct strbuf pctl  = { .maxlen = 0,
+				.len    = (int)sizeof(ctlbytes) - 1,
+				.buf    = (void *)ctlbytes };
+	struct strbuf pdata = { .maxlen = 0,
+				.len    = (int)sizeof(databytes) - 1,
+				.buf    = (void *)databytes };
+	long r2 = do_syscall_4(SYS_putmsg, fd,
+			       (long)(uintptr_t)&pctl,
+			       (long)(uintptr_t)&pdata, 0);
+	kprintf("syscall: putmsg -> %ld\n", r2);
+
+	char gctlbuf[16], gdatabuf[32];
+	struct strbuf gctl  = { .maxlen = sizeof(gctlbuf),  .len = 0,
+				.buf = gctlbuf  };
+	struct strbuf gdata = { .maxlen = sizeof(gdatabuf), .len = 0,
+				.buf = gdatabuf };
+	int gflags = 0;
+	r2 = do_syscall_4(SYS_getmsg, fd,
+			  (long)(uintptr_t)&gctl,
+			  (long)(uintptr_t)&gdata,
+			  (long)(uintptr_t)&gflags);
+	kprintf("syscall: getmsg -> %ld (flags=%d)\n", r2, gflags);
+	print_buf("  ctl ", gctlbuf,  gctl.len);
+	print_buf("  data", gdatabuf, gdata.len);
+
+	do_syscall(SYS_close, fd, 0, 0);
 }
 
 void kmain(void)

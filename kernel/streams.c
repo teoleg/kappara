@@ -228,3 +228,50 @@ int putnext(queue_t *q, mblk_t *mp)
 	}
 	return next->q_qinfo->qi_putp(next, mp);
 }
+
+/* ---- Service procedure scheduling -------------------------------------- */
+
+/*
+ * runqueue: a singly-linked list of queues whose service procedures
+ * we owe a call to.  Threaded via q->q_runlink; QENAB in q_flag is
+ * the "I am already on the runqueue" sentinel that makes qenable
+ * idempotent.
+ */
+static queue_t *runq_head;
+static queue_t *runq_tail;
+
+void qenable(queue_t *q)
+{
+	if (!q || !q->q_qinfo || !q->q_qinfo->qi_srvp)
+		return;
+	if (q->q_flag & QENAB)
+		return;
+	q->q_flag |= QENAB;
+	q->q_runlink = NULL;
+	if (runq_tail)
+		runq_tail->q_runlink = q;
+	else
+		runq_head = q;
+	runq_tail = q;
+}
+
+void streams_run(void)
+{
+	while (runq_head) {
+		queue_t *q = runq_head;
+		runq_head = q->q_runlink;
+		if (!runq_head)
+			runq_tail = NULL;
+		q->q_runlink = NULL;
+		q->q_flag &= ~QENAB;
+
+		/*
+		 * srvp may call putnext -> downstream putp -> putq + qenable,
+		 * which appends to the runqueue we're walking.  That's the
+		 * whole point of having a worklist: those appends get
+		 * picked up by the next iteration.
+		 */
+		if (q->q_qinfo->qi_srvp)
+			q->q_qinfo->qi_srvp(q);
+	}
+}
