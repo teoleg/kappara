@@ -53,6 +53,7 @@
 #include <stdint.h>
 
 #include "kappara/printk.h"
+#include "kappara/timer.h"
 #include "kappara/trap.h"
 
 struct arm_trap_frame {
@@ -97,9 +98,15 @@ static const char *mode_name(unsigned m)
 	}
 }
 
-void trap_dump(struct arm_trap_frame *tf, unsigned vec_id);
-void trap_dump(struct arm_trap_frame *tf, unsigned vec_id)
+void trap_dispatch(struct arm_trap_frame *tf, unsigned vec_id);
+void trap_dispatch(struct arm_trap_frame *tf, unsigned vec_id)
 {
+	/* IRQ vector returns; everything else panics. */
+	if (vec_id == 6) {
+		irq_dispatch();
+		return;
+	}
+
 	kprintf("\n!! trap: %s (vec=%u)\n", vec_name(vec_id), vec_id);
 	kprintf("   pc=0x%08lx  spsr=0x%08lx (pre-mode=%s)\n",
 		(unsigned long)tf->pc,

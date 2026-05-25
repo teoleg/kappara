@@ -89,11 +89,19 @@
  * the frame (matching struct arm_trap_frame in arch/arm/trap.c), and
  * r1 carries the vec_id (0..7) so we know which slot fired.
  *
- * Return from exception (not yet implemented)
- * -------------------------------------------
- * To resume the interrupted code we'd undo the push, restore SPSR via
- * `ldmia sp!, {pc}^` or `rfeia sp!`.  For this first pass trap_dump
- * never returns -- it panics -- so the handler tail just spins on wfe.
+ * Return from exception
+ * ---------------------
+ * After bl trap_dispatch the handler tail unwinds:
+ *
+ *     pop {r0-r12, lr}    ; restore GPRs, sp now at saved (LR, SPSR)
+ *     rfeia sp!           ; PC <- [sp], CPSR <- [sp+4], sp += 8
+ *
+ * rfeia is the symmetric counterpart of srsdb: it pops PC and CPSR
+ * from the stack and jumps, simultaneously restoring the previous
+ * privilege/interrupt-mask state.  trap_dispatch is responsible
+ * for choosing to return (IRQ path) or to never return (kpanic on
+ * unhandled synchronous faults), so this tail is only reached
+ * after a successful IRQ.
  */
 
 .section ".text"
@@ -108,9 +116,9 @@
 	push	{r0-r12, lr}
 	mov	r0, sp			@ trap frame pointer
 	mov	r1, #\vec_id
-	bl	trap_dump
-1:	wfe
-	b	1b
+	bl	trap_dispatch
+	pop	{r0-r12, lr}
+	rfeia	sp!			@ pop saved PC + CPSR, eret
 .endm
 
 .balign 32

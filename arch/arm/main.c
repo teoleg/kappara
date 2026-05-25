@@ -2,21 +2,19 @@
  * arch/arm/main.c -- ARMv7-A kmain
  * ================================
  *
- * Brings up the same subsystems as kernel/main.c on AArch64, but
- * without preemption: the timer + GIC + IRQ unwind aren't here yet,
- * so threads cooperate via explicit kthread_yield() calls.
+ * Mirrors the AArch64 kmain end-to-end: console, vectors, MMU, pmm,
+ * kmem, sched, generic timer + GICv2.  After the timer is armed and
+ * cpsie i unmasks interrupts, three threads (main / alpha / beta)
+ * round-robin under timer preemption.
  *
- * Order of bring-up (mirrors the AArch64 path):
- *   uart_init       PL011 console
+ *   uart_init       PL011 console at 0x09000000
  *   trap_init       VBAR-rooted vector table
  *   mmu_init        LPAE identity map + caches on
- *   pmm_init        free-list over [__kernel_end .. 0x80000000)
+ *   pmm_init        free-list over [__kernel_end .. 0x50000000)
  *   kmem_init       size-cache slab heap
  *   sched_init      register kmain itself as tid 0
- *
- * Two demo threads (alpha, beta) each loop a few times calling
- * kthread_yield(); main does the same.  Expected output rotates
- * main / alpha / beta / main / alpha / beta / ...
+ *   timer_init      100 Hz generic-timer tick via GIC
+ *   cpsie i         unmask CPSR.I; the IRQ vector now drives sched_tick
  */
 
 #include <stdint.h>
@@ -26,12 +24,13 @@
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
 #include "kappara/sched.h"
+#include "kappara/timer.h"
 #include "kappara/trap.h"
 #include "kappara/uart.h"
 
 extern char __kernel_end[];
 
-/* QEMU virt cortex-a15 with -m 256 has RAM at 0x40000000..0x50000000. */
+/* QEMU virt cortex-a15 with -m 256: RAM at 0x40000000..0x50000000. */
 #define ARM_RAM_END	0x50000000UL
 
 static unsigned arm_current_mode(void)
@@ -56,12 +55,18 @@ static const char *mode_name(unsigned m)
 	}
 }
 
+static void spin(unsigned long n)
+{
+	for (volatile unsigned long i = 0; i < n; i++)
+		;
+}
+
 static void demo(void *arg)
 {
 	const char *name = arg;
-	for (int i = 0; i < 5; i++) {
-		kprintf("[%s] i=%d\n", name, i);
-		kthread_yield();
+	for (unsigned long n = 0; ; n++) {
+		kprintf("[%s] n=%lu\n", name, n);
+		spin(500000);
 	}
 }
 
@@ -79,14 +84,16 @@ void kmain(void)
 	pmm_init((uintptr_t)__kernel_end, ARM_RAM_END);
 	kmem_init();
 	sched_init();
+	timer_init(100);
 
 	kthread_create("alpha", demo, (void *)"alpha");
 	kthread_create("beta",  demo, (void *)"beta");
 
-	for (int i = 0; i < 5; i++) {
-		kprintf("[main] i=%d\n", i);
-		kthread_yield();
-	}
+	__asm__ volatile ("cpsie i" ::: "memory");
+	kprintf("[main] IRQs unmasked; entering scheduler loop\n");
 
-	kpanic("end of armv7 kmain");
+	for (unsigned long n = 0; ; n++) {
+		kprintf("[main] n=%lu\n", n);
+		spin(500000);
+	}
 }
