@@ -2,41 +2,28 @@
  * arch/arm/main.c -- ARMv7-A early kmain
  * ======================================
  *
- * Minimal kmain for the ARMv7 build.  Equivalent in scope to the early
- * AArch64 kmain in kernel/main.c after step 2: console up, vectors
- * installed, then a deliberate exception so we can see the trap dumper
- * decode the frame.  When MMU + scheduler land on ARMv7 this will be
- * superseded by the portable kernel/main.c, but for now it lives in
- * arch/arm/ so the AArch64 kmain (which uses arch-specific MMU/IRQ
- * APIs not yet present on ARMv7) stays unaffected.
+ * The "top-level" of the kernel for the ARMv7 build, equivalent in
+ * scope to kernel/main.c on AArch64 -- with a smaller set of
+ * subsystems wired in so we can grow the port one piece at a time.
  *
- * What it does
- * ------------
- *   1. Bring up the PL011 UART (arch/arm/uart.c).
- *   2. Install arm_vectors via VBAR (arch/arm/trap.c).
- *   3. Print the current processor mode -- expect SVC after boot.S has
- *      done the HYP->SVC drop.
- *   4. Execute UDF #0 (permanently undefined ARM instruction) to fire
- *      the "undef" vector and force the trap dumper to print.
+ * Currently brings up:
+ *   uart_init   PL011 console at 0x09000000
+ *   trap_init   VBAR-rooted vector table
+ *   mmu_init    LPAE identity map + caches on
  *
- * Expected output (on QEMU -M virt -cpu cortex-a15):
- *
- *   kappara: hello from armv7
- *           running in SVC mode (cpsr.M=0x13)
- *           VBAR installed; firing udf #0...
- *
- *   !! trap: undef (vec=1)
- *      pc=0x4001xxxx  spsr=0x600000d3 (pre-mode=SVC)
- *      r0 =...  r1 =...
- *      ...
- *   panic: unhandled trap
+ * Demonstrates the MMU is live by writing a sentinel to a RAM
+ * address through the MMU and reading it back, then panics so the
+ * boot returns control to the QEMU monitor.
  */
 
 #include <stdint.h>
 
+#include "kappara/mmu.h"
 #include "kappara/printk.h"
 #include "kappara/trap.h"
 #include "kappara/uart.h"
+
+extern char __kernel_end[];
 
 static unsigned arm_current_mode(void)
 {
@@ -52,7 +39,6 @@ static const char *mode_name(unsigned m)
 	case 0x11: return "FIQ";
 	case 0x12: return "IRQ";
 	case 0x13: return "SVC";
-	case 0x16: return "MON";
 	case 0x17: return "ABT";
 	case 0x1A: return "HYP";
 	case 0x1B: return "UND";
@@ -70,9 +56,16 @@ void kmain(void)
 	kprintf("        no soup for you, only streams\n");
 	kprintf("        running in %s mode (cpsr.M=0x%x)\n",
 		mode_name(arm_current_mode()), arm_current_mode());
-	kprintf("        VBAR installed; firing udf #0...\n");
 
-	__asm__ volatile ("udf #0");
+	mmu_init();
 
-	kpanic("returned from udf?");
+	/* MMU sanity check: write/read a sentinel just past the kernel. */
+	volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)__kernel_end;
+	p[0] = 0xdeadbeefu;
+	p[1] = 0xcafef00du;
+	kprintf("mmu-test: wrote/read %p -> 0x%lx 0x%lx (kernel_end=%p)\n",
+		(void *)p, (unsigned long)p[0], (unsigned long)p[1],
+		(void *)__kernel_end);
+
+	kpanic("end of armv7 kmain");
 }
