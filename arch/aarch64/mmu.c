@@ -1,3 +1,108 @@
+/*
+ * arch/aarch64/mmu.c -- AArch64 stage-1 MMU bring-up
+ * ==================================================
+ *
+ * What this file is
+ * -----------------
+ * Builds a simple identity-mapping page-table tree, programs the MMU
+ * control registers, then flips on translation + caches.  After
+ * mmu_init() returns the CPU is translating every virtual address
+ * through these tables (VA == PA for everything we care about) with
+ * the D-cache and I-cache enabled.
+ *
+ * Stage-1 page-table walk (4 KB granule, 48-bit VA)
+ * -------------------------------------------------
+ * AArch64 splits a 48-bit VA into 9-bit indices per level, plus the
+ * 12-bit page offset:
+ *
+ *     47        39 38        30 29        21 20        12 11      0
+ *    +-----------+-------------+-------------+-------------+--------+
+ *    |   L0 idx  |   L1 idx    |   L2 idx    |   L3 idx    | offset |
+ *    +-----------+-------------+-------------+-------------+--------+
+ *         |             |             |             |
+ *         v             v             v             v
+ *      l0_table     l1_table      l2_table       (page)
+ *      [512 x 8]    [512 x 8]     [512 x 8]
+ *
+ * Each level's entry either:
+ *   - points to the next level's table (type=0b11), or
+ *   - is a "block" descriptor for a large mapping (type=0b01):
+ *       L1 block = 1 GB, L2 block = 2 MB, L3 entry = 4 KB page.
+ *
+ * Our tree
+ * --------
+ *
+ *     l0_table[0]   -> l1_table          (covers VA 0..512 GB)
+ *     l1_table[0]   -> l2_table          (covers VA 0..1 GB)
+ *     l1_table[1]   -> 1 GB Device block (covers VA 1..2 GB,
+ *                                          BCM2836 local peripherals)
+ *     l2_table[i]   -> 2 MB block        (each one covers a 2 MB
+ *                                          chunk of the low 1 GB)
+ *
+ *   For each l2_table[i]:
+ *     - 0x3F000000 <= PA < 0x40000000  -> Device-nGnRE (UART, GPIO, ...)
+ *     - else                            -> Normal Inner+Outer WBWA,
+ *                                          Inner-Shareable, UXN
+ *
+ * Block descriptor bit layout (2 MB block at L2, 4 KB granule)
+ * -----------------------------------------------------------
+ *
+ *     63  55 54 53 52    47          21 20  12 11 10 9 8 7 6 5 4 3 2 1 0
+ *    +-----+--+--+--+------+------------+------+--+-+---+---+---+-+----+--+
+ *    | IGN |UX|PX|  | RES0 |  PA[47:21] | RES0 |nG|AF|SH |AP |NS|AttrIdx|V|
+ *    +-----+--+--+--+------+------------+------+--+-+---+---+---+-+----+--+
+ *                                                              |       block/
+ *                                                              |       table
+ *                                                              v
+ *                                                          bit 1 = 0
+ *
+ *   V         = valid                     (1)
+ *   AttrIdx   = MAIR_EL1 byte selector    (0 = Normal, 2 = Device for us)
+ *   NS        = non-secure                (irrelevant at our EL)
+ *   AP[2:1]   = access permissions        (00 = RW EL1, no EL0)
+ *   SH[1:0]   = shareability              (11 = Inner Shareable for Normal,
+ *                                          00 = ignored for Device)
+ *   AF        = access flag               (must be 1; we set it everywhere)
+ *   nG        = non-global                (0 for kernel mappings)
+ *   PA[47:21] = physical block base
+ *   PXN/UXN   = no privileged/unpriv exec (for Device and UXN for Normal)
+ *
+ * MAIR_EL1 -- memory attribute lookup table
+ * -----------------------------------------
+ *   Eight one-byte slots, indexed by AttrIdx in a descriptor.  We
+ *   define just two:
+ *
+ *     idx 0  Normal memory, Outer WBWA + Inner WBWA cacheable    = 0xFF
+ *     idx 2  Device-nGnRE                                         = 0x04
+ *
+ *   MAIR_EL1 byte layout: 0xFF means "Outer WB, R+W alloc; Inner WB,
+ *   R+W alloc" -- the most aggressive cacheable mode, fine for RAM.
+ *
+ * TCR_EL1 -- translation control register
+ * ---------------------------------------
+ *   T0SZ=16        VA size = 64-16 = 48 bits        (whole TTBR0 region)
+ *   IRGN0/ORGN0=01 inner/outer WBWA for the table walker itself
+ *   SH0=11         table walks are inner-shareable
+ *   TG0=00         4 KB granule
+ *   EPD1=1         disable TTBR1 walks (we don't use the high half yet)
+ *   TG1=10         4 KB for TTBR1 (moot with EPD1=1, but encoded)
+ *   IPS=001        36-bit output physical address space
+ *
+ * The MMU enable dance
+ * --------------------
+ *   1. Write MAIR_EL1, TCR_EL1, TTBR0_EL1   (config first)
+ *   2. tlbi vmalle1; dsb sy; isb            (flush any stale TLB)
+ *   3. ic iallu; dsb sy                     (flush I-cache as a paranoid
+ *                                              measure; nothing in I-cache
+ *                                              has been written by us)
+ *   4. Set SCTLR_EL1.{M,C,I} and write back (this is the actual switch)
+ *   5. isb                                  (synchronise the new pipe)
+ *
+ *   After the ISB at step 5, every memory access is translated and
+ *   cacheable RAM goes through L1 caches.  Because our mapping is
+ *   identity, every pointer that was valid before is still valid.
+ */
+
 #include <stdint.h>
 
 #include "kappara/mmu.h"

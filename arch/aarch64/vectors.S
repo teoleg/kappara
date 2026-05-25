@@ -1,10 +1,73 @@
-.section ".text"
+/*
+ * arch/aarch64/vectors.S -- AArch64 EL1 exception vector table
+ * ============================================================
+ *
+ * What this file is
+ * -----------------
+ * The 16-slot AArch64 vector table programmed into VBAR_EL1 by
+ * trap_init(), plus the per-slot trampolines that save a uniform
+ * 288-byte trap frame on the kernel stack and dispatch to the C
+ * trap_dispatch() function.
+ *
+ * AArch64 vector table shape
+ * --------------------------
+ * Unlike ARMv7's eight 4-byte entries, AArch64 gives each vector a
+ * full 0x80 (128 bytes / 32 instructions).  That's enough room for
+ * the GP-register save sequence to be inlined per-slot, so each
+ * exception lands directly in a self-contained handler without an
+ * extra indirection.  The table is 2 KB total and must be 2 KB
+ * aligned.
+ *
+ * Sixteen slots arranged as 4 categories x 4 causes:
+ *
+ *     offset  category               cause
+ *     ------  ---------------------  -----------
+ *     0x000   Current EL, SP_EL0     synchronous
+ *     0x080                          IRQ
+ *     0x100                          FIQ
+ *     0x180                          SError
+ *     0x200   Current EL, SP_ELx     synchronous   <- we mostly hit this
+ *     0x280                          IRQ           <- timer fires here
+ *     0x300                          FIQ
+ *     0x380                          SError
+ *     0x400   Lower EL, AArch64      synchronous   <- syscalls from EL0
+ *     0x480                          IRQ
+ *     0x500                          FIQ
+ *     0x580                          SError
+ *     0x600   Lower EL, AArch32      synchronous   <- we don't use these
+ *     0x680                          IRQ
+ *     0x700                          FIQ
+ *     0x780                          SError
+ *
+ * Trap frame layout (288 bytes, 16-byte aligned)
+ * ----------------------------------------------
+ *   [0x000..0x0F0)  x0..x29  as 15 stp pairs   (general purpose regs)
+ *   [0x0F0..0x100)  x30, sp_el0                (link reg, user SP)
+ *   [0x100..0x110)  elr_el1, spsr_el1          (return PC + saved PSTATE)
+ *   [0x110..0x120)  esr_el1, far_el1           (syndrome + fault address)
+ *
+ * Matches `struct trap_frame` in include/kappara/trap.h.
+ *
+ * Macros
+ * ------
+ *   KERNEL_ENTRY -- sub sp, push every reg via stp pairs, snapshot the
+ *                   system regs (sp_el0, elr_el1, spsr_el1, esr_el1,
+ *                   far_el1) into the frame.
+ *
+ *   KERNEL_EXIT  -- the mirror image: restore system regs (just elr
+ *                   and spsr; esr/far are read-only-ish), pop the GPRs,
+ *                   `add sp, sp, #288`, `eret`.  Restoring SPSR_EL1
+ *                   and ELR_EL1 before eret is how the CPU returns to
+ *                   the interrupted code with the same PSTATE.
+ *
+ *   VECTOR id    -- one full vector slot: .balign 128, KERNEL_ENTRY,
+ *                   mov r0=sp (frame), r1=id (which slot), branch to
+ *                   the shared trap_tail (bl trap_dispatch; KERNEL_EXIT).
+ *                   Each slot is ~108 bytes of code padded to 128 by
+ *                   .balign before the next.
+ */
 
-// Trap frame layout (288 bytes, 16-byte aligned):
-//   [0x000..0x0F0)  x0..x29  as 15 stp pairs
-//   [0x0F0..0x100)  x30, sp_el0
-//   [0x100..0x110)  elr_el1, spsr_el1
-//   [0x110..0x120)  esr_el1, far_el1
+.section ".text"
 
 .macro KERNEL_ENTRY
 	sub	sp, sp, #288

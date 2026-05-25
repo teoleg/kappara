@@ -1,3 +1,61 @@
+/*
+ * arch/aarch64/timer.c -- ARMv8 generic timer + BCM2836 IRQ routing
+ * =================================================================
+ *
+ * What this file is
+ * -----------------
+ * The driver that turns the ARMv8 architectural per-CPU generic
+ * timer into a periodic scheduler tick.  This is the heartbeat that
+ * makes the scheduler preemptive: every 1/HZ seconds the timer
+ * fires CNTPNSIRQ, the IRQ vector takes us into irq_dispatch(), and
+ * we call sched_tick() which yields to the next ready thread.
+ *
+ * Two parts:
+ *   1. The CPU's generic timer (programmed via CNTP_CTL_EL0 /
+ *      CNTP_TVAL_EL0).  Architectural -- same code would work on any
+ *      ARMv8-A CPU.
+ *   2. The BCM2836/2837-specific routing block that actually delivers
+ *      CNTPNSIRQ to core 0's IRQ line.  Without this, the timer
+ *      fires inside the core but no IRQ is taken.
+ *
+ * Why the routing block exists
+ * ----------------------------
+ * The BCM2836/2837 has no GIC (the Pi 4 / BCM2711 does).  Instead a
+ * tiny "ARM local" peripheral at 0x40000000 routes per-core timer,
+ * mailbox, and legacy-GPU interrupts to each core's IRQ / FIQ lines.
+ * For our purposes we touch two registers:
+ *
+ *   0x40000040  TIMER_CONTROL (core 0)
+ *               bit 0  CNTPSIRQ  -> IRQ
+ *               bit 1  CNTPNSIRQ -> IRQ   <-- we set this
+ *               bit 2  CNTHPIRQ  -> IRQ
+ *               bit 3  CNTVIRQ   -> IRQ
+ *               bit 4  CNTPSIRQ  -> FIQ
+ *               ...    (bits 5..7 FIQ enables for the same four timers)
+ *
+ *   0x40000060  IRQ_SOURCE (core 0, read-only)
+ *               same bit positions; reads 1 while that source is
+ *               asserting an IRQ to this core.  Used by irq_dispatch
+ *               to figure out who fired.
+ *
+ * Why CNTPNSIRQ specifically?
+ * ---------------------------
+ * We left HCR_EL2.RW=1 and dropped to non-secure EL1 in boot.S, so
+ * the EL1 physical timer is the non-secure physical timer; its
+ * out-of-band IRQ line is CNTPNSIRQ (PN = Physical Non-secure).
+ *
+ * The fire-and-rearm loop
+ * -----------------------
+ * Generic timers have two ways to set the next deadline:
+ *   CNTP_CVAL_EL0  absolute counter value
+ *   CNTP_TVAL_EL0  relative: writing N arms the timer for (CNTPCT + N)
+ *
+ * We use TVAL because relative is what "wake me every 10 ms" wants.
+ * Each tick we reload TVAL with the same `tick_cycles` value; the
+ * write also clears the pending condition, so the IRQ deasserts
+ * until the next deadline.
+ */
+
 #include <stdint.h>
 
 #include "kappara/printk.h"

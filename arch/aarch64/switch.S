@@ -1,15 +1,79 @@
-.section ".text"
-
 /*
+ * arch/aarch64/switch.S -- AArch64 kernel thread context switch
+ * =============================================================
+ *
+ * What this file is
+ * -----------------
+ * The two assembly fragments the scheduler needs that you can't write
+ * in C:
+ *   context_switch    -- atomically save outgoing thread state and
+ *                        restore incoming thread state
+ *   thread_trampoline -- the bootstrap stub for a freshly-created
+ *                        thread the first time the scheduler picks it
+ *
+ * The callee-saved subset trick
+ * -----------------------------
+ * AArch64's AAPCS (procedure call standard) says caller-saved
+ * registers (x0..x18) and the temporaries are NOT preserved across
+ * function calls.  Anyone who needs them already spilled them before
+ * making a call.  That means a context switch only has to save the
+ * callee-saved set:
+ *
+ *     x19, x20, x21, x22, x23, x24, x25, x26, x27, x28,
+ *     x29 (frame pointer), x30 (link register == return address)
+ *
+ * Twelve 64-bit registers = 96 bytes, 16-byte aligned (AAPCS
+ * requirement).  Saved as six stp pairs at the top of the outgoing
+ * thread's kernel stack.  When we `mov sp, new_sp; ldp ...; ret`,
+ * the `ret` jumps to whatever x30 was popped -- usually the inside of
+ * the kthread_yield() call that the new thread last made (so it
+ * returns from yield as if nothing happened), OR thread_trampoline
+ * the very first time the thread runs.
+ *
+ *         outgoing stack (high to low)            initial stack of a
+ *         after context_switch save:              freshly-created thread:
+ *
+ *         +----------------+ <-- old sp           +----------------+ <-- top of page
+ *         |   x29, x30     |                      |   0,  trampoline|  x29=0, x30=tramp
+ *         +----------------+                      +----------------+
+ *         |   x27, x28     |                      |     0, 0       |
+ *         +----------------+                      +----------------+
+ *         |   x25, x26     |                      |     0, 0       |
+ *         +----------------+                      +----------------+
+ *         |   x23, x24     |                      |     0, 0       |
+ *         +----------------+                      +----------------+
+ *         |   x21, x22     |                      |     0, 0       |
+ *         +----------------+                      +----------------+
+ *         |   x19, x20     | <-- saved SP         |   fn,  arg     | <-- saved SP
+ *         +----------------+                      +----------------+
+ *           (lower stack...)                        (lower stack...)
+ *
+ * That second column is what kthread_create() lays down: arg goes
+ * into x20 and fn into x19, with x30 pointing at thread_trampoline.
+ *
+ * The trampoline's job
+ * --------------------
+ * When the scheduler picks a new thread for the first time:
+ *     ldp x19, x20, [sp, #0]       <- arg into x20, fn into x19
+ *     ldp x21, x22, [sp, #16]      <- both zero
+ *     ...
+ *     ldp x29, x30, [sp, #80]      <- x29 = 0, x30 = thread_trampoline
+ *     add sp, sp, #96
+ *     ret                           <- jumps to thread_trampoline
+ *
+ * thread_trampoline then unmasks IRQs (a brand-new thread inherits
+ * the masked-IRQ state of whatever context first scheduled it; if
+ * that was an IRQ handler, DAIF.I=1 and we'd never preempt this
+ * thread -- bug), does `blr x19` to call fn(arg), and if fn returns
+ * tail-calls kthread_exit to clean up.
+ *
  * void context_switch(void **save_sp, void *new_sp);
  *   x0 = address at which to save the outgoing SP
  *   x1 = SP of the thread we are switching to
- *
- * Saves the AAPCS callee-saved set (x19..x29, lr) on the outgoing stack,
- * records the new SP, and pops the same set off the incoming stack.  The
- * `ret` at the bottom jumps to whatever LR was popped, so the first time
- * we switch into a freshly-created thread we land in thread_trampoline.
  */
+
+.section ".text"
+
 .global context_switch
 context_switch:
 	sub	sp, sp, #96

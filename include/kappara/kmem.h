@@ -1,3 +1,19 @@
+/*
+ * include/kappara/kmem.h -- slab allocator + kmalloc/kfree
+ *
+ * Two layers of API:
+ *
+ *   kmem_cache_init/alloc/free  for fixed-size objects.  STREAMS will
+ *                                define one cache per object kind
+ *                                (mblk, dblk, queue_t, ...).
+ *
+ *   kmalloc / kfree             generic, backed by power-of-two size
+ *                                caches.  Returns NULL above 2048
+ *                                bytes; callers should not assume a
+ *                                particular alignment beyond 8 bytes.
+ *
+ * Implementation and slab layout: see kernel/kmem.c.
+ */
 #ifndef KAPPARA_KMEM_H
 #define KAPPARA_KMEM_H
 

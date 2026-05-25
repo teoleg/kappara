@@ -1,3 +1,64 @@
+/*
+ * kernel/printk.c -- freestanding kernel printf
+ * =============================================
+ *
+ * What this file is
+ * -----------------
+ * A small printf-flavoured formatter that talks straight to the UART
+ * via uart_putc().  Arch-independent: it neither knows nor cares
+ * which board it's on, and the same source compiles for both
+ * AArch64 and ARMv7.
+ *
+ * Why not use libc?
+ * -----------------
+ * We compile -ffreestanding -nostdlib.  There is no malloc, no
+ * vsnprintf, no FILE.  The only standard-library headers we touch
+ * (<stdint.h>, <stdarg.h>, <stddef.h>) are part of the compiler
+ * itself, not libc, so they work in freestanding mode.  Everything
+ * else we write by hand.
+ *
+ * Supported format directives
+ * ---------------------------
+ *
+ *     %d / %i   signed decimal      (int or long with %ld)
+ *     %u        unsigned decimal    (int or long with %lu)
+ *     %x        lowercase hex       (int or long with %lx)
+ *     %X        uppercase hex
+ *     %s        NUL-terminated string (NULL -> "(null)")
+ *     %c        single char (passed as int after default promotion)
+ *     %p        pointer, formatted as 0x%016lx
+ *     %%        literal '%'
+ *
+ *     Flags / width:  '-' (left-align)
+ *                     '0' (zero-pad numeric)
+ *                     width digits
+ *                     'l' (modifier, promote int -> long)
+ *
+ * Implementation sketch
+ * ---------------------
+ *
+ *     vkprintf  scans fmt, calls emit_str / emit_int / emit_uint
+ *               for each directive
+ *     emit_uint accumulates digits into a small reverse-order buffer
+ *               on the stack (max 64 hex digits is enough for any
+ *               uint64_t), then either prepends padding and dumps,
+ *               or dumps then appends padding (left-align case)
+ *     emit_str  loops uart_putc; '\n' is translated to "\r\n" so a
+ *               raw serial terminal stays in column 0
+ *
+ * kpanic
+ * ------
+ * Final stop for unrecoverable errors.  Prints a "panic: ..." line
+ * via the same formatter, then wfe-loops forever.
+ *
+ * raise
+ * -----
+ * libgcc's 32-bit division-by-zero helpers reference raise() on the
+ * Linux-EABI build of libgcc that ships with the Debian cross.  We
+ * stub it to a kpanic so the linker is happy and we still get a
+ * useful message if the kernel actually does divide by zero.
+ */
+
 #include <stdarg.h>
 #include <stdint.h>
 

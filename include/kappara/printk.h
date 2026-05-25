@@ -1,3 +1,9 @@
+/*
+ * include/kappara/printk.h -- kernel printf + panic
+ *
+ * Freestanding implementation lives in kernel/printk.c; see the file
+ * header there for the supported format directives.
+ */
 #ifndef KAPPARA_PRINTK_H
 #define KAPPARA_PRINTK_H
 

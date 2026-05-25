@@ -1,3 +1,42 @@
+/*
+ * arch/aarch64/uart.c -- PL011 UART driver for Raspberry Pi 3 (BCM2837)
+ * =====================================================================
+ *
+ * What this file is
+ * -----------------
+ * The minimum amount of code we need to talk to a serial console.  We
+ * use ARM's PL011 PrimeCell UART -- there are two on the BCM2837
+ * (PL011 and the simpler "mini UART"); the PL011 is at 0x3F201000 and
+ * the easier one to program (real FIFOs, no MTU divisor games).
+ *
+ * Before the MMU is on, accesses to 0x3F201000 hit physical memory
+ * directly with everything uncached.  After mmu_init() identity-maps
+ * 0x3F000000..0x40000000 as Device-nGnRE, the same address still
+ * works -- it's just travelling through translation and tagged as
+ * MMIO so the CPU won't try to cache or reorder it.
+ *
+ * PL011 register map (offset from 0x3F201000)
+ * -------------------------------------------
+ *   0x00  DR      Data Register (read = received byte, write = TX byte)
+ *   0x18  FR      Flag Register   (bit 5 = TXFF, transmit FIFO full)
+ *   0x24  IBRD    Integer baud-rate divisor
+ *   0x28  FBRD    Fractional baud-rate divisor
+ *   0x2C  LCRH    Line Control: FIFO enable, word length, parity
+ *   0x30  CR      Control: UART enable, TX enable, RX enable
+ *   0x44  ICR     Interrupt Clear Register
+ *
+ * Baud rate
+ * ---------
+ * QEMU ignores the dividers; on real Pi 3 we want 115200 baud from a
+ * 48 MHz UART clock:  divisor = 48e6 / (16 * 115200) = 26.0416...
+ *   IBRD = 26   FBRD = round(0.0416 * 64) = 3
+ *
+ * Transmit
+ * --------
+ * Poll FR.TXFF until the TX FIFO has room, then write a byte to DR.
+ * No interrupts, no DMA -- printf-style spinning is plenty for now.
+ */
+
 #include <stdint.h>
 
 #define PL011_BASE	0x3F201000UL

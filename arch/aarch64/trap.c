@@ -1,3 +1,46 @@
+/*
+ * arch/aarch64/trap.c -- AArch64 exception dispatch
+ * =================================================
+ *
+ * What this file is
+ * -----------------
+ * The C side of the exception path.  arch/aarch64/vectors.S has just
+ * saved a 288-byte struct trap_frame on the kernel stack and called
+ * trap_dispatch(tf, vec_id).  This file decides whether it's an IRQ
+ * (route to irq_dispatch in the timer driver) or a synchronous fault
+ * (decode ESR_EL1, dump every register, panic).
+ *
+ * ESR_EL1 layout (the Exception Syndrome Register)
+ * -----------------------------------------------
+ *
+ *      bit 31         26 25 24                 0
+ *     +-----------------+--+---------------------+
+ *     |       EC        |IL|         ISS         |
+ *     +-----------------+--+---------------------+
+ *      Exception class   |  Instruction-Specific
+ *                        Length bit (1=32b instr)
+ *
+ *   EC encodes the cause of the synchronous exception.  ec_name() has
+ *   the cases we'll see during bring-up; full list is in the ARM ARM
+ *   table D17-2 (~70 entries).  Most useful for us:
+ *
+ *     0x21  Instruction Abort from current EL  -- bad PC translation
+ *     0x25  Data Abort       from current EL  -- bad load/store
+ *     0x22  PC alignment fault
+ *     0x26  SP alignment fault
+ *     0x2F  SError
+ *     0x3C  brk #imm  (AArch64 software breakpoint)
+ *
+ * trap_init
+ * ---------
+ *   msr VBAR_EL1, <addr of arm_vectors>
+ *   isb
+ * After this, any exception while at EL1 follows the table.  EL1h is
+ * the SP-banked variant; we use it (the boot.S SPSR_EL2 = 0x3C5
+ * sets M[4:0]=0101 = EL1h), so synchronous faults / IRQs / FIQs /
+ * SErrors all land in the 0x200..0x380 quarter of the table.
+ */
+
 #include <stdint.h>
 
 #include "kappara/printk.h"

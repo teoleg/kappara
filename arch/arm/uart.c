@@ -1,11 +1,21 @@
+/*
+ * arch/arm/uart.c -- PL011 UART driver for QEMU `-M virt`
+ * =======================================================
+ *
+ * Same PL011 silicon model as the AArch64/Pi build (arch/aarch64/uart.c).
+ * Only the MMIO base differs: virt puts PL011 at 0x09000000.  See the
+ * register-map and baud-rate comments in arch/aarch64/uart.c.
+ *
+ * For real MediaTek MT8125 hardware this file would be replaced by a
+ * MediaTek 8250-flavoured UART driver living next to it (e.g.
+ * arch/arm/mediatek/uart.c).
+ */
+
 #include <stdint.h>
 
 #include "kappara/uart.h"
 
-/*
- * QEMU `-M virt` exposes its PL011 console UART here.  Same silicon
- * model as the AArch64 Pi build uses; only the MMIO base differs.
- */
+/* QEMU `-M virt` PL011 MMIO base. */
 #define PL011_BASE	0x09000000UL
 
 #define UART_DR		(PL011_BASE + 0x00)

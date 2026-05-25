@@ -1,3 +1,18 @@
+/*
+ * include/kappara/sched.h -- kernel thread + scheduler API
+ *
+ * kappara's threading model is intentionally tiny:
+ *
+ *   * One global ready queue, round-robin, no priorities yet.
+ *   * One per-thread 4 KB kernel stack (allocated by pmm).
+ *   * Cooperative kthread_yield() + preemptive sched_tick() (called
+ *     from the timer IRQ handler) both end up doing the same thing.
+ *
+ * cur is the globally-visible "currently running thread" pointer.
+ * For now it's used only by kthread_exit() to identify what just
+ * died, but anything that needs current-thread state (a future
+ * sleep queue, kalarm, errno-equivalent) will reach for it.
+ */
 #ifndef KAPPARA_SCHED_H
 #define KAPPARA_SCHED_H
 
