@@ -46,6 +46,7 @@
 
 #include "kappara/printk.h"
 #include "kappara/sched.h"
+#include "kappara/stream_head.h"
 #include "kappara/syscall.h"
 
 typedef long (*syscall_fn)(long, long, long, long, long, long);
@@ -74,10 +75,45 @@ static long sys_yield(long a0, long a1, long a2, long a3, long a4, long a5)
 	return 0;
 }
 
+static long sys_open(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return (long)sys_open_impl((const char *)(uintptr_t)a0);
+}
+
+static long sys_close(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return (long)sys_close_impl((int)a0);
+}
+
+static long sys_read(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a3; (void)a4; (void)a5;
+	return sys_read_impl((int)a0, (void *)(uintptr_t)a1, (size_t)a2);
+}
+
+static long sys_write(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a3; (void)a4; (void)a5;
+	return sys_write_impl((int)a0, (const void *)(uintptr_t)a1, (size_t)a2);
+}
+
+static long sys_ioctl(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a3; (void)a4; (void)a5;
+	return sys_ioctl_impl((int)a0, (int)a1, a2);
+}
+
 static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_log]    = sys_log,
 	[SYS_getpid] = sys_getpid,
 	[SYS_yield]  = sys_yield,
+	[SYS_open]   = sys_open,
+	[SYS_close]  = sys_close,
+	[SYS_read]   = sys_read,
+	[SYS_write]  = sys_write,
+	[SYS_ioctl]  = sys_ioctl,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

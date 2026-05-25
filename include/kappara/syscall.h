@@ -23,11 +23,16 @@
 #ifndef KAPPARA_SYSCALL_H
 #define KAPPARA_SYSCALL_H
 
-#define SYS_log		0	/* (const char *msg)                 */
-#define SYS_getpid	1	/* (void)                            */
-#define SYS_yield	2	/* (void)                            */
+#define SYS_log		0	/* (const char *msg)                       */
+#define SYS_getpid	1	/* (void)                                  */
+#define SYS_yield	2	/* (void)                                  */
+#define SYS_open	3	/* (const char *name)             -> fd    */
+#define SYS_close	4	/* (int fd)                                */
+#define SYS_read	5	/* (int fd, void *buf, size_t len) -> n    */
+#define SYS_write	6	/* (int fd, const void *buf, size_t len)   */
+#define SYS_ioctl	7	/* (int fd, int cmd, long arg)             */
 
-#define SYS_MAX		3
+#define SYS_MAX		8
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

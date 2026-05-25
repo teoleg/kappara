@@ -29,6 +29,7 @@
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
 #include "kappara/sched.h"
+#include "kappara/stream_head.h"
 #include "kappara/streams.h"
 #include "kappara/string.h"
 #include "kappara/syscall.h"
@@ -152,11 +153,50 @@ static long do_syscall(long num, long a0, long a1, long a2)
 	return x0;
 }
 
+static void print_buf(const char *label, const char *buf, long n)
+{
+	kprintf("%s (%ld bytes): ", label, n);
+	for (long i = 0; i < n; i++)
+		uart_putc(buf[i]);
+	uart_putc('\n');
+}
+
 static void syscall_demo(void)
 {
 	do_syscall(SYS_log, (long)(uintptr_t)"hello from kernel-svc!", 0, 0);
 	long pid = do_syscall(SYS_getpid, 0, 0, 0);
 	kprintf("syscall: getpid -> %ld\n", pid);
+
+	/* STREAMS-over-syscalls: open the "loop" driver, write a payload,
+	 * read it back.  Then I_PUSH "upper" and watch the same payload
+	 * come back uppercased.  Then I_POP and confirm lower-case again. */
+	long fd = do_syscall(SYS_open, (long)(uintptr_t)"loop", 0, 0);
+	kprintf("syscall: open(\"loop\") -> %ld\n", fd);
+
+	char buf[32];
+	const char msg1[] = "hello stream";
+	do_syscall(SYS_write, fd, (long)(uintptr_t)msg1, sizeof(msg1) - 1);
+	long n = do_syscall(SYS_read, fd, (long)(uintptr_t)buf, sizeof(buf));
+	print_buf("syscall: read (loop only)", buf, n);
+
+	long r = do_syscall(SYS_ioctl, fd, I_PUSH, (long)(uintptr_t)"upper");
+	kprintf("syscall: ioctl(I_PUSH, \"upper\") -> %ld\n", r);
+
+	const char msg2[] = "now in upper case please";
+	do_syscall(SYS_write, fd, (long)(uintptr_t)msg2, sizeof(msg2) - 1);
+	n = do_syscall(SYS_read, fd, (long)(uintptr_t)buf, sizeof(buf));
+	print_buf("syscall: read (after I_PUSH upper)", buf, n);
+
+	r = do_syscall(SYS_ioctl, fd, I_POP, 0);
+	kprintf("syscall: ioctl(I_POP) -> %ld\n", r);
+
+	const char msg3[] = "back to plain";
+	do_syscall(SYS_write, fd, (long)(uintptr_t)msg3, sizeof(msg3) - 1);
+	n = do_syscall(SYS_read, fd, (long)(uintptr_t)buf, sizeof(buf));
+	print_buf("syscall: read (after I_POP)", buf, n);
+
+	do_syscall(SYS_close, fd, 0, 0);
+	kprintf("syscall: close(%ld) done\n", fd);
 }
 
 void kmain(void)
@@ -173,6 +213,7 @@ void kmain(void)
 	kmem_init();
 
 	streams_demo();
+	streams_head_init();
 
 	sched_init();
 	syscall_demo();

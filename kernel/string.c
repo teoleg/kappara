@@ -32,3 +32,17 @@ void *kmemcpy(void *dst, const void *src, size_t n)
 		*d++ = *s++;
 	return dst;
 }
+
+int kstrcmp(const char *a, const char *b)
+{
+	while (*a && *a == *b) { a++; b++; }
+	return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+size_t kstrlen(const char *s)
+{
+	size_t n = 0;
+	while (s[n])
+		n++;
+	return n;
+}
