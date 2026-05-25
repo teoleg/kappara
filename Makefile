@@ -7,6 +7,7 @@ CFLAGS  := -Wall -Wextra -Werror -std=gnu11 \
            -ffreestanding -nostdlib -nostartfiles \
            -fno-stack-protector -fno-pie -fno-pic \
            -mgeneral-regs-only -mcpu=cortex-a53 \
+           -Iinclude \
            -O2 -g
 
 ASFLAGS := $(CFLAGS)
@@ -17,6 +18,9 @@ BUILD   := build
 OBJS := \
 	$(BUILD)/arch/aarch64/boot.o \
 	$(BUILD)/arch/aarch64/uart.o \
+	$(BUILD)/arch/aarch64/vectors.o \
+	$(BUILD)/arch/aarch64/trap.o \
+	$(BUILD)/kernel/printk.o \
 	$(BUILD)/kernel/main.o
 
 ELF    := $(BUILD)/kernel8.elf

@@ -1,5 +1,6 @@
-void uart_init(void);
-void uart_puts(const char *s);
+#include "kappara/printk.h"
+#include "kappara/trap.h"
+#include "kappara/uart.h"
 
 static unsigned current_el(void)
 {
@@ -11,17 +12,14 @@ static unsigned current_el(void)
 void kmain(void)
 {
 	uart_init();
-	uart_puts("\n");
-	uart_puts("kappara: hello from aarch64\n");
-	uart_puts("        no soup for you, only streams\n");
+	trap_init();
 
-	switch (current_el()) {
-	case 0: uart_puts("        running at EL0 (!)\n"); break;
-	case 1: uart_puts("        running at EL1\n"); break;
-	case 2: uart_puts("        running at EL2 (drop failed)\n"); break;
-	case 3: uart_puts("        running at EL3 (drop failed)\n"); break;
-	}
+	kprintf("\nkappara: hello from aarch64\n");
+	kprintf("        no soup for you, only streams\n");
+	kprintf("        running at EL%u\n", current_el());
 
-	for (;;)
-		__asm__ volatile ("wfe");
+	kprintf("        firing brk #0 to test the trap path...\n");
+	__asm__ volatile ("brk #0");
+
+	kpanic("returned from brk?");
 }
