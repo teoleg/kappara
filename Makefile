@@ -20,7 +20,9 @@ OBJS := \
 	$(BUILD)/arch/aarch64/uart.o \
 	$(BUILD)/arch/aarch64/vectors.o \
 	$(BUILD)/arch/aarch64/trap.o \
+	$(BUILD)/arch/aarch64/mmu.o \
 	$(BUILD)/kernel/printk.o \
+	$(BUILD)/kernel/pmm.o \
 	$(BUILD)/kernel/main.o
 
 ELF    := $(BUILD)/kernel8.elf
