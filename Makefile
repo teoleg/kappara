@@ -1,4 +1,48 @@
-CROSS   ?= aarch64-linux-gnu-
+ARCH    ?= aarch64
+BUILD   := build/$(ARCH)
+
+ifeq ($(ARCH),aarch64)
+    CROSS         ?= aarch64-linux-gnu-
+    ARCH_CFLAGS   := -mcpu=cortex-a53 -mgeneral-regs-only
+    LINKER_LD     := arch/aarch64/linker.ld
+    ARCH_OBJS     := \
+        $(BUILD)/arch/aarch64/boot.o \
+        $(BUILD)/arch/aarch64/uart.o \
+        $(BUILD)/arch/aarch64/vectors.o \
+        $(BUILD)/arch/aarch64/trap.o \
+        $(BUILD)/arch/aarch64/mmu.o \
+        $(BUILD)/arch/aarch64/timer.o \
+        $(BUILD)/arch/aarch64/switch.o
+    KERNEL_OBJS   := \
+        $(BUILD)/kernel/printk.o \
+        $(BUILD)/kernel/pmm.o \
+        $(BUILD)/kernel/string.o \
+        $(BUILD)/kernel/kmem.o \
+        $(BUILD)/kernel/sched.o \
+        $(BUILD)/kernel/main.o
+    ELF           := $(BUILD)/kernel8.elf
+    KERNEL        := $(BUILD)/kernel8.img
+    QEMU          := qemu-system-aarch64
+    QEMU_ARGS     := -M raspi3b -serial mon:stdio -serial null -display none
+else ifeq ($(ARCH),arm)
+    CROSS         ?= arm-linux-gnueabi-
+    ARCH_CFLAGS   := -mcpu=cortex-a15 -marm -mfloat-abi=soft -mgeneral-regs-only
+    LINKER_LD     := arch/arm/linker.ld
+    ARCH_OBJS     := \
+        $(BUILD)/arch/arm/boot.o \
+        $(BUILD)/arch/arm/uart.o \
+        $(BUILD)/arch/arm/main.o
+    KERNEL_OBJS   := \
+        $(BUILD)/kernel/printk.o \
+        $(BUILD)/kernel/string.o
+    ELF           := $(BUILD)/kernel-arm.elf
+    KERNEL        := $(BUILD)/kernel-arm.img
+    QEMU          := qemu-system-arm
+    QEMU_ARGS     := -M virt -cpu cortex-a15 -m 256 -nographic
+else
+    $(error Unknown ARCH=$(ARCH); use ARCH=aarch64 or ARCH=arm)
+endif
+
 CC      := $(CROSS)gcc
 LD      := $(CROSS)ld
 OBJCOPY := $(CROSS)objcopy
@@ -6,32 +50,16 @@ OBJCOPY := $(CROSS)objcopy
 CFLAGS  := -Wall -Wextra -Werror -std=gnu11 \
            -ffreestanding -nostdlib -nostartfiles \
            -fno-stack-protector -fno-pie -fno-pic \
-           -mgeneral-regs-only -mcpu=cortex-a53 \
+           $(ARCH_CFLAGS) \
            -Iinclude \
            -O2 -g
 
 ASFLAGS := $(CFLAGS)
 LDFLAGS := -nostdlib -static
 
-BUILD   := build
+LIBGCC  := $(shell $(CC) -print-libgcc-file-name)
 
-OBJS := \
-	$(BUILD)/arch/aarch64/boot.o \
-	$(BUILD)/arch/aarch64/uart.o \
-	$(BUILD)/arch/aarch64/vectors.o \
-	$(BUILD)/arch/aarch64/trap.o \
-	$(BUILD)/arch/aarch64/mmu.o \
-	$(BUILD)/arch/aarch64/timer.o \
-	$(BUILD)/arch/aarch64/switch.o \
-	$(BUILD)/kernel/printk.o \
-	$(BUILD)/kernel/pmm.o \
-	$(BUILD)/kernel/string.o \
-	$(BUILD)/kernel/kmem.o \
-	$(BUILD)/kernel/sched.o \
-	$(BUILD)/kernel/main.o
-
-ELF    := $(BUILD)/kernel8.elf
-KERNEL := $(BUILD)/kernel8.img
+OBJS := $(ARCH_OBJS) $(KERNEL_OBJS)
 
 .PHONY: all run clean
 
@@ -45,15 +73,14 @@ $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(ELF): $(OBJS) arch/aarch64/linker.ld
-	$(LD) $(LDFLAGS) -T arch/aarch64/linker.ld -o $@ $(OBJS)
+$(ELF): $(OBJS) $(LINKER_LD)
+	$(LD) $(LDFLAGS) -T $(LINKER_LD) -o $@ $(OBJS) $(LIBGCC)
 
 $(KERNEL): $(ELF)
 	$(OBJCOPY) -O binary $< $@
 
 run: $(KERNEL)
-	qemu-system-aarch64 -M raspi3b -kernel $(KERNEL) \
-		-serial mon:stdio -serial null -display none
+	$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL)
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf build

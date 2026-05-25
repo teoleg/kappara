@@ -134,3 +134,11 @@ void kpanic(const char *msg)
 	for (;;)
 		__asm__ volatile ("wfe");
 }
+
+/* libgcc helpers (notably __aeabi_ldiv0) call raise() on math errors. */
+int raise(int signum);
+int raise(int signum)
+{
+	(void)signum;
+	kpanic("libgcc raise() called");
+}
