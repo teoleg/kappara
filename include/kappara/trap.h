@@ -1,5 +1,19 @@
+/*
+ * include/kappara/trap.h -- portable trap entry points
+ *
+ * trap_init() is the one piece of the exception path that every arch
+ * implements: it installs the vector table so the CPU knows where to
+ * jump on a fault.  Everything below the #ifdef is the AArch64 trap
+ * frame layout and dispatch entry, shared between arch/aarch64
+ * C files and arch/aarch64/vectors.S.  ARMv7 has a different frame,
+ * defined locally in arch/arm/trap.c.
+ */
 #ifndef KAPPARA_TRAP_H
 #define KAPPARA_TRAP_H
+
+void trap_init(void);
+
+#ifdef __aarch64__
 
 #include <stdint.h>
 
@@ -19,7 +33,8 @@ enum {
 	VEC_SYNC_LO32,    VEC_IRQ_LO32,   VEC_FIQ_LO32,   VEC_ERROR_LO32,
 };
 
-void trap_init(void);
 void trap_dispatch(struct trap_frame *tf, unsigned vec_id);
+
+#endif /* __aarch64__ */
 
 #endif

@@ -31,6 +31,8 @@ else ifeq ($(ARCH),arm)
     ARCH_OBJS     := \
         $(BUILD)/arch/arm/boot.o \
         $(BUILD)/arch/arm/uart.o \
+        $(BUILD)/arch/arm/vectors.o \
+        $(BUILD)/arch/arm/trap.o \
         $(BUILD)/arch/arm/main.o
     KERNEL_OBJS   := \
         $(BUILD)/kernel/printk.o \
