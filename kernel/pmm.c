@@ -62,14 +62,6 @@
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
 
-extern char __kernel_end[];
-
-/*
- * Pi 3 / BCM2837: usable RAM ends where the peripheral window begins.
- * Everything above PMM_LIMIT is MMIO, mapped Device by the MMU.
- */
-#define PMM_LIMIT	0x3F000000UL
-
 static uintptr_t freelist;
 static size_t    free_count;
 
@@ -104,12 +96,12 @@ void *pmm_alloc(void)
 
 size_t pmm_free_count(void) { return free_count; }
 
-void pmm_init(void)
+void pmm_init(uintptr_t start, uintptr_t end)
 {
-	uintptr_t start = align_up((uintptr_t)__kernel_end, PAGE_SIZE);
-	uintptr_t end   = align_dn(PMM_LIMIT, PAGE_SIZE);
+	start = align_up(start, PAGE_SIZE);
+	end   = align_dn(end,   PAGE_SIZE);
 
-	/* Free low-to-high so allocations come back in ascending order. */
+	/* Free high-to-low so allocations come back in ascending order. */
 	for (uintptr_t pa = end; pa > start; ) {
 		pa -= PAGE_SIZE;
 		pmm_free((void *)pa);

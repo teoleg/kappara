@@ -12,7 +12,8 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/arch/aarch64/trap.o \
         $(BUILD)/arch/aarch64/mmu.o \
         $(BUILD)/arch/aarch64/timer.o \
-        $(BUILD)/arch/aarch64/switch.o
+        $(BUILD)/arch/aarch64/switch.o \
+        $(BUILD)/arch/aarch64/thread.o
     KERNEL_OBJS   := \
         $(BUILD)/kernel/printk.o \
         $(BUILD)/kernel/pmm.o \
@@ -34,10 +35,15 @@ else ifeq ($(ARCH),arm)
         $(BUILD)/arch/arm/vectors.o \
         $(BUILD)/arch/arm/trap.o \
         $(BUILD)/arch/arm/mmu.o \
+        $(BUILD)/arch/arm/switch.o \
+        $(BUILD)/arch/arm/thread.o \
         $(BUILD)/arch/arm/main.o
     KERNEL_OBJS   := \
         $(BUILD)/kernel/printk.o \
-        $(BUILD)/kernel/string.o
+        $(BUILD)/kernel/pmm.o \
+        $(BUILD)/kernel/string.o \
+        $(BUILD)/kernel/kmem.o \
+        $(BUILD)/kernel/sched.o
     ELF           := $(BUILD)/kernel-arm.elf
     KERNEL        := $(BUILD)/kernel-arm.img
     QEMU          := qemu-system-arm

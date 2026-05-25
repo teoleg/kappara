@@ -39,4 +39,13 @@ void            kthread_yield(void);
 void            kthread_exit(void) __attribute__((noreturn));
 void            sched_tick(void);
 
+/*
+ * Arch-specific hook implemented in arch/<arch>/thread.c.  Lays
+ * down the synthetic saved-register frame at stack_top so that
+ * the first context_switch into the new thread pops fn/arg into
+ * the callee-saved registers and "returns" into thread_trampoline.
+ * Returns the SP value the thread should resume at.
+ */
+void *arch_thread_init_frame(void *stack_top, void (*fn)(void *), void *arg);
+
 #endif

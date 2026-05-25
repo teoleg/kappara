@@ -1,29 +1,38 @@
 /*
- * arch/arm/main.c -- ARMv7-A early kmain
- * ======================================
+ * arch/arm/main.c -- ARMv7-A kmain
+ * ================================
  *
- * The "top-level" of the kernel for the ARMv7 build, equivalent in
- * scope to kernel/main.c on AArch64 -- with a smaller set of
- * subsystems wired in so we can grow the port one piece at a time.
+ * Brings up the same subsystems as kernel/main.c on AArch64, but
+ * without preemption: the timer + GIC + IRQ unwind aren't here yet,
+ * so threads cooperate via explicit kthread_yield() calls.
  *
- * Currently brings up:
- *   uart_init   PL011 console at 0x09000000
- *   trap_init   VBAR-rooted vector table
- *   mmu_init    LPAE identity map + caches on
+ * Order of bring-up (mirrors the AArch64 path):
+ *   uart_init       PL011 console
+ *   trap_init       VBAR-rooted vector table
+ *   mmu_init        LPAE identity map + caches on
+ *   pmm_init        free-list over [__kernel_end .. 0x80000000)
+ *   kmem_init       size-cache slab heap
+ *   sched_init      register kmain itself as tid 0
  *
- * Demonstrates the MMU is live by writing a sentinel to a RAM
- * address through the MMU and reading it back, then panics so the
- * boot returns control to the QEMU monitor.
+ * Two demo threads (alpha, beta) each loop a few times calling
+ * kthread_yield(); main does the same.  Expected output rotates
+ * main / alpha / beta / main / alpha / beta / ...
  */
 
 #include <stdint.h>
 
+#include "kappara/kmem.h"
 #include "kappara/mmu.h"
+#include "kappara/pmm.h"
 #include "kappara/printk.h"
+#include "kappara/sched.h"
 #include "kappara/trap.h"
 #include "kappara/uart.h"
 
 extern char __kernel_end[];
+
+/* QEMU virt cortex-a15 with -m 256 has RAM at 0x40000000..0x50000000. */
+#define ARM_RAM_END	0x50000000UL
 
 static unsigned arm_current_mode(void)
 {
@@ -47,6 +56,15 @@ static const char *mode_name(unsigned m)
 	}
 }
 
+static void demo(void *arg)
+{
+	const char *name = arg;
+	for (int i = 0; i < 5; i++) {
+		kprintf("[%s] i=%d\n", name, i);
+		kthread_yield();
+	}
+}
+
 void kmain(void)
 {
 	uart_init();
@@ -58,14 +76,17 @@ void kmain(void)
 		mode_name(arm_current_mode()), arm_current_mode());
 
 	mmu_init();
+	pmm_init((uintptr_t)__kernel_end, ARM_RAM_END);
+	kmem_init();
+	sched_init();
 
-	/* MMU sanity check: write/read a sentinel just past the kernel. */
-	volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)__kernel_end;
-	p[0] = 0xdeadbeefu;
-	p[1] = 0xcafef00du;
-	kprintf("mmu-test: wrote/read %p -> 0x%lx 0x%lx (kernel_end=%p)\n",
-		(void *)p, (unsigned long)p[0], (unsigned long)p[1],
-		(void *)__kernel_end);
+	kthread_create("alpha", demo, (void *)"alpha");
+	kthread_create("beta",  demo, (void *)"beta");
+
+	for (int i = 0; i < 5; i++) {
+		kprintf("[main] i=%d\n", i);
+		kthread_yield();
+	}
 
 	kpanic("end of armv7 kmain");
 }

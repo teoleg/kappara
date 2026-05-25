@@ -33,6 +33,11 @@
 #include "kappara/trap.h"
 #include "kappara/uart.h"
 
+extern char __kernel_end[];
+
+/* Pi 3 / BCM2837: usable RAM ends here; above is the peripheral window. */
+#define AARCH64_RAM_END	0x3F000000UL
+
 static unsigned current_el(void)
 {
 	unsigned long el;
@@ -65,7 +70,7 @@ void kmain(void)
 	kprintf("        running at EL%u\n", current_el());
 
 	mmu_init();
-	pmm_init();
+	pmm_init((uintptr_t)__kernel_end, AARCH64_RAM_END);
 	kmem_init();
 	sched_init();
 	timer_init(100);

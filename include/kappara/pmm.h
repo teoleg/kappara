@@ -15,7 +15,13 @@
 #define PAGE_SIZE	(1UL << PAGE_SHIFT)
 #define PAGE_MASK	(PAGE_SIZE - 1)
 
-void   pmm_init(void);
+/*
+ * Walks every page in [start, end), aligns the bounds to PAGE_SIZE,
+ * and pushes each page onto the freelist.  Each arch's kmain passes
+ * the bounds appropriate for its memory map -- typically
+ * [__kernel_end .. start_of_MMIO_window).
+ */
+void   pmm_init(uintptr_t start, uintptr_t end);
 void  *pmm_alloc(void);
 void   pmm_free(void *p);
 size_t pmm_free_count(void);

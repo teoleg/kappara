@@ -87,7 +87,6 @@
 #include "kappara/sched.h"
 
 extern void context_switch(void **save_sp, void *new_sp);
-extern void thread_trampoline(void);
 
 struct kthread *cur;
 
@@ -144,27 +143,8 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 	t->stack_base = stack;
 	t->state      = KT_READY;
 	t->next       = NULL;
-
-	/*
-	 * Build the same 96-byte saved frame that context_switch expects:
-	 *   [+0]  x19,x20  (fn, arg)
-	 *   [+16] x21,x22
-	 *   [+32] x23,x24
-	 *   [+48] x25,x26
-	 *   [+64] x27,x28
-	 *   [+80] x29,lr   (fp=0, lr=thread_trampoline)
-	 */
-	uint64_t *sp = (uint64_t *)((char *)stack + PAGE_SIZE);
-	sp -= 12;
-	sp[0]  = (uint64_t)(uintptr_t)fn;
-	sp[1]  = (uint64_t)(uintptr_t)arg;
-	sp[2]  = 0; sp[3]  = 0;
-	sp[4]  = 0; sp[5]  = 0;
-	sp[6]  = 0; sp[7]  = 0;
-	sp[8]  = 0; sp[9]  = 0;
-	sp[10] = 0;
-	sp[11] = (uint64_t)(uintptr_t)thread_trampoline;
-	t->sp = sp;
+	t->sp         = arch_thread_init_frame((char *)stack + PAGE_SIZE,
+					       fn, arg);
 
 	ready_push(t);
 	kprintf("sched: created tid=%u name=%s stack=%p fn=%p\n",
