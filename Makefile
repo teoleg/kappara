@@ -21,10 +21,13 @@ OBJS := \
 	$(BUILD)/arch/aarch64/vectors.o \
 	$(BUILD)/arch/aarch64/trap.o \
 	$(BUILD)/arch/aarch64/mmu.o \
+	$(BUILD)/arch/aarch64/timer.o \
+	$(BUILD)/arch/aarch64/switch.o \
 	$(BUILD)/kernel/printk.o \
 	$(BUILD)/kernel/pmm.o \
 	$(BUILD)/kernel/string.o \
 	$(BUILD)/kernel/kmem.o \
+	$(BUILD)/kernel/sched.o \
 	$(BUILD)/kernel/main.o
 
 ELF    := $(BUILD)/kernel8.elf

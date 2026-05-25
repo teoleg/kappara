@@ -1,6 +1,7 @@
 #include <stdint.h>
 
 #include "kappara/printk.h"
+#include "kappara/timer.h"
 #include "kappara/trap.h"
 
 extern char vectors[];
@@ -52,6 +53,12 @@ static const char *ec_name(unsigned ec)
 
 void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 {
+	if (vec_id == VEC_IRQ_SP0 || vec_id == VEC_IRQ_SPX ||
+	    vec_id == VEC_IRQ_LO64 || vec_id == VEC_IRQ_LO32) {
+		irq_dispatch();
+		return;
+	}
+
 	unsigned ec = (unsigned)((tf->esr >> 26) & 0x3f);
 	unsigned iss = (unsigned)(tf->esr & 0x1ffffff);
 
