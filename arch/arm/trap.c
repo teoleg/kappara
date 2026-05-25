@@ -53,6 +53,7 @@
 #include <stdint.h>
 
 #include "kappara/printk.h"
+#include "kappara/syscall.h"
 #include "kappara/timer.h"
 #include "kappara/trap.h"
 
@@ -101,9 +102,22 @@ static const char *mode_name(unsigned m)
 void trap_dispatch(struct arm_trap_frame *tf, unsigned vec_id);
 void trap_dispatch(struct arm_trap_frame *tf, unsigned vec_id)
 {
-	/* IRQ vector returns; everything else panics. */
+	/* IRQ vector returns; SVC routes to the syscall layer; everything
+	 * else dumps and panics. */
 	if (vec_id == 6) {
 		irq_dispatch();
+		return;
+	}
+
+	/* SVC (vec_id == 2): r7 holds the syscall number, r0..r5 the args.
+	 * The frame's saved PC already points at the instruction after
+	 * `svc #imm` (we passed lr_adj=0 to VEC_HANDLER for SVC), so the
+	 * result we stash in tf->r[0] becomes the value the user sees. */
+	if (vec_id == 2) {
+		tf->r[0] = (uint32_t)syscall_dispatch(
+				(long)tf->r[7],
+				(long)tf->r[0], (long)tf->r[1], (long)tf->r[2],
+				(long)tf->r[3], (long)tf->r[4], (long)tf->r[5]);
 		return;
 	}
 

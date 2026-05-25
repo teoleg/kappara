@@ -31,6 +31,7 @@
 #include "kappara/sched.h"
 #include "kappara/streams.h"
 #include "kappara/string.h"
+#include "kappara/syscall.h"
 #include "kappara/timer.h"
 #include "kappara/trap.h"
 #include "kappara/uart.h"
@@ -131,6 +132,33 @@ static void streams_demo(void)
 	kprintf("streams: demo complete\n");
 }
 
+/*
+ * Syscall demo (AArch64 calling convention).  Issue `svc #0` with
+ * x8 = syscall number and x0..x5 = args; trap_dispatch picks up
+ * ESR_EL1.EC == 0x15, routes to syscall_dispatch, and the return
+ * value is stuffed back into x0 before eret.
+ */
+static long do_syscall(long num, long a0, long a1, long a2)
+{
+	register long x0 __asm__("x0") = a0;
+	register long x1 __asm__("x1") = a1;
+	register long x2 __asm__("x2") = a2;
+	register long x8 __asm__("x8") = num;
+	__asm__ volatile (
+		"svc	#0\n"
+		: "+r"(x0)
+		: "r"(x1), "r"(x2), "r"(x8)
+		: "memory", "cc");
+	return x0;
+}
+
+static void syscall_demo(void)
+{
+	do_syscall(SYS_log, (long)(uintptr_t)"hello from kernel-svc!", 0, 0);
+	long pid = do_syscall(SYS_getpid, 0, 0, 0);
+	kprintf("syscall: getpid -> %ld\n", pid);
+}
+
 void kmain(void)
 {
 	uart_init();
@@ -147,6 +175,8 @@ void kmain(void)
 	streams_demo();
 
 	sched_init();
+	syscall_demo();
+
 	timer_init(100);
 
 	kthread_create("alpha", demo, (void *)"alpha");

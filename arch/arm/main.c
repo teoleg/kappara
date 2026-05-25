@@ -24,6 +24,7 @@
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
 #include "kappara/sched.h"
+#include "kappara/syscall.h"
 #include "kappara/timer.h"
 #include "kappara/trap.h"
 #include "kappara/uart.h"
@@ -70,6 +71,28 @@ static void demo(void *arg)
 	}
 }
 
+/* ARMv7 EABI syscall: number in r7, args r0..r5, return r0. */
+static long do_syscall(long num, long a0, long a1, long a2)
+{
+	register long r0 __asm__("r0") = a0;
+	register long r1 __asm__("r1") = a1;
+	register long r2 __asm__("r2") = a2;
+	register long r7 __asm__("r7") = num;
+	__asm__ volatile (
+		"svc	#0\n"
+		: "+r"(r0)
+		: "r"(r1), "r"(r2), "r"(r7)
+		: "memory", "cc");
+	return r0;
+}
+
+static void syscall_demo(void)
+{
+	do_syscall(SYS_log, (long)(uintptr_t)"hello from kernel-svc!", 0, 0);
+	long pid = do_syscall(SYS_getpid, 0, 0, 0);
+	kprintf("syscall: getpid -> %ld\n", pid);
+}
+
 void kmain(void)
 {
 	uart_init();
@@ -84,6 +107,7 @@ void kmain(void)
 	pmm_init((uintptr_t)__kernel_end, ARM_RAM_END);
 	kmem_init();
 	sched_init();
+	syscall_demo();
 	timer_init(100);
 
 	kthread_create("alpha", demo, (void *)"alpha");

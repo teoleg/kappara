@@ -44,6 +44,7 @@
 #include <stdint.h>
 
 #include "kappara/printk.h"
+#include "kappara/syscall.h"
 #include "kappara/timer.h"
 #include "kappara/trap.h"
 
@@ -102,8 +103,21 @@ void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 		return;
 	}
 
-	unsigned ec = (unsigned)((tf->esr >> 26) & 0x3f);
+	unsigned ec  = (unsigned)((tf->esr >> 26) & 0x3f);
 	unsigned iss = (unsigned)(tf->esr & 0x1ffffff);
+
+	/*
+	 * SVC from AArch64.  ELR_EL1 already points at the instruction
+	 * AFTER the svc, so no PC adjustment is needed; the result we
+	 * stash in tf->x[0] becomes the return value the user sees in x0.
+	 */
+	if (ec == 0x15) {
+		tf->x[0] = (uint64_t)syscall_dispatch(
+				(long)tf->x[8],
+				(long)tf->x[0], (long)tf->x[1], (long)tf->x[2],
+				(long)tf->x[3], (long)tf->x[4], (long)tf->x[5]);
+		return;
+	}
 
 	kprintf("\n!! trap: %s  ec=0x%x (%s)  iss=0x%x\n",
 		vec_name(vec_id), ec, ec_name(ec), iss);
