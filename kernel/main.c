@@ -25,7 +25,6 @@
 #include <stdint.h>
 
 #include "kappara/kmem.h"
-#include "kappara/ksh.h"
 #include "kappara/mmu.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
@@ -194,13 +193,10 @@ void kmain(void)
 	 * first SYS_read. */
 	kthread_create("uart_rx", uart_rx_main, NULL);
 
-	/* Spawn the user-mode init thread; once scheduled it eret's
-	 * into EL0 and stays there, returning to EL1 only via svc. */
+	/* Spawn the user-mode init process; once scheduled it eret's
+	 * into EL0 at user/init.c's _start, opens /dev/console, and
+	 * runs the shell entirely in userspace from there on. */
 	user_spawn();
-
-	/* Launch the interactive shell as a kthread.  Once IRQs unmask
-	 * below it gets preempted and runs concurrently with main. */
-	kthread_create("ksh", ksh_main, NULL);
 
 	__asm__ volatile ("msr daifclr, #2");
 

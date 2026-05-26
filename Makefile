@@ -32,7 +32,6 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/kernel/stream_head.o \
         $(BUILD)/kernel/syscall.o \
         $(BUILD)/kernel/user.o \
-        $(BUILD)/kernel/ksh.o \
         $(BUILD)/kernel/main.o
     ELF           := $(BUILD)/kernel8.elf
     KERNEL        := $(BUILD)/kernel8.img

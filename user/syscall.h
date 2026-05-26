@@ -82,4 +82,22 @@ static inline long sys_read(int fd, void *buf, size_t n)
 	return _syscall3(SYS_read, fd, (long)(unsigned long)buf, (long)n);
 }
 
+static inline long sys_ioctl(int fd, int cmd, long arg)
+{
+	return _syscall3(SYS_ioctl, fd, cmd, arg);
+}
+
+static inline long sys_ls(const char *path, char *out, size_t cap)
+{
+	return _syscall3(SYS_ls,
+			 (long)(unsigned long)path,
+			 (long)(unsigned long)out,
+			 (long)cap);
+}
+
+/* ioctl commands -- mirror include/kappara/stream_head.h. */
+#define I_PUSH		1
+#define I_POP		2
+#define I_LIST		3
+
 #endif
