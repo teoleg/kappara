@@ -110,3 +110,23 @@ thread_trampoline:
 	bl	kthread_exit
 1:	wfe
 	b	1b
+
+/*
+ * void aarch64_enter_userspace(uint64_t entry, uint64_t sp_el0);
+ *   x0 = entry PC for EL0
+ *   x1 = user-mode SP
+ *
+ * Set ELR_EL1 + SP_EL0 + SPSR_EL1 and `eret` into EL0t.  SPSR=0
+ * means EL0t (M[3:0]=0), AArch64 (M[4]=0), all DAIF=0 (IRQs
+ * unmasked from the moment the user runs).
+ *
+ * Does not return -- the eret leaves EL1 entirely.  If the user
+ * program calls svc, control re-enters the kernel via the
+ * VEC_SYNC_LO64 (offset 0x400) vector slot in vectors.S.
+ */
+.global aarch64_enter_userspace
+aarch64_enter_userspace:
+	msr	sp_el0,   x1
+	msr	elr_el1,  x0
+	msr	spsr_el1, xzr
+	eret

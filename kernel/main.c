@@ -38,6 +38,7 @@
 #include "kappara/timer.h"
 #include "kappara/trap.h"
 #include "kappara/uart.h"
+#include "kappara/user.h"
 
 extern char __kernel_end[];
 
@@ -179,6 +180,7 @@ void kmain(void)
 
 	vfs_init();
 	streams_head_init();
+	user_init();
 
 	kprintf("\n");
 	vfs_dump_tree(vfs_root());
@@ -191,6 +193,10 @@ void kmain(void)
 	 * the feeder thread is in the ready queue when ksh issues its
 	 * first SYS_read. */
 	kthread_create("uart_rx", uart_rx_main, NULL);
+
+	/* Spawn the user-mode init thread; once scheduled it eret's
+	 * into EL0 and stays there, returning to EL1 only via svc. */
+	user_spawn();
 
 	/* Launch the interactive shell as a kthread.  Once IRQs unmask
 	 * below it gets preempted and runs concurrently with main. */

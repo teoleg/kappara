@@ -142,6 +142,7 @@
 #define D_TABLE			(1UL << 1)	/* 1=table, 0=block at L0..L2 */
 #define D_ATTRIDX(n)		(((uint64_t)(n) & 0x7) << 2)
 #define D_AP_RW_EL1		(0UL << 6)	/* AP[2:1]=00: RW EL1, no EL0 */
+#define D_AP_RW_EL0		(1UL << 6)	/* AP[2:1]=01: RW EL1+EL0    */
 #define D_SH_INNER		(3UL << 8)
 #define D_SH_NONE		(0UL << 8)
 #define D_AF			(1UL << 10)
@@ -193,6 +194,38 @@ static void build_identity_map(void)
 		}
 		l2_table[i] = desc;
 	}
+}
+
+/*
+ * Remap one 2 MB L2 block to make it accessible from EL0.
+ *
+ *   va, pa     must be 2 MB aligned, and va must lie in the lowest
+ *              1 GB (the L2 we built in build_identity_map covers
+ *              VA 0..1 GB).
+ *
+ * The new descriptor is Normal cacheable, inner-shareable, AF set,
+ * AP[2:1]=01 (RW for both EL1 and EL0).  We leave UXN clear so user
+ * code can be executed; PXN is also clear so the kernel can
+ * trampoline into and out of the page if needed.
+ *
+ * After updating the descriptor we TLBI the VA and ISB so subsequent
+ * accesses go through the new mapping.  The data we wrote into the
+ * region beforehand (if any) is cleaned + invalidated by the caller
+ * via cache maintenance (DC CVAU + IC IVAU) -- needed when populating
+ * a user code page so the I-cache doesn't keep stale lines.
+ */
+void mmu_map_user_2mb(uint64_t va, uint64_t pa)
+{
+	unsigned idx = (unsigned)(va >> BLOCK_2M_SHIFT) & 0x1ff;
+	l2_table[idx] = pa | D_VALID | D_ATTRIDX(ATTR_NORMAL_IDX) |
+			D_AP_RW_EL0 | D_SH_INNER | D_AF;
+
+	__asm__ volatile (
+		"dsb	ishst\n"
+		"tlbi	vaae1is, %0\n"
+		"dsb	ish\n"
+		"isb\n"
+		: : "r"(va >> 12) : "memory");
 }
 
 void mmu_init(void)

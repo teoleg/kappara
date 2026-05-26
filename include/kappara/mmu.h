@@ -11,4 +11,11 @@
 
 void mmu_init(void);
 
+#ifdef __aarch64__
+/* Remap one 2 MB region (va must be 2 MB aligned, must lie in the
+ * low 1 GB on AArch64) as a Normal-cacheable user-RW block.
+ * Used to publish a user code/data page so EL0 can read+execute it. */
+void mmu_map_user_2mb(unsigned long va, unsigned long pa);
+#endif
+
 #endif
