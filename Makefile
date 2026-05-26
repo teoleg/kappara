@@ -24,6 +24,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/kernel/vfs.o \
         $(BUILD)/kernel/stream_head.o \
         $(BUILD)/kernel/syscall.o \
+        $(BUILD)/kernel/ksh.o \
         $(BUILD)/kernel/main.o
     ELF           := $(BUILD)/kernel8.elf
     KERNEL        := $(BUILD)/kernel8.img
@@ -52,7 +53,8 @@ else ifeq ($(ARCH),arm)
         $(BUILD)/kernel/streams.o \
         $(BUILD)/kernel/vfs.o \
         $(BUILD)/kernel/stream_head.o \
-        $(BUILD)/kernel/syscall.o
+        $(BUILD)/kernel/syscall.o \
+        $(BUILD)/kernel/ksh.o
     ELF           := $(BUILD)/kernel-arm.elf
     KERNEL        := $(BUILD)/kernel-arm.img
     QEMU          := qemu-system-arm

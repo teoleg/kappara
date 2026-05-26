@@ -20,14 +20,17 @@
 #include <stdint.h>
 
 #include "kappara/kmem.h"
+#include "kappara/ksh.h"
 #include "kappara/mmu.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
 #include "kappara/sched.h"
+#include "kappara/stream_head.h"
 #include "kappara/syscall.h"
 #include "kappara/timer.h"
 #include "kappara/trap.h"
 #include "kappara/uart.h"
+#include "kappara/vfs.h"
 
 extern char __kernel_end[];
 
@@ -56,43 +59,6 @@ static const char *mode_name(unsigned m)
 	}
 }
 
-static void spin(unsigned long n)
-{
-	for (volatile unsigned long i = 0; i < n; i++)
-		;
-}
-
-static void demo(void *arg)
-{
-	const char *name = arg;
-	for (unsigned long n = 0; ; n++) {
-		kprintf("[%s] n=%lu\n", name, n);
-		spin(500000);
-	}
-}
-
-/* ARMv7 EABI syscall: number in r7, args r0..r5, return r0. */
-static long do_syscall(long num, long a0, long a1, long a2)
-{
-	register long r0 __asm__("r0") = a0;
-	register long r1 __asm__("r1") = a1;
-	register long r2 __asm__("r2") = a2;
-	register long r7 __asm__("r7") = num;
-	__asm__ volatile (
-		"svc	#0\n"
-		: "+r"(r0)
-		: "r"(r1), "r"(r2), "r"(r7)
-		: "memory", "cc");
-	return r0;
-}
-
-static void syscall_demo(void)
-{
-	do_syscall(SYS_log, (long)(uintptr_t)"hello from kernel-svc!", 0, 0);
-	long pid = do_syscall(SYS_getpid, 0, 0, 0);
-	kprintf("syscall: getpid -> %ld\n", pid);
-}
-
 void kmain(void)
 {
 	uart_init();
@@ -106,18 +72,21 @@ void kmain(void)
 	mmu_init();
 	pmm_init((uintptr_t)__kernel_end, ARM_RAM_END);
 	kmem_init();
+	vfs_init();
+	streams_head_init();
+
+	kprintf("\n");
+	vfs_dump_tree(vfs_root());
+
 	sched_init();
-	syscall_demo();
 	timer_init(100);
 
-	kthread_create("alpha", demo, (void *)"alpha");
-	kthread_create("beta",  demo, (void *)"beta");
+	kthread_create("ksh", ksh_main, NULL);
 
 	__asm__ volatile ("cpsie i" ::: "memory");
-	kprintf("[main] IRQs unmasked; entering scheduler loop\n");
 
-	for (unsigned long n = 0; ; n++) {
-		kprintf("[main] n=%lu\n", n);
-		spin(500000);
+	for (;;) {
+		kthread_yield();
+		__asm__ volatile ("wfi");
 	}
 }

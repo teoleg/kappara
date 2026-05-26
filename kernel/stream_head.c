@@ -52,6 +52,9 @@
 #include "kappara/string.h"
 #include "kappara/vfs.h"
 
+/* Forward-declared in streams.h. */
+extern void streams_init(void);
+
 /* ---- Module / driver registry ----------------------------------------- */
 
 struct stmod_entry {
@@ -504,6 +507,10 @@ struct file_ops stream_fops = {
 
 void streams_head_init(void)
 {
+	/* Bring up the mblk/dblk/queue slab caches.  Must run before
+	 * any allocb() call, which means before any stream is opened. */
+	streams_init();
+
 	streams_register("loop",  &loop_streamtab);
 	streams_register("null",  &null_streamtab);
 	streams_register("upper", &upper_streamtab);

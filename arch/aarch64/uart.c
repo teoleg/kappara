@@ -50,6 +50,7 @@
 #define UART_ICR	(PL011_BASE + 0x44)
 
 #define FR_TXFF		(1u << 5)
+#define FR_RXFE		(1u << 4)
 
 #define LCRH_FEN	(1u << 4)
 #define LCRH_WLEN_8	(3u << 5)
@@ -91,4 +92,11 @@ void uart_puts(const char *s)
 			uart_putc('\r');
 		uart_putc(*s++);
 	}
+}
+
+int uart_getc_nonblock(void)
+{
+	if (mmio_read(UART_FR) & FR_RXFE)
+		return -1;
+	return (int)(mmio_read(UART_DR) & 0xFFu);
 }
