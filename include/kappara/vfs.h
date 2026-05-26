@@ -134,4 +134,11 @@ long  sys_putmsg_impl(int fd, const struct strbuf *c,
 long  sys_getmsg_impl(int fd, struct strbuf *c,
 		      struct strbuf *d, int *flagsp);
 
+/* Anonymous STREAMS pipe.  Returns 0 and writes two fresh fds into
+ * fds[2] (read end + write end -- both ends are actually bidirectional;
+ * the names follow Unix convention).  Each end is a separate stdata
+ * whose head_wq.q_next points at the peer's head_rq, so a write on
+ * one side enqueues an mblk on the peer's read deferred list. */
+long  sys_pipe_impl(int fds[2]);
+
 #endif

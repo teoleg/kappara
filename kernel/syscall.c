@@ -143,6 +143,26 @@ static long sys_getmsg(long a0, long a1, long a2, long a3, long a4, long a5)
 			       (int *)(uintptr_t)a3);
 }
 
+static long sys_pipe(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+
+	int kfds[2];
+	long r = sys_pipe_impl(kfds);
+	if (r < 0)
+		return r;
+
+	int *udst = (int *)(uintptr_t)a0;
+	if (syscall_from_user) {
+		if (copy_to_user(udst, kfds, sizeof(kfds)) < 0)
+			return -1;
+	} else {
+		udst[0] = kfds[0];
+		udst[1] = kfds[1];
+	}
+	return 0;
+}
+
 static long sys_ls(long a0, long a1, long a2, long a3, long a4, long a5)
 {
 	(void)a3; (void)a4; (void)a5;
@@ -188,6 +208,7 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_putmsg] = sys_putmsg,
 	[SYS_getmsg] = sys_getmsg,
 	[SYS_ls]     = sys_ls,
+	[SYS_pipe]   = sys_pipe,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

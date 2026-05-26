@@ -177,7 +177,8 @@ static void cmd_help(void)
 		"  read [n]               read up to n bytes from $fd\r\n"
 		"  write <text...>        write text to $fd\r\n"
 		"  push <module>          ioctl(I_PUSH) on $fd\r\n"
-		"  pop                    ioctl(I_POP) on $fd\r\n");
+		"  pop                    ioctl(I_POP) on $fd\r\n"
+		"  pipe                   sys_pipe demo (write + read)\r\n");
 }
 
 static void cmd_pid(void)
@@ -272,6 +273,31 @@ static void cmd_pop(void)
 	cwrite("pop: "); cprint_long(r); cwrite("\r\n");
 }
 
+static void cmd_pipe(void)
+{
+	int fds[2];
+	long r = sys_pipe(fds);
+	if (r < 0) { cwrite("pipe: failed\r\n"); return; }
+	cwrite("pipe: rd_fd=");
+	cprint_long(fds[0]);
+	cwrite(" wr_fd=");
+	cprint_long(fds[1]);
+	cwrite("\r\n");
+
+	const char *msg = "hello through the streams pipe!";
+	long w = sys_write(fds[1], msg, ustrlen(msg));
+	cwrite("pipe: wrote "); cprint_long(w); cwrite(" bytes\r\n");
+
+	char buf[64];
+	long n = sys_read(fds[0], buf, sizeof(buf));
+	cwrite("pipe: read "); cprint_long(n); cwrite(" -> '");
+	for (long i = 0; i < n; i++) cputc(buf[i]);
+	cwrite("'\r\n");
+
+	sys_close(fds[0]);
+	sys_close(fds[1]);
+}
+
 /* -------- dispatch -------- */
 
 static void dispatch(char *line)
@@ -289,6 +315,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "write")) cmd_write(argc, argv);
 	else if (!ustrcmp(argv[0], "push"))  cmd_push(argc, argv);
 	else if (!ustrcmp(argv[0], "pop"))   cmd_pop();
+	else if (!ustrcmp(argv[0], "pipe"))  cmd_pipe();
 	else {
 		cwrite(argv[0]); cwrite(": command not found\r\n");
 	}

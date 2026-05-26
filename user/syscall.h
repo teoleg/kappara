@@ -22,6 +22,7 @@
 #define SYS_putmsg	8
 #define SYS_getmsg	9
 #define SYS_ls		10
+#define SYS_pipe	11
 
 typedef long ssize_t;
 typedef unsigned long size_t;
@@ -93,6 +94,11 @@ static inline long sys_ls(const char *path, char *out, size_t cap)
 			 (long)(unsigned long)path,
 			 (long)(unsigned long)out,
 			 (long)cap);
+}
+
+static inline long sys_pipe(int fds[2])
+{
+	return _syscall1(SYS_pipe, (long)(unsigned long)fds);
 }
 
 /* ioctl commands -- mirror include/kappara/stream_head.h. */

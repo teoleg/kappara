@@ -665,6 +665,69 @@ struct file_ops stream_fops = {
 	.getmsg = stream_getmsg,
 };
 
+/* ---- sys_pipe: anonymous STREAMS pipe -------------------------------- */
+
+/*
+ * Build two stream heads (no driver, no inode) and wire each one's
+ * write side to the other's read side.  Writing to A's wq -> putnext
+ * -> B's rq.putp (sh_rq_putp) -> putq.  A's reader getq's its own rq,
+ * which received whatever B has written.
+ *
+ *     +-----+      head_wq.q_next      +-----+
+ *     |  A  | -----------------------> |  B  |
+ *     |head | <----------------------- |head |
+ *     +-----+      head_wq.q_next      +-----+
+ *           (each direction is a head-to-peer-head edge)
+ */
+static struct stdata *pipe_end(const char *name)
+{
+	struct stdata *sd = kmalloc(sizeof(*sd));
+	queue_t *rq = kmalloc(sizeof(*rq));
+	queue_t *wq = kmalloc(sizeof(*wq));
+	if (!sd || !rq || !wq)
+		return NULL;
+	queue_init_pair(rq, wq, &sh_rinit, &sh_winit);
+	sd->sd_rq   = rq;
+	sd->sd_wq   = wq;
+	sd->sd_refs = 1;
+	sd->sd_name = name;
+	return sd;
+}
+
+long sys_pipe_impl(int fds[2])
+{
+	struct stdata *a = pipe_end("pipe-a");
+	struct stdata *b = pipe_end("pipe-b");
+	if (!a || !b)
+		return -1;
+
+	/* Cross-wire: writes on A land on B's rq, and vice versa. */
+	a->sd_wq->q_next = b->sd_rq;
+	b->sd_wq->q_next = a->sd_rq;
+
+	struct file *fa = kmalloc(sizeof(*fa));
+	struct file *fb = kmalloc(sizeof(*fb));
+	if (!fa || !fb)
+		return -1;
+	fa->f_ops = &stream_fops;
+	fa->f_inode = NULL;
+	fa->f_private = a;
+	fa->f_refs = 1;
+	fb->f_ops = &stream_fops;
+	fb->f_inode = NULL;
+	fb->f_private = b;
+	fb->f_refs = 1;
+
+	int rd = fd_alloc(fa);
+	int wr = fd_alloc(fb);
+	if (rd < 0 || wr < 0)
+		return -1;
+
+	fds[0] = rd;	/* convention: fds[0] = read end, fds[1] = write */
+	fds[1] = wr;
+	return 0;
+}
+
 /* ---- The "klog" driver: replay the kernel log ring ------------------- */
 
 /*
