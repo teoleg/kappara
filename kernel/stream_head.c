@@ -50,6 +50,7 @@
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
 #include "kappara/string.h"
+#include "kappara/uart.h"
 #include "kappara/vfs.h"
 
 /* Forward-declared in streams.h. */
@@ -113,6 +114,54 @@ static struct qinit sh_rinit = {
 };
 static struct qinit sh_winit = {
 	.qi_putp = sh_wq_putp, .qi_minfo = &sh_minfo
+};
+
+/* ---- The "console" driver -- real PL011 TX via STREAMS ---------------
+ *
+ * Bottom of stack; wq.putp walks the mblk chain and pushes every byte
+ * out via uart_putc.  Bytes you `write` to /dev/console end up on the
+ * serial port for real -- not echoed by ksh, not loopback'd.
+ *
+ * RX still goes via uart_getc_nonblock in ksh; threading the receive
+ * path through STREAMS too needs a uart-rx kthread (or PL011 RX IRQ)
+ * that allocb's mblks and putnext's them up.  Future commit.
+ */
+
+static int console_wq_putp(queue_t *q, mblk_t *mp)
+{
+	(void)q;
+	for (mblk_t *m = mp; m; m = m->b_cont) {
+		for (unsigned char *p = m->b_rptr; p < m->b_wptr; p++)
+			uart_putc((char)*p);
+	}
+	freemsg(mp);
+	return 0;
+}
+
+static int console_rq_putp(queue_t *q, mblk_t *mp)
+{
+	return putnext(q, mp);
+}
+
+static struct module_info console_minfo = {
+	.mi_idnum  = 200,
+	.mi_idname = "console",
+	.mi_minpsz = 0,
+	.mi_maxpsz = 4096,
+	.mi_hiwat  = 16384,
+	.mi_lowat  = 8192,
+};
+
+static struct qinit console_rinit = {
+	.qi_putp = console_rq_putp, .qi_minfo = &console_minfo
+};
+static struct qinit console_winit = {
+	.qi_putp = console_wq_putp, .qi_minfo = &console_minfo
+};
+
+static struct streamtab console_streamtab = {
+	.st_rdinit = &console_rinit,
+	.st_wrinit = &console_winit,
 };
 
 /* ---- The "null" driver (writes go nowhere; reads return 0 bytes) ----- */
@@ -228,7 +277,13 @@ static struct streamtab delay_streamtab = {
 
 /* ---- The "upper" module ----------------------------------------------- */
 
-static int upper_rq_putp(queue_t *q, mblk_t *mp)
+/*
+ * Uppercases data in both directions.  In real SVR4 put procedures are
+ * usually direction-specific (e.g. ldterm cooks input but lets output
+ * through), but for a demo it's friendlier if "push upper" affects
+ * everything you write/read.
+ */
+static void uppercase_mblk_chain(mblk_t *mp)
 {
 	for (mblk_t *m = mp; m; m = m->b_cont) {
 		for (unsigned char *p = m->b_rptr; p < m->b_wptr; p++) {
@@ -236,11 +291,17 @@ static int upper_rq_putp(queue_t *q, mblk_t *mp)
 				*p = (unsigned char)(*p - 32);
 		}
 	}
+}
+
+static int upper_rq_putp(queue_t *q, mblk_t *mp)
+{
+	uppercase_mblk_chain(mp);
 	return putnext(q, mp);
 }
 
 static int upper_wq_putp(queue_t *q, mblk_t *mp)
 {
+	uppercase_mblk_chain(mp);
 	return putnext(q, mp);
 }
 
@@ -511,17 +572,19 @@ void streams_head_init(void)
 	 * any allocb() call, which means before any stream is opened. */
 	streams_init();
 
-	streams_register("loop",  &loop_streamtab);
-	streams_register("null",  &null_streamtab);
-	streams_register("upper", &upper_streamtab);
-	streams_register("delay", &delay_streamtab);
+	streams_register("loop",    &loop_streamtab);
+	streams_register("null",    &null_streamtab);
+	streams_register("console", &console_streamtab);
+	streams_register("upper",   &upper_streamtab);
+	streams_register("delay",   &delay_streamtab);
 
 	/* Publish drivers as character-special files under /dev.
 	 * Modules ("upper", "delay") stay registry-only -- they
 	 * are not openable, they're pushed via ioctl(I_PUSH). */
 	struct dentry *dev = vfs_mkdir(vfs_root(), "dev");
-	vfs_mknod_chrdev(dev, "loop", &stream_fops, &loop_streamtab);
-	vfs_mknod_chrdev(dev, "null", &stream_fops, &null_streamtab);
+	vfs_mknod_chrdev(dev, "loop",    &stream_fops, &loop_streamtab);
+	vfs_mknod_chrdev(dev, "null",    &stream_fops, &null_streamtab);
+	vfs_mknod_chrdev(dev, "console", &stream_fops, &console_streamtab);
 
 	kprintf("stream_head: registered modules:");
 	for (struct stmod_entry *e = registry; e; e = e->next)
