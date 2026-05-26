@@ -62,7 +62,8 @@
 #define LINE_MAX	128
 #define TOK_MAX		8
 
-static long ksh_fd = -1;
+static long ksh_fd       = -1;	/* user-current fd                */
+static long ksh_stdin_fd = -1;	/* /dev/console; one byte at a time */
 
 /* ---- Local syscall helpers (AArch64 + ARMv7 inline asm) ---------------- */
 
@@ -107,13 +108,24 @@ static void prompt(void)
 	uart_puts("kappara# ");
 }
 
+/* Pull one character from /dev/console via SYS_read.  Returns -1
+ * on no-data-yet so the caller can yield and try again. */
+static int read_one_char(void)
+{
+	char c;
+	long n = do_sc(SYS_read, ksh_stdin_fd, (long)(uintptr_t)&c, 1);
+	if (n != 1)
+		return -1;
+	return (unsigned char)c;
+}
+
 static void read_line(char *buf, size_t cap)
 {
 	size_t i = 0;
 	for (;;) {
-		int c = uart_getc_nonblock();
+		int c = read_one_char();
 		if (c < 0) {
-			kthread_yield();
+			do_sc(SYS_yield, 0, 0, 0);
 			continue;
 		}
 		if (c == '\r' || c == '\n') {
@@ -303,6 +315,16 @@ static void dispatch(char *line)
 void ksh_main(void *arg)
 {
 	(void)arg;
+
+	/* Take ownership of console RX by opening /dev/console first.
+	 * stream_build registers ksh's stdata as console_active, which
+	 * is what uart_rx_main targets when it pushes received bytes. */
+	ksh_stdin_fd = do_sc(SYS_open, (long)(uintptr_t)"/dev/console", 0, 0);
+	if (ksh_stdin_fd < 0) {
+		uart_puts("ksh: cannot open /dev/console\n");
+		return;
+	}
+
 	uart_puts("\n");
 	uart_puts("kappara shell -- type 'help' for commands\n");
 	char line[LINE_MAX];

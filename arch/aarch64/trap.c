@@ -110,8 +110,15 @@ void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 	 * SVC from AArch64.  ELR_EL1 already points at the instruction
 	 * AFTER the svc, so no PC adjustment is needed; the result we
 	 * stash in tf->x[0] becomes the return value the user sees in x0.
+	 *
+	 * Unmask IRQs (PSTATE.I=0) before the handler runs so that
+	 * syscalls are preemptible -- otherwise a syscall that calls
+	 * kthread_yield (e.g. sys_yield) would context-switch the next
+	 * thread in with PSTATE.I still set, leaving it unable to be
+	 * preempted by the timer and starving other threads.
 	 */
 	if (ec == 0x15) {
+		__asm__ volatile ("msr daifclr, #2" ::: "memory");
 		tf->x[0] = (uint64_t)syscall_dispatch(
 				(long)tf->x[8],
 				(long)tf->x[0], (long)tf->x[1], (long)tf->x[2],

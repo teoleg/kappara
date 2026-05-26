@@ -81,7 +81,8 @@ void kmain(void)
 	sched_init();
 	timer_init(100);
 
-	kthread_create("ksh", ksh_main, NULL);
+	kthread_create("uart_rx", uart_rx_main, NULL);
+	kthread_create("ksh",     ksh_main,     NULL);
 
 	__asm__ volatile ("cpsie i" ::: "memory");
 

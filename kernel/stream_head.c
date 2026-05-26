@@ -47,6 +47,7 @@
 
 #include "kappara/kmem.h"
 #include "kappara/printk.h"
+#include "kappara/sched.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
 #include "kappara/string.h"
@@ -163,6 +164,66 @@ static struct streamtab console_streamtab = {
 	.st_rdinit = &console_rinit,
 	.st_wrinit = &console_winit,
 };
+
+/*
+ * uart_rx_main: PL011 RX -> /dev/console feeder
+ * ---------------------------------------------
+ * Without this, RX bytes only reach the kernel via direct
+ * uart_getc_nonblock calls (what ksh used to do).  This kthread
+ * threads them through STREAMS instead so sys_read on /dev/console
+ * returns them and any module pushed on the stream sees them on
+ * their way up.
+ *
+ * console_active is the first opened /dev/console stream; the
+ * feeder targets it.  Subsequent opens become write-only -- they
+ * can still putnext bytes down to uart_putc but get no RX, since
+ * we don't fan out yet.
+ */
+
+static struct stdata *console_active;
+
+/* Walk down the wq chain to the driver's wq, return its OTHERQ
+ * (the driver's rq).  That's the bottom of the upstream chain
+ * for pushing received bytes into. */
+static queue_t *bottom_driver_rq(struct stdata *sd)
+{
+	queue_t *wq = sd->sd_wq;
+	while (wq->q_next)
+		wq = wq->q_next;
+	return wq->q_link;
+}
+
+void uart_rx_main(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		if (!console_active) {
+			/* Nothing listening yet -- don't drain the FIFO
+			 * or those bytes are lost.  Wait for the first
+			 * open of /dev/console. */
+			kthread_yield();
+			continue;
+		}
+
+		int c = uart_getc_nonblock();
+		if (c >= 0) {
+			mblk_t *mp = allocb(1, 0);
+			if (mp) {
+				*mp->b_wptr++ = (unsigned char)c;
+				queue_t *drq = bottom_driver_rq(console_active);
+				if (drq && drq->q_next)
+					putnext(drq, mp);
+				else
+					freemsg(mp);
+			}
+		}
+
+		/* Yield every iteration so the reader thread gets a turn
+		 * even when piped input is arriving faster than the reader
+		 * can drain it. */
+		kthread_yield();
+	}
+}
 
 /* ---- The "null" driver (writes go nowhere; reads return 0 bytes) ----- */
 
@@ -390,6 +451,12 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name)
 	sd->sd_wq   = head_wq;
 	sd->sd_refs = 1;
 	sd->sd_name = name;
+
+	/* First open of /dev/console captures the RX feed.  Subsequent
+	 * opens become write-only (uart_rx_main only feeds one stream). */
+	if (drv_st == &console_streamtab && !console_active)
+		console_active = sd;
+
 	return sd;
 }
 

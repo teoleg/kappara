@@ -112,8 +112,12 @@ void trap_dispatch(struct arm_trap_frame *tf, unsigned vec_id)
 	/* SVC (vec_id == 2): r7 holds the syscall number, r0..r5 the args.
 	 * The frame's saved PC already points at the instruction after
 	 * `svc #imm` (we passed lr_adj=0 to VEC_HANDLER for SVC), so the
-	 * result we stash in tf->r[0] becomes the value the user sees. */
+	 * result we stash in tf->r[0] becomes the value the user sees.
+	 *
+	 * cpsie i unmasks IRQs so syscalls are preemptible -- same
+	 * reasoning as the AArch64 daifclr in arch/aarch64/trap.c. */
 	if (vec_id == 2) {
+		__asm__ volatile ("cpsie i" ::: "memory");
 		tf->r[0] = (uint32_t)syscall_dispatch(
 				(long)tf->r[7],
 				(long)tf->r[0], (long)tf->r[1], (long)tf->r[2],

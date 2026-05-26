@@ -186,6 +186,12 @@ void kmain(void)
 	sched_init();
 	timer_init(100);
 
+	/* Console RX feeder: polls PL011 RX FIFO and putnext's received
+	 * bytes into /dev/console's read chain.  Spawned before ksh so
+	 * the feeder thread is in the ready queue when ksh issues its
+	 * first SYS_read. */
+	kthread_create("uart_rx", uart_rx_main, NULL);
+
 	/* Launch the interactive shell as a kthread.  Once IRQs unmask
 	 * below it gets preempted and runs concurrently with main. */
 	kthread_create("ksh", ksh_main, NULL);

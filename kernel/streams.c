@@ -255,8 +255,20 @@ void qenable(queue_t *q)
 	runq_tail = q;
 }
 
+/*
+ * Reentrancy guard.  Now that syscalls run with IRQs unmasked the
+ * timer can preempt a thread that's already inside streams_run (via
+ * sys_yield).  Without this, the IRQ-driven sched_tick would walk
+ * the same runqueue from underneath us and corrupt the linked list.
+ */
+static int streams_running;
+
 void streams_run(void)
 {
+	if (streams_running)
+		return;
+	streams_running = 1;
+
 	while (runq_head) {
 		queue_t *q = runq_head;
 		runq_head = q->q_runlink;
@@ -274,4 +286,6 @@ void streams_run(void)
 		if (q->q_qinfo->qi_srvp)
 			q->q_qinfo->qi_srvp(q);
 	}
+
+	streams_running = 0;
 }

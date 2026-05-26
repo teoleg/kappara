@@ -59,6 +59,11 @@ struct stdata {
 
 void streams_head_init(void);
 
+/* Kthread entry point: poll PL011 RX FIFO and putnext received bytes
+ * into the bottom of the active /dev/console read chain.  Spawned by
+ * each arch's kmain before ksh so RX bytes don't get lost. */
+void uart_rx_main(void *arg);
+
 /* Register a driver or module under a name so sys_open / I_PUSH find it. */
 void streams_register(const char *name, struct streamtab *st);
 
