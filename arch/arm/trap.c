@@ -56,6 +56,7 @@
 #include "kappara/syscall.h"
 #include "kappara/timer.h"
 #include "kappara/trap.h"
+#include "kappara/uaccess.h"
 
 struct arm_trap_frame {
 	uint32_t r[13];		/* r0..r12 */
@@ -117,11 +118,17 @@ void trap_dispatch(struct arm_trap_frame *tf, unsigned vec_id)
 	 * cpsie i unmasks IRQs so syscalls are preemptible -- same
 	 * reasoning as the AArch64 daifclr in arch/aarch64/trap.c. */
 	if (vec_id == 2) {
+		/* CPSR.M[4:0] == 0x10 means the caller was USR mode (EL0
+		 * equivalent on ARMv7).  ARMv7 has no EL0 userspace yet,
+		 * so today this stays 0 -- but the wiring is here for when
+		 * it does. */
+		syscall_from_user = ((tf->spsr & 0x1f) == 0x10) ? 1 : 0;
 		__asm__ volatile ("cpsie i" ::: "memory");
 		tf->r[0] = (uint32_t)syscall_dispatch(
 				(long)tf->r[7],
 				(long)tf->r[0], (long)tf->r[1], (long)tf->r[2],
 				(long)tf->r[3], (long)tf->r[4], (long)tf->r[5]);
+		syscall_from_user = 0;
 		return;
 	}
 

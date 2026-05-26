@@ -308,6 +308,25 @@ void _start(void)
 		sys_log(buf);
 	}
 
+	/*
+	 * Probe the user-pointer validation.  sys_log on a kernel
+	 * address used to leak kernel memory; now it returns -1 and
+	 * kprintfs a rejection.  We do a positive and a negative case.
+	 */
+	{
+		long good = sys_log("init: uaccess probe (good user pointer)");
+		long bad  = sys_log((const char *)0x80000); /* kernel text */
+		char buf[80];
+		const char *p = "init: uaccess probe good=";
+		char *q = buf;
+		while (*p) *q++ = *p++;
+		q = udec(q, good);
+		const char *p2 = " bad=";
+		while (*p2) *q++ = *p2++;
+		udec(q, bad);
+		sys_log(buf);
+	}
+
 	fd_console = (int)sys_open("/dev/console");
 	if (fd_console < 0) {
 		sys_log("init: open /dev/console failed");

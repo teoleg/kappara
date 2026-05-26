@@ -31,6 +31,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/kernel/vfs.o \
         $(BUILD)/kernel/stream_head.o \
         $(BUILD)/kernel/syscall.o \
+        $(BUILD)/kernel/uaccess.o \
         $(BUILD)/kernel/user.o \
         $(BUILD)/kernel/main.o
     ELF           := $(BUILD)/kernel8.elf
@@ -62,6 +63,7 @@ else ifeq ($(ARCH),arm)
         $(BUILD)/kernel/vfs.o \
         $(BUILD)/kernel/stream_head.o \
         $(BUILD)/kernel/syscall.o \
+        $(BUILD)/kernel/uaccess.o \
         $(BUILD)/kernel/ksh.o
     ELF           := $(BUILD)/kernel-arm.elf
     KERNEL        := $(BUILD)/kernel-arm.img

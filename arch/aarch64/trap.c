@@ -47,6 +47,7 @@
 #include "kappara/syscall.h"
 #include "kappara/timer.h"
 #include "kappara/trap.h"
+#include "kappara/uaccess.h"
 
 extern char vectors[];
 
@@ -118,11 +119,16 @@ void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 	 * preempted by the timer and starving other threads.
 	 */
 	if (ec == 0x15) {
+		/* SPSR.M[3:0]: 0 = EL0t, 5 = EL1h.  Anything other than 5
+		 * means the caller was at EL0 and the pointers it gave us
+		 * are USER pointers that need bounds checking. */
+		syscall_from_user = ((tf->spsr & 0xf) == 0) ? 1 : 0;
 		__asm__ volatile ("msr daifclr, #2" ::: "memory");
 		tf->x[0] = (uint64_t)syscall_dispatch(
 				(long)tf->x[8],
 				(long)tf->x[0], (long)tf->x[1], (long)tf->x[2],
 				(long)tf->x[3], (long)tf->x[4], (long)tf->x[5]);
+		syscall_from_user = 0;
 		return;
 	}
 
