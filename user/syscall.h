@@ -67,4 +67,19 @@ static inline long sys_write(int fd, const void *buf, size_t n)
 	return _syscall3(SYS_write, fd, (long)(unsigned long)buf, (long)n);
 }
 
+static inline long sys_open(const char *path)
+{
+	return _syscall1(SYS_open, (long)(unsigned long)path);
+}
+
+static inline long sys_close(int fd)
+{
+	return _syscall1(SYS_close, fd);
+}
+
+static inline long sys_read(int fd, void *buf, size_t n)
+{
+	return _syscall3(SYS_read, fd, (long)(unsigned long)buf, (long)n);
+}
+
 #endif
