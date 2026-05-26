@@ -13,7 +13,13 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/arch/aarch64/mmu.o \
         $(BUILD)/arch/aarch64/timer.o \
         $(BUILD)/arch/aarch64/switch.o \
-        $(BUILD)/arch/aarch64/thread.o
+        $(BUILD)/arch/aarch64/thread.o \
+        $(BUILD)/arch/aarch64/userblob.o
+    # User-side init binary, linked at VA 0x10000000 and incbin'd
+    # into userblob.S so the kernel ELF carries the raw bytes.
+    USER_BUILD    := build/user
+    USER_BIN      := $(USER_BUILD)/init.bin
+    USERBLOB_EXTRA_DEP := $(USER_BIN)
     KERNEL_OBJS   := \
         $(BUILD)/kernel/printk.o \
         $(BUILD)/kernel/pmm.o \
@@ -107,3 +113,35 @@ run: $(KERNEL)
 
 clean:
 	rm -rf build
+
+# --- User-side init binary (AArch64 only) ----------------------------
+# Compile user/init.c with the same cross toolchain as the kernel,
+# link with user/linker.ld at VA 0x10000000, objcopy to a raw .bin,
+# then arch/aarch64/userblob.S incbin's the result into the kernel.
+
+ifeq ($(ARCH),aarch64)
+
+USER_CC     := $(CROSS)gcc
+USER_LD     := $(CROSS)ld
+USER_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
+               -ffreestanding -nostdlib -nostartfiles \
+               -fno-stack-protector -fno-pie -fno-pic \
+               -mcpu=cortex-a53 -mgeneral-regs-only \
+               -O2 -g
+
+$(USER_BUILD)/init.o: user/init.c user/syscall.h | $(USER_BUILD)
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_BUILD)/init.elf: $(USER_BUILD)/init.o user/linker.ld
+	$(USER_LD) -nostdlib -static -T user/linker.ld -o $@ $<
+
+$(USER_BIN): $(USER_BUILD)/init.elf
+	$(OBJCOPY) -O binary $< $@
+
+$(USER_BUILD):
+	mkdir -p $@
+
+# Tell make that userblob.o depends on the binary it incbin's.
+$(BUILD)/arch/aarch64/userblob.o: $(USER_BIN)
+
+endif
