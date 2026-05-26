@@ -45,6 +45,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kappara/klog.h"
 #include "kappara/kmem.h"
 #include "kappara/printk.h"
 #include "kappara/sched.h"
@@ -488,16 +489,49 @@ static long stream_read(struct file *f, void *buf, size_t len)
 	if (!mp)
 		return 0;
 
+	/*
+	 * Walk the b_cont chain copying out bytes, advancing each mblk's
+	 * b_rptr as we go.  When we run out of room (copied == len):
+	 *   - mp has leftover -> putbq(mp) so the next read gets it
+	 *   - mp's b_cont has leftover -> disconnect the drained prefix,
+	 *     freemsg it, putbq the tail
+	 * Otherwise (we drained the whole chain) just freemsg(mp).
+	 *
+	 * `cur` tracks the mblk we're currently consuming.  After the
+	 * loop, cur != NULL means there's leftover starting at cur.
+	 */
 	unsigned char *out = buf;
 	size_t copied = 0;
-	for (mblk_t *m = mp; m && copied < len; m = m->b_cont) {
-		size_t avail = (size_t)(m->b_wptr - m->b_rptr);
+	mblk_t *cur = mp;
+	while (cur && copied < len) {
+		size_t avail = (size_t)(cur->b_wptr - cur->b_rptr);
 		size_t room  = len - copied;
 		size_t n     = (avail < room) ? avail : room;
-		kmemcpy(out + copied, m->b_rptr, n);
-		copied += n;
+		kmemcpy(out + copied, cur->b_rptr, n);
+		copied      += n;
+		cur->b_rptr += n;
+		if (cur->b_rptr == cur->b_wptr) {
+			cur = cur->b_cont;	/* fully drained; advance */
+		} else {
+			break;			/* leftover within this mblk */
+		}
 	}
-	freemsg(mp);
+
+	if (cur && cur != mp) {
+		/* Drained mp..(predecessor of cur); leftover starts at cur. */
+		mblk_t *prev = mp;
+		while (prev->b_cont != cur)
+			prev = prev->b_cont;
+		prev->b_cont = NULL;
+		freemsg(mp);
+		putbq(sd->sd_rq, cur);
+	} else if (cur) {
+		/* mp itself has leftover; put it back unchanged. */
+		putbq(sd->sd_rq, mp);
+	} else {
+		/* Chain fully drained. */
+		freemsg(mp);
+	}
 	return (long)copied;
 }
 
@@ -631,6 +665,86 @@ struct file_ops stream_fops = {
 	.getmsg = stream_getmsg,
 };
 
+/* ---- The "klog" driver: replay the kernel log ring ------------------- */
+
+/*
+ * klog read-side procedures.  No put/srv: opening seeds the rq from
+ * the current klog buffer, and subsequent reads just drain that
+ * snapshot via getq.  Write side returns -1 (klog is read-only).
+ */
+static int klog_rq_putp(queue_t *q, mblk_t *mp)
+{
+	return putnext(q, mp);
+}
+
+static int klog_wq_putp(queue_t *q, mblk_t *mp)
+{
+	(void)q;
+	freemsg(mp);
+	return -1;	/* read-only device */
+}
+
+static struct module_info klog_minfo = {
+	.mi_idnum  = 201,
+	.mi_idname = "klog",
+	.mi_minpsz = 0,
+	.mi_maxpsz = 4096,
+	.mi_hiwat  = 16384,
+	.mi_lowat  = 8192,
+};
+
+static struct qinit klog_rinit = {
+	.qi_putp = klog_rq_putp, .qi_minfo = &klog_minfo
+};
+static struct qinit klog_winit = {
+	.qi_putp = klog_wq_putp, .qi_minfo = &klog_minfo
+};
+
+static struct streamtab klog_streamtab = {
+	.st_rdinit = &klog_rinit,
+	.st_wrinit = &klog_winit,
+};
+
+/*
+ * Open hook for /dev/klog.  Builds the normal head + driver stack
+ * via stream_build, then walks the klog ring buffer and putq's a
+ * chain of mblks onto sd_rq -- one chunk per allocation since allocb
+ * caps at the kmalloc max (2 KB).  Subsequent sys_read calls just
+ * drain those mblks; once empty, read returns 0.
+ */
+#define KLOG_CHUNK	1024
+
+static int klog_open(struct file *f)
+{
+	struct streamtab *st = (struct streamtab *)f->f_inode->i_private;
+	if (!st)
+		return -1;
+	struct stdata *sd = stream_build(st, NULL);
+	if (!sd)
+		return -1;
+	f->f_private = sd;
+
+	size_t total = klog_size();
+	for (size_t off = 0; off < total; off += KLOG_CHUNK) {
+		size_t want = total - off;
+		if (want > KLOG_CHUNK) want = KLOG_CHUNK;
+		mblk_t *mp = allocb(want, 0);
+		if (!mp) break;
+		size_t got = klog_copy((char *)mp->b_wptr, off, want);
+		mp->b_wptr += got;
+		putq(sd->sd_rq, mp);
+	}
+	return 0;
+}
+
+struct file_ops klog_fops = {
+	.open   = klog_open,
+	.close  = stream_close,
+	.read   = stream_read,
+	.write  = stream_write,	/* will reject via klog_wq_putp returning -1 */
+	.ioctl  = stream_ioctl,
+};
+
 /* ---- Boot-time registration ------------------------------------------ */
 
 void streams_head_init(void)
@@ -642,16 +756,20 @@ void streams_head_init(void)
 	streams_register("loop",    &loop_streamtab);
 	streams_register("null",    &null_streamtab);
 	streams_register("console", &console_streamtab);
+	streams_register("klog",    &klog_streamtab);
 	streams_register("upper",   &upper_streamtab);
 	streams_register("delay",   &delay_streamtab);
 
 	/* Publish drivers as character-special files under /dev.
 	 * Modules ("upper", "delay") stay registry-only -- they
-	 * are not openable, they're pushed via ioctl(I_PUSH). */
+	 * are not openable, they're pushed via ioctl(I_PUSH).
+	 * /dev/klog uses klog_fops (custom open hook) because opening
+	 * has to seed the read queue with the current ring contents. */
 	struct dentry *dev = vfs_mkdir(vfs_root(), "dev");
 	vfs_mknod_chrdev(dev, "loop",    &stream_fops, &loop_streamtab);
 	vfs_mknod_chrdev(dev, "null",    &stream_fops, &null_streamtab);
 	vfs_mknod_chrdev(dev, "console", &stream_fops, &console_streamtab);
+	vfs_mknod_chrdev(dev, "klog",    &klog_fops,   &klog_streamtab);
 
 	kprintf("stream_head: registered modules:");
 	for (struct stmod_entry *e = registry; e; e = e->next)

@@ -199,6 +199,20 @@ void putq(queue_t *q, mblk_t *mp)
 		q->q_flag |= QFULL;
 }
 
+void putbq(queue_t *q, mblk_t *mp)
+{
+	mp->b_prev = NULL;
+	mp->b_next = q->q_first;
+	if (q->q_first)
+		q->q_first->b_prev = mp;
+	else
+		q->q_last = mp;
+	q->q_first = mp;
+	q->q_count += msgdsize(mp);
+	/* QFULL is not toggled here: we're putting back what we just
+	 * pulled out, so the original ceiling state was already correct. */
+}
+
 mblk_t *getq(queue_t *q)
 {
 	mblk_t *mp = q->q_first;

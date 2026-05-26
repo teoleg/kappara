@@ -194,6 +194,11 @@ void    putq(queue_t *q, mblk_t *mp);
 mblk_t *getq(queue_t *q);
 int     putnext(queue_t *q, mblk_t *mp);
 
+/* Push mp back at the HEAD of q's deferred list.  Used by stream_read
+ * when a read only partially consumed an mblk -- the rest needs to be
+ * the next thing getq returns, not appended at the tail. */
+void    putbq(queue_t *q, mblk_t *mp);
+
 /*
  * Service-procedure machinery.
  *

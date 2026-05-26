@@ -5,7 +5,7 @@
  * What this file is
  * -----------------
  * A small printf-flavoured formatter that talks straight to the UART
- * via uart_putc().  Arch-independent: it neither knows nor cares
+ * via kputc().  Arch-independent: it neither knows nor cares
  * which board it's on, and the same source compiles for both
  * AArch64 and ARMv7.
  *
@@ -43,7 +43,7 @@
  *               on the stack (max 64 hex digits is enough for any
  *               uint64_t), then either prepends padding and dumps,
  *               or dumps then appends padding (left-align case)
- *     emit_str  loops uart_putc; '\n' is translated to "\r\n" so a
+ *     emit_str  loops kputc; '\n' is translated to "\r\n" so a
  *               raw serial terminal stays in column 0
  *
  * kpanic
@@ -62,16 +62,29 @@
 #include <stdarg.h>
 #include <stdint.h>
 
+#include "kappara/klog.h"
 #include "kappara/printk.h"
 #include "kappara/uart.h"
+
+/*
+ * Every byte that kprintf would emit goes out the UART AND into the
+ * kernel-log ring.  uart_putc stays the raw MMIO primitive (used by
+ * panic paths, console_wq_putp, etc); kputc is the kprintf-local
+ * wrapper that tees.
+ */
+static void kputc(char c)
+{
+	uart_putc(c);
+	klog_putc(c);
+}
 
 static void emit_str(const char *s)
 {
 	if (!s) s = "(null)";
 	while (*s) {
 		if (*s == '\n')
-			uart_putc('\r');
-		uart_putc(*s++);
+			kputc('\r');
+		kputc(*s++);
 	}
 }
 
@@ -93,20 +106,20 @@ static void emit_uint(uint64_t v, unsigned base, int width, char pad,
 		while (i < width)
 			buf[i++] = pad;
 		while (i--)
-			uart_putc(buf[i]);
+			kputc(buf[i]);
 	} else {
 		int written = i;
 		while (i--)
-			uart_putc(buf[i]);
+			kputc(buf[i]);
 		while (written++ < width)
-			uart_putc(' ');
+			kputc(' ');
 	}
 }
 
 static void emit_int(int64_t v, int width, char pad, int left)
 {
 	if (v < 0) {
-		uart_putc('-');
+		kputc('-');
 		v = -v;
 		if (width > 0)
 			width--;
@@ -119,8 +132,8 @@ void vkprintf(const char *fmt, va_list ap)
 	while (*fmt) {
 		if (*fmt != '%') {
 			if (*fmt == '\n')
-				uart_putc('\r');
-			uart_putc(*fmt++);
+				kputc('\r');
+			kputc(*fmt++);
 			continue;
 		}
 		fmt++;
@@ -144,7 +157,7 @@ void vkprintf(const char *fmt, va_list ap)
 			emit_str(va_arg(ap, const char *));
 			break;
 		case 'c':
-			uart_putc((char)va_arg(ap, int));
+			kputc((char)va_arg(ap, int));
 			break;
 		case 'd':
 		case 'i':
@@ -168,13 +181,13 @@ void vkprintf(const char *fmt, va_list ap)
 			emit_uint((uint64_t)(uintptr_t)va_arg(ap, void *), 16, 16, '0', 0, 0);
 			break;
 		case '%':
-			uart_putc('%');
+			kputc('%');
 			break;
 		case '\0':
 			return;
 		default:
-			uart_putc('%');
-			uart_putc(*fmt);
+			kputc('%');
+			kputc(*fmt);
 			break;
 		}
 		fmt++;
