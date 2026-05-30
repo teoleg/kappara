@@ -61,20 +61,22 @@
 #include "kappara/printk.h"
 #include "kappara/sched.h"
 #include "kappara/timer.h"
+#include "platform.h"
 
 /*
- * BCM2836/2837 "ARM local" peripherals, used by the Pi 3 to route per-core
- * timer interrupts before the generic timer hits a CPU's IRQ line.
+ * BCM2836/2837 "ARM local" peripherals route per-core timer IRQs on
+ * Pi 3 before the generic timer line hits the CPU.  Addresses + bit
+ * positions are platform-specific (Pi 4 replaces this whole block
+ * with a real GIC-400) and come from arch/aarch64/platform/<name>.h.
  */
-#define LOCAL_BASE		0x40000000UL
-#define CORE0_TIMER_CTL		(LOCAL_BASE + 0x40)
-#define CORE0_IRQ_SRC		(LOCAL_BASE + 0x60)
+#define CORE0_TIMER_CTL		PLAT_TIMER_CONTROL
+#define CORE0_IRQ_SRC		PLAT_TIMER_IRQ_SOURCE
 
-/* TIMER_CONTROL bits: [3:0] route CNTP{S,NS,HP,V}IRQ to IRQ, [7:4] to FIQ. */
-#define ROUTE_CNTPNSIRQ_IRQ	(1u << 1)
+/* TIMER_CONTROL: [3:0] route CNTP{S,NS,HP,V}IRQ to IRQ, [7:4] to FIQ. */
+#define ROUTE_CNTPNSIRQ_IRQ	PLAT_TIMER_CNTPNSIRQ_BIT
 
-/* IRQ_SRC bits: bit 1 = CNTPNSIRQ pending. */
-#define IRQ_CNTPNSIRQ		(1u << 1)
+/* IRQ_SRC: same bit position as TIMER_CONTROL = CNTPNSIRQ pending. */
+#define IRQ_CNTPNSIRQ		PLAT_TIMER_CNTPNSIRQ_BIT
 
 static uint64_t tick_cycles;
 

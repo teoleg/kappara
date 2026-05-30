@@ -3,7 +3,7 @@ BUILD   := build/$(ARCH)
 
 ifeq ($(ARCH),aarch64)
     CROSS         ?= aarch64-linux-gnu-
-    ARCH_CFLAGS   := -mcpu=cortex-a53 -mgeneral-regs-only
+    ARCH_CFLAGS   := -mcpu=cortex-a53 -mgeneral-regs-only -Iarch/aarch64
     LINKER_LD     := arch/aarch64/linker.ld
     ARCH_OBJS     := \
         $(BUILD)/arch/aarch64/boot.o \

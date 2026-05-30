@@ -40,11 +40,12 @@
 #include "kappara/trap.h"
 #include "kappara/uart.h"
 #include "kappara/user.h"
+#include "platform.h"
 
 extern char __kernel_end[];
 
-/* Pi 3 / BCM2837: usable RAM ends here; above is the peripheral window. */
-#define AARCH64_RAM_END	0x3F000000UL
+/* Pmm stops where the SoC's peripheral window begins -- per-platform. */
+#define AARCH64_RAM_END	PLAT_RAM_END
 
 static unsigned current_el(void)
 {
@@ -173,7 +174,8 @@ void kmain(void)
 
 	kprintf("\nkappara: hello from aarch64\n");
 	kprintf("        no soup for you, only streams\n");
-	kprintf("        running at EL%u\n", current_el());
+	kprintf("        running at EL%u on %s\n",
+		current_el(), PLAT_NAME);
 
 	mmu_init();
 	pmm_init((uintptr_t)__kernel_end, AARCH64_RAM_END);

@@ -108,6 +108,7 @@
 #include "kappara/mmu.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
+#include "platform.h"
 
 #define ENTRIES_PER_TABLE	512
 
@@ -153,8 +154,8 @@
 #define BLOCK_2M_SHIFT		21
 #define BLOCK_2M_SIZE		(1UL << BLOCK_2M_SHIFT)
 
-#define PERIPH_BASE		0x3F000000UL
-#define PERIPH_END		0x40000000UL
+#define PERIPH_BASE		PLAT_PERIPH_BASE
+#define PERIPH_END		PLAT_PERIPH_END
 
 /* SCTLR_EL1 bits we flip on. */
 #define SCTLR_M			(1UL << 0)
@@ -176,7 +177,8 @@ static void build_identity_map(void)
 	 * mailboxes, per-core IRQ source) starting at 0x40000000.  Coarse but
 	 * cheap; only the first ~1 MB above 0x40000000 is actually populated.
 	 */
-	l1_table[1] = 0x40000000UL | D_VALID | D_ATTRIDX(ATTR_DEVICE_IDX) |
+	l1_table[1] = PLAT_LOCAL_PERIPH_BASE |
+		      D_VALID | D_ATTRIDX(ATTR_DEVICE_IDX) |
 		      D_AP_RW_EL1 | D_SH_NONE | D_AF | D_PXN | D_UXN;
 
 	for (int i = 0; i < ENTRIES_PER_TABLE; i++) {
