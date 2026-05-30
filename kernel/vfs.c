@@ -55,6 +55,7 @@
 #include "kappara/kmem.h"
 #include "kappara/printk.h"
 #include "kappara/string.h"
+#include "kappara/uaccess.h"
 #include "kappara/vfs.h"
 
 /* ---- Root of the in-memory tree --------------------------------------- */
@@ -170,6 +171,13 @@ struct dentry *vfs_mknod_chrdev(struct dentry *parent, const char *name,
 	return new_dentry(name, i, parent);
 }
 
+struct dentry *vfs_mknod_regfile(struct dentry *parent, const char *name,
+				 struct file_ops *fops, void *priv)
+{
+	struct inode *i = new_inode(INODE_REG, fops, priv);
+	return new_dentry(name, i, parent);
+}
+
 /* ---- Visualisation --------------------------------------------------- */
 
 static const char *type_tag(enum inode_type t)
@@ -177,6 +185,7 @@ static const char *type_tag(enum inode_type t)
 	switch (t) {
 	case INODE_DIR:    return "dir";
 	case INODE_CHRDEV: return "chr";
+	case INODE_REG:    return "reg";
 	default:           return "?";
 	}
 }
@@ -259,11 +268,22 @@ struct file *fd_get(int fd)
 
 int sys_open_impl(const char *path)
 {
-	if (!path)
-		return -1;
-	struct dentry *d = vfs_lookup(path);
+	char kpath[128];
+	const char *p;
+	if (syscall_from_user) {
+		if (strncpy_from_user(kpath, path, sizeof(kpath)) < 0) {
+			kprintf("sys_open: rejected user path pointer\n");
+			return -1;
+		}
+		p = kpath;
+	} else {
+		if (!path)
+			return -1;
+		p = path;
+	}
+	struct dentry *d = vfs_lookup(p);
 	if (!d) {
-		kprintf("sys_open: ENOENT '%s'\n", path);
+		kprintf("sys_open: ENOENT '%s'\n", p);
 		return -1;
 	}
 	struct inode *ino = d->d_inode;
@@ -309,6 +329,11 @@ int sys_close_impl(int fd)
 
 long sys_read_impl(int fd, void *buf, size_t len)
 {
+	if (syscall_from_user && !user_ptr_ok(buf, len)) {
+		kprintf("sys_read: rejected user buf %p len %lu\n",
+			buf, (unsigned long)len);
+		return -1;
+	}
 	struct file *f = fd_get(fd);
 	if (!f || !f->f_ops->read)
 		return -1;
@@ -317,6 +342,11 @@ long sys_read_impl(int fd, void *buf, size_t len)
 
 long sys_write_impl(int fd, const void *buf, size_t len)
 {
+	if (syscall_from_user && !user_ptr_ok(buf, len)) {
+		kprintf("sys_write: rejected user buf %p len %lu\n",
+			buf, (unsigned long)len);
+		return -1;
+	}
 	struct file *f = fd_get(fd);
 	if (!f || !f->f_ops->write)
 		return -1;
@@ -328,6 +358,21 @@ long sys_ioctl_impl(int fd, int cmd, long arg)
 	struct file *f = fd_get(fd);
 	if (!f || !f->f_ops->ioctl)
 		return -1;
+
+	/* I_PUSH takes a (user) string pointer.  Copy the name into a
+	 * local buffer so the ioctl handler can dereference safely
+	 * without trusting the user pointer beyond a bounds check.
+	 * I_POP / future integer ioctls pass through unchanged. */
+	char kname[64];
+	if (syscall_from_user && cmd == 1 /* I_PUSH */) {
+		if (strncpy_from_user(kname,
+				      (const char *)(uintptr_t)arg,
+				      sizeof(kname)) < 0) {
+			kprintf("sys_ioctl(I_PUSH): rejected user name ptr\n");
+			return -1;
+		}
+		arg = (long)(uintptr_t)kname;
+	}
 	return f->f_ops->ioctl(f, cmd, arg);
 }
 

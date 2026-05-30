@@ -24,8 +24,10 @@
 
 #include <stdint.h>
 
+#include "kappara/blkdev.h"
+#include "kappara/framebuffer.h"
+#include "kappara/kfs.h"
 #include "kappara/kmem.h"
-#include "kappara/ksh.h"
 #include "kappara/mmu.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
@@ -39,11 +41,12 @@
 #include "kappara/trap.h"
 #include "kappara/uart.h"
 #include "kappara/user.h"
+#include "platform.h"
 
 extern char __kernel_end[];
 
-/* Pi 3 / BCM2837: usable RAM ends here; above is the peripheral window. */
-#define AARCH64_RAM_END	0x3F000000UL
+/* Pmm stops where the SoC's peripheral window begins -- per-platform. */
+#define AARCH64_RAM_END	PLAT_RAM_END
 
 static unsigned current_el(void)
 {
@@ -172,7 +175,8 @@ void kmain(void)
 
 	kprintf("\nkappara: hello from aarch64\n");
 	kprintf("        no soup for you, only streams\n");
-	kprintf("        running at EL%u\n", current_el());
+	kprintf("        running at EL%u on %s\n",
+		current_el(), PLAT_NAME);
 
 	mmu_init();
 	pmm_init((uintptr_t)__kernel_end, AARCH64_RAM_END);
@@ -181,6 +185,48 @@ void kmain(void)
 	vfs_init();
 	streams_head_init();
 	user_init();
+
+	/* Boot a ramdisk-backed kfs and mount it at /etc.
+	 * The mkimage call writes the canned files into the ramdisk
+	 * the first time (no formatter tool yet), then mount discovers
+	 * them via the block-device interface as if from real storage. */
+	ramdisk_init();
+	kfs_mkimage(ramdisk_get());
+	struct dentry *etc = vfs_mkdir(vfs_root(), "etc");
+	kfs_mount(ramdisk_get(), etc);
+
+	/* Ask the GPU for a 1024x768 framebuffer.  No-op visually on
+	 * `-display none`; pops up an HDMI image on real hardware. */
+	if (framebuffer_init(1024, 768) == 0) {
+		/* Splash:
+		 *   - navy background
+		 *   - "kappara" centered near the top at 8x scale (64-pixel
+		 *     tall glyphs, so the whole word is 7*64 = 448 px wide)
+		 *   - subtitle "no soup for you, only streams" below it
+		 *     at 2x scale
+		 *   - thin colour bar at the bottom edge */
+		framebuffer_fill(0xff001a40u);
+
+		const unsigned big_scale = 8;
+		const char    *title     = "kappara";
+		uint32_t       title_w   = 7 * 8 * big_scale;
+		uint32_t       title_x   = (1024 - title_w) / 2;
+		framebuffer_puts(title_x, 120, title,
+				 0xffffffffu, 0, big_scale);
+
+		const unsigned sub_scale = 2;
+		const char    *sub       = "no soup for you, only streams";
+		uint32_t       sub_w     = 29u * 8 * sub_scale;
+		uint32_t       sub_x     = (1024 - sub_w) / 2;
+		framebuffer_puts(sub_x, 260, sub, 0xffc4c4d4u, 0, sub_scale);
+
+		framebuffer_rect(  0, 760, 256, 8, 0xffe05c5cu);
+		framebuffer_rect(256, 760, 256, 8, 0xff5ce05cu);
+		framebuffer_rect(512, 760, 256, 8, 0xff5c8ce0u);
+		framebuffer_rect(768, 760, 256, 8, 0xffe0c45cu);
+
+		framebuffer_flush();
+	}
 
 	kprintf("\n");
 	vfs_dump_tree(vfs_root());
@@ -194,13 +240,10 @@ void kmain(void)
 	 * first SYS_read. */
 	kthread_create("uart_rx", uart_rx_main, NULL);
 
-	/* Spawn the user-mode init thread; once scheduled it eret's
-	 * into EL0 and stays there, returning to EL1 only via svc. */
+	/* Spawn the user-mode init process; once scheduled it eret's
+	 * into EL0 at user/init.c's _start, opens /dev/console, and
+	 * runs the shell entirely in userspace from there on. */
 	user_spawn();
-
-	/* Launch the interactive shell as a kthread.  Once IRQs unmask
-	 * below it gets preempted and runs concurrently with main. */
-	kthread_create("ksh", ksh_main, NULL);
 
 	__asm__ volatile ("msr daifclr, #2");
 

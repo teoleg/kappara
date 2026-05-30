@@ -79,9 +79,6 @@
 #define USER_SIZE	0x00200000UL
 #define USER_STACK_TOP	(USER_VA + USER_SIZE)
 
-/* Offset within the user page where the message string lives. */
-#define MSG_OFFSET	0x40
-
 /*
  * Backing storage: a 2 MB-aligned slab in BSS.  This is the physical
  * memory the user 2 MB VA window will eventually map to.
@@ -90,39 +87,35 @@ __attribute__((aligned(0x200000)))
 static unsigned char user_storage[USER_SIZE];
 
 /*
- * Hand-coded AArch64 user program.  Five instructions / 20 bytes:
- *
- *   movz x0, #0x40                ; low 16 bits of msg addr
- *   movk x0, #0x1000, lsl #16     ; high 16 -> x0 = 0x10000040
- *   movz x8, #0                   ; SYS_log
- *   svc  #0                       ; trap to kernel
- *   b    .                        ; spin forever in EL0
- *
- * Encoding values cross-checked against the ARMv8 instruction reference.
+ * The user init binary, embedded into the kernel image by
+ * arch/aarch64/userblob.S via .incbin "build/user/init.bin".  The
+ * sources live in user/, the build rules in Makefile.  Bytes start
+ * with _start (linker.ld in user/ forces .text._start first), so
+ * entry is USER_VA + 0.
  */
-static const uint32_t user_program[] = {
-	0xd2800800,	/* movz x0, #0x40                  */
-	0xf2a20000,	/* movk x0, #0x1000, lsl #16       */
-	0xd2800008,	/* movz x8, #0   (SYS_log)         */
-	0xd4000001,	/* svc  #0                          */
-	0x14000000,	/* b    .                           */
-};
-
-static const char user_msg[] = "hello from EL0 userspace!";
+extern char user_blob_start[];
+extern char user_blob_end[];
 
 extern void aarch64_enter_userspace(uint64_t entry, uint64_t sp_el0);
 
 void user_init(void)
 {
-	/* Lay the program down at offset 0. */
-	kmemcpy(user_storage, user_program, sizeof(user_program));
+	size_t blob_len = (size_t)(user_blob_end - user_blob_start);
+	if (blob_len > USER_SIZE) {
+		kprintf("user: init binary too big (%lu > %lu)\n",
+			(unsigned long)blob_len, (unsigned long)USER_SIZE);
+		return;
+	}
+	kmemcpy(user_storage, user_blob_start, blob_len);
 
-	/* And the message at MSG_OFFSET. */
-	kmemcpy(user_storage + MSG_OFFSET, user_msg, sizeof(user_msg));
-
-	/* Make the I-cache see the new code: clean+invalidate by VA
-	 * is more surgical, but iallu is fine at this scale and avoids
-	 * a per-line loop. */
+	/*
+	 * Cache maintenance.  user_storage was last touched as DATA;
+	 * the CPU's I-cache has no entries for it yet, but if it ever
+	 * speculatively prefetched stale lines they'd be invalid now.
+	 * DC CVAU pushes the new bytes out of D-cache to unification;
+	 * IC IALLU drops any I-cache lines that might've been brought
+	 * in.  DSB ISH + ISB seal the order.
+	 */
 	__asm__ volatile (
 		"dsb	ish\n"
 		"ic	iallu\n"
@@ -133,10 +126,11 @@ void user_init(void)
 	/* Publish to EL0 at USER_VA. */
 	mmu_map_user_2mb(USER_VA, (uintptr_t)&user_storage[0]);
 
-	kprintf("user: program at PA=%p VA=0x%lx; msg at VA=0x%lx\n",
+	kprintf("user: init binary loaded (%lu bytes) at PA=%p, "
+		"EL0 entry VA=0x%lx\n",
+		(unsigned long)blob_len,
 		(void *)&user_storage[0],
-		(unsigned long)USER_VA,
-		(unsigned long)(USER_VA + MSG_OFFSET));
+		(unsigned long)USER_VA);
 }
 
 static void user_thread_main(void *arg)

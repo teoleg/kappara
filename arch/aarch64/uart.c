@@ -39,7 +39,9 @@
 
 #include <stdint.h>
 
-#define PL011_BASE	0x3F201000UL
+#include "platform.h"
+
+#define PL011_BASE	PLAT_PL011_BASE
 
 #define UART_DR		(PL011_BASE + 0x00)
 #define UART_FR		(PL011_BASE + 0x18)

@@ -58,7 +58,8 @@
 enum inode_type {
 	INODE_DIR    = 1,
 	INODE_CHRDEV = 2,
-	/* INODE_REG, INODE_BLOCKDEV, INODE_SYMLINK ... later */
+	INODE_REG    = 3,	/* regular file backed by a filesystem driver */
+	/* INODE_BLOCKDEV, INODE_SYMLINK ... later */
 };
 
 struct file;
@@ -106,6 +107,13 @@ struct dentry *vfs_mkdir(struct dentry *parent, const char *name);
 struct dentry *vfs_mknod_chrdev(struct dentry *parent, const char *name,
 				struct file_ops *fops, void *priv);
 
+/* Same shape as mknod_chrdev but creates an INODE_REG -- used by
+ * filesystem drivers (kfs today) to publish files they discovered
+ * on disk.  priv typically points at the FS-specific metadata
+ * (struct kfs_file *, etc.) the file_ops will dereference. */
+struct dentry *vfs_mknod_regfile(struct dentry *parent, const char *name,
+				 struct file_ops *fops, void *priv);
+
 /* Pretty-print the tree rooted at d (use vfs_root() for the whole fs).
  * Walks the dentry tree recursively; chrdev nodes get tagged with
  * their inode type so you can tell directories from device files. */
@@ -133,5 +141,12 @@ long  sys_putmsg_impl(int fd, const struct strbuf *c,
 		      const struct strbuf *d, int flags);
 long  sys_getmsg_impl(int fd, struct strbuf *c,
 		      struct strbuf *d, int *flagsp);
+
+/* Anonymous STREAMS pipe.  Returns 0 and writes two fresh fds into
+ * fds[2] (read end + write end -- both ends are actually bidirectional;
+ * the names follow Unix convention).  Each end is a separate stdata
+ * whose head_wq.q_next points at the peer's head_rq, so a write on
+ * one side enqueues an mblk on the peer's read deferred list. */
+long  sys_pipe_impl(int fds[2]);
 
 #endif
