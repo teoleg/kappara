@@ -24,6 +24,8 @@
 
 #include <stdint.h>
 
+#include "kappara/blkdev.h"
+#include "kappara/kfs.h"
 #include "kappara/kmem.h"
 #include "kappara/mmu.h"
 #include "kappara/pmm.h"
@@ -180,6 +182,15 @@ void kmain(void)
 	vfs_init();
 	streams_head_init();
 	user_init();
+
+	/* Boot a ramdisk-backed kfs and mount it at /etc.
+	 * The mkimage call writes the canned files into the ramdisk
+	 * the first time (no formatter tool yet), then mount discovers
+	 * them via the block-device interface as if from real storage. */
+	ramdisk_init();
+	kfs_mkimage(ramdisk_get());
+	struct dentry *etc = vfs_mkdir(vfs_root(), "etc");
+	kfs_mount(ramdisk_get(), etc);
 
 	kprintf("\n");
 	vfs_dump_tree(vfs_root());

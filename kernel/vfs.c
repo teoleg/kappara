@@ -171,6 +171,13 @@ struct dentry *vfs_mknod_chrdev(struct dentry *parent, const char *name,
 	return new_dentry(name, i, parent);
 }
 
+struct dentry *vfs_mknod_regfile(struct dentry *parent, const char *name,
+				 struct file_ops *fops, void *priv)
+{
+	struct inode *i = new_inode(INODE_REG, fops, priv);
+	return new_dentry(name, i, parent);
+}
+
 /* ---- Visualisation --------------------------------------------------- */
 
 static const char *type_tag(enum inode_type t)
@@ -178,6 +185,7 @@ static const char *type_tag(enum inode_type t)
 	switch (t) {
 	case INODE_DIR:    return "dir";
 	case INODE_CHRDEV: return "chr";
+	case INODE_REG:    return "reg";
 	default:           return "?";
 	}
 }
