@@ -47,6 +47,11 @@
 /* PL011 UART. */
 #define PLAT_PL011_BASE			(PLAT_PERIPH_BASE + 0x00201000UL)
 
+/* VideoCore mailbox interface (channel 8 = property tags).  This is
+ * how we talk to the GPU firmware to allocate framebuffers, query
+ * temperatures, set clocks, etc. */
+#define PLAT_MBOX_BASE			(PLAT_PERIPH_BASE + 0x0000B880UL)
+
 /* BCM2836 per-core timer routing (offsets from PLAT_LOCAL_PERIPH_BASE). */
 #define PLAT_TIMER_CONTROL		(PLAT_LOCAL_PERIPH_BASE + 0x40UL)
 #define PLAT_TIMER_IRQ_SOURCE		(PLAT_LOCAL_PERIPH_BASE + 0x60UL)

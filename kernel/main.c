@@ -25,6 +25,7 @@
 #include <stdint.h>
 
 #include "kappara/blkdev.h"
+#include "kappara/framebuffer.h"
 #include "kappara/kfs.h"
 #include "kappara/kmem.h"
 #include "kappara/mmu.h"
@@ -193,6 +194,20 @@ void kmain(void)
 	kfs_mkimage(ramdisk_get());
 	struct dentry *etc = vfs_mkdir(vfs_root(), "etc");
 	kfs_mount(ramdisk_get(), etc);
+
+	/* Ask the GPU for a 1024x768 framebuffer.  No-op visually on
+	 * `-display none`; pops up an HDMI image on real hardware. */
+	if (framebuffer_init(1024, 768) == 0) {
+		/* Paint something so we know the pixels are reaching the
+		 * screen even before there's a font: navy background with
+		 * a few stripe blocks across the top. */
+		framebuffer_fill(0xff001a40u);
+		framebuffer_rect(  0, 0, 256, 32, 0xffe05c5cu); /* red    */
+		framebuffer_rect(256, 0, 256, 32, 0xff5ce05cu); /* green  */
+		framebuffer_rect(512, 0, 256, 32, 0xff5c8ce0u); /* blue   */
+		framebuffer_rect(768, 0, 256, 32, 0xffe0c45cu); /* yellow */
+		framebuffer_flush();
+	}
 
 	kprintf("\n");
 	vfs_dump_tree(vfs_root());

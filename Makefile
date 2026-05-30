@@ -14,6 +14,8 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/arch/aarch64/timer.o \
         $(BUILD)/arch/aarch64/switch.o \
         $(BUILD)/arch/aarch64/thread.o \
+        $(BUILD)/arch/aarch64/mailbox.o \
+        $(BUILD)/arch/aarch64/framebuffer.o \
         $(BUILD)/arch/aarch64/userblob.o
     # User-side init binary, linked at VA 0x10000000 and incbin'd
     # into userblob.S so the kernel ELF carries the raw bytes.

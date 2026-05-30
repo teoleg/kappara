@@ -30,6 +30,7 @@
 #define PLAT_RAM_END			PLAT_PERIPH_BASE
 
 #define PLAT_PL011_BASE			(PLAT_PERIPH_BASE + 0x00201000UL)
+#define PLAT_MBOX_BASE			(PLAT_PERIPH_BASE + 0x0000B880UL)
 
 /* These are placeholders -- Pi 4 will use the GIC-400 directly, not
  * a BCM2836-style local routing block.  Setting them to 0 means a
