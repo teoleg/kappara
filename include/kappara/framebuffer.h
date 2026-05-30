@@ -41,6 +41,19 @@ void framebuffer_pixel(uint32_t x, uint32_t y, uint32_t color);
 void framebuffer_rect (uint32_t x, uint32_t y,
 		       uint32_t w, uint32_t h, uint32_t color);
 
+/* Draw one 8x8 glyph at (x,y) -- top-left corner, in pixels.
+ * fg is the foreground colour; bg is the background colour (use 0
+ * to leave the background unchanged -- i.e. transparent).  scale
+ * multiplies each font pixel into an NxN block, so scale=4 gives
+ * a 32x32 char. */
+void framebuffer_putc(uint32_t x, uint32_t y, char c,
+		      uint32_t fg, uint32_t bg, unsigned scale);
+
+/* Render NUL-terminated string left-to-right starting at (x,y),
+ * advancing 8*scale pixels per character. */
+void framebuffer_puts(uint32_t x, uint32_t y, const char *s,
+		      uint32_t fg, uint32_t bg, unsigned scale);
+
 /* DC CVAC the framebuffer back to memory so the GPU sees our writes.
  * Call after a batch of draws.  No-op in QEMU (no real caches);
  * essential on real Pi 3/4 since the framebuffer sits in Normal

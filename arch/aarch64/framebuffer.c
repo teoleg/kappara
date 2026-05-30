@@ -42,6 +42,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kappara/font8x8.h"
 #include "kappara/framebuffer.h"
 #include "kappara/mailbox.h"
 #include "kappara/printk.h"
@@ -177,4 +178,38 @@ void framebuffer_flush(void)
 	for (; a < end; a += 64)
 		__asm__ volatile ("dc cvac, %0" :: "r"(a) : "memory");
 	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+void framebuffer_putc(uint32_t x, uint32_t y, char c,
+		      uint32_t fg, uint32_t bg, unsigned scale)
+{
+	if (!fb_ready || scale == 0) return;
+	const uint8_t *g = font8x8[(unsigned char)c & 0x7F];
+
+	for (unsigned row = 0; row < 8; row++) {
+		uint8_t bits = g[row];
+		for (unsigned col = 0; col < 8; col++) {
+			int on = (bits >> col) & 1;
+			if (on)
+				framebuffer_rect(x + col * scale,
+						 y + row * scale,
+						 scale, scale, fg);
+			else if (bg)
+				framebuffer_rect(x + col * scale,
+						 y + row * scale,
+						 scale, scale, bg);
+		}
+	}
+}
+
+void framebuffer_puts(uint32_t x, uint32_t y, const char *s,
+		      uint32_t fg, uint32_t bg, unsigned scale)
+{
+	if (!fb_ready || !s) return;
+	uint32_t cx = x;
+	while (*s) {
+		framebuffer_putc(cx, y, *s, fg, bg, scale);
+		cx += 8 * scale;
+		s++;
+	}
 }

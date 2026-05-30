@@ -198,14 +198,33 @@ void kmain(void)
 	/* Ask the GPU for a 1024x768 framebuffer.  No-op visually on
 	 * `-display none`; pops up an HDMI image on real hardware. */
 	if (framebuffer_init(1024, 768) == 0) {
-		/* Paint something so we know the pixels are reaching the
-		 * screen even before there's a font: navy background with
-		 * a few stripe blocks across the top. */
+		/* Splash:
+		 *   - navy background
+		 *   - "kappara" centered near the top at 8x scale (64-pixel
+		 *     tall glyphs, so the whole word is 7*64 = 448 px wide)
+		 *   - subtitle "no soup for you, only streams" below it
+		 *     at 2x scale
+		 *   - thin colour bar at the bottom edge */
 		framebuffer_fill(0xff001a40u);
-		framebuffer_rect(  0, 0, 256, 32, 0xffe05c5cu); /* red    */
-		framebuffer_rect(256, 0, 256, 32, 0xff5ce05cu); /* green  */
-		framebuffer_rect(512, 0, 256, 32, 0xff5c8ce0u); /* blue   */
-		framebuffer_rect(768, 0, 256, 32, 0xffe0c45cu); /* yellow */
+
+		const unsigned big_scale = 8;
+		const char    *title     = "kappara";
+		uint32_t       title_w   = 7 * 8 * big_scale;
+		uint32_t       title_x   = (1024 - title_w) / 2;
+		framebuffer_puts(title_x, 120, title,
+				 0xffffffffu, 0, big_scale);
+
+		const unsigned sub_scale = 2;
+		const char    *sub       = "no soup for you, only streams";
+		uint32_t       sub_w     = 29u * 8 * sub_scale;
+		uint32_t       sub_x     = (1024 - sub_w) / 2;
+		framebuffer_puts(sub_x, 260, sub, 0xffc4c4d4u, 0, sub_scale);
+
+		framebuffer_rect(  0, 760, 256, 8, 0xffe05c5cu);
+		framebuffer_rect(256, 760, 256, 8, 0xff5ce05cu);
+		framebuffer_rect(512, 760, 256, 8, 0xff5c8ce0u);
+		framebuffer_rect(768, 760, 256, 8, 0xffe0c45cu);
+
 		framebuffer_flush();
 	}
 
