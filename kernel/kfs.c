@@ -85,12 +85,66 @@ static long regfile_read(struct file *f, void *buf, size_t len)
 	return (long)n;
 }
 
-/* No write / ioctl / putmsg / getmsg for kfs files yet -- regular
- * files are just bytes, no STREAMS plumbing. */
+/*
+ * Write bytes at the cursor.  Bounded by the file's pre-allocated
+ * KFS_BLOCKS_PER_FILE blocks; we never re-allocate.  If the cursor
+ * advances past the previous EOF we update size_bytes in memory and
+ * push the change back to the directory block on the device so it
+ * survives across mount cycles (once we have persistent storage).
+ *
+ * Each block is read-modify-written so we preserve neighbouring
+ * bytes when len doesn't fill the whole block.
+ */
+static long regfile_write(struct file *f, const void *buf, size_t len)
+{
+	struct regfile_cursor *c  = f->f_private;
+	struct kfs_file       *kf = c->kf;
+
+	uint32_t max = kf->alloc_blocks * BLK_SIZE;
+	if (c->pos >= max)
+		return -1;
+	if (c->pos + len > max)
+		len = max - c->pos;
+
+	const unsigned char *src = buf;
+	size_t written = 0;
+	while (written < len) {
+		uint32_t off_total = c->pos + (uint32_t)written;
+		uint32_t blk       = kf->start_block + off_total / BLK_SIZE;
+		uint32_t offblk    = off_total % BLK_SIZE;
+
+		unsigned char tmp[BLK_SIZE];
+		if (kf->bd->bd_read(kf->bd, blk, tmp) < 0)
+			break;
+
+		size_t n = BLK_SIZE - offblk;
+		if (n > len - written)
+			n = len - written;
+		kmemcpy(tmp + offblk, src + written, n);
+
+		if (kf->bd->bd_write(kf->bd, blk, tmp) < 0)
+			break;
+		written += n;
+	}
+	c->pos += (uint32_t)written;
+
+	if (c->pos > kf->size_bytes) {
+		kf->size_bytes = c->pos;
+		/* Push the new size back to the directory entry on disk. */
+		struct kfs_dirent dir[KFS_DIRENTS];
+		if (kf->bd->bd_read(kf->bd, 1, dir) == 0) {
+			dir[kf->dirent_idx].size_bytes = kf->size_bytes;
+			kf->bd->bd_write(kf->bd, 1, dir);
+		}
+	}
+	return (long)written;
+}
+
 static struct file_ops regfile_fops = {
 	.open  = regfile_open,
 	.close = regfile_close,
 	.read  = regfile_read,
+	.write = regfile_write,
 };
 
 /* ---- mkimage: build a fresh fs in `bd` from baked-in files --------- */
@@ -125,6 +179,12 @@ void kfs_mkimage(struct block_device *bd)
 	struct kfs_dirent dir[KFS_DIRENTS];
 	kmemset(dir, 0, sizeof(dir));
 
+	/*
+	 * Each file gets a fixed KFS_BLOCKS_PER_FILE-block slot so it
+	 * can be overwritten or extended in place up to that size, with
+	 * no free-block management needed.  Unused trailing blocks are
+	 * zeroed so they read as zeros if the file later grows into them.
+	 */
 	uint32_t cur_block = 2;
 	for (unsigned i = 0; i < NPAYLOADS && i < KFS_DIRENTS; i++) {
 		const struct payload *p = &payloads[i];
@@ -137,21 +197,20 @@ void kfs_mkimage(struct block_device *bd)
 		dir[i].start_block   = cur_block;
 		dir[i].size_bytes    = p->size;
 
-		/* Write the file data, one block at a time. */
 		const char *src = p->data;
 		uint32_t    rem = p->size;
-		uint32_t    blk = cur_block;
-		while (rem > 0) {
+		for (uint32_t b = 0; b < KFS_BLOCKS_PER_FILE; b++) {
 			unsigned char buf[BLK_SIZE];
 			kmemset(buf, 0, sizeof(buf));
-			size_t n = (rem < BLK_SIZE) ? rem : BLK_SIZE;
-			kmemcpy(buf, src, n);
-			bd->bd_write(bd, blk, buf);
-			blk++;
-			src += n;
-			rem -= n;
+			if (rem > 0) {
+				size_t n = (rem < BLK_SIZE) ? rem : BLK_SIZE;
+				kmemcpy(buf, src, n);
+				src += n;
+				rem -= n;
+			}
+			bd->bd_write(bd, cur_block + b, buf);
 		}
-		cur_block = blk;
+		cur_block += KFS_BLOCKS_PER_FILE;
 	}
 	bd->bd_write(bd, 1, dir);
 
@@ -186,9 +245,11 @@ int kfs_mount(struct block_device *bd, struct dentry *mountpoint)
 	for (unsigned i = 0; i < n; i++) {
 		struct kfs_file *kf = kmalloc(sizeof(*kf));
 		if (!kf) continue;
-		kf->bd          = bd;
-		kf->start_block = dir[i].start_block;
-		kf->size_bytes  = dir[i].size_bytes;
+		kf->bd           = bd;
+		kf->start_block  = dir[i].start_block;
+		kf->size_bytes   = dir[i].size_bytes;
+		kf->alloc_blocks = KFS_BLOCKS_PER_FILE;
+		kf->dirent_idx   = (uint8_t)i;
 
 		/* dir[i].name is in our stack-local buffer; the dentry
 		 * stores d_name as a raw pointer (callers like vfs_mkdir

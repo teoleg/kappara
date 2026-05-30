@@ -56,11 +56,18 @@ struct kfs_dirent {
 	uint32_t	size_bytes;
 };
 
+/* Each file is given a fixed number of contiguous blocks at mkimage
+ * time so it has room to grow when written.  Real on-disk filesystems
+ * use a free-block bitmap + indirect blocks; we cheat. */
+#define KFS_BLOCKS_PER_FILE	4
+
 /* In-memory per-file metadata pointed at by inode i_private. */
 struct kfs_file {
 	struct block_device	*bd;
 	uint32_t		 start_block;
 	uint32_t		 size_bytes;
+	uint32_t		 alloc_blocks;	/* fixed at mkimage */
+	uint8_t			 dirent_idx;	/* slot in the dir block */
 };
 
 /* Forward decl for vfs.h dependency. */

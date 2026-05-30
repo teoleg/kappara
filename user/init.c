@@ -178,6 +178,8 @@ static void cmd_help(void)
 		"  write <text...>        write text to $fd\r\n"
 		"  push <module>          ioctl(I_PUSH) on $fd\r\n"
 		"  pop                    ioctl(I_POP) on $fd\r\n"
+		"  cat <path>             dump file to console\r\n"
+		"  echo <path> <text...>  write text to file (overwrite)\r\n"
 		"  pipe                   sys_pipe demo (write + read)\r\n");
 }
 
@@ -273,6 +275,47 @@ static void cmd_pop(void)
 	cwrite("pop: "); cprint_long(r); cwrite("\r\n");
 }
 
+static void cmd_cat(int argc, char *argv[])
+{
+	if (argc < 2) { cwrite("usage: cat <path>\r\n"); return; }
+	long fd = sys_open(argv[1]);
+	if (fd < 0) { cwrite("cat: cannot open '"); cwrite(argv[1]);
+		      cwrite("'\r\n"); return; }
+	char buf[256];
+	long n;
+	while ((n = sys_read((int)fd, buf, sizeof(buf))) > 0) {
+		for (long i = 0; i < n; i++) {
+			if (buf[i] == '\n') cputc('\r');
+			cputc(buf[i]);
+		}
+	}
+	sys_close((int)fd);
+}
+
+static void cmd_echo(int argc, char *argv[])
+{
+	if (argc < 3) { cwrite("usage: echo <path> <text...>\r\n"); return; }
+	long fd = sys_open(argv[1]);
+	if (fd < 0) { cwrite("echo: cannot open '"); cwrite(argv[1]);
+		      cwrite("'\r\n"); return; }
+
+	char buf[256];
+	size_t off = 0;
+	for (int i = 2; i < argc; i++) {
+		if (i > 2 && off + 1 < sizeof(buf))
+			buf[off++] = ' ';
+		size_t l = ustrlen(argv[i]);
+		if (off + l > sizeof(buf)) l = sizeof(buf) - off;
+		for (size_t j = 0; j < l; j++) buf[off + j] = argv[i][j];
+		off += l;
+	}
+	if (off + 1 < sizeof(buf)) buf[off++] = '\n';
+
+	long w = sys_write((int)fd, buf, off);
+	cwrite("wrote "); cprint_long(w); cwrite(" bytes\r\n");
+	sys_close((int)fd);
+}
+
 static void cmd_pipe(void)
 {
 	int fds[2];
@@ -315,6 +358,8 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "write")) cmd_write(argc, argv);
 	else if (!ustrcmp(argv[0], "push"))  cmd_push(argc, argv);
 	else if (!ustrcmp(argv[0], "pop"))   cmd_pop();
+	else if (!ustrcmp(argv[0], "cat"))   cmd_cat(argc, argv);
+	else if (!ustrcmp(argv[0], "echo"))  cmd_echo(argc, argv);
 	else if (!ustrcmp(argv[0], "pipe"))  cmd_pipe();
 	else {
 		cwrite(argv[0]); cwrite(": command not found\r\n");
