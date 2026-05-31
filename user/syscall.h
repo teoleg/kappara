@@ -26,6 +26,8 @@
 #define SYS_creat	12
 #define SYS_seek	13
 #define SYS_mkdir	14
+#define SYS_spawn	15
+#define SYS_exit	16
 
 #define SEEK_SET	0
 #define SEEK_CUR	1
@@ -91,6 +93,25 @@ static inline long sys_open(const char *path, int flags)
 static inline long sys_mkdir(const char *path)
 {
 	return _syscall1(SYS_mkdir, (long)(unsigned long)path);
+}
+
+static inline long sys_spawn(void (*entry)(long), long arg)
+{
+	register long x0 __asm__("x0") = (long)(unsigned long)entry;
+	register long x1 __asm__("x1") = arg;
+	register long x8 __asm__("x8") = SYS_spawn;
+	__asm__ volatile ("svc #0"
+			  : "+r"(x0) : "r"(x1), "r"(x8)
+			  : "memory", "cc");
+	return x0;
+}
+
+static inline void sys_exit(void) __attribute__((noreturn));
+static inline void sys_exit(void)
+{
+	register long x8 __asm__("x8") = SYS_exit;
+	__asm__ volatile ("svc #0" :: "r"(x8) : "memory");
+	__builtin_unreachable();
 }
 
 static inline long sys_close(int fd)

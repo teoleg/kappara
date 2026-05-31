@@ -38,8 +38,10 @@
 #define SYS_creat	12	/* (const char *path) -> 0 / -1             */
 #define SYS_seek	13	/* (int fd, long off, int whence) -> newpos */
 #define SYS_mkdir	14	/* (const char *path) -> 0 / -1             */
+#define SYS_spawn	15	/* (void (*entry)(long), long arg) -> tid   */
+#define SYS_exit	16	/* (void)  no return                        */
 
-#define SYS_MAX		15
+#define SYS_MAX		17
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

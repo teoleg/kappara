@@ -50,6 +50,7 @@
 #include "kappara/streams.h"
 #include "kappara/syscall.h"
 #include "kappara/uaccess.h"
+#include "kappara/user.h"
 #include "kappara/vfs.h"
 
 typedef long (*syscall_fn)(long, long, long, long, long, long);
@@ -105,6 +106,19 @@ static long sys_mkdir(long a0, long a1, long a2, long a3, long a4, long a5)
 {
 	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
 	return (long)sys_mkdir_impl((const char *)(uintptr_t)a0);
+}
+
+static long sys_spawn(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_spawn_impl((uint64_t)a0, (uint64_t)a1);
+}
+
+static long sys_exit(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	sys_exit_impl();
+	return 0;	/* unreachable */
 }
 
 static long sys_close(long a0, long a1, long a2, long a3, long a4, long a5)
@@ -230,6 +244,8 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_creat]  = sys_creat,
 	[SYS_seek]   = sys_seek,
 	[SYS_mkdir]  = sys_mkdir,
+	[SYS_spawn]  = sys_spawn,
+	[SYS_exit]   = sys_exit,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

@@ -112,21 +112,21 @@ thread_trampoline:
 	b	1b
 
 /*
- * void aarch64_enter_userspace(uint64_t entry, uint64_t sp_el0);
+ * void aarch64_enter_userspace(uint64_t entry, uint64_t sp_el0, uint64_t arg);
  *   x0 = entry PC for EL0
  *   x1 = user-mode SP
+ *   x2 = value to land in user x0 (function argument for `entry`)
  *
- * Set ELR_EL1 + SP_EL0 + SPSR_EL1 and `eret` into EL0t.  SPSR=0
- * means EL0t (M[3:0]=0), AArch64 (M[4]=0), all DAIF=0 (IRQs
- * unmasked from the moment the user runs).
+ * Sets SP_EL0 + ELR_EL1 + SPSR_EL1, copies arg into user x0, and
+ * eret's into EL0t.  SPSR=0 means EL0t (M[3:0]=0), AArch64 (M[4]=0),
+ * all DAIF=0 (IRQs unmasked from the moment the user runs).
  *
- * Does not return -- the eret leaves EL1 entirely.  If the user
- * program calls svc, control re-enters the kernel via the
- * VEC_SYNC_LO64 (offset 0x400) vector slot in vectors.S.
+ * Does not return -- the eret leaves EL1 entirely.
  */
 .global aarch64_enter_userspace
 aarch64_enter_userspace:
 	msr	sp_el0,   x1
 	msr	elr_el1,  x0
 	msr	spsr_el1, xzr
+	mov	x0, x2		/* user x0 = arg                         */
 	eret

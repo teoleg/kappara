@@ -205,7 +205,8 @@ static void cmd_help(void)
 		"  touch <path>           create empty file (kfs only)\r\n"
 		"  mkdir <path>           create directory (kfs only)\r\n"
 		"  append <path> <text>   append text + newline to file\r\n"
-		"  pipe                   sys_pipe demo (write + read)\r\n");
+		"  pipe                   sys_pipe demo (write + read)\r\n"
+		"  spawn [arg]            sys_spawn a worker thread\r\n");
 }
 
 static void cmd_pid(void)
@@ -419,6 +420,46 @@ static void cmd_echo(int argc, char *argv[])
 	sys_close((int)fd);
 }
 
+/*
+ * Spawnable worker.  cmd_spawn hands sys_spawn a function pointer to
+ * this; the kernel sets the new thread up at EL0 with arg in x0.
+ *
+ * We can't legally call cwrite here without locking -- two user
+ * threads writing into /dev/console at the same time interleave at
+ * the byte level.  For a learning demo that's a feature, not a bug:
+ * the worker's lines wind up interspersed with the shell's, which
+ * proves they're real concurrent threads.
+ */
+__attribute__((used))
+static void worker_main(long arg)
+{
+	for (int i = 0; i < 3; i++) {
+		char buf[80];
+		const char *p = "worker: tid=";
+		char *q = buf;
+		while (*p) *q++ = *p++;
+		q = udec(q, sys_getpid());
+		const char *p2 = " arg=";
+		while (*p2) *q++ = *p2++;
+		q = udec(q, arg);
+		const char *p3 = " iter=";
+		while (*p3) *q++ = *p3++;
+		udec(q, i);
+		sys_log(buf);
+		for (int j = 0; j < 10; j++) sys_yield();
+	}
+	sys_exit();
+}
+
+static void cmd_spawn(int argc, char *argv[])
+{
+	long a = (argc > 1) ? uparse_long(argv[1]) : 0;
+	long tid = sys_spawn(worker_main, a);
+	cwrite("spawn: tid=");
+	cprint_long(tid);
+	cwrite("\r\n");
+}
+
 static void cmd_pipe(void)
 {
 	int fds[2];
@@ -469,6 +510,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "mkdir"))  cmd_mkdir(argc, argv);
 	else if (!ustrcmp(argv[0], "append")) cmd_append(argc, argv);
 	else if (!ustrcmp(argv[0], "pipe"))   cmd_pipe();
+	else if (!ustrcmp(argv[0], "spawn"))  cmd_spawn(argc, argv);
 	else {
 		cwrite(argv[0]); cwrite(": command not found\r\n");
 	}
