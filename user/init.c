@@ -591,11 +591,12 @@ static void cmd_pipe(void)
 
 /*
  * Pipework demo: spawn two worker threads connected by a pipe.
- * The writer puts a message on the pipe and exits; the reader
- * polls until something shows up and logs it.  Both share the
- * shell's fd table since we don't have per-process fds yet --
- * fine, the workers each get their own end and close it when
- * they're done.
+ * The writer puts a message and exits, dropping its end.  The
+ * reader does blocking reads until it sees EOF -- which happens
+ * once the file's refcount hits zero, i.e. once every other
+ * holder of the write end has also closed.  That's why ksh
+ * closes its own copies of both ends after spawning, the same
+ * "parent closes after fork" pattern Unix uses.
  */
 __attribute__((used))
 static void pipe_writer_main(long fd)
@@ -609,13 +610,14 @@ static void pipe_writer_main(long fd)
 __attribute__((used))
 static void pipe_reader_main(long fd)
 {
-	char buf[80];
-	long n = 0;
-	for (int tries = 0; tries < 200 && n <= 0; tries++) {
-		n = sys_read((int)fd, buf, sizeof(buf) - 1);
-		if (n <= 0) sys_yield();
-	}
-	if (n > 0) {
+	/* Blocking read: sleeps in the kernel until the writer puts
+	 * data or all writers close (EOF).  Loop until we see 0 so
+	 * a multi-chunk writer is fully drained. */
+	for (;;) {
+		char buf[80];
+		long n = sys_read((int)fd, buf, sizeof(buf) - 1);
+		if (n < 0) { sys_log("pipe-reader: read error"); break; }
+		if (n == 0) { sys_log("pipe-reader: EOF");        break; }
 		buf[n] = '\0';
 		char log[120];
 		const char *p = "pipe-reader: got '";
@@ -626,8 +628,6 @@ static void pipe_reader_main(long fd)
 		*q++ = '\'';
 		*q   = '\0';
 		sys_log(log);
-	} else {
-		sys_log("pipe-reader: no data");
 	}
 	sys_close((int)fd);
 	sys_exit();
@@ -641,6 +641,11 @@ static void cmd_pipework(void)
 	}
 	long wtid = sys_spawn(pipe_writer_main, (long)fds[1]);
 	long rtid = sys_spawn(pipe_reader_main, (long)fds[0]);
+	/* Drop the shell's copies so the workers are the only holders.
+	 * When the writer closes its end, the write-side file refcount
+	 * goes to zero, stream_close fires, and the reader sees EOF. */
+	sys_close(fds[0]);
+	sys_close(fds[1]);
 	cwrite("pipework: writer tid="); cprint_long(wtid);
 	cwrite(", reader tid="); cprint_long(rtid);
 	cwrite("\r\n");

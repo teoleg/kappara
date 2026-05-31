@@ -48,13 +48,22 @@
 
 #include <stddef.h>
 
+#include "kappara/sched.h"	/* struct wait_queue */
 #include "kappara/streams.h"
+
+/* sd_flags bits. */
+#define SD_EOF		(1u << 0)	/* peer (if any) has closed; reads
+					 * past the queued backlog return 0 */
 
 struct stdata {
 	queue_t		*sd_rq;	/* read queue at top of stack */
 	queue_t		*sd_wq;	/* write queue at top of stack */
 	int		 sd_refs;
 	const char	*sd_name;
+	unsigned	 sd_flags;	/* SD_EOF / future SD_ERR etc.   */
+	struct stdata	*sd_peer;	/* pipe peer; non-NULL only for
+					 * the two ends of a sys_pipe.    */
+	struct wait_queue sd_readwait;	/* readers blocked on empty sd_rq */
 };
 
 void streams_head_init(void);

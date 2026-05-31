@@ -215,8 +215,11 @@ void kthread_sleep_on(struct wait_queue *wq)
 	cur->next  = wq->head;
 	wq->head   = cur;
 	switch_to_next(0);
-	/* Reached here after someone called kthread_wake_*; back to
-	 * normal RUNNING state.  Caller will re-check its condition. */
+	/* Reached here after someone called kthread_wake_*; the new
+	 * DAIF that context_switch restored is whatever this thread
+	 * had at the moment it slept (masked) -- so restore the
+	 * pre-sleep state explicitly to put us back at the caller's
+	 * IRQ-mask level. */
 	irq_restore(flags);
 }
 
