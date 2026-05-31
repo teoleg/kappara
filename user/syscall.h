@@ -23,6 +23,12 @@
 #define SYS_getmsg	9
 #define SYS_ls		10
 #define SYS_pipe	11
+#define SYS_creat	12
+#define SYS_seek	13
+
+#define SEEK_SET	0
+#define SEEK_CUR	1
+#define SEEK_END	2
 
 typedef long ssize_t;
 typedef unsigned long size_t;
@@ -99,6 +105,16 @@ static inline long sys_ls(const char *path, char *out, size_t cap)
 static inline long sys_pipe(int fds[2])
 {
 	return _syscall1(SYS_pipe, (long)(unsigned long)fds);
+}
+
+static inline long sys_creat(const char *path)
+{
+	return _syscall1(SYS_creat, (long)(unsigned long)path);
+}
+
+static inline long sys_seek(int fd, long offset, int whence)
+{
+	return _syscall3(SYS_seek, fd, offset, whence);
 }
 
 /* ioctl commands -- mirror include/kappara/stream_head.h. */

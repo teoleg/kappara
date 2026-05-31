@@ -205,6 +205,9 @@ void kprintf(const char *fmt, ...)
 	va_start(ap, fmt);
 	vkprintf(fmt, ap);
 	va_end(ap);
+	/* One batched fb flush per kprintf call -- amortises the
+	 * 3 MB dc cvac sweep across many characters. */
+	fbcon_tee_flush();
 }
 
 void kpanic(const char *msg)

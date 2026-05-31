@@ -185,19 +185,30 @@ void framebuffer_putc(uint32_t x, uint32_t y, char c,
 {
 	if (!fb_ready || scale == 0) return;
 	const uint8_t *g = font8x8[(unsigned char)c & 0x7F];
+	uint32_t stride = fb.pitch / 4;
 
+	/* Bail if the cell would walk past the framebuffer.  Cheap
+	 * single check vs. per-pixel bounds checks. */
+	if (x + 8 * scale > fb.width || y + 8 * scale > fb.height)
+		return;
+
+	/* Inline pixel writes -- no framebuffer_rect call per pixel.
+	 * For each font row we expand each of its 8 bits into a
+	 * scale*scale block; this loop pattern lets the compiler
+	 * keep the row pointer in a register and the inner write
+	 * straight into the framebuffer. */
 	for (unsigned row = 0; row < 8; row++) {
 		uint8_t bits = g[row];
-		for (unsigned col = 0; col < 8; col++) {
-			int on = (bits >> col) & 1;
-			if (on)
-				framebuffer_rect(x + col * scale,
-						 y + row * scale,
-						 scale, scale, fg);
-			else if (bg)
-				framebuffer_rect(x + col * scale,
-						 y + row * scale,
-						 scale, scale, bg);
+		for (unsigned dy = 0; dy < scale; dy++) {
+			uint32_t *p = fb.fb
+				+ (size_t)(y + row * scale + dy) * stride + x;
+			for (unsigned col = 0; col < 8; col++) {
+				int on = (bits >> col) & 1;
+				if (!on && bg == 0) continue;
+				uint32_t color = on ? fg : bg;
+				for (unsigned dx = 0; dx < scale; dx++)
+					p[col * scale + dx] = color;
+			}
 		}
 	}
 }

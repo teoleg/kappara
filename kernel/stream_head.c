@@ -139,6 +139,7 @@ static int console_wq_putp(queue_t *q, mblk_t *mp)
 			fbcon_putc_tee((char)*p);
 		}
 	}
+	fbcon_tee_flush();
 	freemsg(mp);
 	return 0;
 }

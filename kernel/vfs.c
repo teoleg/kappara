@@ -393,3 +393,76 @@ long sys_getmsg_impl(int fd, struct strbuf *c,
 		return -1;
 	return f->f_ops->getmsg(f, c, d, flagsp);
 }
+
+long sys_seek_impl(int fd, long offset, int whence)
+{
+	struct file *f = fd_get(fd);
+	if (!f || !f->f_ops->seek)
+		return -1;
+	return f->f_ops->seek(f, offset, whence);
+}
+
+/*
+ * Split a path like "/etc/foo" into the parent dentry "/etc" and the
+ * basename "foo".  Returns 0 on success.  Lives at the bottom of
+ * sys_creat_impl since that's the only caller today.
+ */
+static int split_parent(const char *path, char *dir, size_t dirsz,
+			const char **base)
+{
+	if (!path || path[0] != '/')
+		return -1;
+	const char *last = path;
+	for (const char *p = path; *p; p++)
+		if (*p == '/')
+			last = p;
+	size_t dirlen = (size_t)(last - path);
+	if (dirlen == 0) dirlen = 1;	/* parent is "/" itself */
+	if (dirlen >= dirsz)
+		return -1;
+	for (size_t i = 0; i < dirlen; i++)
+		dir[i] = path[i];
+	dir[dirlen] = '\0';
+	*base = last + 1;
+	return 0;
+}
+
+int sys_creat_impl(const char *path)
+{
+	char kpath[128];
+	const char *p;
+	if (syscall_from_user) {
+		if (strncpy_from_user(kpath, path, sizeof(kpath)) < 0) {
+			kprintf("sys_creat: rejected user path\n");
+			return -1;
+		}
+		p = kpath;
+	} else {
+		if (!path) return -1;
+		p = path;
+	}
+
+	char dirbuf[128];
+	const char *basename;
+	if (split_parent(p, dirbuf, sizeof(dirbuf), &basename) < 0) {
+		kprintf("sys_creat: bad path '%s'\n", p);
+		return -1;
+	}
+	if (!*basename) {
+		kprintf("sys_creat: empty basename\n");
+		return -1;
+	}
+
+	struct dentry *d = vfs_lookup(dirbuf);
+	if (!d || !d->d_inode) {
+		kprintf("sys_creat: parent '%s' not found\n", dirbuf);
+		return -1;
+	}
+	struct inode *parent = d->d_inode;
+	if (parent->i_type != INODE_DIR || !parent->i_fops ||
+	    !parent->i_fops->creat) {
+		kprintf("sys_creat: '%s' does not support create\n", dirbuf);
+		return -1;
+	}
+	return parent->i_fops->creat(parent, basename);
+}

@@ -49,7 +49,7 @@
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
 
-#define FBCON_SCALE	2
+#define FBCON_SCALE	1
 #define FBCON_CW	(8 * FBCON_SCALE)	/* cell width  in pixels */
 #define FBCON_CH	(8 * FBCON_SCALE)	/* cell height in pixels */
 #define FBCON_FG	0xffffffffu		/* white */
@@ -155,13 +155,45 @@ struct streamtab fbcon_streamtab = {
 
 /* ---- "tee" entry points used by printk + /dev/console -------------- */
 
+/* Tee state: we accumulate dirty writes and let the caller (kprintf,
+ * console_wq_putp) decide when to push them to the GPU via
+ * fbcon_tee_flush.  Otherwise every kprintf char triggers a 3 MB
+ * dc cvac sweep -- death by a thousand cuts in QEMU TCG. */
+static int fbcon_tee_dirty;
+
 void fbcon_putc_tee(char c)
 {
 	if (!framebuffer_get())
 		return;
 	fbcon_putc(c);
-	if (c == '\n')
-		framebuffer_flush();
+	fbcon_tee_dirty = 1;
+}
+
+void fbcon_tee_flush(void)
+{
+	/*
+	 * No-op for now.  The "right" thing is to dc cvac the dirty
+	 * pixel range so the GPU sees the writes -- but framebuffer_flush
+	 * is currently a sweep of the WHOLE framebuffer (3 MB = ~49k
+	 * cache lines), and even when called once per kprintf that ends
+	 * up being the dominant cost during boot in QEMU TCG, slowing
+	 * the shell prompt from seconds to minutes.
+	 *
+	 * Two ways to fix it properly:
+	 *   1. Track the dirty rectangle and flush only those lines,
+	 *      not all 3 MB.
+	 *   2. Remap the framebuffer's 2 MB block as Normal Non-Cacheable
+	 *      so D-cache never gets in the way and no flush is needed.
+	 *
+	 * QEMU doesn't model caches so we silently get away with no
+	 * flush here; the splash + first frame still get their explicit
+	 * framebuffer_flush() in kmain.  On real Pi hardware text writes
+	 * via this tee may not reach HDMI until something else flushes
+	 * the relevant lines.  That's the next commit on the framebuffer
+	 * track.
+	 */
+	if (!fbcon_tee_dirty) return;
+	fbcon_tee_dirty = 0;
 }
 
 void fbcon_init_cursor(uint32_t y)

@@ -44,7 +44,8 @@
 struct kfs_super {
 	uint32_t	magic;
 	uint32_t	num_files;
-	uint8_t		pad[BLK_SIZE - 8];
+	uint32_t	next_free_block;	/* first block past all files */
+	uint8_t		pad[BLK_SIZE - 12];
 };
 
 #define KFS_NAME_MAX	24

@@ -35,8 +35,10 @@
 #define SYS_getmsg	9	/* (int fd, strbuf *c, strbuf *d, int *fl) */
 #define SYS_ls		10	/* (const char *path, char *out, size_t cap) */
 #define SYS_pipe	11	/* (int fds[2]) -> 0 / -1                   */
+#define SYS_creat	12	/* (const char *path) -> 0 / -1             */
+#define SYS_seek	13	/* (int fd, long off, int whence) -> newpos */
 
-#define SYS_MAX		12
+#define SYS_MAX		14
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

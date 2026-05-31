@@ -80,11 +80,31 @@ static long uparse_long(const char *s)
 
 /* -------- shell state -------- */
 
-static int fd_console = -1;
-static int fd_user    = -1;
+static int  fd_console = -1;
+static int  fd_user    = -1;
+static char cwd[128]   = "/";
 
 #define LINE_MAX	128
 #define TOK_MAX		8
+
+/* Combine cwd + arg into out so commands accept relative paths.
+ * Absolute paths (start with '/') pass through. */
+static void resolve_path(const char *arg, char *out, size_t cap)
+{
+	if (arg[0] == '/') {
+		size_t i = 0;
+		while (arg[i] && i + 1 < cap) { out[i] = arg[i]; i++; }
+		out[i] = '\0';
+		return;
+	}
+	size_t i = 0;
+	while (cwd[i] && i + 1 < cap) { out[i] = cwd[i]; i++; }
+	/* Add a slash separator unless cwd is "/" (which ends in '/'). */
+	if (i > 1 && i + 1 < cap) out[i++] = '/';
+	size_t j = 0;
+	while (arg[j] && i + 1 < cap) out[i++] = arg[j++];
+	out[i] = '\0';
+}
 
 /* -------- console output helpers -------- */
 
@@ -114,7 +134,7 @@ static void cprint_long(long v)
 
 static void prompt(void)
 {
-	cwrite("kappara# ");
+	cwrite("kappara:"); cwrite(cwd); cwrite("# ");
 }
 
 static int read_one(void)
@@ -171,6 +191,8 @@ static void cmd_help(void)
 	cwrite("commands:\r\n"
 		"  help\r\n"
 		"  pid                    sys_getpid\r\n"
+		"  pwd                    print current directory\r\n"
+		"  cd [path]              change current directory\r\n"
 		"  ls [path]              list a directory\r\n"
 		"  open <path>            open and remember as $fd\r\n"
 		"  close                  close $fd\r\n"
@@ -179,7 +201,9 @@ static void cmd_help(void)
 		"  push <module>          ioctl(I_PUSH) on $fd\r\n"
 		"  pop                    ioctl(I_POP) on $fd\r\n"
 		"  cat <path>             dump file to console\r\n"
-		"  echo <path> <text...>  write text to file (overwrite)\r\n"
+		"  echo <path> <text>     write text to file (overwrite)\r\n"
+		"  touch <path>           create empty file (kfs only)\r\n"
+		"  append <path> <text>   append text + newline to file\r\n"
 		"  pipe                   sys_pipe demo (write + read)\r\n");
 }
 
@@ -191,7 +215,14 @@ static void cmd_pid(void)
 
 static void cmd_ls(int argc, char *argv[])
 {
-	const char *path = (argc > 1) ? argv[1] : "/";
+	char path[128];
+	if (argc > 1)
+		resolve_path(argv[1], path, sizeof(path));
+	else {
+		size_t i = 0;
+		while (cwd[i]) { path[i] = cwd[i]; i++; }
+		path[i] = '\0';
+	}
 	char out[256];
 	long n = sys_ls(path, out, sizeof(out));
 	if (n < 0) {
@@ -204,11 +235,67 @@ static void cmd_ls(int argc, char *argv[])
 	}
 }
 
+static void cmd_cd(int argc, char *argv[])
+{
+	const char *target = (argc > 1) ? argv[1] : "/";
+	char path[128];
+	resolve_path(target, path, sizeof(path));
+	/* Trust the user; subsequent commands will fail if it's bogus. */
+	size_t i = 0;
+	while (path[i] && i + 1 < sizeof(cwd)) { cwd[i] = path[i]; i++; }
+	cwd[i] = '\0';
+}
+
+static void cmd_pwd(void)
+{
+	cwrite(cwd); cwrite("\r\n");
+}
+
+static void cmd_touch(int argc, char *argv[])
+{
+	if (argc < 2) { cwrite("usage: touch <path>\r\n"); return; }
+	char path[128];
+	resolve_path(argv[1], path, sizeof(path));
+	long r = sys_creat(path);
+	if (r < 0) {
+		cwrite("touch: failed: "); cwrite(path); cwrite("\r\n");
+	}
+}
+
+static void cmd_append(int argc, char *argv[])
+{
+	if (argc < 3) { cwrite("usage: append <path> <text...>\r\n"); return; }
+	char path[128];
+	resolve_path(argv[1], path, sizeof(path));
+	long fd = sys_open(path);
+	if (fd < 0) { cwrite("append: cannot open '");
+		      cwrite(path); cwrite("'\r\n"); return; }
+	if (sys_seek((int)fd, 0, SEEK_END) < 0) {
+		cwrite("append: seek failed\r\n");
+		sys_close((int)fd); return;
+	}
+	char buf[256];
+	size_t off = 0;
+	for (int i = 2; i < argc; i++) {
+		if (i > 2 && off + 1 < sizeof(buf)) buf[off++] = ' ';
+		size_t l = ustrlen(argv[i]);
+		if (off + l > sizeof(buf)) l = sizeof(buf) - off;
+		for (size_t j = 0; j < l; j++) buf[off + j] = argv[i][j];
+		off += l;
+	}
+	if (off + 1 < sizeof(buf)) buf[off++] = '\n';
+	long w = sys_write((int)fd, buf, off);
+	cwrite("wrote "); cprint_long(w); cwrite(" bytes\r\n");
+	sys_close((int)fd);
+}
+
 static void cmd_open(int argc, char *argv[])
 {
 	if (argc < 2) { cwrite("usage: open <path>\r\n"); return; }
 	if (fd_user >= 0) { sys_close(fd_user); fd_user = -1; }
-	long fd = sys_open(argv[1]);
+	char path[128];
+	resolve_path(argv[1], path, sizeof(path));
+	long fd = sys_open(path);
 	if (fd < 0) { cwrite("open: failed\r\n"); return; }
 	fd_user = (int)fd;
 	cwrite("fd="); cprint_long(fd); cwrite("\r\n");
@@ -278,8 +365,10 @@ static void cmd_pop(void)
 static void cmd_cat(int argc, char *argv[])
 {
 	if (argc < 2) { cwrite("usage: cat <path>\r\n"); return; }
-	long fd = sys_open(argv[1]);
-	if (fd < 0) { cwrite("cat: cannot open '"); cwrite(argv[1]);
+	char path[128];
+	resolve_path(argv[1], path, sizeof(path));
+	long fd = sys_open(path);
+	if (fd < 0) { cwrite("cat: cannot open '"); cwrite(path);
 		      cwrite("'\r\n"); return; }
 	char buf[256];
 	long n;
@@ -295,8 +384,10 @@ static void cmd_cat(int argc, char *argv[])
 static void cmd_echo(int argc, char *argv[])
 {
 	if (argc < 3) { cwrite("usage: echo <path> <text...>\r\n"); return; }
-	long fd = sys_open(argv[1]);
-	if (fd < 0) { cwrite("echo: cannot open '"); cwrite(argv[1]);
+	char path[128];
+	resolve_path(argv[1], path, sizeof(path));
+	long fd = sys_open(path);
+	if (fd < 0) { cwrite("echo: cannot open '"); cwrite(path);
 		      cwrite("'\r\n"); return; }
 
 	char buf[256];
@@ -349,18 +440,22 @@ static void dispatch(char *line)
 	int argc = tokenize(line, argv, TOK_MAX);
 	if (argc == 0) return;
 
-	if      (!ustrcmp(argv[0], "help"))  cmd_help();
-	else if (!ustrcmp(argv[0], "pid"))   cmd_pid();
-	else if (!ustrcmp(argv[0], "ls"))    cmd_ls(argc, argv);
-	else if (!ustrcmp(argv[0], "open"))  cmd_open(argc, argv);
-	else if (!ustrcmp(argv[0], "close")) cmd_close();
-	else if (!ustrcmp(argv[0], "read"))  cmd_read(argc, argv);
-	else if (!ustrcmp(argv[0], "write")) cmd_write(argc, argv);
-	else if (!ustrcmp(argv[0], "push"))  cmd_push(argc, argv);
-	else if (!ustrcmp(argv[0], "pop"))   cmd_pop();
-	else if (!ustrcmp(argv[0], "cat"))   cmd_cat(argc, argv);
-	else if (!ustrcmp(argv[0], "echo"))  cmd_echo(argc, argv);
-	else if (!ustrcmp(argv[0], "pipe"))  cmd_pipe();
+	if      (!ustrcmp(argv[0], "help"))   cmd_help();
+	else if (!ustrcmp(argv[0], "pid"))    cmd_pid();
+	else if (!ustrcmp(argv[0], "pwd"))    cmd_pwd();
+	else if (!ustrcmp(argv[0], "cd"))     cmd_cd(argc, argv);
+	else if (!ustrcmp(argv[0], "ls"))     cmd_ls(argc, argv);
+	else if (!ustrcmp(argv[0], "open"))   cmd_open(argc, argv);
+	else if (!ustrcmp(argv[0], "close"))  cmd_close();
+	else if (!ustrcmp(argv[0], "read"))   cmd_read(argc, argv);
+	else if (!ustrcmp(argv[0], "write"))  cmd_write(argc, argv);
+	else if (!ustrcmp(argv[0], "push"))   cmd_push(argc, argv);
+	else if (!ustrcmp(argv[0], "pop"))    cmd_pop();
+	else if (!ustrcmp(argv[0], "cat"))    cmd_cat(argc, argv);
+	else if (!ustrcmp(argv[0], "echo"))   cmd_echo(argc, argv);
+	else if (!ustrcmp(argv[0], "touch"))  cmd_touch(argc, argv);
+	else if (!ustrcmp(argv[0], "append")) cmd_append(argc, argv);
+	else if (!ustrcmp(argv[0], "pipe"))   cmd_pipe();
 	else {
 		cwrite(argv[0]); cwrite(": command not found\r\n");
 	}
@@ -383,7 +478,7 @@ void _start(void)
 	/*
 	 * Probe the user-pointer validation.  sys_log on a kernel
 	 * address used to leak kernel memory; now it returns -1 and
-	 * kprintfs a rejection.  We do a positive and a negative case.
+	 * kprintfs a rejection.
 	 */
 	{
 		long good = sys_log("init: uaccess probe (good user pointer)");

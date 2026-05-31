@@ -28,9 +28,11 @@
 
 #ifdef __aarch64__
 void fbcon_putc_tee   (char c);
+void fbcon_tee_flush  (void);
 void fbcon_init_cursor(uint32_t y);
 #else
 static inline void fbcon_putc_tee   (char c)        { (void)c; }
+static inline void fbcon_tee_flush  (void)          { }
 static inline void fbcon_init_cursor(uint32_t y)    { (void)y; }
 #endif
 

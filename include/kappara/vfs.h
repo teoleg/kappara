@@ -75,6 +75,11 @@ struct file_ops {
 			const struct strbuf *d, int flags);
 	long  (*getmsg)(struct file *f, struct strbuf *c,
 			struct strbuf *d, int *flagsp);
+	long  (*seek)  (struct file *f, long offset, int whence);
+	/* Directory-side: create a new regular file named `name` under
+	 * the inode `dir`.  Returns 0 on success.  Only meaningful on
+	 * directory inodes whose underlying filesystem supports it. */
+	int   (*creat) (struct inode *dir, const char *name);
 };
 
 struct inode {
@@ -148,5 +153,13 @@ long  sys_getmsg_impl(int fd, struct strbuf *c,
  * whose head_wq.q_next points at the peer's head_rq, so a write on
  * one side enqueues an mblk on the peer's read deferred list. */
 long  sys_pipe_impl(int fds[2]);
+
+int   sys_creat_impl(const char *path);
+long  sys_seek_impl (int fd, long offset, int whence);
+
+/* Whence constants matching POSIX. */
+#define SEEK_SET	0
+#define SEEK_CUR	1
+#define SEEK_END	2
 
 #endif

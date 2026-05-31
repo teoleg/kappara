@@ -140,11 +140,125 @@ static long regfile_write(struct file *f, const void *buf, size_t len)
 	return (long)written;
 }
 
+static long regfile_seek(struct file *f, long offset, int whence)
+{
+	struct regfile_cursor *c  = f->f_private;
+	struct kfs_file       *kf = c->kf;
+	long newpos;
+	switch (whence) {
+	case 0: newpos = offset; break;			/* SEEK_SET */
+	case 1: newpos = (long)c->pos + offset; break;	/* SEEK_CUR */
+	case 2: newpos = (long)kf->size_bytes + offset; break;	/* SEEK_END */
+	default: return -1;
+	}
+	if (newpos < 0)
+		return -1;
+	c->pos = (uint32_t)newpos;
+	return newpos;
+}
+
 static struct file_ops regfile_fops = {
 	.open  = regfile_open,
 	.close = regfile_close,
 	.read  = regfile_read,
 	.write = regfile_write,
+	.seek  = regfile_seek,
+};
+
+/*
+ * Per-mount creat state.  Tracks the block device backing the kfs
+ * mount + the next free block in the linear allocation pool.  We
+ * only support one kfs mount today so this is a single static;
+ * generalising to multiple mounts means moving these into a per-
+ * mount object reachable via the directory inode's i_private.
+ */
+static struct {
+	struct block_device *bd;
+	uint32_t             next_free_block;
+} kfs_mnt;
+
+static int kfs_dir_creat(struct inode *dir, const char *name)
+{
+	(void)dir;	/* single-mount; use kfs_mnt */
+	struct block_device *bd = kfs_mnt.bd;
+	if (!bd) return -1;
+
+	struct kfs_dirent dir_blk[KFS_DIRENTS];
+	if (bd->bd_read(bd, 1, dir_blk) < 0) return -1;
+
+	/* Find an empty slot.  An empty slot is one whose name[0]=='\0'. */
+	int slot = -1;
+	size_t nlen = 0;
+	while (name[nlen]) nlen++;
+	if (nlen >= KFS_NAME_MAX) return -1;
+
+	for (unsigned i = 0; i < KFS_DIRENTS; i++) {
+		if (dir_blk[i].name[0] == '\0') {
+			if (slot < 0) slot = (int)i;
+			continue;
+		}
+		/* Reject duplicates. */
+		size_t k;
+		for (k = 0; k < KFS_NAME_MAX && dir_blk[i].name[k] == name[k]; k++)
+			if (name[k] == '\0') break;
+		if (k < KFS_NAME_MAX && dir_blk[i].name[k] == name[k])
+			return -1;	/* name already exists */
+	}
+	if (slot < 0) {
+		kprintf("kfs_creat: directory full\n");
+		return -1;
+	}
+
+	/* Allocate the next KFS_BLOCKS_PER_FILE blocks and zero them. */
+	uint32_t start = kfs_mnt.next_free_block;
+	unsigned char zero[BLK_SIZE];
+	for (size_t i = 0; i < BLK_SIZE; i++) zero[i] = 0;
+	for (uint32_t b = 0; b < KFS_BLOCKS_PER_FILE; b++)
+		if (bd->bd_write(bd, start + b, zero) < 0) return -1;
+
+	/* Fill the dirent. */
+	for (size_t i = 0; i < KFS_NAME_MAX; i++) dir_blk[slot].name[i] = 0;
+	for (size_t i = 0; i < nlen; i++) dir_blk[slot].name[i] = name[i];
+	dir_blk[slot].start_block = start;
+	dir_blk[slot].size_bytes  = 0;
+
+	if (bd->bd_write(bd, 1, dir_blk) < 0) return -1;
+	kfs_mnt.next_free_block += KFS_BLOCKS_PER_FILE;
+
+	/* Update the superblock so next_free_block survives a remount. */
+	struct kfs_super sb;
+	if (bd->bd_read(bd, 0, &sb) == 0) {
+		sb.next_free_block = kfs_mnt.next_free_block;
+		bd->bd_write(bd, 0, &sb);
+	}
+
+	/* Hook into the VFS tree.  We need a stable kmalloc'd name and
+	 * a struct kfs_file the regfile ops can use. */
+	struct kfs_file *kf = kmalloc(sizeof(*kf));
+	char *nm = kmalloc(KFS_NAME_MAX);
+	if (!kf || !nm) return -1;
+	kf->bd           = bd;
+	kf->start_block  = start;
+	kf->size_bytes   = 0;
+	kf->alloc_blocks = KFS_BLOCKS_PER_FILE;
+	kf->dirent_idx   = (uint8_t)slot;
+	for (size_t i = 0; i < KFS_NAME_MAX; i++) nm[i] = 0;
+	for (size_t i = 0; i < nlen; i++) nm[i] = name[i];
+
+	/* Find the mountpoint dentry by walking from root via the dir
+	 * inode's i_private (which we stashed there at mount time). */
+	struct dentry *mp = (struct dentry *)dir->i_private;
+	if (!mp) return -1;
+	vfs_mknod_regfile(mp, nm, &regfile_fops, kf);
+
+	kprintf("kfs_creat: '%s' slot=%d blocks=%u..%u\n",
+		name, slot, start, start + KFS_BLOCKS_PER_FILE - 1);
+	return 0;
+}
+
+/* file_ops for the directory inode: only .creat is meaningful. */
+static struct file_ops kfs_dir_fops = {
+	.creat = kfs_dir_creat,
 };
 
 /* ---- mkimage: build a fresh fs in `bd` from baked-in files --------- */
@@ -171,8 +285,10 @@ void kfs_mkimage(struct block_device *bd)
 	/* Superblock at block 0. */
 	struct kfs_super sb;
 	kmemset(&sb, 0, sizeof(sb));
-	sb.magic     = KFS_MAGIC;
-	sb.num_files = NPAYLOADS;
+	sb.magic           = KFS_MAGIC;
+	sb.num_files       = NPAYLOADS;
+	/* next_free_block filled in after we know how many blocks
+	 * the canned files take up; see end of function. */
 	bd->bd_write(bd, 0, &sb);
 
 	/* Directory at block 1; up to KFS_DIRENTS entries. */
@@ -214,8 +330,14 @@ void kfs_mkimage(struct block_device *bd)
 	}
 	bd->bd_write(bd, 1, dir);
 
-	kprintf("kfs: mkimage wrote %u files (blocks used: 0..%u)\n",
-		(unsigned)NPAYLOADS, (unsigned)(cur_block - 1));
+	/* Re-write the superblock with the final next_free_block. */
+	sb.next_free_block = cur_block;
+	bd->bd_write(bd, 0, &sb);
+
+	kprintf("kfs: mkimage wrote %u files (blocks used: 0..%u, "
+		"next_free_block=%u)\n",
+		(unsigned)NPAYLOADS, (unsigned)(cur_block - 1),
+		(unsigned)cur_block);
 }
 
 /* ---- mount: pull metadata off the device, attach to the VFS -------- */
@@ -232,6 +354,14 @@ int kfs_mount(struct block_device *bd, struct dentry *mountpoint)
 			(unsigned long)sb.magic, (unsigned long)KFS_MAGIC);
 		return -1;
 	}
+
+	/* Publish creat capability on the mountpoint's inode and remember
+	 * the dentry so kfs_dir_creat can hand new file dentries to the
+	 * VFS via vfs_mknod_regfile. */
+	kfs_mnt.bd              = bd;
+	kfs_mnt.next_free_block = sb.next_free_block;
+	mountpoint->d_inode->i_fops    = &kfs_dir_fops;
+	mountpoint->d_inode->i_private = mountpoint;
 
 	struct kfs_dirent dir[KFS_DIRENTS];
 	if (bd->bd_read(bd, 1, dir) < 0) {
