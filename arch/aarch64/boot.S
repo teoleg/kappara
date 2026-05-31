@@ -74,7 +74,18 @@ _start:
 	b	.Lin_el1
 
 .Lpark:
-	wfe
+	/* Park the secondary cores until SMP arrives.
+	 *
+	 * Use WFI, not WFE.  WFE can wake spuriously when any core
+	 * executes a DSB/STREX/SEV anywhere in the system -- in QEMU
+	 * TCG that turns "wfe; b ." into a tight loop that burns a
+	 * host CPU each.  WFI sleeps until an interrupt actually
+	 * fires, and since timer_init routes CNTPNSIRQ only to core
+	 * 0, the secondary cores have nothing wired and stay asleep.
+	 * QEMU's vCPU threads block, host CPU usage drops. */
+	msr	daifset, #0xf	/* mask everything so a spurious IRQ
+				 * can't drag us back into b .Lpark */
+	wfi
 	b	.Lpark
 
 	/* EL3 -> EL2 transition (only used if firmware drops us in EL3). */
