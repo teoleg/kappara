@@ -316,16 +316,22 @@ int sys_open_impl(const char *path, int flags)
 	return fd;
 }
 
-int sys_mkdir_impl(const char *path)
+/*
+ * Resolve a path into (parent dentry, basename).  Used by every
+ * "operate on a name in a directory" syscall (creat, mkdir, unlink,
+ * rmdir).  Copies the user pointer if syscall_from_user is set;
+ * writes the parent name into dirbuf and points *base into the
+ * original (kernel-side) string.
+ */
+static int resolve_parent(const char *path, char *dirbuf, size_t dirsz,
+			  const char **base_out, char *pathbuf,
+			  size_t pathsz)
 {
-	char kpath[128];
 	const char *p;
 	if (syscall_from_user) {
-		if (strncpy_from_user(kpath, path, sizeof(kpath)) < 0) {
-			kprintf("sys_mkdir: rejected user path\n");
+		if (strncpy_from_user(pathbuf, path, pathsz) < 0)
 			return -1;
-		}
-		p = kpath;
+		p = pathbuf;
 	} else {
 		if (!path) return -1;
 		p = path;
@@ -337,25 +343,90 @@ int sys_mkdir_impl(const char *path)
 		if (*q == '/') last = q;
 	size_t dirlen = (size_t)(last - p);
 	if (dirlen == 0) dirlen = 1;
-	char dirbuf[128];
-	if (dirlen >= sizeof(dirbuf)) return -1;
+	if (dirlen >= dirsz) return -1;
 	for (size_t i = 0; i < dirlen; i++) dirbuf[i] = p[i];
 	dirbuf[dirlen] = '\0';
-	const char *basename = last + 1;
-	if (!*basename) return -1;
+	*base_out = last + 1;
+	return 0;
+}
 
-	struct dentry *d = vfs_lookup(dirbuf);
-	if (!d || !d->d_inode) {
-		kprintf("sys_mkdir: parent '%s' not found\n", dirbuf);
+int sys_mkdir_impl(const char *path)
+{
+	char dirbuf[128], pathbuf[128];
+	const char *base;
+	if (resolve_parent(path, dirbuf, sizeof(dirbuf), &base,
+			   pathbuf, sizeof(pathbuf)) < 0) {
+		kprintf("sys_mkdir: bad path\n");
 		return -1;
 	}
+	if (!*base) return -1;
+	struct dentry *d = vfs_lookup(dirbuf);
+	if (!d || !d->d_inode) return -1;
 	struct inode *parent = d->d_inode;
 	if (parent->i_type != INODE_DIR || !parent->i_fops ||
-	    !parent->i_fops->mkdir) {
-		kprintf("sys_mkdir: '%s' does not support mkdir\n", dirbuf);
+	    !parent->i_fops->mkdir)
+		return -1;
+	return parent->i_fops->mkdir(parent, base);
+}
+
+int sys_unlink_impl(const char *path)
+{
+	char dirbuf[128], pathbuf[128];
+	const char *base;
+	if (resolve_parent(path, dirbuf, sizeof(dirbuf), &base,
+			   pathbuf, sizeof(pathbuf)) < 0)
+		return -1;
+	if (!*base) return -1;
+	struct dentry *d = vfs_lookup(dirbuf);
+	if (!d || !d->d_inode) return -1;
+	struct inode *parent = d->d_inode;
+	if (!parent->i_fops || !parent->i_fops->unlink) {
+		kprintf("sys_unlink: '%s' has no unlink op\n", dirbuf);
 		return -1;
 	}
-	return parent->i_fops->mkdir(parent, basename);
+	int rc = parent->i_fops->unlink(parent, base);
+	if (rc == 0)
+		vfs_remove_child(d, base);
+	return rc;
+}
+
+int sys_rmdir_impl(const char *path)
+{
+	char dirbuf[128], pathbuf[128];
+	const char *base;
+	if (resolve_parent(path, dirbuf, sizeof(dirbuf), &base,
+			   pathbuf, sizeof(pathbuf)) < 0)
+		return -1;
+	if (!*base) return -1;
+	struct dentry *d = vfs_lookup(dirbuf);
+	if (!d || !d->d_inode) return -1;
+	struct inode *parent = d->d_inode;
+	if (!parent->i_fops || !parent->i_fops->rmdir) {
+		kprintf("sys_rmdir: '%s' has no rmdir op\n", dirbuf);
+		return -1;
+	}
+	int rc = parent->i_fops->rmdir(parent, base);
+	if (rc == 0)
+		vfs_remove_child(d, base);
+	return rc;
+}
+
+int vfs_remove_child(struct dentry *parent, const char *name)
+{
+	if (!parent || !parent->d_child) return -1;
+	struct dentry **link = &parent->d_child;
+	while (*link) {
+		struct dentry *cur = *link;
+		size_t i;
+		for (i = 0; cur->d_name[i] && cur->d_name[i] == name[i]; i++)
+			;
+		if (cur->d_name[i] == '\0' && name[i] == '\0') {
+			*link = cur->d_sibling;
+			return 0;
+		}
+		link = &cur->d_sibling;
+	}
+	return -1;
 }
 
 int sys_close_impl(int fd)

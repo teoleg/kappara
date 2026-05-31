@@ -81,6 +81,8 @@ struct file_ops {
 	 * directory inodes whose underlying filesystem supports it. */
 	int   (*creat) (struct inode *dir, const char *name);
 	int   (*mkdir) (struct inode *dir, const char *name);
+	int   (*unlink)(struct inode *dir, const char *name);
+	int   (*rmdir) (struct inode *dir, const char *name);
 };
 
 /* sys_open / file open flags. */
@@ -144,6 +146,13 @@ struct file  *fd_get(int fd);
 
 int   sys_open_impl(const char *path, int flags);
 int   sys_mkdir_impl(const char *path);
+int   sys_unlink_impl(const char *path);
+int   sys_rmdir_impl(const char *path);
+
+/* VFS-level helper: remove the dentry named `name` from `parent`'s
+ * child list.  Does not free the inode/dentry (memory leak for now);
+ * just unlinks from the tree so lookups fail. */
+int   vfs_remove_child(struct dentry *parent, const char *name);
 int   sys_close_impl(int fd);
 long  sys_read_impl(int fd, void *buf, size_t len);
 long  sys_write_impl(int fd, const void *buf, size_t len);

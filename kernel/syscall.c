@@ -121,6 +121,18 @@ static long sys_exit(long a0, long a1, long a2, long a3, long a4, long a5)
 	return 0;	/* unreachable */
 }
 
+static long sys_unlink(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return (long)sys_unlink_impl((const char *)(uintptr_t)a0);
+}
+
+static long sys_rmdir(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return (long)sys_rmdir_impl((const char *)(uintptr_t)a0);
+}
+
 static long sys_close(long a0, long a1, long a2, long a3, long a4, long a5)
 {
 	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
@@ -246,6 +258,8 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_mkdir]  = sys_mkdir,
 	[SYS_spawn]  = sys_spawn,
 	[SYS_exit]   = sys_exit,
+	[SYS_unlink] = sys_unlink,
+	[SYS_rmdir]  = sys_rmdir,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

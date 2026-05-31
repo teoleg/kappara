@@ -334,9 +334,104 @@ static int kfs_dir_mkdir(struct inode *dir, const char *name)
 	return 0;
 }
 
+/* Scan a directory block for an entry matching `name`.  Returns the
+ * slot index or -1.  Compares up to the first NUL on either side. */
+static int kfs_dir_find_named(const struct kfs_dirent *dir_blk,
+			      const char *name)
+{
+	for (unsigned i = 0; i < KFS_DIRENTS; i++) {
+		if (dir_blk[i].name[0] == '\0')
+			continue;
+		size_t k = 0;
+		while (k < KFS_NAME_MAX
+		       && dir_blk[i].name[k] == name[k]
+		       && name[k]
+		       && dir_blk[i].name[k])
+			k++;
+		if (k < KFS_NAME_MAX
+		    && dir_blk[i].name[k] == '\0'
+		    && name[k] == '\0')
+			return (int)i;
+	}
+	return -1;
+}
+
+static int kfs_dir_unlink(struct inode *dir, const char *name)
+{
+	struct kfs_dir *d = kfs_dir_of(dir);
+	if (!d) return -1;
+	struct block_device *bd = d->bd;
+
+	struct kfs_dirent dir_blk[KFS_DIRENTS];
+	if (bd->bd_read(bd, d->dir_block, dir_blk) < 0) return -1;
+	int slot = kfs_dir_find_named(dir_blk, name);
+	if (slot < 0) {
+		kprintf("kfs_unlink: '%s' not found in dir_block=%u\n",
+			name, d->dir_block);
+		return -1;
+	}
+	if (dir_blk[slot].type != KFS_TYPE_FILE) {
+		kprintf("kfs_unlink: '%s' is not a regular file\n", name);
+		return -1;
+	}
+	/* Clear the dirent (name[0]=0 marks empty).  Blocks become
+	 * "leaked" since we don't have a free-block bitmap yet; cheap
+	 * to fix later. */
+	for (size_t i = 0; i < KFS_NAME_MAX; i++) dir_blk[slot].name[i] = 0;
+	dir_blk[slot].start_block = 0;
+	dir_blk[slot].size_bytes  = 0;
+	dir_blk[slot].type        = 0;
+	if (bd->bd_write(bd, d->dir_block, dir_blk) < 0) return -1;
+
+	kprintf("kfs_unlink: '%s' from dir_block=%u slot=%d\n",
+		name, d->dir_block, slot);
+	return 0;
+}
+
+static int kfs_dir_rmdir(struct inode *dir, const char *name)
+{
+	struct kfs_dir *d = kfs_dir_of(dir);
+	if (!d) return -1;
+	struct block_device *bd = d->bd;
+
+	struct kfs_dirent dir_blk[KFS_DIRENTS];
+	if (bd->bd_read(bd, d->dir_block, dir_blk) < 0) return -1;
+	int slot = kfs_dir_find_named(dir_blk, name);
+	if (slot < 0) {
+		kprintf("kfs_rmdir: '%s' not found\n", name);
+		return -1;
+	}
+	if (dir_blk[slot].type != KFS_TYPE_DIR) {
+		kprintf("kfs_rmdir: '%s' is not a directory\n", name);
+		return -1;
+	}
+	/* Refuse to remove a non-empty dir. */
+	struct kfs_dirent sub[KFS_DIRENTS];
+	uint32_t sub_block = dir_blk[slot].start_block;
+	if (bd->bd_read(bd, sub_block, sub) < 0) return -1;
+	for (unsigned i = 0; i < KFS_DIRENTS; i++) {
+		if (sub[i].name[0] != '\0') {
+			kprintf("kfs_rmdir: '%s' is not empty\n", name);
+			return -1;
+		}
+	}
+
+	for (size_t i = 0; i < KFS_NAME_MAX; i++) dir_blk[slot].name[i] = 0;
+	dir_blk[slot].start_block = 0;
+	dir_blk[slot].size_bytes  = 0;
+	dir_blk[slot].type        = 0;
+	if (bd->bd_write(bd, d->dir_block, dir_blk) < 0) return -1;
+
+	kprintf("kfs_rmdir: '%s' from dir_block=%u slot=%d (dirent_block=%u "
+		"leaked)\n", name, d->dir_block, slot, sub_block);
+	return 0;
+}
+
 static struct file_ops kfs_dir_fops = {
-	.creat = kfs_dir_creat,
-	.mkdir = kfs_dir_mkdir,
+	.creat  = kfs_dir_creat,
+	.mkdir  = kfs_dir_mkdir,
+	.unlink = kfs_dir_unlink,
+	.rmdir  = kfs_dir_rmdir,
 };
 
 /* ---- mkimage: build a fresh fs in `bd` from baked-in files --------- */

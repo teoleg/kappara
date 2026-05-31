@@ -204,6 +204,8 @@ static void cmd_help(void)
 		"  echo <path> <text>     write text to file (overwrite)\r\n"
 		"  touch <path>           create empty file (kfs only)\r\n"
 		"  mkdir <path>           create directory (kfs only)\r\n"
+		"  rm <path>              remove file\r\n"
+		"  rmdir <path>           remove empty directory\r\n"
 		"  append <path> <text>   append text + newline to file\r\n"
 		"  pipe                   sys_pipe demo (write + read)\r\n"
 		"  spawn [arg]            sys_spawn a worker thread\r\n");
@@ -272,6 +274,29 @@ static void cmd_mkdir(int argc, char *argv[])
 	long r = sys_mkdir(path);
 	if (r < 0) {
 		cwrite("mkdir: failed: "); cwrite(path); cwrite("\r\n");
+	}
+}
+
+static void cmd_rm(int argc, char *argv[])
+{
+	if (argc < 2) { cwrite("usage: rm <path>\r\n"); return; }
+	char path[128];
+	resolve_path(argv[1], path, sizeof(path));
+	long r = sys_unlink(path);
+	if (r < 0) {
+		cwrite("rm: failed: "); cwrite(path); cwrite("\r\n");
+	}
+}
+
+static void cmd_rmdir(int argc, char *argv[])
+{
+	if (argc < 2) { cwrite("usage: rmdir <path>\r\n"); return; }
+	char path[128];
+	resolve_path(argv[1], path, sizeof(path));
+	long r = sys_rmdir(path);
+	if (r < 0) {
+		cwrite("rmdir: failed (not empty?): ");
+		cwrite(path); cwrite("\r\n");
 	}
 }
 
@@ -508,6 +533,8 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "echo"))   cmd_echo(argc, argv);
 	else if (!ustrcmp(argv[0], "touch"))  cmd_touch(argc, argv);
 	else if (!ustrcmp(argv[0], "mkdir"))  cmd_mkdir(argc, argv);
+	else if (!ustrcmp(argv[0], "rm"))     cmd_rm(argc, argv);
+	else if (!ustrcmp(argv[0], "rmdir"))  cmd_rmdir(argc, argv);
 	else if (!ustrcmp(argv[0], "append")) cmd_append(argc, argv);
 	else if (!ustrcmp(argv[0], "pipe"))   cmd_pipe();
 	else if (!ustrcmp(argv[0], "spawn"))  cmd_spawn(argc, argv);

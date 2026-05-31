@@ -40,8 +40,10 @@
 #define SYS_mkdir	14	/* (const char *path) -> 0 / -1             */
 #define SYS_spawn	15	/* (void (*entry)(long), long arg) -> tid   */
 #define SYS_exit	16	/* (void)  no return                        */
+#define SYS_unlink	17	/* (const char *path) -> 0 / -1             */
+#define SYS_rmdir	18	/* (const char *path) -> 0 / -1             */
 
-#define SYS_MAX		17
+#define SYS_MAX		19
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

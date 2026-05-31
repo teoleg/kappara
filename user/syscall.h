@@ -28,6 +28,8 @@
 #define SYS_mkdir	14
 #define SYS_spawn	15
 #define SYS_exit	16
+#define SYS_unlink	17
+#define SYS_rmdir	18
 
 #define SEEK_SET	0
 #define SEEK_CUR	1
@@ -112,6 +114,16 @@ static inline void sys_exit(void)
 	register long x8 __asm__("x8") = SYS_exit;
 	__asm__ volatile ("svc #0" :: "r"(x8) : "memory");
 	__builtin_unreachable();
+}
+
+static inline long sys_unlink(const char *path)
+{
+	return _syscall1(SYS_unlink, (long)(unsigned long)path);
+}
+
+static inline long sys_rmdir(const char *path)
+{
+	return _syscall1(SYS_rmdir, (long)(unsigned long)path);
 }
 
 static inline long sys_close(int fd)
