@@ -102,6 +102,8 @@ static struct inode *new_inode(enum inode_type t, struct file_ops *fops,
 	i->i_fops    = fops;
 	i->i_private = priv;
 	i->i_rdev    = 0;
+	i->i_count   = 1;	/* the dentry that's about to be created
+				 * holds this initial reference */
 	return i;
 }
 
@@ -355,6 +357,10 @@ static void file_put(struct file *f)
 	if (--f->f_refs > 0) return;
 	if (f->f_ops && f->f_ops->close)
 		f->f_ops->close(f);
+	/* Drop the inode reference acquired by sys_open_impl.  If this
+	 * was the last reference -- and the name has already been
+	 * unlinked -- vop_inactive runs now and the inode is freed. */
+	vfs_iput(f->f_inode);
 	kfree(f);
 }
 
@@ -413,6 +419,11 @@ int sys_open_impl(const char *path, int flags)
 	struct file *f = kmalloc(sizeof(*f));
 	if (!f)
 		return -1;
+	/* Pin the inode for as long as the open file holds it.  The
+	 * matching vfs_iput is in file_put when the last close drops
+	 * f_refs to 0 -- unlink between now and then sees i_count > 1
+	 * and only removes the name. */
+	vfs_iget(ino);
 	f->f_ops     = ino->i_fops;
 	f->f_inode   = ino;
 	f->f_private = NULL;
@@ -420,6 +431,7 @@ int sys_open_impl(const char *path, int flags)
 	f->f_flags   = flags;
 
 	if (f->f_ops->open(f) < 0) {
+		vfs_iput(ino);
 		kfree(f);
 		return -1;
 	}
@@ -428,6 +440,7 @@ int sys_open_impl(const char *path, int flags)
 	if (fd < 0) {
 		if (f->f_ops->close)
 			f->f_ops->close(f);
+		vfs_iput(ino);
 		kfree(f);
 		return -1;
 	}
@@ -539,12 +552,44 @@ int vfs_remove_child(struct dentry *parent, const char *name)
 		for (i = 0; cur->d_name[i] && cur->d_name[i] == name[i]; i++)
 			;
 		if (cur->d_name[i] == '\0' && name[i] == '\0') {
+			/* Splice out of the parent's child list. */
 			*link = cur->d_sibling;
+			/* Drop the dentry's reference to its inode --
+			 * if no open file is holding it the inode goes
+			 * away inside vfs_iput (vop_inactive frees
+			 * i_private, then we kfree the inode).  Anyone
+			 * who still has an fd on this inode keeps it
+			 * alive until they close, matching the SVR4
+			 * "removed-but-open" lifetime rule. */
+			vfs_iput(cur->d_inode);
+			/* d_name was kmalloc'd via kfs_dup_name when the
+			 * dirent was added (literal-name dentries like
+			 * the root or /dev are never passed to
+			 * vfs_remove_child, so this is always slab
+			 * memory). */
+			kfree((void *)(uintptr_t)cur->d_name);
+			kfree(cur);
 			return 0;
 		}
 		link = &cur->d_sibling;
 	}
 	return -1;
+}
+
+void vfs_iget(struct inode *ino)
+{
+	if (ino) ino->i_count++;
+}
+
+void vfs_iput(struct inode *ino)
+{
+	if (!ino) return;
+	if (--ino->i_count > 0) return;
+	/* Last reference -- ask the FS to release whatever lived behind
+	 * i_private (kfs_file, kfs_dir), then free the inode body. */
+	if (ino->i_fops && ino->i_fops->inactive)
+		ino->i_fops->inactive(ino);
+	kfree(ino);
 }
 
 int sys_close_impl(int fd)

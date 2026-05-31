@@ -88,6 +88,11 @@ struct file_ops {
 	 * Operates on the inode (not an open file) so callers don't have
 	 * to open just to stat. */
 	long  (*size)  (struct inode *ino);
+	/* SVR4 vop_inactive: called by vfs_iput when the inode's last
+	 * reference drops.  The FS releases whatever lived behind
+	 * i_private (kfs_file, kfs_dir, ...).  After this returns the
+	 * VFS frees the inode itself. */
+	void  (*inactive)(struct inode *ino);
 };
 
 /* sys_open / file open flags. */
@@ -102,6 +107,14 @@ struct inode {
 	 * driver (think /dev/tty0 vs /dev/tty1).  Unused for dirs and
 	 * regular files. */
 	uint32_t          i_rdev;
+	/* Reference count -- vnode.v_count in SVR4 terms.  Starts at 1
+	 * (the dentry holds the inode).  Every open bumps it; every
+	 * close drops it.  When it falls to 0, vfs_iput calls
+	 * i_fops->inactive (vop_inactive) to release the FS-private
+	 * data and then frees the inode itself.  This is the lifecycle
+	 * model SVR4 used; Linux's separate dcache/inode refcounting
+	 * is a different shape -- we don't need it here. */
+	int               i_count;
 };
 
 struct dentry {
@@ -156,6 +169,17 @@ long           vfs_listdir(struct dentry *dir, char *out, size_t cap);
  * where TYPE is one of dir/reg/chr.  SIZE is the file size for reg,
  * or 0 for dir/chr.  Used by SYS_lsl. */
 long           vfs_listdir_long(struct dentry *dir, char *out, size_t cap);
+
+/* ---- Inode lifecycle (SVR4 vnode v_count style) -------------------- */
+
+/* Bump i_count to register a new reference (e.g. an open file).
+ * Safe on NULL. */
+void          vfs_iget(struct inode *ino);
+
+/* Drop a reference.  When i_count falls to 0 the FS's inactive hook
+ * is called to release i_private and the inode is freed.  Safe on
+ * NULL. */
+void          vfs_iput(struct inode *ino);
 
 /* ---- fd table ------------------------------------------------------- */
 

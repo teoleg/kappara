@@ -195,13 +195,24 @@ static long regfile_size(struct inode *ino)
 	return kf ? (long)kf->size_bytes : -1;
 }
 
+/* SVR4 vop_inactive: the inode's last reference just dropped, so
+ * the kfs_file metadata behind i_private can go.  The on-disk
+ * blocks were already returned to the bitmap by kfs_dir_unlink
+ * before vfs_remove_child triggered this. */
+static void regfile_inactive(struct inode *ino)
+{
+	kfree(ino->i_private);
+	ino->i_private = NULL;
+}
+
 static struct file_ops regfile_fops = {
-	.open  = regfile_open,
-	.close = regfile_close,
-	.read  = regfile_read,
-	.write = regfile_write,
-	.seek  = regfile_seek,
-	.size  = regfile_size,
+	.open     = regfile_open,
+	.close    = regfile_close,
+	.read     = regfile_read,
+	.write    = regfile_write,
+	.seek     = regfile_seek,
+	.size     = regfile_size,
+	.inactive = regfile_inactive,
 };
 
 /*
@@ -497,11 +508,21 @@ static int kfs_dir_rmdir(struct inode *dir, const char *name)
 	return 0;
 }
 
+/* Same as regfile_inactive but for the kfs_dir handle that
+ * directory inodes hang off of.  Triggered by rmdir + the last
+ * close of any open fd referring to this dir. */
+static void kfs_dir_inactive(struct inode *ino)
+{
+	kfree(ino->i_private);
+	ino->i_private = NULL;
+}
+
 static struct file_ops kfs_dir_fops = {
-	.creat  = kfs_dir_creat,
-	.mkdir  = kfs_dir_mkdir,
-	.unlink = kfs_dir_unlink,
-	.rmdir  = kfs_dir_rmdir,
+	.creat    = kfs_dir_creat,
+	.mkdir    = kfs_dir_mkdir,
+	.unlink   = kfs_dir_unlink,
+	.rmdir    = kfs_dir_rmdir,
+	.inactive = kfs_dir_inactive,
 };
 
 /* ---- mkimage: build a fresh fs in `bd` from baked-in files --------- */
