@@ -86,6 +86,10 @@ static char cwd[128]   = "/";
 
 #define LINE_MAX	128
 #define TOK_MAX		8
+#define HIST_MAX	8	/* recent command lines kept for arrow-up */
+
+static char hist[HIST_MAX][LINE_MAX];
+static int  hist_count;	/* 0..HIST_MAX -- how many slots are filled */
 
 /* Combine cwd + arg into out so commands accept relative paths.
  * Absolute paths (start with '/') pass through. */
@@ -146,12 +150,85 @@ static int read_one(void)
 	return (unsigned char)c;
 }
 
+/* Push line onto the history ring (hist[0] = most recent).  No-op on
+ * empty input or exact duplicate of the previous entry. */
+static void history_add(const char *line)
+{
+	if (!line[0]) return;
+	if (hist_count > 0 && !ustrcmp(line, hist[0])) return;
+
+	int n = hist_count < HIST_MAX ? hist_count : HIST_MAX - 1;
+	for (int i = n - 1; i >= 0; i--)
+		for (int j = 0; j < LINE_MAX; j++)
+			hist[i + 1][j] = hist[i][j];
+	size_t j = 0;
+	while (line[j] && j < LINE_MAX - 1) { hist[0][j] = line[j]; j++; }
+	hist[0][j] = '\0';
+	if (hist_count < HIST_MAX) hist_count++;
+}
+
+/* Replace the displayed line with `new_line` -- ANSI CR + clear-EOL,
+ * redraw the prompt, then write the new bytes.  Updates *i_inout to
+ * reflect the new content length. */
+static void replace_line(char *buf, size_t *i_inout, const char *new_line)
+{
+	cwrite("\r\033[K");
+	prompt();
+	size_t j = 0;
+	while (new_line[j] && j < LINE_MAX - 1) {
+		buf[j] = new_line[j];
+		cputc(new_line[j]);
+		j++;
+	}
+	buf[j] = '\0';
+	*i_inout = j;
+}
+
+/*
+ * Line input with VT100 cursor-key support.  After reading a byte
+ * we feed it through a tiny state machine:
+ *   ESC               -> set in_esc
+ *   in_esc and '['    -> set in_csi (CSI = Control Sequence Introducer)
+ *   in_csi and 'A'    -> up arrow  -> previous history entry
+ *   in_csi and 'B'    -> down arrow -> next entry / blank
+ * All other bytes go through the normal echo+buffer path.
+ */
 static void read_line(char *buf, size_t cap)
 {
 	size_t i = 0;
+	int hist_pos = -1;	/* -1 = currently editing a fresh line */
+	int in_esc = 0;
+	int in_csi = 0;
+
 	for (;;) {
 		int c = read_one();
 		if (c < 0) { sys_yield(); continue; }
+
+		if (in_csi) {
+			in_csi = 0;
+			if (c == 'A') {		/* up */
+				if (hist_pos + 1 < hist_count) {
+					hist_pos++;
+					replace_line(buf, &i, hist[hist_pos]);
+				}
+			} else if (c == 'B') {	/* down */
+				if (hist_pos > 0) {
+					hist_pos--;
+					replace_line(buf, &i, hist[hist_pos]);
+				} else if (hist_pos == 0) {
+					hist_pos = -1;
+					replace_line(buf, &i, "");
+				}
+			}
+			continue;
+		}
+		if (in_esc) {
+			in_esc = 0;
+			if (c == '[') { in_csi = 1; continue; }
+			continue;
+		}
+		if (c == 0x1B) { in_esc = 1; continue; }
+
 		if (c == '\r' || c == '\n') {
 			cwrite("\r\n");
 			break;
@@ -166,6 +243,7 @@ static void read_line(char *buf, size_t cap)
 		}
 	}
 	buf[i] = '\0';
+	history_add(buf);
 }
 
 /* -------- tokenize on spaces -------- */
