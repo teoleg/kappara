@@ -154,17 +154,98 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 	return t;
 }
 
-void kthread_yield(void)
+/* Common scheduler step.  If requeue_current is set, the outgoing
+ * thread goes back on the ready queue (cooperative yield); if not,
+ * it has already been parked somewhere else (a wait queue, exit
+ * limbo, ...) and we MUST NOT put it back on the ready queue or
+ * the scheduler will think it's runnable. */
+static void switch_to_next(int requeue_current)
 {
 	struct kthread *next = ready_pop();
-	if (!next)
-		return;
+	if (!next) {
+		if (requeue_current)
+			return;
+		/* Nobody runnable AND the caller is about to block.
+		 * That's a deadlock for now (no idle thread).  Park
+		 * on WFE so an IRQ -- specifically the timer or a
+		 * future device interrupt -- can wake us into a wake
+		 * path that puts somebody on the ready queue. */
+		kprintf("sched: nothing to run; deadlock or pure idle\n");
+		for (;;)
+			__asm__ volatile ("wfe");
+	}
 	struct kthread *prev = cur;
-	ready_push(prev);
-	prev->state = KT_READY;
+	if (requeue_current) {
+		ready_push(prev);
+		prev->state = KT_READY;
+	}
 	next->state = KT_RUNNING;
 	cur = next;
 	context_switch(&prev->sp, next->sp);
+}
+
+void kthread_yield(void)
+{
+	switch_to_next(1);
+}
+
+/* Bracket the wait-queue mutation + context switch so the timer
+ * tick can't fire between marking us BLOCKED and actually leaving
+ * the CPU -- otherwise we'd be on a wait queue AND on the ready
+ * queue, and the next scheduling decision would run us with
+ * state=BLOCKED.  IRQs are restored on the wake side by the new
+ * thread's own resume path. */
+static inline unsigned long irq_save_and_disable(void)
+{
+	unsigned long daif;
+	__asm__ volatile ("mrs %0, daif" : "=r"(daif));
+	__asm__ volatile ("msr daifset, #2" ::: "memory");
+	return daif;
+}
+
+static inline void irq_restore(unsigned long daif)
+{
+	__asm__ volatile ("msr daif, %0" :: "r"(daif) : "memory");
+}
+
+void kthread_sleep_on(struct wait_queue *wq)
+{
+	unsigned long flags = irq_save_and_disable();
+	cur->state = KT_BLOCKED;
+	cur->next  = wq->head;
+	wq->head   = cur;
+	switch_to_next(0);
+	/* Reached here after someone called kthread_wake_*; back to
+	 * normal RUNNING state.  Caller will re-check its condition. */
+	irq_restore(flags);
+}
+
+void kthread_wake_all(struct wait_queue *wq)
+{
+	unsigned long flags = irq_save_and_disable();
+	struct kthread *t = wq->head;
+	wq->head = NULL;
+	while (t) {
+		struct kthread *n = t->next;
+		t->next  = NULL;
+		t->state = KT_READY;
+		ready_push(t);
+		t = n;
+	}
+	irq_restore(flags);
+}
+
+void kthread_wake_one(struct wait_queue *wq)
+{
+	unsigned long flags = irq_save_and_disable();
+	struct kthread *t = wq->head;
+	if (t) {
+		wq->head = t->next;
+		t->next  = NULL;
+		t->state = KT_READY;
+		ready_push(t);
+	}
+	irq_restore(flags);
 }
 
 void sched_tick(void)

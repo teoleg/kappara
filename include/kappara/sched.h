@@ -57,6 +57,34 @@ void            sched_tick(void);
 void            kthread_inherit_fds(struct kthread *child,
 				    const struct kthread *parent);
 
+/* ---- Wait queues -----------------------------------------------------
+ *
+ * A wait_queue is a singly linked list of threads parked on some
+ * condition (data on a stream-head read queue, timer expiry, ...).
+ * kthread_sleep_on flips the caller from RUNNING to BLOCKED, threads
+ * it onto wq, and yields without re-queuing -- so the scheduler skips
+ * over the thread entirely until something wakes it.
+ *
+ * kthread_wake_all / _one pulls waiters off wq, marks them READY, and
+ * pushes them back onto the run queue.  The freshly-woken thread
+ * resumes inside sleep_on and loops to re-check its condition (think
+ * "while empty, sleep" rather than "if empty, sleep") so spurious or
+ * coalesced wakeups don't matter.
+ *
+ * Single-CPU concurrency: the primitives disable IRQs around the
+ * state mutation so the timer can't preempt between marking us
+ * BLOCKED and the context switch.  Spin-locking lands when SMP does.
+ */
+struct wait_queue {
+	struct kthread *head;
+};
+
+#define WAIT_QUEUE_INIT		{ .head = NULL }
+
+void            kthread_sleep_on (struct wait_queue *wq);
+void            kthread_wake_all (struct wait_queue *wq);
+void            kthread_wake_one (struct wait_queue *wq);
+
 /*
  * Arch-specific hook implemented in arch/<arch>/thread.c.  Lays
  * down the synthetic saved-register frame at stack_top so that
