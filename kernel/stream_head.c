@@ -45,6 +45,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kappara/fbcon.h"
 #include "kappara/klog.h"
 #include "kappara/kmem.h"
 #include "kappara/printk.h"
@@ -133,8 +134,10 @@ static int console_wq_putp(queue_t *q, mblk_t *mp)
 {
 	(void)q;
 	for (mblk_t *m = mp; m; m = m->b_cont) {
-		for (unsigned char *p = m->b_rptr; p < m->b_wptr; p++)
+		for (unsigned char *p = m->b_rptr; p < m->b_wptr; p++) {
 			uart_putc((char)*p);
+			fbcon_putc_tee((char)*p);
+		}
 	}
 	freemsg(mp);
 	return 0;

@@ -25,6 +25,7 @@
 #include <stdint.h>
 
 #include "kappara/blkdev.h"
+#include "kappara/fbcon.h"
 #include "kappara/framebuffer.h"
 #include "kappara/kfs.h"
 #include "kappara/kmem.h"
@@ -226,6 +227,12 @@ void kmain(void)
 		framebuffer_rect(768, 760, 256, 8, 0xffe0c45cu);
 
 		framebuffer_flush();
+
+		/* Position the fbcon cursor below the splash so the
+		 * teed kprintf output and any /dev/console writes land
+		 * in the lower half of the screen, scrolling under the
+		 * "kappara" title rather than over it. */
+		fbcon_init_cursor(320);
 	}
 
 	kprintf("\n");

@@ -43,6 +43,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kappara/fbcon.h"
 #include "kappara/framebuffer.h"
 #include "kappara/printk.h"
 #include "kappara/stream_head.h"
@@ -151,3 +152,20 @@ struct streamtab fbcon_streamtab = {
 	.st_rdinit = &fbcon_rinit,
 	.st_wrinit = &fbcon_winit,
 };
+
+/* ---- "tee" entry points used by printk + /dev/console -------------- */
+
+void fbcon_putc_tee(char c)
+{
+	if (!framebuffer_get())
+		return;
+	fbcon_putc(c);
+	if (c == '\n')
+		framebuffer_flush();
+}
+
+void fbcon_init_cursor(uint32_t y)
+{
+	fbcon.cx = 0;
+	fbcon.cy = y;
+}
