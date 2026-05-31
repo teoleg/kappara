@@ -33,6 +33,7 @@
 #include "kappara/mmu.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
+#include "kappara/proc.h"
 #include "kappara/sched.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
@@ -229,6 +230,7 @@ void kmain(void)
 
 	vfs_init();
 	streams_head_init();
+	proc_init();
 	user_init();
 
 	/* Boot a ramdisk-backed kfs and mount it at /etc.

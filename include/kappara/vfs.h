@@ -84,6 +84,10 @@ struct file_ops {
 	int   (*mkdir) (struct inode *dir, const char *name);
 	int   (*unlink)(struct inode *dir, const char *name);
 	int   (*rmdir) (struct inode *dir, const char *name);
+	/* Optional: return the file's current size in bytes for ls -l.
+	 * Operates on the inode (not an open file) so callers don't have
+	 * to open just to stat. */
+	long  (*size)  (struct inode *ino);
 };
 
 /* sys_open / file open flags. */
@@ -147,6 +151,11 @@ void           vfs_dump_tree(struct dentry *d);
  * by '\n'.  Returns bytes written (without trailing NUL) or -1.
  * Truncates if `out` is too small.  Used by SYS_ls. */
 long           vfs_listdir(struct dentry *dir, char *out, size_t cap);
+
+/* Like vfs_listdir but emits "TYPE SIZE NAME\n" rows (ls -l style)
+ * where TYPE is one of dir/reg/chr.  SIZE is the file size for reg,
+ * or 0 for dir/chr.  Used by SYS_lsl. */
+long           vfs_listdir_long(struct dentry *dir, char *out, size_t cap);
 
 /* ---- fd table ------------------------------------------------------- */
 

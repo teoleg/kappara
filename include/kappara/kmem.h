@@ -39,4 +39,9 @@ void  kmem_cache_free(struct kmem_cache *c, void *p);
 void *kmalloc(size_t size);
 void  kfree(void *p);
 
+/* Iteration for introspection -- /proc/slabinfo walks the static size-
+ * caches via these.  Returns NULL once `i` runs past the last cache. */
+unsigned                   kmem_num_size_caches(void);
+const struct kmem_cache   *kmem_get_size_cache(unsigned i);
+
 #endif

@@ -82,6 +82,13 @@ void streams_register(const char *name, struct streamtab *st);
 /* Look up a registered streamtab by name. */
 struct streamtab *streams_lookup(const char *name);
 
+/* Walk every registered module/driver in registration order; calls
+ * cb(name, st, arg) for each.  Used by /proc/streams. */
+void              streams_for_each(void (*cb)(const char *name,
+					      struct streamtab *st,
+					      void *arg),
+				   void *arg);
+
 /* sys_open / sys_close / sys_read / sys_write / sys_ioctl / sys_putmsg /
  * sys_getmsg now live in include/kappara/vfs.h -- they dispatch via the
  * VFS through each inode's file_ops vtable.  stream_fops is the

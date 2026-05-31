@@ -186,12 +186,22 @@ static long regfile_seek(struct file *f, long offset, int whence)
 	return newpos;
 }
 
+/* Return the file's current size for ls -l / stat.  The kfs_file
+ * pointer lives in inode->i_private; it tracks size as bytes are
+ * written and as O_TRUNC zeroes the file. */
+static long regfile_size(struct inode *ino)
+{
+	struct kfs_file *kf = (struct kfs_file *)ino->i_private;
+	return kf ? (long)kf->size_bytes : -1;
+}
+
 static struct file_ops regfile_fops = {
 	.open  = regfile_open,
 	.close = regfile_close,
 	.read  = regfile_read,
 	.write = regfile_write,
 	.seek  = regfile_seek,
+	.size  = regfile_size,
 };
 
 /*

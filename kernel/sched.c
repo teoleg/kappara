@@ -311,6 +311,28 @@ struct kthread *kthread_find(unsigned tid)
 	return t;
 }
 
+unsigned kthread_max_tid(void)
+{
+	return KSCHED_MAX_TID;
+}
+
+struct kthread *kthread_at(unsigned tid)
+{
+	if (tid >= KSCHED_MAX_TID) return NULL;
+	return tid_table[tid];	/* includes DEAD; /proc/ps wants to see them */
+}
+
+const char *kthread_state_name(enum kt_state s)
+{
+	switch (s) {
+	case KT_READY:   return "READY";
+	case KT_RUNNING: return "RUN";
+	case KT_BLOCKED: return "BLOCK";
+	case KT_DEAD:    return "DEAD";
+	}
+	return "?";
+}
+
 int kthread_signal(struct kthread *t, unsigned sig)
 {
 	if (!t || sig == 0 || sig >= NSIG) return -1;

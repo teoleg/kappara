@@ -37,6 +37,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/kernel/stream_head.o \
         $(BUILD)/kernel/syscall.o \
         $(BUILD)/kernel/signal.o \
+        $(BUILD)/kernel/proc.o \
         $(BUILD)/kernel/uaccess.o \
         $(BUILD)/kernel/ramdisk.o \
         $(BUILD)/kernel/kfs.o \

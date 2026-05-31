@@ -252,6 +252,59 @@ long vfs_listdir(struct dentry *dir, char *out, size_t cap)
 	return (long)off;
 }
 
+static const char *type_tag_short(enum inode_type t)
+{
+	switch (t) {
+	case INODE_DIR:    return "dir";
+	case INODE_CHRDEV: return "chr";
+	case INODE_REG:    return "reg";
+	}
+	return "?";
+}
+
+/* Append `s` to out[off..cap], return new off (clipped to cap). */
+static size_t append_str(char *out, size_t off, size_t cap, const char *s)
+{
+	while (*s && off + 1 < cap) out[off++] = *s++;
+	return off;
+}
+
+/* Append unsigned decimal v (right-justified to width) to out. */
+static size_t append_dec(char *out, size_t off, size_t cap,
+			 unsigned long v, int width)
+{
+	char tmp[24];
+	int  i = 0;
+	if (v == 0) tmp[i++] = '0';
+	while (v) { tmp[i++] = (char)('0' + v % 10); v /= 10; }
+	while (i < width && off + 1 < cap) { out[off++] = ' '; width--; }
+	while (i-- && off + 1 < cap) out[off++] = tmp[i];
+	return off;
+}
+
+long vfs_listdir_long(struct dentry *dir, char *out, size_t cap)
+{
+	if (!dir || !dir->d_inode || dir->d_inode->i_type != INODE_DIR)
+		return -1;
+	size_t off = 0;
+	for (struct dentry *c = dir->d_child; c; c = c->d_sibling) {
+		struct inode *ino = c->d_inode;
+		const char *tag = ino ? type_tag_short(ino->i_type) : "?";
+		long sz = 0;
+		if (ino && ino->i_fops && ino->i_fops->size)
+			sz = ino->i_fops->size(ino);
+		if (sz < 0) sz = 0;
+		off = append_str(out, off, cap, tag);
+		out[off++] = ' ';
+		off = append_dec(out, off, cap, (unsigned long)sz, 8);
+		out[off++] = ' ';
+		off = append_str(out, off, cap, c->d_name);
+		if (off + 1 >= cap) break;
+		out[off++] = '\n';
+	}
+	return (long)off;
+}
+
 /* ---- fd table --------------------------------------------------------- */
 
 /* Per-thread fdt lives in struct kthread (KT_FD_MAX slots).  The

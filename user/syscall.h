@@ -31,6 +31,7 @@
 #define SYS_unlink	17
 #define SYS_rmdir	18
 #define SYS_kill	19
+#define SYS_lsl		20
 
 /* POSIX signal numbers -- mirror include/kappara/signal.h. */
 #define SIGHUP		1
@@ -165,6 +166,14 @@ static inline long sys_ioctl(int fd, int cmd, long arg)
 static inline long sys_ls(const char *path, char *out, size_t cap)
 {
 	return _syscall3(SYS_ls,
+			 (long)(unsigned long)path,
+			 (long)(unsigned long)out,
+			 (long)cap);
+}
+
+static inline long sys_lsl(const char *path, char *out, size_t cap)
+{
+	return _syscall3(SYS_lsl,
 			 (long)(unsigned long)path,
 			 (long)(unsigned long)out,
 			 (long)cap);

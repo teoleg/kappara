@@ -43,8 +43,10 @@
 #define SYS_unlink	17	/* (const char *path) -> 0 / -1             */
 #define SYS_rmdir	18	/* (const char *path) -> 0 / -1             */
 #define SYS_kill	19	/* (int tid, int sig) -> 0 / -1             */
+#define SYS_lsl		20	/* same args as SYS_ls but emits "type     */
+				/* size name\n" rows (ls -l style)         */
 
-#define SYS_MAX		20
+#define SYS_MAX		21
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

@@ -94,6 +94,14 @@ struct streamtab *streams_lookup(const char *name)
 	return NULL;
 }
 
+void streams_for_each(void (*cb)(const char *name, struct streamtab *st,
+				 void *arg),
+		      void *arg)
+{
+	for (struct stmod_entry *e = registry; e; e = e->next)
+		cb(e->name, e->st, arg);
+}
+
 /* ---- Stream-head queue procedures ------------------------------------- */
 
 static int sh_rq_putp(queue_t *q, mblk_t *mp)

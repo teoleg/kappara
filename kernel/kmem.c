@@ -249,3 +249,14 @@ void *kmalloc(size_t size)
 	kprintf("kmalloc(%lu): too large\n", (unsigned long)size);
 	return NULL;
 }
+
+unsigned kmem_num_size_caches(void)
+{
+	return (unsigned)N_SIZE_CACHES;
+}
+
+const struct kmem_cache *kmem_get_size_cache(unsigned i)
+{
+	if (i >= N_SIZE_CACHES) return NULL;
+	return &size_caches[i].cache;
+}

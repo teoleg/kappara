@@ -104,6 +104,14 @@ void            kthread_wake_one (struct wait_queue *wq);
  * owns that id.  O(1) lookup via a sparse table; sys_kill uses this. */
 struct kthread *kthread_find(unsigned tid);
 
+/* Iteration helpers for /proc/ps -- the table is sparse so the
+ * caller scans 0..max-1 and skips NULLs. */
+unsigned        kthread_max_tid(void);
+struct kthread *kthread_at(unsigned tid);
+
+/* Human-readable name for a state.  Returns a small static string. */
+const char     *kthread_state_name(enum kt_state s);
+
 /* Set `sig` pending on `t`, and if `t` is parked on a wait queue
  * surgically remove it and put it on the ready queue so it wakes
  * and observes the signal.  Returns 0 on success or -1 if sig is
