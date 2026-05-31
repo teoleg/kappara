@@ -97,8 +97,14 @@ static long sys_yield(long a0, long a1, long a2, long a3, long a4, long a5)
 
 static long sys_open(long a0, long a1, long a2, long a3, long a4, long a5)
 {
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	return (long)sys_open_impl((const char *)(uintptr_t)a0, (int)a1);
+}
+
+static long sys_mkdir(long a0, long a1, long a2, long a3, long a4, long a5)
+{
 	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-	return (long)sys_open_impl((const char *)(uintptr_t)a0);
+	return (long)sys_mkdir_impl((const char *)(uintptr_t)a0);
 }
 
 static long sys_close(long a0, long a1, long a2, long a3, long a4, long a5)
@@ -223,6 +229,7 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_pipe]   = sys_pipe,
 	[SYS_creat]  = sys_creat,
 	[SYS_seek]   = sys_seek,
+	[SYS_mkdir]  = sys_mkdir,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

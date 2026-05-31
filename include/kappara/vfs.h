@@ -76,11 +76,15 @@ struct file_ops {
 	long  (*getmsg)(struct file *f, struct strbuf *c,
 			struct strbuf *d, int *flagsp);
 	long  (*seek)  (struct file *f, long offset, int whence);
-	/* Directory-side: create a new regular file named `name` under
-	 * the inode `dir`.  Returns 0 on success.  Only meaningful on
+	/* Directory-side ops: create a regular file or a subdirectory
+	 * named `name` under the inode `dir`.  Only meaningful on
 	 * directory inodes whose underlying filesystem supports it. */
 	int   (*creat) (struct inode *dir, const char *name);
+	int   (*mkdir) (struct inode *dir, const char *name);
 };
+
+/* sys_open / file open flags. */
+#define O_TRUNC		0x01	/* size -> 0 on open */
 
 struct inode {
 	enum inode_type   i_type;
@@ -101,6 +105,7 @@ struct file {
 	struct inode    *f_inode;
 	void            *f_private;
 	int              f_refs;
+	int              f_flags;	/* O_TRUNC | ...  set by sys_open */
 };
 
 /* ---- Tree management ------------------------------------------------- */
@@ -137,7 +142,8 @@ struct file  *fd_get(int fd);
 
 /* ---- Syscall implementations (dispatch through f_ops) --------------- */
 
-int   sys_open_impl(const char *path);
+int   sys_open_impl(const char *path, int flags);
+int   sys_mkdir_impl(const char *path);
 int   sys_close_impl(int fd);
 long  sys_read_impl(int fd, void *buf, size_t len);
 long  sys_write_impl(int fd, const void *buf, size_t len);

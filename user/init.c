@@ -203,6 +203,7 @@ static void cmd_help(void)
 		"  cat <path>             dump file to console\r\n"
 		"  echo <path> <text>     write text to file (overwrite)\r\n"
 		"  touch <path>           create empty file (kfs only)\r\n"
+		"  mkdir <path>           create directory (kfs only)\r\n"
 		"  append <path> <text>   append text + newline to file\r\n"
 		"  pipe                   sys_pipe demo (write + read)\r\n");
 }
@@ -262,12 +263,23 @@ static void cmd_touch(int argc, char *argv[])
 	}
 }
 
+static void cmd_mkdir(int argc, char *argv[])
+{
+	if (argc < 2) { cwrite("usage: mkdir <path>\r\n"); return; }
+	char path[128];
+	resolve_path(argv[1], path, sizeof(path));
+	long r = sys_mkdir(path);
+	if (r < 0) {
+		cwrite("mkdir: failed: "); cwrite(path); cwrite("\r\n");
+	}
+}
+
 static void cmd_append(int argc, char *argv[])
 {
 	if (argc < 3) { cwrite("usage: append <path> <text...>\r\n"); return; }
 	char path[128];
 	resolve_path(argv[1], path, sizeof(path));
-	long fd = sys_open(path);
+	long fd = sys_open(path, 0);
 	if (fd < 0) { cwrite("append: cannot open '");
 		      cwrite(path); cwrite("'\r\n"); return; }
 	if (sys_seek((int)fd, 0, SEEK_END) < 0) {
@@ -295,7 +307,7 @@ static void cmd_open(int argc, char *argv[])
 	if (fd_user >= 0) { sys_close(fd_user); fd_user = -1; }
 	char path[128];
 	resolve_path(argv[1], path, sizeof(path));
-	long fd = sys_open(path);
+	long fd = sys_open(path, 0);
 	if (fd < 0) { cwrite("open: failed\r\n"); return; }
 	fd_user = (int)fd;
 	cwrite("fd="); cprint_long(fd); cwrite("\r\n");
@@ -367,7 +379,7 @@ static void cmd_cat(int argc, char *argv[])
 	if (argc < 2) { cwrite("usage: cat <path>\r\n"); return; }
 	char path[128];
 	resolve_path(argv[1], path, sizeof(path));
-	long fd = sys_open(path);
+	long fd = sys_open(path, 0);
 	if (fd < 0) { cwrite("cat: cannot open '"); cwrite(path);
 		      cwrite("'\r\n"); return; }
 	char buf[256];
@@ -386,7 +398,7 @@ static void cmd_echo(int argc, char *argv[])
 	if (argc < 3) { cwrite("usage: echo <path> <text...>\r\n"); return; }
 	char path[128];
 	resolve_path(argv[1], path, sizeof(path));
-	long fd = sys_open(path);
+	long fd = sys_open(path, O_TRUNC);
 	if (fd < 0) { cwrite("echo: cannot open '"); cwrite(path);
 		      cwrite("'\r\n"); return; }
 
@@ -454,6 +466,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "cat"))    cmd_cat(argc, argv);
 	else if (!ustrcmp(argv[0], "echo"))   cmd_echo(argc, argv);
 	else if (!ustrcmp(argv[0], "touch"))  cmd_touch(argc, argv);
+	else if (!ustrcmp(argv[0], "mkdir"))  cmd_mkdir(argc, argv);
 	else if (!ustrcmp(argv[0], "append")) cmd_append(argc, argv);
 	else if (!ustrcmp(argv[0], "pipe"))   cmd_pipe();
 	else {
@@ -494,7 +507,7 @@ void _start(void)
 		sys_log(buf);
 	}
 
-	fd_console = (int)sys_open("/dev/console");
+	fd_console = (int)sys_open("/dev/console", 0);
 	if (fd_console < 0) {
 		sys_log("init: open /dev/console failed");
 		for (;;) sys_yield();

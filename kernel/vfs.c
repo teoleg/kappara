@@ -266,7 +266,7 @@ struct file *fd_get(int fd)
 
 /* ---- Syscall entry points -------------------------------------------- */
 
-int sys_open_impl(const char *path)
+int sys_open_impl(const char *path, int flags)
 {
 	char kpath[128];
 	const char *p;
@@ -288,7 +288,7 @@ int sys_open_impl(const char *path)
 	}
 	struct inode *ino = d->d_inode;
 	if (!ino->i_fops || !ino->i_fops->open) {
-		kprintf("sys_open: '%s' has no open op\n", path);
+		kprintf("sys_open: '%s' has no open op\n", p);
 		return -1;
 	}
 
@@ -299,6 +299,7 @@ int sys_open_impl(const char *path)
 	f->f_inode   = ino;
 	f->f_private = NULL;
 	f->f_refs    = 1;
+	f->f_flags   = flags;
 
 	if (f->f_ops->open(f) < 0) {
 		kfree(f);
@@ -313,6 +314,48 @@ int sys_open_impl(const char *path)
 		return -1;
 	}
 	return fd;
+}
+
+int sys_mkdir_impl(const char *path)
+{
+	char kpath[128];
+	const char *p;
+	if (syscall_from_user) {
+		if (strncpy_from_user(kpath, path, sizeof(kpath)) < 0) {
+			kprintf("sys_mkdir: rejected user path\n");
+			return -1;
+		}
+		p = kpath;
+	} else {
+		if (!path) return -1;
+		p = path;
+	}
+	if (p[0] != '/') return -1;
+
+	const char *last = p;
+	for (const char *q = p; *q; q++)
+		if (*q == '/') last = q;
+	size_t dirlen = (size_t)(last - p);
+	if (dirlen == 0) dirlen = 1;
+	char dirbuf[128];
+	if (dirlen >= sizeof(dirbuf)) return -1;
+	for (size_t i = 0; i < dirlen; i++) dirbuf[i] = p[i];
+	dirbuf[dirlen] = '\0';
+	const char *basename = last + 1;
+	if (!*basename) return -1;
+
+	struct dentry *d = vfs_lookup(dirbuf);
+	if (!d || !d->d_inode) {
+		kprintf("sys_mkdir: parent '%s' not found\n", dirbuf);
+		return -1;
+	}
+	struct inode *parent = d->d_inode;
+	if (parent->i_type != INODE_DIR || !parent->i_fops ||
+	    !parent->i_fops->mkdir) {
+		kprintf("sys_mkdir: '%s' does not support mkdir\n", dirbuf);
+		return -1;
+	}
+	return parent->i_fops->mkdir(parent, basename);
 }
 
 int sys_close_impl(int fd)

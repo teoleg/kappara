@@ -49,6 +49,19 @@ static int regfile_open(struct file *f)
 	c->kf  = (struct kfs_file *)f->f_inode->i_private;
 	c->pos = 0;
 	f->f_private = c;
+
+	/* O_TRUNC: zero size + push to disk so subsequent reads see EOF
+	 * immediately and `echo` style overwrites don't leak the tail of
+	 * the previous content. */
+	if (f->f_flags & O_TRUNC) {
+		struct kfs_file *kf = c->kf;
+		kf->size_bytes = 0;
+		struct kfs_dirent dir[KFS_DIRENTS];
+		if (kf->bd->bd_read(kf->bd, kf->dir_block, dir) == 0) {
+			dir[kf->dirent_idx].size_bytes = 0;
+			kf->bd->bd_write(kf->bd, kf->dir_block, dir);
+		}
+	}
 	return 0;
 }
 
@@ -169,96 +182,161 @@ static struct file_ops regfile_fops = {
  * Per-mount creat state.  Tracks the block device backing the kfs
  * mount + the next free block in the linear allocation pool.  We
  * only support one kfs mount today so this is a single static;
- * generalising to multiple mounts means moving these into a per-
- * mount object reachable via the directory inode's i_private.
+ * generalising to multiple mounts means turning kfs_mnt into a
+ * per-mount object reachable via the directory inode's i_private.
  */
 static struct {
 	struct block_device *bd;
 	uint32_t             next_free_block;
 } kfs_mnt;
 
-static int kfs_dir_creat(struct inode *dir, const char *name)
+static struct file_ops kfs_dir_fops;	/* fwd; defined below */
+
+/* Allocate one block from the linear pool and zero it.  Returns the
+ * allocated block number; updates the superblock so next_free_block
+ * survives a remount.  Returns 0 on failure (block 0 is the super,
+ * never returned as data). */
+static uint32_t kfs_alloc_block_zero(struct block_device *bd, uint32_t count)
 {
-	(void)dir;	/* single-mount; use kfs_mnt */
-	struct block_device *bd = kfs_mnt.bd;
-	if (!bd) return -1;
-
-	struct kfs_dirent dir_blk[KFS_DIRENTS];
-	if (bd->bd_read(bd, 1, dir_blk) < 0) return -1;
-
-	/* Find an empty slot.  An empty slot is one whose name[0]=='\0'. */
-	int slot = -1;
-	size_t nlen = 0;
-	while (name[nlen]) nlen++;
-	if (nlen >= KFS_NAME_MAX) return -1;
-
-	for (unsigned i = 0; i < KFS_DIRENTS; i++) {
-		if (dir_blk[i].name[0] == '\0') {
-			if (slot < 0) slot = (int)i;
-			continue;
-		}
-		/* Reject duplicates. */
-		size_t k;
-		for (k = 0; k < KFS_NAME_MAX && dir_blk[i].name[k] == name[k]; k++)
-			if (name[k] == '\0') break;
-		if (k < KFS_NAME_MAX && dir_blk[i].name[k] == name[k])
-			return -1;	/* name already exists */
-	}
-	if (slot < 0) {
-		kprintf("kfs_creat: directory full\n");
-		return -1;
-	}
-
-	/* Allocate the next KFS_BLOCKS_PER_FILE blocks and zero them. */
 	uint32_t start = kfs_mnt.next_free_block;
 	unsigned char zero[BLK_SIZE];
 	for (size_t i = 0; i < BLK_SIZE; i++) zero[i] = 0;
-	for (uint32_t b = 0; b < KFS_BLOCKS_PER_FILE; b++)
-		if (bd->bd_write(bd, start + b, zero) < 0) return -1;
-
-	/* Fill the dirent. */
-	for (size_t i = 0; i < KFS_NAME_MAX; i++) dir_blk[slot].name[i] = 0;
-	for (size_t i = 0; i < nlen; i++) dir_blk[slot].name[i] = name[i];
-	dir_blk[slot].start_block = start;
-	dir_blk[slot].size_bytes  = 0;
-
-	if (bd->bd_write(bd, 1, dir_blk) < 0) return -1;
-	kfs_mnt.next_free_block += KFS_BLOCKS_PER_FILE;
-
-	/* Update the superblock so next_free_block survives a remount. */
+	for (uint32_t b = 0; b < count; b++)
+		if (bd->bd_write(bd, start + b, zero) < 0) return 0;
+	kfs_mnt.next_free_block += count;
 	struct kfs_super sb;
 	if (bd->bd_read(bd, 0, &sb) == 0) {
 		sb.next_free_block = kfs_mnt.next_free_block;
 		bd->bd_write(bd, 0, &sb);
 	}
+	return start;
+}
 
-	/* Hook into the VFS tree.  We need a stable kmalloc'd name and
-	 * a struct kfs_file the regfile ops can use. */
-	struct kfs_file *kf = kmalloc(sizeof(*kf));
+/* Look up the dir_block to operate on for a directory inode.  The
+ * inode's i_private points at a struct kfs_dir we set up at mount
+ * (or kfs_dir_mkdir) time. */
+static struct kfs_dir *kfs_dir_of(struct inode *dir)
+{
+	return (struct kfs_dir *)dir->i_private;
+}
+
+/* Scan a dirent block for a free slot and reject duplicates.
+ * Returns the slot index or -1.  Caller already loaded dir_blk. */
+static int kfs_dir_find_slot(struct kfs_dirent *dir_blk, const char *name)
+{
+	int slot = -1;
+	size_t nlen = 0;
+	while (name[nlen]) nlen++;
+	if (nlen >= KFS_NAME_MAX) return -1;
+	for (unsigned i = 0; i < KFS_DIRENTS; i++) {
+		if (dir_blk[i].name[0] == '\0') {
+			if (slot < 0) slot = (int)i;
+			continue;
+		}
+		size_t k;
+		for (k = 0; k < KFS_NAME_MAX && dir_blk[i].name[k] == name[k]; k++)
+			if (name[k] == '\0') break;
+		if (k < KFS_NAME_MAX && dir_blk[i].name[k] == name[k])
+			return -1;	/* duplicate */
+	}
+	return slot;
+}
+
+static char *kfs_dup_name(const char *name)
+{
 	char *nm = kmalloc(KFS_NAME_MAX);
+	if (!nm) return NULL;
+	size_t i = 0;
+	for (; i < KFS_NAME_MAX - 1 && name[i]; i++) nm[i] = name[i];
+	nm[i] = '\0';
+	return nm;
+}
+
+static int kfs_dir_creat(struct inode *dir, const char *name)
+{
+	struct kfs_dir *d = kfs_dir_of(dir);
+	if (!d) return -1;
+	struct block_device *bd = d->bd;
+
+	struct kfs_dirent dir_blk[KFS_DIRENTS];
+	if (bd->bd_read(bd, d->dir_block, dir_blk) < 0) return -1;
+
+	int slot = kfs_dir_find_slot(dir_blk, name);
+	if (slot < 0) { kprintf("kfs_creat: full or dup\n"); return -1; }
+
+	uint32_t start = kfs_alloc_block_zero(bd, KFS_BLOCKS_PER_FILE);
+	if (!start) return -1;
+
+	for (size_t i = 0; i < KFS_NAME_MAX; i++) dir_blk[slot].name[i] = 0;
+	for (size_t i = 0; name[i] && i < KFS_NAME_MAX - 1; i++)
+		dir_blk[slot].name[i] = name[i];
+	dir_blk[slot].start_block = start;
+	dir_blk[slot].size_bytes  = 0;
+	dir_blk[slot].type        = KFS_TYPE_FILE;
+	if (bd->bd_write(bd, d->dir_block, dir_blk) < 0) return -1;
+
+	struct kfs_file *kf = kmalloc(sizeof(*kf));
+	char *nm = kfs_dup_name(name);
 	if (!kf || !nm) return -1;
 	kf->bd           = bd;
 	kf->start_block  = start;
 	kf->size_bytes   = 0;
 	kf->alloc_blocks = KFS_BLOCKS_PER_FILE;
+	kf->dir_block    = d->dir_block;
 	kf->dirent_idx   = (uint8_t)slot;
-	for (size_t i = 0; i < KFS_NAME_MAX; i++) nm[i] = 0;
-	for (size_t i = 0; i < nlen; i++) nm[i] = name[i];
+	vfs_mknod_regfile(d->dentry, nm, &regfile_fops, kf);
 
-	/* Find the mountpoint dentry by walking from root via the dir
-	 * inode's i_private (which we stashed there at mount time). */
-	struct dentry *mp = (struct dentry *)dir->i_private;
-	if (!mp) return -1;
-	vfs_mknod_regfile(mp, nm, &regfile_fops, kf);
-
-	kprintf("kfs_creat: '%s' slot=%d blocks=%u..%u\n",
-		name, slot, start, start + KFS_BLOCKS_PER_FILE - 1);
+	kprintf("kfs_creat: '%s' in dir_block=%u slot=%d blocks=%u..%u\n",
+		name, d->dir_block, slot, start,
+		start + KFS_BLOCKS_PER_FILE - 1);
 	return 0;
 }
 
-/* file_ops for the directory inode: only .creat is meaningful. */
+static int kfs_dir_mkdir(struct inode *dir, const char *name)
+{
+	struct kfs_dir *d = kfs_dir_of(dir);
+	if (!d) return -1;
+	struct block_device *bd = d->bd;
+
+	struct kfs_dirent dir_blk[KFS_DIRENTS];
+	if (bd->bd_read(bd, d->dir_block, dir_blk) < 0) return -1;
+
+	int slot = kfs_dir_find_slot(dir_blk, name);
+	if (slot < 0) { kprintf("kfs_mkdir: full or dup\n"); return -1; }
+
+	uint32_t subblk = kfs_alloc_block_zero(bd, 1);
+	if (!subblk) return -1;
+
+	for (size_t i = 0; i < KFS_NAME_MAX; i++) dir_blk[slot].name[i] = 0;
+	for (size_t i = 0; name[i] && i < KFS_NAME_MAX - 1; i++)
+		dir_blk[slot].name[i] = name[i];
+	dir_blk[slot].start_block = subblk;
+	dir_blk[slot].size_bytes  = 0;
+	dir_blk[slot].type        = KFS_TYPE_DIR;
+	if (bd->bd_write(bd, d->dir_block, dir_blk) < 0) return -1;
+
+	/* Hook into VFS: a new directory dentry whose i_fops route
+	 * subsequent creat/mkdir back here and whose i_private knows
+	 * the new dirent block. */
+	char *nm = kfs_dup_name(name);
+	struct kfs_dir *sub = kmalloc(sizeof(*sub));
+	if (!nm || !sub) return -1;
+	struct dentry *sub_dentry = vfs_mkdir(d->dentry, nm);
+	if (!sub_dentry) return -1;
+	sub->bd        = bd;
+	sub->dir_block = subblk;
+	sub->dentry    = sub_dentry;
+	sub_dentry->d_inode->i_fops    = &kfs_dir_fops;
+	sub_dentry->d_inode->i_private = sub;
+
+	kprintf("kfs_mkdir: '%s' dirent_block=%u under dir_block=%u slot=%d\n",
+		name, subblk, d->dir_block, slot);
+	return 0;
+}
+
 static struct file_ops kfs_dir_fops = {
 	.creat = kfs_dir_creat,
+	.mkdir = kfs_dir_mkdir,
 };
 
 /* ---- mkimage: build a fresh fs in `bd` from baked-in files --------- */
@@ -313,6 +391,7 @@ void kfs_mkimage(struct block_device *bd)
 		dir[i].start_block   = cur_block;
 		dir[i].size_bytes    = p->size;
 
+		dir[i].type        = KFS_TYPE_FILE;
 		const char *src = p->data;
 		uint32_t    rem = p->size;
 		for (uint32_t b = 0; b < KFS_BLOCKS_PER_FILE; b++) {
@@ -342,6 +421,50 @@ void kfs_mkimage(struct block_device *bd)
 
 /* ---- mount: pull metadata off the device, attach to the VFS -------- */
 
+/* Recursively walk a dir block and populate the VFS subtree rooted
+ * at vfs_parent.  Subdirectories get their own dir block + kfs_dir
+ * metadata so creat/mkdir on them lands in the right place. */
+static void kfs_mount_dir(struct block_device *bd,
+			  uint32_t dir_block,
+			  struct dentry *vfs_parent)
+{
+	struct kfs_dirent dir[KFS_DIRENTS];
+	if (bd->bd_read(bd, dir_block, dir) < 0)
+		return;
+
+	for (unsigned i = 0; i < KFS_DIRENTS; i++) {
+		if (dir[i].name[0] == '\0')
+			continue;
+
+		char *nm = kfs_dup_name(dir[i].name);
+		if (!nm) continue;
+
+		if (dir[i].type == KFS_TYPE_DIR) {
+			struct kfs_dir *sub = kmalloc(sizeof(*sub));
+			if (!sub) { kfree(nm); continue; }
+			struct dentry *sd = vfs_mkdir(vfs_parent, nm);
+			if (!sd) { kfree(nm); kfree(sub); continue; }
+			sub->bd        = bd;
+			sub->dir_block = dir[i].start_block;
+			sub->dentry    = sd;
+			sd->d_inode->i_fops    = &kfs_dir_fops;
+			sd->d_inode->i_private = sub;
+			kfs_mount_dir(bd, dir[i].start_block, sd);
+		} else {
+			struct kfs_file *kf = kmalloc(sizeof(*kf));
+			if (!kf) { kfree(nm); continue; }
+			kf->bd           = bd;
+			kf->start_block  = dir[i].start_block;
+			kf->size_bytes   = dir[i].size_bytes;
+			kf->alloc_blocks = KFS_BLOCKS_PER_FILE;
+			kf->dir_block    = dir_block;
+			kf->dirent_idx   = (uint8_t)i;
+			vfs_mknod_regfile(vfs_parent, nm,
+					  &regfile_fops, kf);
+		}
+	}
+}
+
 int kfs_mount(struct block_device *bd, struct dentry *mountpoint)
 {
 	struct kfs_super sb;
@@ -355,46 +478,23 @@ int kfs_mount(struct block_device *bd, struct dentry *mountpoint)
 		return -1;
 	}
 
-	/* Publish creat capability on the mountpoint's inode and remember
-	 * the dentry so kfs_dir_creat can hand new file dentries to the
-	 * VFS via vfs_mknod_regfile. */
 	kfs_mnt.bd              = bd;
 	kfs_mnt.next_free_block = sb.next_free_block;
+
+	/* Publish creat/mkdir on the mountpoint's inode and stash a
+	 * kfs_dir so kfs_dir_creat / kfs_dir_mkdir know which dir
+	 * block to operate on. */
+	struct kfs_dir *root = kmalloc(sizeof(*root));
+	if (!root) return -1;
+	root->bd        = bd;
+	root->dir_block = 1;
+	root->dentry    = mountpoint;
 	mountpoint->d_inode->i_fops    = &kfs_dir_fops;
-	mountpoint->d_inode->i_private = mountpoint;
+	mountpoint->d_inode->i_private = root;
 
-	struct kfs_dirent dir[KFS_DIRENTS];
-	if (bd->bd_read(bd, 1, dir) < 0) {
-		kprintf("kfs_mount: directory read failed\n");
-		return -1;
-	}
+	kfs_mount_dir(bd, 1, mountpoint);
 
-	unsigned n = sb.num_files;
-	if (n > KFS_DIRENTS) n = KFS_DIRENTS;
-
-	for (unsigned i = 0; i < n; i++) {
-		struct kfs_file *kf = kmalloc(sizeof(*kf));
-		if (!kf) continue;
-		kf->bd           = bd;
-		kf->start_block  = dir[i].start_block;
-		kf->size_bytes   = dir[i].size_bytes;
-		kf->alloc_blocks = KFS_BLOCKS_PER_FILE;
-		kf->dirent_idx   = (uint8_t)i;
-
-		/* dir[i].name is in our stack-local buffer; the dentry
-		 * stores d_name as a raw pointer (callers like vfs_mkdir
-		 * usually pass string literals).  Make a kmalloc copy
-		 * with stable lifetime. */
-		char *nm = kmalloc(KFS_NAME_MAX);
-		if (!nm) { kfree(kf); continue; }
-		for (int j = 0; j < KFS_NAME_MAX; j++)
-			nm[j] = dir[i].name[j];
-		nm[KFS_NAME_MAX - 1] = '\0';
-
-		vfs_mknod_regfile(mountpoint, nm, &regfile_fops, kf);
-	}
-
-	kprintf("kfs: mounted '%s' on /%s (%u files)\n",
-		bd->bd_name, mountpoint->d_name, n);
+	kprintf("kfs: mounted '%s' on /%s\n",
+		bd->bd_name, mountpoint->d_name);
 	return 0;
 }

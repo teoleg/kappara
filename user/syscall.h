@@ -25,10 +25,13 @@
 #define SYS_pipe	11
 #define SYS_creat	12
 #define SYS_seek	13
+#define SYS_mkdir	14
 
 #define SEEK_SET	0
 #define SEEK_CUR	1
 #define SEEK_END	2
+
+#define O_TRUNC		0x01
 
 typedef long ssize_t;
 typedef unsigned long size_t;
@@ -74,9 +77,20 @@ static inline long sys_write(int fd, const void *buf, size_t n)
 	return _syscall3(SYS_write, fd, (long)(unsigned long)buf, (long)n);
 }
 
-static inline long sys_open(const char *path)
+static inline long sys_open(const char *path, int flags)
 {
-	return _syscall1(SYS_open, (long)(unsigned long)path);
+	register long x0 __asm__("x0") = (long)(unsigned long)path;
+	register long x1 __asm__("x1") = (long)flags;
+	register long x8 __asm__("x8") = SYS_open;
+	__asm__ volatile ("svc #0"
+			  : "+r"(x0) : "r"(x1), "r"(x8)
+			  : "memory", "cc");
+	return x0;
+}
+
+static inline long sys_mkdir(const char *path)
+{
+	return _syscall1(SYS_mkdir, (long)(unsigned long)path);
 }
 
 static inline long sys_close(int fd)

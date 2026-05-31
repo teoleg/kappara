@@ -49,12 +49,18 @@ struct kfs_super {
 };
 
 #define KFS_NAME_MAX	24
-#define KFS_DIRENTS	16		/* per directory block */
+#define KFS_DIRENTS	14		/* per directory block (36-byte slots) */
+
+#define KFS_TYPE_FILE	0
+#define KFS_TYPE_DIR	1
 
 struct kfs_dirent {
 	char		name[KFS_NAME_MAX];
-	uint32_t	start_block;
-	uint32_t	size_bytes;
+	uint32_t	start_block;	/* for files: first data block      */
+					/* for dirs:  block of the subdir's */
+					/*            own dirent table       */
+	uint32_t	size_bytes;	/* file size in bytes; 0 for dirs   */
+	uint32_t	type;		/* KFS_TYPE_FILE / _DIR             */
 };
 
 /* Each file is given a fixed number of contiguous blocks at mkimage
@@ -68,7 +74,20 @@ struct kfs_file {
 	uint32_t		 start_block;
 	uint32_t		 size_bytes;
 	uint32_t		 alloc_blocks;	/* fixed at mkimage */
-	uint8_t			 dirent_idx;	/* slot in the dir block */
+	uint32_t		 dir_block;	/* block of the parent dir's   */
+						/* dirent table (so we can     */
+						/* push size updates back)     */
+	uint8_t			 dirent_idx;	/* slot in that dir block */
+};
+
+/* In-memory per-directory metadata.  Directory inodes' i_private
+ * points to one of these.  The mountpoint's dir_block is 1 (the
+ * root directory block written by kfs_mkimage); subdirs get their
+ * own block when created by kfs_dir_mkdir. */
+struct kfs_dir {
+	struct block_device	*bd;
+	uint32_t		 dir_block;
+	struct dentry		*dentry;
 };
 
 /* Forward decl for vfs.h dependency. */
