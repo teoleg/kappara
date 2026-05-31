@@ -76,15 +76,19 @@ _start:
 .Lpark:
 	/* Park the secondary cores until SMP arrives.
 	 *
-	 * Use WFI, not WFE.  WFE can wake spuriously when any core
-	 * executes a DSB/STREX/SEV anywhere in the system -- in QEMU
-	 * TCG that turns "wfe; b ." into a tight loop that burns a
-	 * host CPU each.  WFI sleeps until an interrupt actually
-	 * fires, and since timer_init routes CNTPNSIRQ only to core
-	 * 0, the secondary cores have nothing wired and stay asleep.
-	 * QEMU's vCPU threads block, host CPU usage drops. */
-	msr	daifset, #0xf	/* mask everything so a spurious IRQ
-				 * can't drag us back into b .Lpark */
+	 * Use WFI, not WFE.  WFE wakes on the global event register
+	 * which gets set by any DSB/STREX/SEV anywhere in the system,
+	 * so the old "wfe; b ." loop burned a host CPU per vCPU under
+	 * QEMU TCG.  WFI sleeps until a real interrupt, and since
+	 * timer_init routes CNTPNSIRQ only to core 0, secondary cores
+	 * have nothing wired and stay asleep.
+	 *
+	 * Don't touch DAIF here -- secondary cores are still at EL2
+	 * at this point (boot.S only drops to EL1 on core 0), and at
+	 * least one QEMU TCG version segfaults on "msr daifset; wfi"
+	 * from EL2 on the raspi3b model.  WFI on its own is enough:
+	 * the cores in EL2 have no interrupts routed in either, so
+	 * they sleep just as well without the explicit mask. */
 	wfi
 	b	.Lpark
 

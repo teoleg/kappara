@@ -161,6 +161,24 @@ $(KERNEL): $(ELF)
 run: $(KERNEL)
 	$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL)
 
+# Pi/Debian host friendly defaults: no display window, single-thread
+# TCG so QEMU can't spin more than one host CPU even when WFI on the
+# raspi3b model doesn't properly idle the vCPU threads.  Wrap in
+# taskset -c 0 if you also want to cap that one core's wall usage.
+ifeq ($(ARCH),aarch64)
+.PHONY: run-thrifty run-gui
+run-thrifty: $(KERNEL)
+	$(QEMU) -M raspi3b -display none -accel tcg,thread=single \
+	        -serial mon:stdio -serial null -kernel $(KERNEL)
+
+# Boot with the splash window.  Only safe where QEMU's display
+# backend works (X / Wayland with the right libs); on some headless
+# / Pi setups the GTK init segfaults the QEMU process.  Falls back
+# to -serial mon:stdio for the shell.
+run-gui: $(KERNEL)
+	$(QEMU) -M raspi3b -serial mon:stdio -kernel $(KERNEL)
+endif
+
 clean:
 	rm -rf build
 
