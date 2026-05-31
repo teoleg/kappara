@@ -53,6 +53,7 @@
 #include "kappara/kmem.h"
 #include "kappara/printk.h"
 #include "kappara/sched.h"
+#include "kappara/signal.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
 #include "kappara/string.h"
@@ -93,11 +94,26 @@ struct streamtab *streams_lookup(const char *name)
 	return NULL;
 }
 
+void streams_for_each(void (*cb)(const char *name, struct streamtab *st,
+				 void *arg),
+		      void *arg)
+{
+	for (struct stmod_entry *e = registry; e; e = e->next)
+		cb(e->name, e->st, arg);
+}
+
 /* ---- Stream-head queue procedures ------------------------------------- */
 
 static int sh_rq_putp(queue_t *q, mblk_t *mp)
 {
 	putq(q, mp);
+	/* Wake any reader parked on this stream head's read queue.
+	 * q_ptr was wired to the owning stdata in stream_build so we
+	 * can hop back from the queue to its waitq without a global
+	 * lookup. */
+	struct stdata *sd = q->q_ptr;
+	if (sd)
+		kthread_wake_all(&sd->sd_readwait);
 	return 0;
 }
 
@@ -455,10 +471,21 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name)
 	head_wq->q_next = drv_wq;	/* writes go down: head -> drv */
 	drv_rq->q_next  = head_rq;	/* reads go up:    drv -> head */
 
-	sd->sd_rq   = head_rq;
-	sd->sd_wq   = head_wq;
-	sd->sd_refs = 1;
-	sd->sd_name = name;
+	sd->sd_rq     = head_rq;
+	sd->sd_wq     = head_wq;
+	sd->sd_drv_rq = drv_rq;
+	sd->sd_drv_wq = drv_wq;
+	sd->sd_refs   = 1;
+	sd->sd_name   = name;
+	sd->sd_flags  = 0;
+	sd->sd_peer   = NULL;
+	sd->sd_readwait.head = NULL;
+
+	/* Backref so sh_rq_putp can wake readers without a global
+	 * queue->stdata lookup.  The driver-side queues are not seen
+	 * by readers, so only the head queues need the wiring. */
+	head_rq->q_ptr = sd;
+	head_wq->q_ptr = sd;
 
 	/* First open of /dev/console captures the RX feed.  Subsequent
 	 * opens become write-only (uart_rx_main only feeds one stream). */
@@ -490,10 +517,81 @@ static int stream_open(struct file *f)
 	return 0;
 }
 
+/* Drain every mblk queued on `q` and free them.  Safe on NULL. */
+static void drain_q(queue_t *q)
+{
+	if (!q) return;
+	mblk_t *mp;
+	while ((mp = getq(q)) != NULL)
+		freemsg(mp);
+}
+
 static int stream_close(struct file *f)
 {
-	/* TODO: walk and free the queue stack + drain. */
+	struct stdata *sd = f->f_private;
+	if (!sd) return 0;
+
+	/* If this is one end of a pipe, the peer's reader sees EOF
+	 * now that no more writers can reach it.  Wake any reader
+	 * parked in stream_read so they observe SD_EOF and return 0
+	 * instead of sleeping forever.  Both sides null their sd_peer
+	 * so the peer's later close doesn't chase a freed pointer. */
+	if (sd->sd_peer) {
+		struct stdata *peer = sd->sd_peer;
+		peer->sd_flags |= SD_EOF;
+		peer->sd_peer   = NULL;
+		sd->sd_peer     = NULL;
+		kthread_wake_all(&peer->sd_readwait);
+	}
+
 	f->f_private = NULL;
+	if (--sd->sd_refs > 0)
+		return 0;
+
+	/* Don't leave uart_rx pointing at a stream we're about to
+	 * free.  In practice init never closes /dev/console, so this
+	 * branch is defensive. */
+	if (console_active == sd)
+		console_active = NULL;
+
+	/* Last reference: free the queue stack + stdata.  Order:
+	 *   1. drain any queued mblks so the buffers go back to slab
+	 *   2. walk head_wq down via q_next freeing each module pair
+	 *      until we hit the driver pair (recorded separately)
+	 *      or NULL (pipe case: the chain points at the peer, not
+	 *      our own queues, so we stop at the head pair)
+	 *   3. free the driver pair (NULL for pipes)
+	 *   4. free stdata itself
+	 *
+	 * Pipe special-case: sd_wq->q_next was set to the peer's rq
+	 * for cross-wiring; we must NOT walk past our own head pair
+	 * in that case.  Detect by sd_drv_wq == NULL. */
+	drain_q(sd->sd_rq);
+	drain_q(sd->sd_wq);
+
+	if (sd->sd_drv_wq) {
+		/* Free any pushed-module pairs sitting between head and
+		 * driver. */
+		queue_t *q = sd->sd_wq->q_next;
+		while (q && q != sd->sd_drv_wq) {
+			queue_t *next = q->q_next;
+			queue_t *peer_q = q->q_link;
+			drain_q(q);
+			drain_q(peer_q);
+			kfree(q);
+			kfree(peer_q);
+			q = next;
+		}
+		/* Now the driver pair. */
+		drain_q(sd->sd_drv_rq);
+		drain_q(sd->sd_drv_wq);
+		kfree(sd->sd_drv_rq);
+		kfree(sd->sd_drv_wq);
+	}
+
+	kfree(sd->sd_rq);
+	kfree(sd->sd_wq);
+	kfree(sd);
 	return 0;
 }
 
@@ -523,9 +621,27 @@ static long stream_read(struct file *f, void *buf, size_t len)
 	struct stdata *sd = f->f_private;
 	if (!sd)
 		return -1;
-	mblk_t *mp = getq(sd->sd_rq);
-	if (!mp)
-		return 0;
+
+	/* Block until something arrives on the head's read queue, or
+	 * the peer closes (SD_EOF) and the backlog is drained.  The
+	 * SD_EOF check after getq is what gives us proper Unix EOF
+	 * semantics: drained data is still returned before the 0. */
+	mblk_t *mp;
+	for (;;) {
+		mp = getq(sd->sd_rq);
+		if (mp) break;
+		if (sd->sd_flags & SD_EOF)
+			return 0;	/* EOF -- no more writers */
+		/* A pending fatal signal short-circuits the read so the
+		 * thread can exit cleanly in check_signals on the way
+		 * back out of the syscall.  Mirrors EINTR on real Unix
+		 * (we don't surface errno yet). */
+		if (cur && (cur->sig_pending & SIG_FATAL_MASK))
+			return -1;
+		kthread_sleep_on(&sd->sd_readwait);
+		if (cur && (cur->sig_pending & SIG_FATAL_MASK))
+			return -1;
+	}
 
 	/*
 	 * Walk the b_cont chain copying out bytes, advancing each mblk's
@@ -730,10 +846,17 @@ static struct stdata *pipe_end(const char *name)
 	if (!sd || !rq || !wq)
 		return NULL;
 	queue_init_pair(rq, wq, &sh_rinit, &sh_winit);
-	sd->sd_rq   = rq;
-	sd->sd_wq   = wq;
-	sd->sd_refs = 1;
-	sd->sd_name = name;
+	sd->sd_rq     = rq;
+	sd->sd_wq     = wq;
+	sd->sd_drv_rq = NULL;	/* no driver for pipes */
+	sd->sd_drv_wq = NULL;
+	sd->sd_refs   = 1;
+	sd->sd_name   = name;
+	sd->sd_flags  = 0;
+	sd->sd_peer   = NULL;
+	sd->sd_readwait.head = NULL;
+	rq->q_ptr = sd;	/* so sh_rq_putp can wake readers */
+	wq->q_ptr = sd;
 	return sd;
 }
 
@@ -747,6 +870,12 @@ long sys_pipe_impl(int fds[2])
 	/* Cross-wire: writes on A land on B's rq, and vice versa. */
 	a->sd_wq->q_next = b->sd_rq;
 	b->sd_wq->q_next = a->sd_rq;
+
+	/* Pipe-peer pointers: when one end closes, stream_close uses
+	 * these to set SD_EOF on the OTHER end (since the closer's
+	 * writes were the only thing feeding the peer's read queue). */
+	a->sd_peer = b;
+	b->sd_peer = a;
 
 	struct file *fa = kmalloc(sizeof(*fa));
 	struct file *fb = kmalloc(sizeof(*fb));

@@ -30,10 +30,17 @@
 void fbcon_putc_tee   (char c);
 void fbcon_tee_flush  (void);
 void fbcon_init_cursor(uint32_t y);
+/* Toggle the kprintf-to-framebuffer mirror.  Off by default --
+ * the splash still renders (it goes through framebuffer_* directly,
+ * not the tee), but the kernel log stays on UART so QEMU's display
+ * refresh thread doesn't fight per-character fbcon writes for the
+ * same 3 MB region. */
+void fbcon_tee_enable (int on);
 #else
 static inline void fbcon_putc_tee   (char c)        { (void)c; }
 static inline void fbcon_tee_flush  (void)          { }
 static inline void fbcon_init_cursor(uint32_t y)    { (void)y; }
+static inline void fbcon_tee_enable (int on)        { (void)on; }
 #endif
 
 #endif

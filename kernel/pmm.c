@@ -86,6 +86,7 @@ static void zero_page(void *p)
 
 void pmm_free(void *p)
 {
+	if (!p) return;	/* defensive: never crash on free(NULL) */
 	uintptr_t pa = (uintptr_t)p;
 	*(uintptr_t *)pa = freelist;
 	freelist = pa;

@@ -78,6 +78,13 @@ SECTIONS
 	. = ALIGN(8);
 	__bss_end = .;
 
+	/* Kernel symbol table for backtrace.  Placed after BSS so its
+	 * size doesn't shift any code/data addresses between the two
+	 * link passes -- see tools/gen_kallsyms.sh. */
+	.kallsyms : ALIGN(8) {
+		*(.kallsyms)
+	}
+
 	. = ALIGN(4096);
 	__kernel_end = .;
 

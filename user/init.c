@@ -272,6 +272,7 @@ static void cmd_help(void)
 		"  pwd                    print current directory\r\n"
 		"  cd [path]              change current directory\r\n"
 		"  ls [path]              list a directory\r\n"
+		"  lsl [path]             list with type + size (ls -l)\r\n"
 		"  open <path>            open and remember as $fd\r\n"
 		"  close                  close $fd\r\n"
 		"  read [n]               read up to n bytes from $fd\r\n"
@@ -280,6 +281,7 @@ static void cmd_help(void)
 		"  pop                    ioctl(I_POP) on $fd\r\n"
 		"  cat <path>             dump file to console\r\n"
 		"  echo <path> <text>     write text to file (overwrite)\r\n"
+		"  ked <path>             tiny ed-like line editor\r\n"
 		"  touch <path>           create empty file (kfs only)\r\n"
 		"  mkdir <path>           create directory (kfs only)\r\n"
 		"  rm <path>              remove file\r\n"
@@ -287,7 +289,9 @@ static void cmd_help(void)
 		"  append <path> <text>   append text + newline to file\r\n"
 		"  pipe                   sys_pipe demo (write + read)\r\n"
 		"  spawn [arg]            sys_spawn a worker thread\r\n"
-		"  pipework               sys_pipe + two spawned workers\r\n");
+		"  pipework               sys_pipe + two spawned workers\r\n"
+		"  kill <tid> [sig]       POSIX signal numbers (default SIGTERM=15)\r\n"
+		"  crash                  spawn a thread that dereferences NULL\r\n");
 }
 
 static void cmd_pid(void)
@@ -310,6 +314,28 @@ static void cmd_ls(int argc, char *argv[])
 	long n = sys_ls(path, out, sizeof(out));
 	if (n < 0) {
 		cwrite("ls: cannot access '"); cwrite(path); cwrite("'\r\n");
+		return;
+	}
+	for (long i = 0; i < n; i++) {
+		if (out[i] == '\n') cputc('\r');
+		cputc(out[i]);
+	}
+}
+
+static void cmd_lsl(int argc, char *argv[])
+{
+	char path[128];
+	if (argc > 1)
+		resolve_path(argv[1], path, sizeof(path));
+	else {
+		size_t i = 0;
+		while (cwd[i]) { path[i] = cwd[i]; i++; }
+		path[i] = '\0';
+	}
+	char out[512];
+	long n = sys_lsl(path, out, sizeof(out));
+	if (n < 0) {
+		cwrite("lsl: cannot access '"); cwrite(path); cwrite("'\r\n");
 		return;
 	}
 	for (long i = 0; i < n; i++) {
@@ -524,6 +550,282 @@ static void cmd_echo(int argc, char *argv[])
 	sys_close((int)fd);
 }
 
+/* -------- ked: a tiny ed-like line editor -------- */
+
+/*
+ * ked: tiny line editor in the spirit of Unix ed(1).
+ *
+ * The buffer is a fixed 2-D char array (no malloc in userland).  Line
+ * numbers are 1-based; line 0 means "before the first line" -- used
+ * by `0a` to append at the very top.  `$` and `.` are addresses for
+ * "last line" and "current line" respectively, the same ed shorthand.
+ *
+ * Commands (only what's actually useful)
+ * --------------------------------------
+ *   <addr>            move to addr and print that line
+ *   p, <range>p       print line(s); `,p` is `1,$p`
+ *   a, <addr>a        append after addr (or current); end with a "." line
+ *   i, <addr>i        insert before addr
+ *   d, <range>d       delete line(s)
+ *   w                 write back to the file
+ *   q                 quit (refuses if dirty)
+ *   q!                force quit
+ *   empty             advance one line and print
+ *
+ * The split between command-mode read (one line at the ed prompt) and
+ * insert-mode read (text lines until ".") both use simple_read_line --
+ * no history, no arrow keys -- because that's what ed feels like and
+ * we don't want stray VT100 escapes ending up in the file.
+ */
+
+#define KED_MAX_LINES	64
+#define KED_MAX_LINE	120
+
+static struct {
+	char	path[64];
+	char	lines[KED_MAX_LINES][KED_MAX_LINE];
+	int	nlines;
+	int	cur;	/* 1..nlines; 0 means "no current line" (empty buf) */
+	int	dirty;
+} ked;
+
+/* Bare-bones line read: backspace works, no history, no escape parsing.
+ * Suitable for ed insert mode where stray VT100 sequences would land
+ * in the file, and for the ed command line itself. */
+static void simple_read_line(char *buf, size_t cap)
+{
+	size_t i = 0;
+	for (;;) {
+		int c = read_one();
+		if (c < 0) { sys_yield(); continue; }
+		if (c == '\r' || c == '\n') { cwrite("\r\n"); break; }
+		if (c == 0x08 || c == 0x7F) {
+			if (i > 0) { i--; cwrite("\b \b"); }
+			continue;
+		}
+		if (i + 1 < cap) {
+			buf[i++] = (char)c;
+			cputc((char)c);
+		}
+	}
+	buf[i] = '\0';
+}
+
+static void ked_copy_str(char *dst, const char *src, size_t cap)
+{
+	size_t i = 0;
+	for (; src[i] && i < cap - 1; i++) dst[i] = src[i];
+	dst[i] = '\0';
+}
+
+static int ked_load(const char *path)
+{
+	ked.nlines = 0;
+	ked.cur    = 0;
+	ked.dirty  = 0;
+	ked_copy_str(ked.path, path, sizeof(ked.path));
+
+	long fd = sys_open(path, 0);
+	if (fd < 0) {
+		/* Treat as a new file -- empty buffer is fine. */
+		return 0;
+	}
+	char buf[256];
+	int  line_idx = 0;
+	int  col      = 0;
+	long n;
+	while ((n = sys_read((int)fd, buf, sizeof(buf))) > 0) {
+		for (long i = 0; i < n; i++) {
+			char c = buf[i];
+			if (c == '\n') {
+				if (line_idx < KED_MAX_LINES) {
+					ked.lines[line_idx][col] = '\0';
+					line_idx++;
+				}
+				col = 0;
+			} else if (col < KED_MAX_LINE - 1
+				   && line_idx < KED_MAX_LINES) {
+				ked.lines[line_idx][col++] = c;
+			}
+		}
+	}
+	/* File without trailing newline -- keep the last partial line. */
+	if (col > 0 && line_idx < KED_MAX_LINES) {
+		ked.lines[line_idx][col] = '\0';
+		line_idx++;
+	}
+	sys_close((int)fd);
+	ked.nlines = line_idx;
+	ked.cur    = ked.nlines;	/* ed: addr after load = last line */
+	return 0;
+}
+
+static int ked_save(void)
+{
+	long fd = sys_open(ked.path, O_TRUNC);
+	if (fd < 0) {
+		/* File didn't exist -- create it then reopen with TRUNC. */
+		if (sys_creat(ked.path) < 0) {
+			cwrite("ked: cannot create '");
+			cwrite(ked.path); cwrite("'\r\n");
+			return -1;
+		}
+		fd = sys_open(ked.path, O_TRUNC);
+		if (fd < 0) return -1;
+	}
+	long total = 0;
+	for (int i = 0; i < ked.nlines; i++) {
+		size_t len = ustrlen(ked.lines[i]);
+		sys_write((int)fd, ked.lines[i], len);
+		sys_write((int)fd, "\n", 1);
+		total += (long)len + 1;
+	}
+	sys_close((int)fd);
+	ked.dirty = 0;
+	cprint_long(total); cwrite(" bytes\r\n");
+	return 0;
+}
+
+static void ked_print_range(int from, int to)
+{
+	if (from < 1) from = 1;
+	if (to > ked.nlines) to = ked.nlines;
+	for (int i = from; i <= to; i++) {
+		cprint_long(i); cwrite(": ");
+		cwrite(ked.lines[i - 1]);
+		cwrite("\r\n");
+	}
+	if (to >= from) ked.cur = to;
+}
+
+/* Read insert-mode lines until a lone "." and splice them in after
+ * the given address (0 = at the very top). */
+static void ked_insert_after(int after)
+{
+	for (;;) {
+		char line[KED_MAX_LINE];
+		simple_read_line(line, sizeof(line));
+		if (line[0] == '.' && line[1] == '\0') break;
+		if (ked.nlines >= KED_MAX_LINES) {
+			cwrite("ked: buffer full\r\n"); break;
+		}
+		for (int i = ked.nlines; i > after; i--)
+			ked_copy_str(ked.lines[i], ked.lines[i - 1],
+				     KED_MAX_LINE);
+		ked_copy_str(ked.lines[after], line, KED_MAX_LINE);
+		ked.nlines++;
+		after++;
+		ked.cur   = after;
+		ked.dirty = 1;
+	}
+}
+
+static void ked_delete_line(int n)
+{
+	if (n < 1 || n > ked.nlines) return;
+	for (int i = n - 1; i < ked.nlines - 1; i++)
+		ked_copy_str(ked.lines[i], ked.lines[i + 1], KED_MAX_LINE);
+	ked.nlines--;
+	ked.dirty = 1;
+	if (ked.cur > ked.nlines) ked.cur = ked.nlines;
+}
+
+/* Parse a single ed address from *p (numeric, '.', '$').  Returns the
+ * resolved line number, or -1 if no address was present.  Advances *p
+ * past whatever it consumed. */
+static int ked_parse_addr(const char **p)
+{
+	if (**p == '.') { (*p)++; return ked.cur; }
+	if (**p == '$') { (*p)++; return ked.nlines; }
+	int n = 0, has = 0;
+	while (**p >= '0' && **p <= '9') {
+		n = n * 10 + (**p - '0');
+		(*p)++;
+		has = 1;
+	}
+	return has ? n : -1;
+}
+
+/* Returns 1 if the command was `q` or `q!` and we should exit ked. */
+static int ked_dispatch(const char *line)
+{
+	const char *p = line;
+	int from = ked_parse_addr(&p);
+	int to   = from;
+	if (*p == ',') {
+		p++;
+		int t = ked_parse_addr(&p);
+		to   = (t   < 0) ? ked.nlines : t;
+		if (from < 0) from = 1;
+	}
+	char cmd = *p ? *p++ : '\0';
+	int force = 0;
+	if (*p == '!') { force = 1; p++; }
+
+	if (cmd == '\0') {
+		/* Empty input + no address -> advance one line. */
+		int n = (from > 0) ? from : ked.cur + 1;
+		if (n < 1 || n > ked.nlines) { cwrite("?\r\n"); return 0; }
+		ked.cur = n;
+		ked_print_range(n, n);
+		return 0;
+	}
+
+	switch (cmd) {
+	case 'p':
+		if (from < 0) from = ked.cur;
+		if (to   < 0) to   = from;
+		if (from < 1 || from > ked.nlines) { cwrite("?\r\n"); break; }
+		ked_print_range(from, to);
+		break;
+	case 'a':
+		ked_insert_after(from > 0 ? from : ked.cur);
+		break;
+	case 'i': {
+		int at = (from > 0) ? from : ked.cur;
+		if (at > 0) at--;
+		ked_insert_after(at);
+		break;
+	}
+	case 'd':
+		if (from < 0) from = ked.cur;
+		if (to   < 0) to   = from;
+		if (from < 1 || from > ked.nlines) { cwrite("?\r\n"); break; }
+		for (int i = to; i >= from; i--) ked_delete_line(i);
+		break;
+	case 'w':
+		ked_save();
+		break;
+	case 'q':
+		if (ked.dirty && !force) {
+			cwrite("ked: unsaved changes (use q!)\r\n");
+			return 0;
+		}
+		return 1;
+	default:
+		cwrite("?\r\n");
+		break;
+	}
+	return 0;
+}
+
+static void cmd_ked(int argc, char *argv[])
+{
+	if (argc < 2) { cwrite("usage: ked <path>\r\n"); return; }
+	char path[128];
+	resolve_path(argv[1], path, sizeof(path));
+	if (ked_load(path) < 0) { cwrite("ked: load failed\r\n"); return; }
+	cwrite("ked: "); cwrite(path); cwrite(" (");
+	cprint_long(ked.nlines); cwrite(" lines)\r\n");
+
+	for (;;) {
+		cwrite("* ");
+		char cmd[80];
+		simple_read_line(cmd, sizeof(cmd));
+		if (ked_dispatch(cmd)) break;
+	}
+}
+
 /*
  * Spawnable worker.  cmd_spawn hands sys_spawn a function pointer to
  * this; the kernel sets the new thread up at EL0 with arg in x0.
@@ -537,20 +839,26 @@ static void cmd_echo(int argc, char *argv[])
 __attribute__((used))
 static void worker_main(long arg)
 {
-	for (int i = 0; i < 3; i++) {
-		char buf[80];
-		const char *p = "worker: tid=";
-		char *q = buf;
-		while (*p) *q++ = *p++;
-		q = udec(q, sys_getpid());
-		const char *p2 = " arg=";
-		while (*p2) *q++ = *p2++;
-		q = udec(q, arg);
-		const char *p3 = " iter=";
-		while (*p3) *q++ = *p3++;
-		udec(q, i);
-		sys_log(buf);
-		for (int j = 0; j < 10; j++) sys_yield();
+	/* Loop "forever" -- enough iterations that an interactive
+	 * `kill <tid>` has time to land.  Each sys_yield is an SVC,
+	 * so check_signals on its way back means a pending fatal
+	 * signal terminates the worker within one tick. */
+	for (int i = 0; i < 100000; i++) {
+		if ((i % 20000) == 0) {
+			char buf[80];
+			const char *p = "worker: tid=";
+			char *q = buf;
+			while (*p) *q++ = *p++;
+			q = udec(q, sys_getpid());
+			const char *p2 = " arg=";
+			while (*p2) *q++ = *p2++;
+			q = udec(q, arg);
+			const char *p3 = " iter=";
+			while (*p3) *q++ = *p3++;
+			udec(q, i);
+			sys_log(buf);
+		}
+		sys_yield();
 	}
 	sys_exit();
 }
@@ -562,6 +870,39 @@ static void cmd_spawn(int argc, char *argv[])
 	cwrite("spawn: tid=");
 	cprint_long(tid);
 	cwrite("\r\n");
+}
+
+/* Spawnable bad-thread: dereferences NULL on purpose.  Used to
+ * exercise the trap-from-EL0 -> SIGSEGV path without taking the
+ * shell down with it. */
+__attribute__((used))
+static void crash_main(long arg)
+{
+	(void)arg;
+	sys_log("crash: about to deref NULL");
+	volatile int *p = (volatile int *)0;
+	*p = 1;	/* should trap; kernel kills us with SIGSEGV */
+	sys_log("crash: still alive (BUG -- kernel let us through)");
+	sys_exit();
+}
+
+static void cmd_crash(int argc, char *argv[])
+{
+	(void)argc; (void)argv;
+	long tid = sys_spawn(crash_main, 0);
+	cwrite("crash: spawned tid="); cprint_long(tid); cwrite("\r\n");
+}
+
+/* kill <tid> [sig]  -- POSIX numbering; default is SIGTERM (15). */
+static void cmd_kill(int argc, char *argv[])
+{
+	if (argc < 2) { cwrite("usage: kill <tid> [sig]\r\n"); return; }
+	int tid = (int)uparse_long(argv[1]);
+	int sig = (argc > 2) ? (int)uparse_long(argv[2]) : SIGTERM;
+	long r  = sys_kill(tid, sig);
+	if (r < 0) { cwrite("kill: failed\r\n"); return; }
+	cwrite("kill: sig "); cprint_long(sig);
+	cwrite(" -> tid "); cprint_long(tid); cwrite("\r\n");
 }
 
 static void cmd_pipe(void)
@@ -591,31 +932,48 @@ static void cmd_pipe(void)
 
 /*
  * Pipework demo: spawn two worker threads connected by a pipe.
- * The writer puts a message on the pipe and exits; the reader
- * polls until something shows up and logs it.  Both share the
- * shell's fd table since we don't have per-process fds yet --
- * fine, the workers each get their own end and close it when
- * they're done.
+ * The writer puts a message and exits, dropping its end.  The
+ * reader does blocking reads until it sees EOF -- which happens
+ * once the file's refcount hits zero, i.e. once every other
+ * holder of the write end has also closed.  That's why ksh
+ * closes its own copies of both ends after spawning, the same
+ * "parent closes after fork" pattern Unix uses.
  */
+/* Workers inherit BOTH pipe ends from the shell (spawn copies the
+ * parent's fd table).  The POSIX pattern is for each side to close
+ * the end it doesn't use; otherwise the file's refcount never hits
+ * zero, stream_close never runs, and the reader never sees EOF.
+ *
+ * Encoding: the high 16 bits of `packed` carry the fd to keep,
+ * low 16 bits carry the fd to close-and-discard.  Cheap convention
+ * to avoid a heap allocation just to pass two ints. */
+
 __attribute__((used))
-static void pipe_writer_main(long fd)
+static void pipe_writer_main(long packed)
 {
+	int keep    = (int)(packed >> 16);
+	int discard = (int)(packed & 0xffff);
+	sys_close(discard);
 	const char *msg = "pipe-writer: greetings from a second EL0 thread";
-	sys_write((int)fd, msg, ustrlen(msg));
-	sys_close((int)fd);
+	sys_write(keep, msg, ustrlen(msg));
+	sys_close(keep);
 	sys_exit();
 }
 
 __attribute__((used))
-static void pipe_reader_main(long fd)
+static void pipe_reader_main(long packed)
 {
-	char buf[80];
-	long n = 0;
-	for (int tries = 0; tries < 200 && n <= 0; tries++) {
-		n = sys_read((int)fd, buf, sizeof(buf) - 1);
-		if (n <= 0) sys_yield();
-	}
-	if (n > 0) {
+	int keep    = (int)(packed >> 16);
+	int discard = (int)(packed & 0xffff);
+	sys_close(discard);
+	/* Blocking read: sleeps in the kernel until the writer puts
+	 * data or all writers close (EOF).  Loop until we see 0 so
+	 * a multi-chunk writer is fully drained. */
+	for (;;) {
+		char buf[80];
+		long n = sys_read(keep, buf, sizeof(buf) - 1);
+		if (n < 0) { sys_log("pipe-reader: read error"); break; }
+		if (n == 0) { sys_log("pipe-reader: EOF");        break; }
 		buf[n] = '\0';
 		char log[120];
 		const char *p = "pipe-reader: got '";
@@ -626,10 +984,8 @@ static void pipe_reader_main(long fd)
 		*q++ = '\'';
 		*q   = '\0';
 		sys_log(log);
-	} else {
-		sys_log("pipe-reader: no data");
 	}
-	sys_close((int)fd);
+	sys_close(keep);
 	sys_exit();
 }
 
@@ -639,8 +995,15 @@ static void cmd_pipework(void)
 	if (sys_pipe(fds) < 0) {
 		cwrite("pipework: sys_pipe failed\r\n"); return;
 	}
-	long wtid = sys_spawn(pipe_writer_main, (long)fds[1]);
-	long rtid = sys_spawn(pipe_reader_main, (long)fds[0]);
+	long wpacked = ((long)fds[1] << 16) | (long)(fds[0] & 0xffff);
+	long rpacked = ((long)fds[0] << 16) | (long)(fds[1] & 0xffff);
+	long wtid = sys_spawn(pipe_writer_main, wpacked);
+	long rtid = sys_spawn(pipe_reader_main, rpacked);
+	/* Drop the shell's copies so the workers are the only holders.
+	 * When the writer closes its end, the write-side file refcount
+	 * goes to zero, stream_close fires, and the reader sees EOF. */
+	sys_close(fds[0]);
+	sys_close(fds[1]);
 	cwrite("pipework: writer tid="); cprint_long(wtid);
 	cwrite(", reader tid="); cprint_long(rtid);
 	cwrite("\r\n");
@@ -659,6 +1022,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "pwd"))    cmd_pwd();
 	else if (!ustrcmp(argv[0], "cd"))     cmd_cd(argc, argv);
 	else if (!ustrcmp(argv[0], "ls"))     cmd_ls(argc, argv);
+	else if (!ustrcmp(argv[0], "lsl"))    cmd_lsl(argc, argv);
 	else if (!ustrcmp(argv[0], "open"))   cmd_open(argc, argv);
 	else if (!ustrcmp(argv[0], "close"))  cmd_close();
 	else if (!ustrcmp(argv[0], "read"))   cmd_read(argc, argv);
@@ -667,6 +1031,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "pop"))    cmd_pop();
 	else if (!ustrcmp(argv[0], "cat"))    cmd_cat(argc, argv);
 	else if (!ustrcmp(argv[0], "echo"))   cmd_echo(argc, argv);
+	else if (!ustrcmp(argv[0], "ked"))    cmd_ked(argc, argv);
 	else if (!ustrcmp(argv[0], "touch"))  cmd_touch(argc, argv);
 	else if (!ustrcmp(argv[0], "mkdir"))  cmd_mkdir(argc, argv);
 	else if (!ustrcmp(argv[0], "rm"))     cmd_rm(argc, argv);
@@ -674,6 +1039,8 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "append")) cmd_append(argc, argv);
 	else if (!ustrcmp(argv[0], "pipe"))   cmd_pipe();
 	else if (!ustrcmp(argv[0], "spawn"))  cmd_spawn(argc, argv);
+	else if (!ustrcmp(argv[0], "kill"))   cmd_kill(argc, argv);
+	else if (!ustrcmp(argv[0], "crash"))  cmd_crash(argc, argv);
 	else if (!ustrcmp(argv[0], "pipework")) cmd_pipework();
 	else {
 		cwrite(argv[0]); cwrite(": command not found\r\n");

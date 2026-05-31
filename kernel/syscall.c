@@ -46,6 +46,7 @@
 
 #include "kappara/printk.h"
 #include "kappara/sched.h"
+#include "kappara/signal.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
 #include "kappara/syscall.h"
@@ -131,6 +132,45 @@ static long sys_rmdir(long a0, long a1, long a2, long a3, long a4, long a5)
 {
 	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
 	return (long)sys_rmdir_impl((const char *)(uintptr_t)a0);
+}
+
+static long sys_kill(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	return (long)sys_kill_impl((int)a0, (int)a1);
+}
+
+static long sys_lsl(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a3; (void)a4; (void)a5;
+	char kpath[128];
+	const char *path = (const char *)(uintptr_t)a0;
+	char *out = (char *)(uintptr_t)a1;
+	size_t cap = (size_t)a2;
+
+	if (syscall_from_user) {
+		if (a0 == 0) {
+			path = "/";
+		} else if (strncpy_from_user(kpath, path, sizeof(kpath)) < 0) {
+			kprintf("sys_lsl: rejected user path pointer\n");
+			return -1;
+		} else {
+			path = kpath;
+		}
+		if (!user_ptr_ok(out, cap)) {
+			kprintf("sys_lsl: rejected user out buf\n");
+			return -1;
+		}
+	} else if (!path) {
+		path = "/";
+	}
+
+	struct dentry *d = vfs_lookup(path);
+	if (!d) {
+		kprintf("sys_lsl: ENOENT '%s'\n", path);
+		return -1;
+	}
+	return vfs_listdir_long(d, out, cap);
 }
 
 static long sys_close(long a0, long a1, long a2, long a3, long a4, long a5)
@@ -260,6 +300,8 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_exit]   = sys_exit,
 	[SYS_unlink] = sys_unlink,
 	[SYS_rmdir]  = sys_rmdir,
+	[SYS_kill]   = sys_kill,
+	[SYS_lsl]    = sys_lsl,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

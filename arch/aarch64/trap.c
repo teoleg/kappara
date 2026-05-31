@@ -43,11 +43,15 @@
 
 #include <stdint.h>
 
+#include "kappara/kallsyms.h"
 #include "kappara/printk.h"
+#include "kappara/sched.h"	/* cur */
+#include "kappara/signal.h"
 #include "kappara/syscall.h"
 #include "kappara/timer.h"
 #include "kappara/trap.h"
 #include "kappara/uaccess.h"
+#include "kappara/user.h"	/* sys_exit_impl */
 
 extern char vectors[];
 
@@ -129,6 +133,12 @@ void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 				(long)tf->x[0], (long)tf->x[1], (long)tf->x[2],
 				(long)tf->x[3], (long)tf->x[4], (long)tf->x[5]);
 		syscall_from_user = 0;
+		/* DEC/BSD reliable-signal delivery point: if a sys_kill
+		 * landed while this syscall was running (or while the
+		 * thread was blocked inside it), check_signals takes
+		 * the default action -- currently always "exit" for
+		 * fatal signals -- before we eret back to user. */
+		check_signals();
 		return;
 	}
 
@@ -147,5 +157,31 @@ void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 	kprintf("   x30=0x%016lx  sp0=0x%016lx\n",
 		(unsigned long)tf->x[30], (unsigned long)tf->sp_el0);
 
+	/* Decode the faulting PC and walk the call stack via the saved
+	 * (x29, x30) pair so the trace covers the faulting code, not
+	 * the trap handler.  ksym_lookup turns each address into a
+	 * function name + offset. */
+	uint64_t off = 0;
+	const char *name = ksym_lookup(tf->elr, &off);
+	kprintf("   at %s+0x%lx\n",
+		name ? name : "?", (unsigned long)off);
+	kernel_backtrace_from(tf->x[29], tf->x[30]);
+
+	/* A synchronous fault FROM EL0 is a user bug, not a kernel
+	 * bug -- the right Unix response is to kill that thread with
+	 * SIGSEGV and keep the kernel running.  vec_id 8 is "Lower
+	 * EL using AArch64, synchronous" per the AArch64 vector
+	 * table; the alternative VEC_SYNC_LO32 (AArch32) isn't
+	 * reachable since we never enter EL0 in AArch32 mode. */
+	if (vec_id == VEC_SYNC_LO64) {
+		kprintf("   killing tid=%u with SIGSEGV\n",
+			cur ? cur->tid : 0);
+		if (cur) cur->sig_pending |= SIGBIT(SIGSEGV);
+		sys_exit_impl();
+		/* unreachable: sys_exit_impl never returns */
+	}
+
+	/* EL1 fault = real kernel bug.  Panic so we get the dump and
+	 * stop before doing more damage. */
 	kpanic("unhandled trap");
 }

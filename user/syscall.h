@@ -30,6 +30,17 @@
 #define SYS_exit	16
 #define SYS_unlink	17
 #define SYS_rmdir	18
+#define SYS_kill	19
+#define SYS_lsl		20
+
+/* POSIX signal numbers -- mirror include/kappara/signal.h. */
+#define SIGHUP		1
+#define SIGINT		2
+#define SIGQUIT		3
+#define SIGKILL		9
+#define SIGSEGV		11
+#define SIGPIPE		13
+#define SIGTERM		15
 
 #define SEEK_SET	0
 #define SEEK_CUR	1
@@ -126,6 +137,17 @@ static inline long sys_rmdir(const char *path)
 	return _syscall1(SYS_rmdir, (long)(unsigned long)path);
 }
 
+static inline long sys_kill(int tid, int sig)
+{
+	register long x0 __asm__("x0") = (long)tid;
+	register long x1 __asm__("x1") = (long)sig;
+	register long x8 __asm__("x8") = SYS_kill;
+	__asm__ volatile ("svc #0"
+			  : "+r"(x0) : "r"(x1), "r"(x8)
+			  : "memory", "cc");
+	return x0;
+}
+
 static inline long sys_close(int fd)
 {
 	return _syscall1(SYS_close, fd);
@@ -144,6 +166,14 @@ static inline long sys_ioctl(int fd, int cmd, long arg)
 static inline long sys_ls(const char *path, char *out, size_t cap)
 {
 	return _syscall3(SYS_ls,
+			 (long)(unsigned long)path,
+			 (long)(unsigned long)out,
+			 (long)cap);
+}
+
+static inline long sys_lsl(const char *path, char *out, size_t cap)
+{
+	return _syscall3(SYS_lsl,
 			 (long)(unsigned long)path,
 			 (long)(unsigned long)out,
 			 (long)cap);

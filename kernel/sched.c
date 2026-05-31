@@ -84,8 +84,10 @@
 #include "kappara/kmem.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
+#include "kappara/signal.h"
 #include "kappara/streams.h"
 #include "kappara/sched.h"
+#include "kappara/string.h"
 #include "kappara/vfs.h"
 
 extern void context_switch(void **save_sp, void *new_sp);
@@ -95,6 +97,26 @@ struct kthread *cur;
 static struct kthread *ready_head;
 static struct kthread *ready_tail;
 static unsigned        next_tid = 1;
+
+/*
+ * Threads that called kthread_exit but haven't been reaped yet.
+ * A thread can't free its own kernel stack while running on it; it
+ * adds itself here and yields.  The very next switch_to_next call
+ * runs after we've switched OFF the dying thread, on the new
+ * thread's stack -- safe to free the body now.  Single linked list
+ * via kthread.next, same as the ready queue (the two are mutually
+ * exclusive: dead threads aren't ready).
+ */
+static struct kthread *to_reap;
+
+/*
+ * Sparse table from tid -> kthread *.  next_tid increments by 1
+ * each kthread_create; we don't recycle slots when threads die, so
+ * tid values are unique within a boot and grow monotonically.  Cap
+ * is small for now since spawn pool is also small (sub-32 typical).
+ */
+#define KSCHED_MAX_TID	256
+static struct kthread *tid_table[KSCHED_MAX_TID];
 
 static void ready_push(struct kthread *t)
 {
@@ -126,6 +148,7 @@ void sched_init(void)
 	main_thread.state = KT_RUNNING;
 	main_thread.next  = NULL;
 	cur = &main_thread;
+	tid_table[0] = &main_thread;
 	kprintf("sched: main thread is tid=0\n");
 }
 
@@ -134,6 +157,11 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 	struct kthread *t = kmalloc(sizeof(*t));
 	if (!t)
 		return NULL;
+	/* Slab returns recycled memory; zero the whole struct so any
+	 * field we don't explicitly assign (fdt[], future signal
+	 * fields, ...) starts clean instead of holding stale bytes
+	 * from a previously freed thread. */
+	kmemset(t, 0, sizeof(*t));
 	void *stack = pmm_alloc();
 	if (!stack) {
 		kfree(t);
@@ -148,23 +176,191 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 	t->sp         = arch_thread_init_frame((char *)stack + PAGE_SIZE,
 					       fn, arg);
 
+	if (t->tid < KSCHED_MAX_TID)
+		tid_table[t->tid] = t;
 	ready_push(t);
 	kprintf("sched: created tid=%u name=%s stack=%p fn=%p\n",
 		t->tid, name, stack, (void *)(uintptr_t)fn);
 	return t;
 }
 
-void kthread_yield(void)
+/* Common scheduler step.  If requeue_current is set, the outgoing
+ * thread goes back on the ready queue (cooperative yield); if not,
+ * it has already been parked somewhere else (a wait queue, exit
+ * limbo, ...) and we MUST NOT put it back on the ready queue or
+ * the scheduler will think it's runnable. */
+static void switch_to_next(int requeue_current)
 {
 	struct kthread *next = ready_pop();
-	if (!next)
-		return;
+	if (!next) {
+		if (requeue_current)
+			return;
+		/* Nobody runnable AND the caller is about to block.
+		 * That's a deadlock for now (no idle thread).  Park
+		 * on WFE so an IRQ -- specifically the timer or a
+		 * future device interrupt -- can wake us into a wake
+		 * path that puts somebody on the ready queue. */
+		kprintf("sched: nothing to run; deadlock or pure idle\n");
+		for (;;)
+			__asm__ volatile ("wfe");
+	}
 	struct kthread *prev = cur;
-	ready_push(prev);
-	prev->state = KT_READY;
+	if (requeue_current) {
+		ready_push(prev);
+		prev->state = KT_READY;
+	}
 	next->state = KT_RUNNING;
 	cur = next;
 	context_switch(&prev->sp, next->sp);
+
+	/* We're now running as `next` (cur = next, but that's the same
+	 * pointer the OLD context had).  Drain the to-reap list: any
+	 * thread that called kthread_exit added itself here and we're
+	 * guaranteed to be on a DIFFERENT stack now, so freeing those
+	 * pages is safe.  The main thread is a static struct with no
+	 * pmm-allocated stack, so we use stack_base != NULL as the
+	 * "safe to free" marker. */
+	while (to_reap) {
+		struct kthread *t = to_reap;
+		to_reap = t->next;
+		if (t->stack_base) {
+			if (t->tid < KSCHED_MAX_TID)
+				tid_table[t->tid] = NULL;
+			pmm_free(t->stack_base);
+			kfree(t);
+		}
+	}
+}
+
+void kthread_yield(void)
+{
+	switch_to_next(1);
+}
+
+/* Bracket the wait-queue mutation + context switch so the timer
+ * tick can't fire between marking us BLOCKED and actually leaving
+ * the CPU -- otherwise we'd be on a wait queue AND on the ready
+ * queue, and the next scheduling decision would run us with
+ * state=BLOCKED.  IRQs are restored on the wake side by the new
+ * thread's own resume path. */
+static inline unsigned long irq_save_and_disable(void)
+{
+	unsigned long daif;
+	__asm__ volatile ("mrs %0, daif" : "=r"(daif));
+	__asm__ volatile ("msr daifset, #2" ::: "memory");
+	return daif;
+}
+
+static inline void irq_restore(unsigned long daif)
+{
+	__asm__ volatile ("msr daif, %0" :: "r"(daif) : "memory");
+}
+
+void kthread_sleep_on(struct wait_queue *wq)
+{
+	unsigned long flags = irq_save_and_disable();
+	cur->state      = KT_BLOCKED;
+	cur->waiting_on = wq;
+	cur->next       = wq->head;
+	wq->head        = cur;
+	switch_to_next(0);
+	/* Reached here after someone called kthread_wake_*; the new
+	 * DAIF that context_switch restored is whatever this thread
+	 * had at the moment it slept (masked) -- so restore the
+	 * pre-sleep state explicitly to put us back at the caller's
+	 * IRQ-mask level. */
+	cur->waiting_on = NULL;
+	irq_restore(flags);
+}
+
+void kthread_wake_all(struct wait_queue *wq)
+{
+	unsigned long flags = irq_save_and_disable();
+	struct kthread *t = wq->head;
+	wq->head = NULL;
+	while (t) {
+		struct kthread *n = t->next;
+		t->next       = NULL;
+		t->waiting_on = NULL;
+		t->state      = KT_READY;
+		ready_push(t);
+		t = n;
+	}
+	irq_restore(flags);
+}
+
+void kthread_wake_one(struct wait_queue *wq)
+{
+	unsigned long flags = irq_save_and_disable();
+	struct kthread *t = wq->head;
+	if (t) {
+		wq->head      = t->next;
+		t->next       = NULL;
+		t->waiting_on = NULL;
+		t->state      = KT_READY;
+		ready_push(t);
+	}
+	irq_restore(flags);
+}
+
+struct kthread *kthread_find(unsigned tid)
+{
+	if (tid >= KSCHED_MAX_TID) return NULL;
+	struct kthread *t = tid_table[tid];
+	if (t && t->state == KT_DEAD) return NULL;
+	return t;
+}
+
+unsigned kthread_max_tid(void)
+{
+	return KSCHED_MAX_TID;
+}
+
+struct kthread *kthread_at(unsigned tid)
+{
+	if (tid >= KSCHED_MAX_TID) return NULL;
+	return tid_table[tid];	/* includes DEAD; /proc/ps wants to see them */
+}
+
+const char *kthread_state_name(enum kt_state s)
+{
+	switch (s) {
+	case KT_READY:   return "READY";
+	case KT_RUNNING: return "RUN";
+	case KT_BLOCKED: return "BLOCK";
+	case KT_DEAD:    return "DEAD";
+	}
+	return "?";
+}
+
+int kthread_signal(struct kthread *t, unsigned sig)
+{
+	if (!t || sig == 0 || sig >= NSIG) return -1;
+	unsigned long flags = irq_save_and_disable();
+	t->sig_pending |= SIGBIT(sig);
+	/* If t is sleeping on a wait queue, surgically unlink it and
+	 * put it on the ready queue so it wakes and observes the
+	 * signal.  The blocking primitive is expected to re-check
+	 * cur->sig_pending after sleep_on returns. */
+	if (t->state == KT_BLOCKED && t->waiting_on) {
+		struct wait_queue *wq = t->waiting_on;
+		if (wq->head == t) {
+			wq->head = t->next;
+		} else {
+			for (struct kthread *p = wq->head; p; p = p->next) {
+				if (p->next == t) {
+					p->next = t->next;
+					break;
+				}
+			}
+		}
+		t->next       = NULL;
+		t->waiting_on = NULL;
+		t->state      = KT_READY;
+		ready_push(t);
+	}
+	irq_restore(flags);
+	return 0;
 }
 
 void sched_tick(void)
@@ -181,6 +377,17 @@ void kthread_exit(void)
 	 * the pipe goes away naturally when both ends are closed. */
 	vfs_drain_fds(cur);
 	kprintf("kthread: tid=%u (%s) exited\n", cur->tid, cur->name);
+
+	/* Park ourselves on the to-reap list -- some other thread will
+	 * free our stack + kthread once we've context-switched away. */
+	unsigned long flags = irq_save_and_disable();
+	cur->state = KT_DEAD;
+	cur->next  = to_reap;
+	to_reap    = cur;
+	switch_to_next(0);
+	/* unreachable: switch_to_next with requeue=0 never returns
+	 * once cur is no longer in the ready queue and never woken. */
+	(void)flags;
 	for (;;)
 		__asm__ volatile ("wfe");
 }

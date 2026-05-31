@@ -74,27 +74,41 @@
 
 .section ".text"
 
+/*
+ * Per-thread DAIF is saved at [sp, #96] so each thread carries its
+ * own IRQ-mask state across switches.  Without this, the CPU's DAIF
+ * is just inherited from whoever ran last, which breaks the wake
+ * path: a thread that slept with IRQs masked would otherwise
+ * resume with whatever DAIF the waker happened to have, and a
+ * thread that yielded from an IRQ handler (DAIF auto-masked on
+ * entry) would propagate that masked state to every thread it
+ * later switches to.
+ */
 .global context_switch
 context_switch:
-	sub	sp, sp, #96
+	sub	sp, sp, #112
 	stp	x19, x20, [sp, #0]
 	stp	x21, x22, [sp, #16]
 	stp	x23, x24, [sp, #32]
 	stp	x25, x26, [sp, #48]
 	stp	x27, x28, [sp, #64]
 	stp	x29, x30, [sp, #80]
+	mrs	x2, daif
+	str	x2, [sp, #96]
 
 	mov	x2, sp
 	str	x2, [x0]
 
 	mov	sp, x1
+	ldr	x2, [sp, #96]
+	msr	daif, x2
 	ldp	x19, x20, [sp, #0]
 	ldp	x21, x22, [sp, #16]
 	ldp	x23, x24, [sp, #32]
 	ldp	x25, x26, [sp, #48]
 	ldp	x27, x28, [sp, #64]
 	ldp	x29, x30, [sp, #80]
-	add	sp, sp, #96
+	add	sp, sp, #112
 	ret
 
 /*

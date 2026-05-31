@@ -102,6 +102,8 @@ static struct inode *new_inode(enum inode_type t, struct file_ops *fops,
 	i->i_fops    = fops;
 	i->i_private = priv;
 	i->i_rdev    = 0;
+	i->i_count   = 1;	/* the dentry that's about to be created
+				 * holds this initial reference */
 	return i;
 }
 
@@ -252,6 +254,68 @@ long vfs_listdir(struct dentry *dir, char *out, size_t cap)
 	return (long)off;
 }
 
+static const char *type_tag_short(enum inode_type t)
+{
+	switch (t) {
+	case INODE_DIR:    return "dir";
+	case INODE_CHRDEV: return "chr";
+	case INODE_REG:    return "reg";
+	}
+	return "?";
+}
+
+/* Append `s` to out[off..cap], return new off (clipped to cap). */
+static size_t append_str(char *out, size_t off, size_t cap, const char *s)
+{
+	while (*s && off + 1 < cap) out[off++] = *s++;
+	return off;
+}
+
+/* Append unsigned decimal v (right-justified to width) to out. */
+static size_t append_dec(char *out, size_t off, size_t cap,
+			 unsigned long v, int width)
+{
+	char tmp[24];
+	int  i = 0;
+	if (v == 0) tmp[i++] = '0';
+	while (v) { tmp[i++] = (char)('0' + v % 10); v /= 10; }
+	while (i < width && off + 1 < cap) { out[off++] = ' '; width--; }
+	while (i-- && off + 1 < cap) out[off++] = tmp[i];
+	return off;
+}
+
+long vfs_listdir_long(struct dentry *dir, char *out, size_t cap)
+{
+	if (!dir || !dir->d_inode || dir->d_inode->i_type != INODE_DIR)
+		return -1;
+	size_t off = 0;
+	for (struct dentry *c = dir->d_child; c; c = c->d_sibling) {
+		struct inode *ino = c->d_inode;
+		const char *tag = ino ? type_tag_short(ino->i_type) : "?";
+		off = append_str(out, off, cap, tag);
+		out[off++] = ' ';
+		/* Real Unix ls -l replaces the size column with "M, N"
+		 * for character special files -- the major+minor dev_t
+		 * tuple that selects the driver in cdevsw[].  Same here. */
+		if (ino && ino->i_type == INODE_CHRDEV) {
+			off = append_dec(out, off, cap, MAJOR(ino->i_rdev), 4);
+			out[off++] = ',';
+			off = append_dec(out, off, cap, MINOR(ino->i_rdev), 3);
+		} else {
+			long sz = 0;
+			if (ino && ino->i_fops && ino->i_fops->size)
+				sz = ino->i_fops->size(ino);
+			if (sz < 0) sz = 0;
+			off = append_dec(out, off, cap, (unsigned long)sz, 8);
+		}
+		out[off++] = ' ';
+		off = append_str(out, off, cap, c->d_name);
+		if (off + 1 >= cap) break;
+		out[off++] = '\n';
+	}
+	return (long)off;
+}
+
 /* ---- fd table --------------------------------------------------------- */
 
 /* Per-thread fdt lives in struct kthread (KT_FD_MAX slots).  The
@@ -293,6 +357,10 @@ static void file_put(struct file *f)
 	if (--f->f_refs > 0) return;
 	if (f->f_ops && f->f_ops->close)
 		f->f_ops->close(f);
+	/* Drop the inode reference acquired by sys_open_impl.  If this
+	 * was the last reference -- and the name has already been
+	 * unlinked -- vop_inactive runs now and the inode is freed. */
+	vfs_iput(f->f_inode);
 	kfree(f);
 }
 
@@ -351,6 +419,11 @@ int sys_open_impl(const char *path, int flags)
 	struct file *f = kmalloc(sizeof(*f));
 	if (!f)
 		return -1;
+	/* Pin the inode for as long as the open file holds it.  The
+	 * matching vfs_iput is in file_put when the last close drops
+	 * f_refs to 0 -- unlink between now and then sees i_count > 1
+	 * and only removes the name. */
+	vfs_iget(ino);
 	f->f_ops     = ino->i_fops;
 	f->f_inode   = ino;
 	f->f_private = NULL;
@@ -358,6 +431,7 @@ int sys_open_impl(const char *path, int flags)
 	f->f_flags   = flags;
 
 	if (f->f_ops->open(f) < 0) {
+		vfs_iput(ino);
 		kfree(f);
 		return -1;
 	}
@@ -366,6 +440,7 @@ int sys_open_impl(const char *path, int flags)
 	if (fd < 0) {
 		if (f->f_ops->close)
 			f->f_ops->close(f);
+		vfs_iput(ino);
 		kfree(f);
 		return -1;
 	}
@@ -477,12 +552,44 @@ int vfs_remove_child(struct dentry *parent, const char *name)
 		for (i = 0; cur->d_name[i] && cur->d_name[i] == name[i]; i++)
 			;
 		if (cur->d_name[i] == '\0' && name[i] == '\0') {
+			/* Splice out of the parent's child list. */
 			*link = cur->d_sibling;
+			/* Drop the dentry's reference to its inode --
+			 * if no open file is holding it the inode goes
+			 * away inside vfs_iput (vop_inactive frees
+			 * i_private, then we kfree the inode).  Anyone
+			 * who still has an fd on this inode keeps it
+			 * alive until they close, matching the SVR4
+			 * "removed-but-open" lifetime rule. */
+			vfs_iput(cur->d_inode);
+			/* d_name was kmalloc'd via kfs_dup_name when the
+			 * dirent was added (literal-name dentries like
+			 * the root or /dev are never passed to
+			 * vfs_remove_child, so this is always slab
+			 * memory). */
+			kfree((void *)(uintptr_t)cur->d_name);
+			kfree(cur);
 			return 0;
 		}
 		link = &cur->d_sibling;
 	}
 	return -1;
+}
+
+void vfs_iget(struct inode *ino)
+{
+	if (ino) ino->i_count++;
+}
+
+void vfs_iput(struct inode *ino)
+{
+	if (!ino) return;
+	if (--ino->i_count > 0) return;
+	/* Last reference -- ask the FS to release whatever lived behind
+	 * i_private (kfs_file, kfs_dir), then free the inode body. */
+	if (ino->i_fops && ino->i_fops->inactive)
+		ino->i_fops->inactive(ino);
+	kfree(ino);
 }
 
 int sys_close_impl(int fd)
