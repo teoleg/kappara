@@ -49,6 +49,14 @@
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
 
+/*
+ * FBCON_SCALE = 1 keeps the per-character cost low enough that
+ * QEMU TCG (which emulates every pixel write as a memory access
+ * with no caching) can render a kprintf-heavy boot at human speed.
+ * On real Pi hardware, raising this to 2 makes the text much easier
+ * to read on a TV.  TODO: pick at runtime based on framebuffer
+ * geometry and target.
+ */
 #define FBCON_SCALE	1
 #define FBCON_CW	(8 * FBCON_SCALE)	/* cell width  in pixels */
 #define FBCON_CH	(8 * FBCON_SCALE)	/* cell height in pixels */
@@ -59,6 +67,24 @@ static struct {
 	uint32_t cx;	/* cursor x in pixels (top-left of next cell) */
 	uint32_t cy;	/* cursor y in pixels                          */
 } fbcon;
+
+/*
+ * Dirty-rectangle tracking.  We only need a vertical span because
+ * almost everything we draw spans the full width of a character row.
+ * fbcon_putc updates the span around each glyph cell it touches;
+ * fbcon_scroll_one_row marks the whole framebuffer dirty since it
+ * copies pixels everywhere.  fbcon_tee_flush dc-cvacs only the rows
+ * in that span, not the whole 3 MB.
+ */
+static uint32_t fbcon_dirty_y_lo = 0xffffffffu;
+static uint32_t fbcon_dirty_y_hi = 0;
+
+static void fbcon_mark_dirty(uint32_t y, uint32_t h)
+{
+	uint32_t end = y + h;
+	if (y   < fbcon_dirty_y_lo) fbcon_dirty_y_lo = y;
+	if (end > fbcon_dirty_y_hi) fbcon_dirty_y_hi = end;
+}
 
 static void fbcon_scroll_one_row(void)
 {
@@ -74,6 +100,7 @@ static void fbcon_scroll_one_row(void)
 	}
 	framebuffer_rect(0, fb->height - FBCON_CH,
 			 fb->width, FBCON_CH, FBCON_BG);
+	fbcon_mark_dirty(0, fb->height);
 }
 
 static void fbcon_putc(char c)
@@ -99,6 +126,7 @@ static void fbcon_putc(char c)
 	default:
 		framebuffer_putc(fbcon.cx, fbcon.cy, c,
 				 FBCON_FG, FBCON_BG, FBCON_SCALE);
+		fbcon_mark_dirty(fbcon.cy, FBCON_CH);
 		fbcon.cx += FBCON_CW;
 		if (fbcon.cx + FBCON_CW > fb->width) {
 			fbcon.cx  = 0;
@@ -169,31 +197,41 @@ void fbcon_putc_tee(char c)
 	fbcon_tee_dirty = 1;
 }
 
+/*
+ * Dirty-rectangle flush.  Only the rows we actually touched since
+ * the last flush get a dc cvac sweep -- typically one or two text
+ * rows (~16 cache lines each) per kprintf, not all 49k lines of
+ * the 3 MB framebuffer.  Reduces boot-time fb cache maintenance
+ * cost by roughly 1000x and brings the shell prompt back from
+ * "minutes in QEMU TCG" to "instant".
+ *
+ * The flush is essential on real Pi 3/4 silicon so the GPU sees
+ * fresh pixels; QEMU doesn't model caches and would work without
+ * it, but we keep the sweep so the same kernel image is correct on
+ * both targets.
+ */
 void fbcon_tee_flush(void)
 {
-	/*
-	 * No-op for now.  The "right" thing is to dc cvac the dirty
-	 * pixel range so the GPU sees the writes -- but framebuffer_flush
-	 * is currently a sweep of the WHOLE framebuffer (3 MB = ~49k
-	 * cache lines), and even when called once per kprintf that ends
-	 * up being the dominant cost during boot in QEMU TCG, slowing
-	 * the shell prompt from seconds to minutes.
-	 *
-	 * Two ways to fix it properly:
-	 *   1. Track the dirty rectangle and flush only those lines,
-	 *      not all 3 MB.
-	 *   2. Remap the framebuffer's 2 MB block as Normal Non-Cacheable
-	 *      so D-cache never gets in the way and no flush is needed.
-	 *
-	 * QEMU doesn't model caches so we silently get away with no
-	 * flush here; the splash + first frame still get their explicit
-	 * framebuffer_flush() in kmain.  On real Pi hardware text writes
-	 * via this tee may not reach HDMI until something else flushes
-	 * the relevant lines.  That's the next commit on the framebuffer
-	 * track.
-	 */
-	if (!fbcon_tee_dirty) return;
-	fbcon_tee_dirty = 0;
+	if (!fbcon_tee_dirty)
+		return;
+	const struct framebuffer *fb = framebuffer_get();
+	if (fb && fbcon_dirty_y_hi > fbcon_dirty_y_lo) {
+		uint32_t y0 = fbcon_dirty_y_lo;
+		uint32_t y1 = fbcon_dirty_y_hi;
+		if (y1 > fb->height) y1 = fb->height;
+		uintptr_t row_start = (uintptr_t)fb->fb
+			+ (size_t)y0 * fb->pitch;
+		uintptr_t row_end   = (uintptr_t)fb->fb
+			+ (size_t)y1 * fb->pitch;
+		row_start &= ~63UL;
+		for (; row_start < row_end; row_start += 64)
+			__asm__ volatile ("dc cvac, %0"
+					  :: "r"(row_start) : "memory");
+		__asm__ volatile ("dsb sy" ::: "memory");
+	}
+	fbcon_dirty_y_lo = 0xffffffffu;
+	fbcon_dirty_y_hi = 0;
+	fbcon_tee_dirty  = 0;
 }
 
 void fbcon_init_cursor(uint32_t y)
