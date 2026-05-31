@@ -497,6 +497,27 @@ static int stream_close(struct file *f)
 	return 0;
 }
 
+/*
+ * SVR4 read vs getmsg
+ * -------------------
+ * Both consume from the stream head's read queue, but they have
+ * different semantics on purpose:
+ *
+ *   read   -- byte-stream view.  Splits an mblk mid-buffer if `len`
+ *             is smaller than the mblk, putbq()s the remainder, and
+ *             chains across multiple b_cont mblks to fill `len`.
+ *             Message boundaries are invisible to the caller.
+ *
+ *   getmsg -- message-oriented view.  Returns one whole logical
+ *             message (the b_cont chain rooted at one getq) and
+ *             splits its ctl (M_PROTO) and data (M_DATA) pieces
+ *             into separate strbufs so the caller sees protocol
+ *             metadata next to the payload it accompanies.
+ *
+ * read is therefore NOT a thin wrapper over getmsg -- they really
+ * are separate read paths.  write, on the other hand, IS just a
+ * putmsg with ctl=NULL/data=buf -- see stream_write below.
+ */
 static long stream_read(struct file *f, void *buf, size_t len)
 {
 	struct stdata *sd = f->f_private;
@@ -552,22 +573,27 @@ static long stream_read(struct file *f, void *buf, size_t len)
 	return (long)copied;
 }
 
+static long stream_putmsg(struct file *f, const struct strbuf *ctl,
+			  const struct strbuf *data, int flags);
+
+/*
+ * SVR4 write is a documented special case of putmsg: ctl=NULL,
+ * data={buf,len}, flags=0.  Same M_DATA mblk lands on the same
+ * downstream queue.  We make the equivalence literal here so any
+ * change to message-build semantics happens in one place.
+ *
+ * The single deviation: write() returns the byte count on success
+ * (POSIX), putmsg() returns 0 (SVR4).  We translate on the boundary.
+ */
 static long stream_write(struct file *f, const void *buf, size_t len)
 {
-	struct stdata *sd = f->f_private;
-	if (!sd)
-		return -1;
-	mblk_t *mp = allocb(len, 0);
-	if (!mp)
-		return -1;
-	kmemcpy(mp->b_wptr, buf, len);
-	mp->b_wptr += len;
-	if (!sd->sd_wq->q_next) {
-		freemsg(mp);
-		return -1;
-	}
-	putnext(sd->sd_wq, mp);
-	return (long)len;
+	struct strbuf data = {
+		.maxlen = 0,
+		.len    = (int)len,
+		.buf    = (void *)(uintptr_t)buf,
+	};
+	long r = stream_putmsg(f, NULL, &data, 0);
+	return r < 0 ? r : (long)len;
 }
 
 static long stream_ioctl(struct file *f, int cmd, long arg)
