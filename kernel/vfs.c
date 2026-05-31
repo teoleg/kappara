@@ -290,13 +290,22 @@ long vfs_listdir_long(struct dentry *dir, char *out, size_t cap)
 	for (struct dentry *c = dir->d_child; c; c = c->d_sibling) {
 		struct inode *ino = c->d_inode;
 		const char *tag = ino ? type_tag_short(ino->i_type) : "?";
-		long sz = 0;
-		if (ino && ino->i_fops && ino->i_fops->size)
-			sz = ino->i_fops->size(ino);
-		if (sz < 0) sz = 0;
 		off = append_str(out, off, cap, tag);
 		out[off++] = ' ';
-		off = append_dec(out, off, cap, (unsigned long)sz, 8);
+		/* Real Unix ls -l replaces the size column with "M, N"
+		 * for character special files -- the major+minor dev_t
+		 * tuple that selects the driver in cdevsw[].  Same here. */
+		if (ino && ino->i_type == INODE_CHRDEV) {
+			off = append_dec(out, off, cap, MAJOR(ino->i_rdev), 4);
+			out[off++] = ',';
+			off = append_dec(out, off, cap, MINOR(ino->i_rdev), 3);
+		} else {
+			long sz = 0;
+			if (ino && ino->i_fops && ino->i_fops->size)
+				sz = ino->i_fops->size(ino);
+			if (sz < 0) sz = 0;
+			off = append_dec(out, off, cap, (unsigned long)sz, 8);
+		}
 		out[off++] = ' ';
 		off = append_str(out, off, cap, c->d_name);
 		if (off + 1 >= cap) break;
