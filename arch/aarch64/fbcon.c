@@ -189,9 +189,29 @@ struct streamtab fbcon_streamtab = {
  * dc cvac sweep -- death by a thousand cuts in QEMU TCG. */
 static int fbcon_tee_dirty;
 
+/*
+ * Runtime knob.  Off by default: the boot splash is drawn once and
+ * left alone.  When the QEMU display window is visible the host's
+ * 30-60 Hz refresh thread reads the entire 3 MB framebuffer every
+ * frame, and that competes with the guest's per-kprintf
+ * pixel-write + dc cvac loop to the point where the shell appears
+ * to freeze.  Minimizing the window stops the host-side reads and
+ * "fixes" it -- but the real fix is just not to write the kernel
+ * log to the framebuffer in the first place.  /dev/fbcon writes
+ * via the STREAMS driver still work for anyone who wants text on
+ * screen, and the boot splash stays put because it's drawn through
+ * the framebuffer_* primitives, not through the tee.
+ */
+static int fbcon_tee_enabled;
+
+void fbcon_tee_enable(int on)
+{
+	fbcon_tee_enabled = on;
+}
+
 void fbcon_putc_tee(char c)
 {
-	if (!framebuffer_get())
+	if (!fbcon_tee_enabled || !framebuffer_get())
 		return;
 	fbcon_putc(c);
 	fbcon_tee_dirty = 1;
