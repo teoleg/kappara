@@ -46,6 +46,7 @@
 
 #include "kappara/printk.h"
 #include "kappara/sched.h"
+#include "kappara/signal.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
 #include "kappara/syscall.h"
@@ -131,6 +132,12 @@ static long sys_rmdir(long a0, long a1, long a2, long a3, long a4, long a5)
 {
 	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
 	return (long)sys_rmdir_impl((const char *)(uintptr_t)a0);
+}
+
+static long sys_kill(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	return (long)sys_kill_impl((int)a0, (int)a1);
 }
 
 static long sys_close(long a0, long a1, long a2, long a3, long a4, long a5)
@@ -260,6 +267,7 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_exit]   = sys_exit,
 	[SYS_unlink] = sys_unlink,
 	[SYS_rmdir]  = sys_rmdir,
+	[SYS_kill]   = sys_kill,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

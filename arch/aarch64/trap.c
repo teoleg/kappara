@@ -45,6 +45,7 @@
 
 #include "kappara/kallsyms.h"
 #include "kappara/printk.h"
+#include "kappara/signal.h"
 #include "kappara/syscall.h"
 #include "kappara/timer.h"
 #include "kappara/trap.h"
@@ -130,6 +131,12 @@ void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 				(long)tf->x[0], (long)tf->x[1], (long)tf->x[2],
 				(long)tf->x[3], (long)tf->x[4], (long)tf->x[5]);
 		syscall_from_user = 0;
+		/* DEC/BSD reliable-signal delivery point: if a sys_kill
+		 * landed while this syscall was running (or while the
+		 * thread was blocked inside it), check_signals takes
+		 * the default action -- currently always "exit" for
+		 * fatal signals -- before we eret back to user. */
+		check_signals();
 		return;
 	}
 

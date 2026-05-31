@@ -84,8 +84,10 @@
 #include "kappara/kmem.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
+#include "kappara/signal.h"
 #include "kappara/streams.h"
 #include "kappara/sched.h"
+#include "kappara/string.h"
 #include "kappara/vfs.h"
 
 extern void context_switch(void **save_sp, void *new_sp);
@@ -106,6 +108,15 @@ static unsigned        next_tid = 1;
  * exclusive: dead threads aren't ready).
  */
 static struct kthread *to_reap;
+
+/*
+ * Sparse table from tid -> kthread *.  next_tid increments by 1
+ * each kthread_create; we don't recycle slots when threads die, so
+ * tid values are unique within a boot and grow monotonically.  Cap
+ * is small for now since spawn pool is also small (sub-32 typical).
+ */
+#define KSCHED_MAX_TID	256
+static struct kthread *tid_table[KSCHED_MAX_TID];
 
 static void ready_push(struct kthread *t)
 {
@@ -137,6 +148,7 @@ void sched_init(void)
 	main_thread.state = KT_RUNNING;
 	main_thread.next  = NULL;
 	cur = &main_thread;
+	tid_table[0] = &main_thread;
 	kprintf("sched: main thread is tid=0\n");
 }
 
@@ -145,6 +157,11 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 	struct kthread *t = kmalloc(sizeof(*t));
 	if (!t)
 		return NULL;
+	/* Slab returns recycled memory; zero the whole struct so any
+	 * field we don't explicitly assign (fdt[], future signal
+	 * fields, ...) starts clean instead of holding stale bytes
+	 * from a previously freed thread. */
+	kmemset(t, 0, sizeof(*t));
 	void *stack = pmm_alloc();
 	if (!stack) {
 		kfree(t);
@@ -159,6 +176,8 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 	t->sp         = arch_thread_init_frame((char *)stack + PAGE_SIZE,
 					       fn, arg);
 
+	if (t->tid < KSCHED_MAX_TID)
+		tid_table[t->tid] = t;
 	ready_push(t);
 	kprintf("sched: created tid=%u name=%s stack=%p fn=%p\n",
 		t->tid, name, stack, (void *)(uintptr_t)fn);
@@ -205,6 +224,8 @@ static void switch_to_next(int requeue_current)
 		struct kthread *t = to_reap;
 		to_reap = t->next;
 		if (t->stack_base) {
+			if (t->tid < KSCHED_MAX_TID)
+				tid_table[t->tid] = NULL;
 			pmm_free(t->stack_base);
 			kfree(t);
 		}
@@ -238,15 +259,17 @@ static inline void irq_restore(unsigned long daif)
 void kthread_sleep_on(struct wait_queue *wq)
 {
 	unsigned long flags = irq_save_and_disable();
-	cur->state = KT_BLOCKED;
-	cur->next  = wq->head;
-	wq->head   = cur;
+	cur->state      = KT_BLOCKED;
+	cur->waiting_on = wq;
+	cur->next       = wq->head;
+	wq->head        = cur;
 	switch_to_next(0);
 	/* Reached here after someone called kthread_wake_*; the new
 	 * DAIF that context_switch restored is whatever this thread
 	 * had at the moment it slept (masked) -- so restore the
 	 * pre-sleep state explicitly to put us back at the caller's
 	 * IRQ-mask level. */
+	cur->waiting_on = NULL;
 	irq_restore(flags);
 }
 
@@ -257,8 +280,9 @@ void kthread_wake_all(struct wait_queue *wq)
 	wq->head = NULL;
 	while (t) {
 		struct kthread *n = t->next;
-		t->next  = NULL;
-		t->state = KT_READY;
+		t->next       = NULL;
+		t->waiting_on = NULL;
+		t->state      = KT_READY;
 		ready_push(t);
 		t = n;
 	}
@@ -270,12 +294,51 @@ void kthread_wake_one(struct wait_queue *wq)
 	unsigned long flags = irq_save_and_disable();
 	struct kthread *t = wq->head;
 	if (t) {
-		wq->head = t->next;
-		t->next  = NULL;
-		t->state = KT_READY;
+		wq->head      = t->next;
+		t->next       = NULL;
+		t->waiting_on = NULL;
+		t->state      = KT_READY;
 		ready_push(t);
 	}
 	irq_restore(flags);
+}
+
+struct kthread *kthread_find(unsigned tid)
+{
+	if (tid >= KSCHED_MAX_TID) return NULL;
+	struct kthread *t = tid_table[tid];
+	if (t && t->state == KT_DEAD) return NULL;
+	return t;
+}
+
+int kthread_signal(struct kthread *t, unsigned sig)
+{
+	if (!t || sig == 0 || sig >= NSIG) return -1;
+	unsigned long flags = irq_save_and_disable();
+	t->sig_pending |= SIGBIT(sig);
+	/* If t is sleeping on a wait queue, surgically unlink it and
+	 * put it on the ready queue so it wakes and observes the
+	 * signal.  The blocking primitive is expected to re-check
+	 * cur->sig_pending after sleep_on returns. */
+	if (t->state == KT_BLOCKED && t->waiting_on) {
+		struct wait_queue *wq = t->waiting_on;
+		if (wq->head == t) {
+			wq->head = t->next;
+		} else {
+			for (struct kthread *p = wq->head; p; p = p->next) {
+				if (p->next == t) {
+					p->next = t->next;
+					break;
+				}
+			}
+		}
+		t->next       = NULL;
+		t->waiting_on = NULL;
+		t->state      = KT_READY;
+		ready_push(t);
+	}
+	irq_restore(flags);
+	return 0;
 }
 
 void sched_tick(void)

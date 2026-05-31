@@ -288,7 +288,8 @@ static void cmd_help(void)
 		"  append <path> <text>   append text + newline to file\r\n"
 		"  pipe                   sys_pipe demo (write + read)\r\n"
 		"  spawn [arg]            sys_spawn a worker thread\r\n"
-		"  pipework               sys_pipe + two spawned workers\r\n");
+		"  pipework               sys_pipe + two spawned workers\r\n"
+		"  kill <tid> [sig]       POSIX signal numbers (default SIGTERM=15)\r\n");
 }
 
 static void cmd_pid(void)
@@ -814,20 +815,26 @@ static void cmd_ked(int argc, char *argv[])
 __attribute__((used))
 static void worker_main(long arg)
 {
-	for (int i = 0; i < 3; i++) {
-		char buf[80];
-		const char *p = "worker: tid=";
-		char *q = buf;
-		while (*p) *q++ = *p++;
-		q = udec(q, sys_getpid());
-		const char *p2 = " arg=";
-		while (*p2) *q++ = *p2++;
-		q = udec(q, arg);
-		const char *p3 = " iter=";
-		while (*p3) *q++ = *p3++;
-		udec(q, i);
-		sys_log(buf);
-		for (int j = 0; j < 10; j++) sys_yield();
+	/* Loop "forever" -- enough iterations that an interactive
+	 * `kill <tid>` has time to land.  Each sys_yield is an SVC,
+	 * so check_signals on its way back means a pending fatal
+	 * signal terminates the worker within one tick. */
+	for (int i = 0; i < 100000; i++) {
+		if ((i % 20000) == 0) {
+			char buf[80];
+			const char *p = "worker: tid=";
+			char *q = buf;
+			while (*p) *q++ = *p++;
+			q = udec(q, sys_getpid());
+			const char *p2 = " arg=";
+			while (*p2) *q++ = *p2++;
+			q = udec(q, arg);
+			const char *p3 = " iter=";
+			while (*p3) *q++ = *p3++;
+			udec(q, i);
+			sys_log(buf);
+		}
+		sys_yield();
 	}
 	sys_exit();
 }
@@ -839,6 +846,18 @@ static void cmd_spawn(int argc, char *argv[])
 	cwrite("spawn: tid=");
 	cprint_long(tid);
 	cwrite("\r\n");
+}
+
+/* kill <tid> [sig]  -- POSIX numbering; default is SIGTERM (15). */
+static void cmd_kill(int argc, char *argv[])
+{
+	if (argc < 2) { cwrite("usage: kill <tid> [sig]\r\n"); return; }
+	int tid = (int)uparse_long(argv[1]);
+	int sig = (argc > 2) ? (int)uparse_long(argv[2]) : SIGTERM;
+	long r  = sys_kill(tid, sig);
+	if (r < 0) { cwrite("kill: failed\r\n"); return; }
+	cwrite("kill: sig "); cprint_long(sig);
+	cwrite(" -> tid "); cprint_long(tid); cwrite("\r\n");
 }
 
 static void cmd_pipe(void)
@@ -974,6 +993,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "append")) cmd_append(argc, argv);
 	else if (!ustrcmp(argv[0], "pipe"))   cmd_pipe();
 	else if (!ustrcmp(argv[0], "spawn"))  cmd_spawn(argc, argv);
+	else if (!ustrcmp(argv[0], "kill"))   cmd_kill(argc, argv);
 	else if (!ustrcmp(argv[0], "pipework")) cmd_pipework();
 	else {
 		cwrite(argv[0]); cwrite(": command not found\r\n");

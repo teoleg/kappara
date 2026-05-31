@@ -42,8 +42,9 @@
 #define SYS_exit	16	/* (void)  no return                        */
 #define SYS_unlink	17	/* (const char *path) -> 0 / -1             */
 #define SYS_rmdir	18	/* (const char *path) -> 0 / -1             */
+#define SYS_kill	19	/* (int tid, int sig) -> 0 / -1             */
 
-#define SYS_MAX		19
+#define SYS_MAX		20
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

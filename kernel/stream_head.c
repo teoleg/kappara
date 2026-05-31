@@ -53,6 +53,7 @@
 #include "kappara/kmem.h"
 #include "kappara/printk.h"
 #include "kappara/sched.h"
+#include "kappara/signal.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
 #include "kappara/string.h"
@@ -623,7 +624,15 @@ static long stream_read(struct file *f, void *buf, size_t len)
 		if (mp) break;
 		if (sd->sd_flags & SD_EOF)
 			return 0;	/* EOF -- no more writers */
+		/* A pending fatal signal short-circuits the read so the
+		 * thread can exit cleanly in check_signals on the way
+		 * back out of the syscall.  Mirrors EINTR on real Unix
+		 * (we don't surface errno yet). */
+		if (cur && (cur->sig_pending & SIG_FATAL_MASK))
+			return -1;
 		kthread_sleep_on(&sd->sd_readwait);
+		if (cur && (cur->sig_pending & SIG_FATAL_MASK))
+			return -1;
 	}
 
 	/*

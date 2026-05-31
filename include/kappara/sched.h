@@ -16,6 +16,8 @@
 #ifndef KAPPARA_SCHED_H
 #define KAPPARA_SCHED_H
 
+#include <stdint.h>
+
 enum kt_state {
 	KT_READY = 0,
 	KT_RUNNING,
@@ -30,7 +32,8 @@ enum kt_state {
  * kept here to avoid pulling all of vfs.h into sched.h. */
 #define KT_FD_MAX	16
 
-struct file;	/* fwd; defined in vfs.h */
+struct file;		/* fwd; defined in vfs.h */
+struct wait_queue;	/* fwd; defined later in this file */
 
 struct kthread {
 	void          *sp;		/* saved kernel SP for context switch */
@@ -39,6 +42,14 @@ struct kthread {
 	unsigned       tid;
 	enum kt_state  state;
 	struct kthread *next;
+	/* Pending-signal bitmap.  sys_kill sets bits, check_signals
+	 * (from trap_dispatch's SVC return) consumes them.  See
+	 * include/kappara/signal.h for the layout and SIGBIT(). */
+	uint32_t       sig_pending;
+	/* The wait queue this thread is parked on, or NULL.  Lets
+	 * sys_kill surgically extract a sleeping thread from its
+	 * queue so it wakes and observes the signal. */
+	struct wait_queue *waiting_on;
 	/* Per-thread open files.  Each entry is either NULL or a
 	 * struct file * whose f_refs counts how many fd slots (across
 	 * all threads) still point at it.  See kernel/vfs.c. */
@@ -88,6 +99,16 @@ struct wait_queue {
 void            kthread_sleep_on (struct wait_queue *wq);
 void            kthread_wake_all (struct wait_queue *wq);
 void            kthread_wake_one (struct wait_queue *wq);
+
+/* Return the kthread with the given tid, or NULL if no live thread
+ * owns that id.  O(1) lookup via a sparse table; sys_kill uses this. */
+struct kthread *kthread_find(unsigned tid);
+
+/* Set `sig` pending on `t`, and if `t` is parked on a wait queue
+ * surgically remove it and put it on the ready queue so it wakes
+ * and observes the signal.  Returns 0 on success or -1 if sig is
+ * out of range. */
+int             kthread_signal(struct kthread *t, unsigned sig);
 
 /*
  * Arch-specific hook implemented in arch/<arch>/thread.c.  Lays
