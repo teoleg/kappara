@@ -286,7 +286,8 @@ static void cmd_help(void)
 		"  rmdir <path>           remove empty directory\r\n"
 		"  append <path> <text>   append text + newline to file\r\n"
 		"  pipe                   sys_pipe demo (write + read)\r\n"
-		"  spawn [arg]            sys_spawn a worker thread\r\n");
+		"  spawn [arg]            sys_spawn a worker thread\r\n"
+		"  pipework               sys_pipe + two spawned workers\r\n");
 }
 
 static void cmd_pid(void)
@@ -588,6 +589,63 @@ static void cmd_pipe(void)
 	sys_close(fds[1]);
 }
 
+/*
+ * Pipework demo: spawn two worker threads connected by a pipe.
+ * The writer puts a message on the pipe and exits; the reader
+ * polls until something shows up and logs it.  Both share the
+ * shell's fd table since we don't have per-process fds yet --
+ * fine, the workers each get their own end and close it when
+ * they're done.
+ */
+__attribute__((used))
+static void pipe_writer_main(long fd)
+{
+	const char *msg = "pipe-writer: greetings from a second EL0 thread";
+	sys_write((int)fd, msg, ustrlen(msg));
+	sys_close((int)fd);
+	sys_exit();
+}
+
+__attribute__((used))
+static void pipe_reader_main(long fd)
+{
+	char buf[80];
+	long n = 0;
+	for (int tries = 0; tries < 200 && n <= 0; tries++) {
+		n = sys_read((int)fd, buf, sizeof(buf) - 1);
+		if (n <= 0) sys_yield();
+	}
+	if (n > 0) {
+		buf[n] = '\0';
+		char log[120];
+		const char *p = "pipe-reader: got '";
+		char *q = log;
+		while (*p) *q++ = *p++;
+		for (long i = 0; i < n && q < log + sizeof(log) - 3; i++)
+			*q++ = buf[i];
+		*q++ = '\'';
+		*q   = '\0';
+		sys_log(log);
+	} else {
+		sys_log("pipe-reader: no data");
+	}
+	sys_close((int)fd);
+	sys_exit();
+}
+
+static void cmd_pipework(void)
+{
+	int fds[2];
+	if (sys_pipe(fds) < 0) {
+		cwrite("pipework: sys_pipe failed\r\n"); return;
+	}
+	long wtid = sys_spawn(pipe_writer_main, (long)fds[1]);
+	long rtid = sys_spawn(pipe_reader_main, (long)fds[0]);
+	cwrite("pipework: writer tid="); cprint_long(wtid);
+	cwrite(", reader tid="); cprint_long(rtid);
+	cwrite("\r\n");
+}
+
 /* -------- dispatch -------- */
 
 static void dispatch(char *line)
@@ -616,6 +674,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "append")) cmd_append(argc, argv);
 	else if (!ustrcmp(argv[0], "pipe"))   cmd_pipe();
 	else if (!ustrcmp(argv[0], "spawn"))  cmd_spawn(argc, argv);
+	else if (!ustrcmp(argv[0], "pipework")) cmd_pipework();
 	else {
 		cwrite(argv[0]); cwrite(": command not found\r\n");
 	}
