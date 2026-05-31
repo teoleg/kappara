@@ -94,6 +94,10 @@
 #define M_PROTO		0x01	/* protocol control information */
 #define M_CTL		0x0d	/* module-private control */
 #define M_BREAK		0x08	/* line break */
+#define M_HANGUP	0x07	/* no more data this side (SVR4 stream
+				 * head turns this into SD_EOF -- used by
+				 * the procfs and klog snapshots once
+				 * their one-shot data is enqueued). */
 #define M_FLUSH		0x06	/* flush queues */
 #define M_ERROR		0x05	/* error from driver / module */
 

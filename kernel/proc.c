@@ -82,15 +82,26 @@ static void pb_pad_dec(struct procbuf *b, unsigned long v, int width)
 
 /* Hand the formatted buffer up to the stream head as a single mblk
  * (assumes the snapshot fits in PB_SIZE, which is < kmalloc's
- * 2 KB cap so allocb is happy). */
+ * 2 KB cap so allocb is happy), then send M_HANGUP so the next
+ * sys_read after the data is drained returns 0 instead of blocking
+ * forever -- procfs entries are one-shot snapshots, not streams. */
 static void pb_flush_to_q(struct procbuf *b, queue_t *q)
 {
-	if (b->len == 0) return;
-	mblk_t *mp = allocb(b->len, 0);
-	if (!mp) return;
-	kmemcpy(mp->b_wptr, b->buf, b->len);
-	mp->b_wptr += b->len;
-	putnext(q, mp);
+	if (b->len > 0) {
+		mblk_t *mp = allocb(b->len, 0);
+		if (mp) {
+			kmemcpy(mp->b_wptr, b->buf, b->len);
+			mp->b_wptr += b->len;
+			putnext(q, mp);
+		}
+	}
+	/* The hangup is a metadata mblk -- size 1 just because some
+	 * older allocb variants reject size 0; the buffer is unused. */
+	mblk_t *hup = allocb(1, 0);
+	if (hup) {
+		hup->b_datap->db_type = M_HANGUP;
+		putnext(q, hup);
+	}
 }
 
 /* ---- /proc/ps -------------------------------------------------------- */
