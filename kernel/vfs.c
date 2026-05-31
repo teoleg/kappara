@@ -55,12 +55,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kappara/cdevsw.h"
 #include "kappara/kmem.h"
 #include "kappara/printk.h"
 #include "kappara/sched.h"
 #include "kappara/string.h"
 #include "kappara/uaccess.h"
 #include "kappara/vfs.h"
+
+/* The single chrdev file_ops table -- defined in kernel/stream_head.c.
+ * All STREAMS chrdev inodes hang their VFS dispatch off this one
+ * vtable; the per-driver behavior is reached through cdevsw[MAJOR(rdev)]
+ * inside the stream_*  methods.  See include/kappara/cdevsw.h. */
+extern struct file_ops stream_fops;
 
 /* ---- Root of the in-memory tree --------------------------------------- */
 
@@ -94,6 +101,7 @@ static struct inode *new_inode(enum inode_type t, struct file_ops *fops,
 	i->i_type    = t;
 	i->i_fops    = fops;
 	i->i_private = priv;
+	i->i_rdev    = 0;
 	return i;
 }
 
@@ -169,9 +177,16 @@ struct dentry *vfs_mkdir(struct dentry *parent, const char *name)
 }
 
 struct dentry *vfs_mknod_chrdev(struct dentry *parent, const char *name,
-				struct file_ops *fops, void *priv)
+				uint32_t rdev)
 {
-	struct inode *i = new_inode(INODE_CHRDEV, fops, priv);
+	if (!cdev_lookup(MAJOR(rdev))) {
+		kprintf("vfs_mknod_chrdev: '%s': no driver at major %u\n",
+			name, MAJOR(rdev));
+		return NULL;
+	}
+	struct inode *i = new_inode(INODE_CHRDEV, &stream_fops, NULL);
+	if (!i) return NULL;
+	i->i_rdev = rdev;
 	return new_dentry(name, i, parent);
 }
 

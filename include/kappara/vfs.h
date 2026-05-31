@@ -52,6 +52,7 @@
 #define KAPPARA_VFS_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "kappara/stream_head.h"	/* struct strbuf */
 
@@ -91,7 +92,12 @@ struct file_ops {
 struct inode {
 	enum inode_type   i_type;
 	struct file_ops  *i_fops;
-	void             *i_private;	/* chrdev: streamtab *  */
+	void             *i_private;	/* dir/reg: FS-specific meta  */
+	/* For CHRDEV inodes: the SVR4 device id.  MAJOR(i_rdev) indexes
+	 * the cdevsw[]; MINOR distinguishes instances of the same
+	 * driver (think /dev/tty0 vs /dev/tty1).  Unused for dirs and
+	 * regular files. */
+	uint32_t          i_rdev;
 };
 
 struct dentry {
@@ -116,8 +122,14 @@ void           vfs_init(void);
 struct dentry *vfs_root(void);
 struct dentry *vfs_lookup(const char *path);
 struct dentry *vfs_mkdir(struct dentry *parent, const char *name);
+/* Create a character-device dentry.  `rdev` is the SVR4 dev_t --
+ * MAJOR(rdev) must already be registered in cdevsw[] (see
+ * cdevsw.h).  The VFS open path uses MAJOR(rdev) to find the
+ * driver's streamtab; MINOR is passed to whatever driver-specific
+ * open hook cares.  The inode's i_fops is set to a stock chrdev
+ * vtable that funnels through STREAMS. */
 struct dentry *vfs_mknod_chrdev(struct dentry *parent, const char *name,
-				struct file_ops *fops, void *priv);
+				uint32_t rdev);
 
 /* Same shape as mknod_chrdev but creates an INODE_REG -- used by
  * filesystem drivers (kfs today) to publish files they discovered

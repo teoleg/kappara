@@ -33,6 +33,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/kernel/streams.o \
         $(BUILD)/kernel/klog.o \
         $(BUILD)/kernel/vfs.o \
+        $(BUILD)/kernel/cdevsw.o \
         $(BUILD)/kernel/stream_head.o \
         $(BUILD)/kernel/syscall.o \
         $(BUILD)/kernel/uaccess.o \
@@ -67,6 +68,7 @@ else ifeq ($(ARCH),arm)
         $(BUILD)/kernel/streams.o \
         $(BUILD)/kernel/klog.o \
         $(BUILD)/kernel/vfs.o \
+        $(BUILD)/kernel/cdevsw.o \
         $(BUILD)/kernel/stream_head.o \
         $(BUILD)/kernel/syscall.o \
         $(BUILD)/kernel/uaccess.o \
