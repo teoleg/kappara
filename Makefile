@@ -98,6 +98,7 @@ CFLAGS  := -Wall -Wextra -Werror -std=gnu11 \
            -fno-stack-protector -fno-pie -fno-pic \
            $(ARCH_CFLAGS) \
            -Iinclude \
+           -MMD -MP \
            -O2 -g
 
 ASFLAGS := $(CFLAGS)
@@ -106,8 +107,14 @@ LDFLAGS := -nostdlib -static
 LIBGCC  := $(shell $(CC) -print-libgcc-file-name)
 
 OBJS := $(ARCH_OBJS) $(KERNEL_OBJS)
+DEPS := $(OBJS:.o=.d)
 
 .PHONY: all run clean
+
+# Pin the default goal explicitly -- the `-include $(DEPS)` below would
+# otherwise promote whichever .d file loads first to be the default
+# target (its first rule wins).
+.DEFAULT_GOAL := all
 
 all: $(KERNEL)
 
@@ -188,3 +195,8 @@ $(USER_BUILD):
 $(BUILD)/arch/aarch64/userblob.o: $(USER_BIN)
 
 endif
+
+# Pull in compiler-emitted header deps so editing a header forces a
+# rebuild of every .o that includes it.  Placed at the very end so
+# the .d files' rules don't poison the default-goal selection.
+-include $(DEPS)

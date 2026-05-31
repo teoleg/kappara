@@ -290,7 +290,8 @@ static void cmd_help(void)
 		"  pipe                   sys_pipe demo (write + read)\r\n"
 		"  spawn [arg]            sys_spawn a worker thread\r\n"
 		"  pipework               sys_pipe + two spawned workers\r\n"
-		"  kill <tid> [sig]       POSIX signal numbers (default SIGTERM=15)\r\n");
+		"  kill <tid> [sig]       POSIX signal numbers (default SIGTERM=15)\r\n"
+		"  crash                  spawn a thread that dereferences NULL\r\n");
 }
 
 static void cmd_pid(void)
@@ -871,6 +872,27 @@ static void cmd_spawn(int argc, char *argv[])
 	cwrite("\r\n");
 }
 
+/* Spawnable bad-thread: dereferences NULL on purpose.  Used to
+ * exercise the trap-from-EL0 -> SIGSEGV path without taking the
+ * shell down with it. */
+__attribute__((used))
+static void crash_main(long arg)
+{
+	(void)arg;
+	sys_log("crash: about to deref NULL");
+	volatile int *p = (volatile int *)0;
+	*p = 1;	/* should trap; kernel kills us with SIGSEGV */
+	sys_log("crash: still alive (BUG -- kernel let us through)");
+	sys_exit();
+}
+
+static void cmd_crash(int argc, char *argv[])
+{
+	(void)argc; (void)argv;
+	long tid = sys_spawn(crash_main, 0);
+	cwrite("crash: spawned tid="); cprint_long(tid); cwrite("\r\n");
+}
+
 /* kill <tid> [sig]  -- POSIX numbering; default is SIGTERM (15). */
 static void cmd_kill(int argc, char *argv[])
 {
@@ -1018,6 +1040,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "pipe"))   cmd_pipe();
 	else if (!ustrcmp(argv[0], "spawn"))  cmd_spawn(argc, argv);
 	else if (!ustrcmp(argv[0], "kill"))   cmd_kill(argc, argv);
+	else if (!ustrcmp(argv[0], "crash"))  cmd_crash(argc, argv);
 	else if (!ustrcmp(argv[0], "pipework")) cmd_pipework();
 	else {
 		cwrite(argv[0]); cwrite(": command not found\r\n");

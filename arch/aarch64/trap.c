@@ -45,11 +45,13 @@
 
 #include "kappara/kallsyms.h"
 #include "kappara/printk.h"
+#include "kappara/sched.h"	/* cur */
 #include "kappara/signal.h"
 #include "kappara/syscall.h"
 #include "kappara/timer.h"
 #include "kappara/trap.h"
 #include "kappara/uaccess.h"
+#include "kappara/user.h"	/* sys_exit_impl */
 
 extern char vectors[];
 
@@ -165,5 +167,21 @@ void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 		name ? name : "?", (unsigned long)off);
 	kernel_backtrace_from(tf->x[29], tf->x[30]);
 
+	/* A synchronous fault FROM EL0 is a user bug, not a kernel
+	 * bug -- the right Unix response is to kill that thread with
+	 * SIGSEGV and keep the kernel running.  vec_id 8 is "Lower
+	 * EL using AArch64, synchronous" per the AArch64 vector
+	 * table; the alternative VEC_SYNC_LO32 (AArch32) isn't
+	 * reachable since we never enter EL0 in AArch32 mode. */
+	if (vec_id == VEC_SYNC_LO64) {
+		kprintf("   killing tid=%u with SIGSEGV\n",
+			cur ? cur->tid : 0);
+		if (cur) cur->sig_pending |= SIGBIT(SIGSEGV);
+		sys_exit_impl();
+		/* unreachable: sys_exit_impl never returns */
+	}
+
+	/* EL1 fault = real kernel bug.  Panic so we get the dump and
+	 * stop before doing more damage. */
 	kpanic("unhandled trap");
 }
