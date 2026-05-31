@@ -598,24 +598,39 @@ static void cmd_pipe(void)
  * closes its own copies of both ends after spawning, the same
  * "parent closes after fork" pattern Unix uses.
  */
+/* Workers inherit BOTH pipe ends from the shell (spawn copies the
+ * parent's fd table).  The POSIX pattern is for each side to close
+ * the end it doesn't use; otherwise the file's refcount never hits
+ * zero, stream_close never runs, and the reader never sees EOF.
+ *
+ * Encoding: the high 16 bits of `packed` carry the fd to keep,
+ * low 16 bits carry the fd to close-and-discard.  Cheap convention
+ * to avoid a heap allocation just to pass two ints. */
+
 __attribute__((used))
-static void pipe_writer_main(long fd)
+static void pipe_writer_main(long packed)
 {
+	int keep    = (int)(packed >> 16);
+	int discard = (int)(packed & 0xffff);
+	sys_close(discard);
 	const char *msg = "pipe-writer: greetings from a second EL0 thread";
-	sys_write((int)fd, msg, ustrlen(msg));
-	sys_close((int)fd);
+	sys_write(keep, msg, ustrlen(msg));
+	sys_close(keep);
 	sys_exit();
 }
 
 __attribute__((used))
-static void pipe_reader_main(long fd)
+static void pipe_reader_main(long packed)
 {
+	int keep    = (int)(packed >> 16);
+	int discard = (int)(packed & 0xffff);
+	sys_close(discard);
 	/* Blocking read: sleeps in the kernel until the writer puts
 	 * data or all writers close (EOF).  Loop until we see 0 so
 	 * a multi-chunk writer is fully drained. */
 	for (;;) {
 		char buf[80];
-		long n = sys_read((int)fd, buf, sizeof(buf) - 1);
+		long n = sys_read(keep, buf, sizeof(buf) - 1);
 		if (n < 0) { sys_log("pipe-reader: read error"); break; }
 		if (n == 0) { sys_log("pipe-reader: EOF");        break; }
 		buf[n] = '\0';
@@ -629,7 +644,7 @@ static void pipe_reader_main(long fd)
 		*q   = '\0';
 		sys_log(log);
 	}
-	sys_close((int)fd);
+	sys_close(keep);
 	sys_exit();
 }
 
@@ -639,8 +654,10 @@ static void cmd_pipework(void)
 	if (sys_pipe(fds) < 0) {
 		cwrite("pipework: sys_pipe failed\r\n"); return;
 	}
-	long wtid = sys_spawn(pipe_writer_main, (long)fds[1]);
-	long rtid = sys_spawn(pipe_reader_main, (long)fds[0]);
+	long wpacked = ((long)fds[1] << 16) | (long)(fds[0] & 0xffff);
+	long rpacked = ((long)fds[0] << 16) | (long)(fds[1] & 0xffff);
+	long wtid = sys_spawn(pipe_writer_main, wpacked);
+	long rtid = sys_spawn(pipe_reader_main, rpacked);
 	/* Drop the shell's copies so the workers are the only holders.
 	 * When the writer closes its end, the write-side file refcount
 	 * goes to zero, stream_close fires, and the reader sees EOF. */

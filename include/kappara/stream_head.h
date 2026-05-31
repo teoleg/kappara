@@ -58,6 +58,9 @@
 struct stdata {
 	queue_t		*sd_rq;	/* read queue at top of stack */
 	queue_t		*sd_wq;	/* write queue at top of stack */
+	queue_t		*sd_drv_rq;	/* driver's read queue (NULL for
+					 * pipes -- no driver at all)     */
+	queue_t		*sd_drv_wq;	/* driver's write queue           */
 	int		 sd_refs;
 	const char	*sd_name;
 	unsigned	 sd_flags;	/* SD_EOF / future SD_ERR etc.   */

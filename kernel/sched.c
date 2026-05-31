@@ -96,6 +96,17 @@ static struct kthread *ready_head;
 static struct kthread *ready_tail;
 static unsigned        next_tid = 1;
 
+/*
+ * Threads that called kthread_exit but haven't been reaped yet.
+ * A thread can't free its own kernel stack while running on it; it
+ * adds itself here and yields.  The very next switch_to_next call
+ * runs after we've switched OFF the dying thread, on the new
+ * thread's stack -- safe to free the body now.  Single linked list
+ * via kthread.next, same as the ready queue (the two are mutually
+ * exclusive: dead threads aren't ready).
+ */
+static struct kthread *to_reap;
+
 static void ready_push(struct kthread *t)
 {
 	t->next = NULL;
@@ -182,6 +193,22 @@ static void switch_to_next(int requeue_current)
 	next->state = KT_RUNNING;
 	cur = next;
 	context_switch(&prev->sp, next->sp);
+
+	/* We're now running as `next` (cur = next, but that's the same
+	 * pointer the OLD context had).  Drain the to-reap list: any
+	 * thread that called kthread_exit added itself here and we're
+	 * guaranteed to be on a DIFFERENT stack now, so freeing those
+	 * pages is safe.  The main thread is a static struct with no
+	 * pmm-allocated stack, so we use stack_base != NULL as the
+	 * "safe to free" marker. */
+	while (to_reap) {
+		struct kthread *t = to_reap;
+		to_reap = t->next;
+		if (t->stack_base) {
+			pmm_free(t->stack_base);
+			kfree(t);
+		}
+	}
 }
 
 void kthread_yield(void)
@@ -265,6 +292,17 @@ void kthread_exit(void)
 	 * the pipe goes away naturally when both ends are closed. */
 	vfs_drain_fds(cur);
 	kprintf("kthread: tid=%u (%s) exited\n", cur->tid, cur->name);
+
+	/* Park ourselves on the to-reap list -- some other thread will
+	 * free our stack + kthread once we've context-switched away. */
+	unsigned long flags = irq_save_and_disable();
+	cur->state = KT_DEAD;
+	cur->next  = to_reap;
+	to_reap    = cur;
+	switch_to_next(0);
+	/* unreachable: switch_to_next with requeue=0 never returns
+	 * once cur is no longer in the ready queue and never woken. */
+	(void)flags;
 	for (;;)
 		__asm__ volatile ("wfe");
 }

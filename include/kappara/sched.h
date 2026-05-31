@@ -20,6 +20,10 @@ enum kt_state {
 	KT_READY = 0,
 	KT_RUNNING,
 	KT_BLOCKED,
+	KT_DEAD,	/* kthread_exit called; awaiting reap by another
+			 * thread (we can't free the stack we're standing
+			 * on -- the next switch_to_next picks the body
+			 * off the to-reap list once we're safely off it). */
 };
 
 /* Per-thread fd table size.  Stays in lockstep with FD_MAX in vfs.c;
