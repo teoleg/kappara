@@ -182,6 +182,16 @@ endif
 clean:
 	rm -rf build
 
+# Last-resort QEMU killer for when Ctrl-A x doesn't work because
+# your terminal multiplexer (screen, tmux) is eating Ctrl-A first.
+# Use exact process name (-x) to avoid matching shells that happen
+# to have the qemu binary path in their environment.
+.PHONY: stop
+stop:
+	@pkill -x qemu-system-aarch64 2>/dev/null || true
+	@pkill -x qemu-system-arm     2>/dev/null || true
+	@echo "QEMU killed (if any was running)."
+
 # --- User-side init binary (AArch64 only) ----------------------------
 # Compile user/init.c with the same cross toolchain as the kernel,
 # link with user/linker.ld at VA 0x10000000, objcopy to a raw .bin,
