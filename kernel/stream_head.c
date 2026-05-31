@@ -8,11 +8,13 @@
  *     stream stack.  sh_rq_putp queues messages arriving from below
  *     so sys_read can pop them; sh_wq_putp forwards downstream.
  *
- *   * stream_fops: the struct file_ops the VFS dispatches through
- *     when an open file points at a character-special inode whose
- *     i_private is a streamtab pointer.  The VFS (kernel/vfs.c)
- *     owns the fd table; this file owns the per-stream state under
- *     file->f_private.
+ *   * stream_fops: the single struct file_ops that every STREAMS
+ *     chrdev inode hangs its VFS dispatch off.  stream_open uses
+ *     the inode's dev_t to look up cdevsw[MAJOR(rdev)], finds the
+ *     driver's streamtab there, and builds a head + driver queue
+ *     stack -- pure SVR4 cdevsw, not Linux's "f_ops on every inode."
+ *     The VFS (kernel/vfs.c) owns the fd table; this file owns the
+ *     per-stream state under file->f_private.
  *
  *   * streams_head_init: at boot, register the demo modules/drivers
  *     and publish the drivers as character-special files under /dev.
@@ -45,6 +47,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kappara/cdevsw.h"
+#include "kappara/fbcon.h"
 #include "kappara/klog.h"
 #include "kappara/kmem.h"
 #include "kappara/printk.h"
@@ -133,9 +137,12 @@ static int console_wq_putp(queue_t *q, mblk_t *mp)
 {
 	(void)q;
 	for (mblk_t *m = mp; m; m = m->b_cont) {
-		for (unsigned char *p = m->b_rptr; p < m->b_wptr; p++)
+		for (unsigned char *p = m->b_rptr; p < m->b_wptr; p++) {
 			uart_putc((char)*p);
+			fbcon_putc_tee((char)*p);
+		}
 	}
+	fbcon_tee_flush();
 	freemsg(mp);
 	return 0;
 }
@@ -458,15 +465,25 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name)
 	if (drv_st == &console_streamtab && !console_active)
 		console_active = sd;
 
+	/* SVR4 streams call the driver's qi_qopen on the read side at
+	 * open time.  klog uses this to prime the queue with the ring
+	 * buffer contents; most drivers leave it NULL. */
+	if (drv_st->st_rdinit && drv_st->st_rdinit->qi_qopen)
+		drv_st->st_rdinit->qi_qopen(drv_rq);
+
 	return sd;
 }
 
 static int stream_open(struct file *f)
 {
-	struct streamtab *st = (struct streamtab *)f->f_inode->i_private;
-	if (!st)
+	/* SVR4 cdev open: dev_t -> major -> cdevsw[] -> streamtab. */
+	struct cdev_entry *cdev = cdev_lookup(MAJOR(f->f_inode->i_rdev));
+	if (!cdev || !cdev->streamtab) {
+		kprintf("stream_open: no driver at major %u\n",
+			MAJOR(f->f_inode->i_rdev));
 		return -1;
-	struct stdata *sd = stream_build(st, NULL);
+	}
+	struct stdata *sd = stream_build(cdev->streamtab, cdev->name);
 	if (!sd)
 		return -1;
 	f->f_private = sd;
@@ -480,6 +497,27 @@ static int stream_close(struct file *f)
 	return 0;
 }
 
+/*
+ * SVR4 read vs getmsg
+ * -------------------
+ * Both consume from the stream head's read queue, but they have
+ * different semantics on purpose:
+ *
+ *   read   -- byte-stream view.  Splits an mblk mid-buffer if `len`
+ *             is smaller than the mblk, putbq()s the remainder, and
+ *             chains across multiple b_cont mblks to fill `len`.
+ *             Message boundaries are invisible to the caller.
+ *
+ *   getmsg -- message-oriented view.  Returns one whole logical
+ *             message (the b_cont chain rooted at one getq) and
+ *             splits its ctl (M_PROTO) and data (M_DATA) pieces
+ *             into separate strbufs so the caller sees protocol
+ *             metadata next to the payload it accompanies.
+ *
+ * read is therefore NOT a thin wrapper over getmsg -- they really
+ * are separate read paths.  write, on the other hand, IS just a
+ * putmsg with ctl=NULL/data=buf -- see stream_write below.
+ */
 static long stream_read(struct file *f, void *buf, size_t len)
 {
 	struct stdata *sd = f->f_private;
@@ -535,22 +573,27 @@ static long stream_read(struct file *f, void *buf, size_t len)
 	return (long)copied;
 }
 
+static long stream_putmsg(struct file *f, const struct strbuf *ctl,
+			  const struct strbuf *data, int flags);
+
+/*
+ * SVR4 write is a documented special case of putmsg: ctl=NULL,
+ * data={buf,len}, flags=0.  Same M_DATA mblk lands on the same
+ * downstream queue.  We make the equivalence literal here so any
+ * change to message-build semantics happens in one place.
+ *
+ * The single deviation: write() returns the byte count on success
+ * (POSIX), putmsg() returns 0 (SVR4).  We translate on the boundary.
+ */
 static long stream_write(struct file *f, const void *buf, size_t len)
 {
-	struct stdata *sd = f->f_private;
-	if (!sd)
-		return -1;
-	mblk_t *mp = allocb(len, 0);
-	if (!mp)
-		return -1;
-	kmemcpy(mp->b_wptr, buf, len);
-	mp->b_wptr += len;
-	if (!sd->sd_wq->q_next) {
-		freemsg(mp);
-		return -1;
-	}
-	putnext(sd->sd_wq, mp);
-	return (long)len;
+	struct strbuf data = {
+		.maxlen = 0,
+		.len    = (int)len,
+		.buf    = (void *)(uintptr_t)buf,
+	};
+	long r = stream_putmsg(f, NULL, &data, 0);
+	return r < 0 ? r : (long)len;
 }
 
 static long stream_ioctl(struct file *f, int cmd, long arg)
@@ -731,9 +774,11 @@ long sys_pipe_impl(int fds[2])
 /* ---- The "klog" driver: replay the kernel log ring ------------------- */
 
 /*
- * klog read-side procedures.  No put/srv: opening seeds the rq from
- * the current klog buffer, and subsequent reads just drain that
- * snapshot via getq.  Write side returns -1 (klog is read-only).
+ * Pure SVR4 STREAMS driver: no per-file open hook.  The priming-from-
+ * ring step is the read-side qi_qopen, invoked by stream_build the
+ * moment the queue pair is wired up.  After that, sys_read just
+ * drains the queued mblks via getq.  Write side rejects everything;
+ * klog is read-only.
  */
 static int klog_rq_putp(queue_t *q, mblk_t *mp)
 {
@@ -747,6 +792,28 @@ static int klog_wq_putp(queue_t *q, mblk_t *mp)
 	return -1;	/* read-only device */
 }
 
+#define KLOG_CHUNK	1024
+
+/* SVR4 read-side qopen: prime the stream with the current klog ring
+ * by putnext'ing one mblk per KLOG_CHUNK upstream (so it lands on
+ * the head's read queue, where sys_read drains from).  One allocation
+ * per chunk so we stay inside the slab size caches (allocb caps at
+ * the kmalloc max). */
+static int klog_rq_qopen(queue_t *q)
+{
+	size_t total = klog_size();
+	for (size_t off = 0; off < total; off += KLOG_CHUNK) {
+		size_t want = total - off;
+		if (want > KLOG_CHUNK) want = KLOG_CHUNK;
+		mblk_t *mp = allocb(want, 0);
+		if (!mp) break;
+		size_t got = klog_copy((char *)mp->b_wptr, off, want);
+		mp->b_wptr += got;
+		putnext(q, mp);
+	}
+	return 0;
+}
+
 static struct module_info klog_minfo = {
 	.mi_idnum  = 201,
 	.mi_idname = "klog",
@@ -757,7 +824,9 @@ static struct module_info klog_minfo = {
 };
 
 static struct qinit klog_rinit = {
-	.qi_putp = klog_rq_putp, .qi_minfo = &klog_minfo
+	.qi_putp   = klog_rq_putp,
+	.qi_qopen  = klog_rq_qopen,
+	.qi_minfo  = &klog_minfo
 };
 static struct qinit klog_winit = {
 	.qi_putp = klog_wq_putp, .qi_minfo = &klog_minfo
@@ -768,47 +837,13 @@ static struct streamtab klog_streamtab = {
 	.st_wrinit = &klog_winit,
 };
 
-/*
- * Open hook for /dev/klog.  Builds the normal head + driver stack
- * via stream_build, then walks the klog ring buffer and putq's a
- * chain of mblks onto sd_rq -- one chunk per allocation since allocb
- * caps at the kmalloc max (2 KB).  Subsequent sys_read calls just
- * drain those mblks; once empty, read returns 0.
- */
-#define KLOG_CHUNK	1024
-
-static int klog_open(struct file *f)
-{
-	struct streamtab *st = (struct streamtab *)f->f_inode->i_private;
-	if (!st)
-		return -1;
-	struct stdata *sd = stream_build(st, NULL);
-	if (!sd)
-		return -1;
-	f->f_private = sd;
-
-	size_t total = klog_size();
-	for (size_t off = 0; off < total; off += KLOG_CHUNK) {
-		size_t want = total - off;
-		if (want > KLOG_CHUNK) want = KLOG_CHUNK;
-		mblk_t *mp = allocb(want, 0);
-		if (!mp) break;
-		size_t got = klog_copy((char *)mp->b_wptr, off, want);
-		mp->b_wptr += got;
-		putq(sd->sd_rq, mp);
-	}
-	return 0;
-}
-
-struct file_ops klog_fops = {
-	.open   = klog_open,
-	.close  = stream_close,
-	.read   = stream_read,
-	.write  = stream_write,	/* will reject via klog_wq_putp returning -1 */
-	.ioctl  = stream_ioctl,
-};
-
 /* ---- Boot-time registration ------------------------------------------ */
+
+/* Defined in arch/aarch64/fbcon.c; not present on ARMv7 (no framebuffer yet).
+ * Conditional on __aarch64__ so the ARMv7 build links cleanly. */
+#ifdef __aarch64__
+extern struct streamtab fbcon_streamtab;
+#endif
 
 void streams_head_init(void)
 {
@@ -816,23 +851,45 @@ void streams_head_init(void)
 	 * any allocb() call, which means before any stream is opened. */
 	streams_init();
 
+	/* The by-name registry stays -- it backs I_PUSH module lookup,
+	 * which is name-keyed in SVR4.  Modules with no chrdev (upper,
+	 * delay) live here only. */
 	streams_register("loop",    &loop_streamtab);
 	streams_register("null",    &null_streamtab);
 	streams_register("console", &console_streamtab);
 	streams_register("klog",    &klog_streamtab);
 	streams_register("upper",   &upper_streamtab);
 	streams_register("delay",   &delay_streamtab);
+#ifdef __aarch64__
+	streams_register("fbcon",   &fbcon_streamtab);
+#endif
 
-	/* Publish drivers as character-special files under /dev.
-	 * Modules ("upper", "delay") stay registry-only -- they
-	 * are not openable, they're pushed via ioctl(I_PUSH).
-	 * /dev/klog uses klog_fops (custom open hook) because opening
-	 * has to seed the read queue with the current ring contents. */
+	/* SVR4 cdevsw: each openable STREAMS driver claims a major
+	 * number.  Modules (upper, delay) are pushed onto an already-
+	 * open stream and don't need a major; we register them here
+	 * anyway so /dev/upper and /dev/delay are openable too -- handy
+	 * for testing the module logic in isolation. */
+	cdev_register(CDEV_MAJ_LOOP,    "loop",    &loop_streamtab);
+	cdev_register(CDEV_MAJ_NULL,    "null",    &null_streamtab);
+	cdev_register(CDEV_MAJ_CONSOLE, "console", &console_streamtab);
+	cdev_register(CDEV_MAJ_KLOG,    "klog",    &klog_streamtab);
+	cdev_register(CDEV_MAJ_UPPER,   "upper",   &upper_streamtab);
+	cdev_register(CDEV_MAJ_DELAY,   "delay",   &delay_streamtab);
+#ifdef __aarch64__
+	cdev_register(CDEV_MAJ_FBCON,   "fbcon",   &fbcon_streamtab);
+#endif
+
+	/* Publish under /dev with their dev_t.  The VFS open path
+	 * looks up cdevsw[MAJOR(rdev)] to find the streamtab; the
+	 * inode no longer holds the driver pointer directly. */
 	struct dentry *dev = vfs_mkdir(vfs_root(), "dev");
-	vfs_mknod_chrdev(dev, "loop",    &stream_fops, &loop_streamtab);
-	vfs_mknod_chrdev(dev, "null",    &stream_fops, &null_streamtab);
-	vfs_mknod_chrdev(dev, "console", &stream_fops, &console_streamtab);
-	vfs_mknod_chrdev(dev, "klog",    &klog_fops,   &klog_streamtab);
+	vfs_mknod_chrdev(dev, "loop",    MKDEV(CDEV_MAJ_LOOP,    0));
+	vfs_mknod_chrdev(dev, "null",    MKDEV(CDEV_MAJ_NULL,    0));
+	vfs_mknod_chrdev(dev, "console", MKDEV(CDEV_MAJ_CONSOLE, 0));
+	vfs_mknod_chrdev(dev, "klog",    MKDEV(CDEV_MAJ_KLOG,    0));
+#ifdef __aarch64__
+	vfs_mknod_chrdev(dev, "fbcon",   MKDEV(CDEV_MAJ_FBCON,   0));
+#endif
 
 	kprintf("stream_head: registered modules:");
 	for (struct stmod_entry *e = registry; e; e = e->next)

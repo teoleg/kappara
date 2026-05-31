@@ -8,8 +8,11 @@
  *      vfs_mkdir, vfs_mknod_chrdev).  Real filesystems will plug in
  *      next to this.
  *
- *   2. Own the global fd table.  fd_alloc / fd_free / fd_get; small
- *      fixed-size array indexed by fd integer.
+ *   2. Drive the per-thread fd table.  fd_alloc / fd_free / fd_get
+ *      operate on cur->fdt[], so each thread sees its own fds; spawn
+ *      copies the parent's table over and bumps f_refs on every
+ *      inherited file so a close in one thread doesn't free the
+ *      file out from under the other.
  *
  *   3. Provide the sys_*_impl entry points that the syscall layer
  *      calls into.  These do the path lookup, find the file_ops via
@@ -52,11 +55,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kappara/cdevsw.h"
 #include "kappara/kmem.h"
 #include "kappara/printk.h"
+#include "kappara/sched.h"
 #include "kappara/string.h"
 #include "kappara/uaccess.h"
 #include "kappara/vfs.h"
+
+/* The single chrdev file_ops table -- defined in kernel/stream_head.c.
+ * All STREAMS chrdev inodes hang their VFS dispatch off this one
+ * vtable; the per-driver behavior is reached through cdevsw[MAJOR(rdev)]
+ * inside the stream_*  methods.  See include/kappara/cdevsw.h. */
+extern struct file_ops stream_fops;
 
 /* ---- Root of the in-memory tree --------------------------------------- */
 
@@ -90,6 +101,7 @@ static struct inode *new_inode(enum inode_type t, struct file_ops *fops,
 	i->i_type    = t;
 	i->i_fops    = fops;
 	i->i_private = priv;
+	i->i_rdev    = 0;
 	return i;
 }
 
@@ -165,9 +177,16 @@ struct dentry *vfs_mkdir(struct dentry *parent, const char *name)
 }
 
 struct dentry *vfs_mknod_chrdev(struct dentry *parent, const char *name,
-				struct file_ops *fops, void *priv)
+				uint32_t rdev)
 {
-	struct inode *i = new_inode(INODE_CHRDEV, fops, priv);
+	if (!cdev_lookup(MAJOR(rdev))) {
+		kprintf("vfs_mknod_chrdev: '%s': no driver at major %u\n",
+			name, MAJOR(rdev));
+		return NULL;
+	}
+	struct inode *i = new_inode(INODE_CHRDEV, &stream_fops, NULL);
+	if (!i) return NULL;
+	i->i_rdev = rdev;
 	return new_dentry(name, i, parent);
 }
 
@@ -235,15 +254,16 @@ long vfs_listdir(struct dentry *dir, char *out, size_t cap)
 
 /* ---- fd table --------------------------------------------------------- */
 
-#define FD_MAX	16
-
-static struct file *fd_table[FD_MAX];
+/* Per-thread fdt lives in struct kthread (KT_FD_MAX slots).  The
+ * symbols below operate on whichever thread is currently scheduled,
+ * which is the right thing for the syscall path. */
 
 int fd_alloc(struct file *f)
 {
-	for (int i = 0; i < FD_MAX; i++) {
-		if (!fd_table[i]) {
-			fd_table[i] = f;
+	if (!cur) return -1;
+	for (int i = 0; i < KT_FD_MAX; i++) {
+		if (!cur->fdt[i]) {
+			cur->fdt[i] = f;
 			return i;
 		}
 	}
@@ -252,21 +272,57 @@ int fd_alloc(struct file *f)
 
 void fd_free(int fd)
 {
-	if (fd < 0 || fd >= FD_MAX)
+	if (!cur || fd < 0 || fd >= KT_FD_MAX)
 		return;
-	fd_table[fd] = NULL;
+	cur->fdt[fd] = NULL;
 }
 
 struct file *fd_get(int fd)
 {
-	if (fd < 0 || fd >= FD_MAX)
+	if (!cur || fd < 0 || fd >= KT_FD_MAX)
 		return NULL;
-	return fd_table[fd];
+	return cur->fdt[fd];
+}
+
+/* Drop one reference; on the last reference call the file's close op
+ * and free the struct file.  Used by both sys_close and the implicit
+ * close-all on thread exit. */
+static void file_put(struct file *f)
+{
+	if (!f) return;
+	if (--f->f_refs > 0) return;
+	if (f->f_ops && f->f_ops->close)
+		f->f_ops->close(f);
+	kfree(f);
+}
+
+void kthread_inherit_fds(struct kthread *child, const struct kthread *parent)
+{
+	if (!child || !parent) return;
+	for (int i = 0; i < KT_FD_MAX; i++) {
+		struct file *f = parent->fdt[i];
+		child->fdt[i] = f;
+		if (f) f->f_refs++;
+	}
+}
+
+/* Called from kthread_exit on the dying thread.  Releases every fd
+ * the thread still holds, so exiting cleanly is enough to close any
+ * pipe ends or open files the thread inherited or opened. */
+void vfs_drain_fds(struct kthread *t)
+{
+	if (!t) return;
+	for (int i = 0; i < KT_FD_MAX; i++) {
+		struct file *f = t->fdt[i];
+		if (!f) continue;
+		t->fdt[i] = NULL;
+		file_put(f);
+	}
 }
 
 /* ---- Syscall entry points -------------------------------------------- */
 
-int sys_open_impl(const char *path)
+int sys_open_impl(const char *path, int flags)
 {
 	char kpath[128];
 	const char *p;
@@ -288,7 +344,7 @@ int sys_open_impl(const char *path)
 	}
 	struct inode *ino = d->d_inode;
 	if (!ino->i_fops || !ino->i_fops->open) {
-		kprintf("sys_open: '%s' has no open op\n", path);
+		kprintf("sys_open: '%s' has no open op\n", p);
 		return -1;
 	}
 
@@ -299,6 +355,7 @@ int sys_open_impl(const char *path)
 	f->f_inode   = ino;
 	f->f_private = NULL;
 	f->f_refs    = 1;
+	f->f_flags   = flags;
 
 	if (f->f_ops->open(f) < 0) {
 		kfree(f);
@@ -315,15 +372,126 @@ int sys_open_impl(const char *path)
 	return fd;
 }
 
+/*
+ * Resolve a path into (parent dentry, basename).  Used by every
+ * "operate on a name in a directory" syscall (creat, mkdir, unlink,
+ * rmdir).  Copies the user pointer if syscall_from_user is set;
+ * writes the parent name into dirbuf and points *base into the
+ * original (kernel-side) string.
+ */
+static int resolve_parent(const char *path, char *dirbuf, size_t dirsz,
+			  const char **base_out, char *pathbuf,
+			  size_t pathsz)
+{
+	const char *p;
+	if (syscall_from_user) {
+		if (strncpy_from_user(pathbuf, path, pathsz) < 0)
+			return -1;
+		p = pathbuf;
+	} else {
+		if (!path) return -1;
+		p = path;
+	}
+	if (p[0] != '/') return -1;
+
+	const char *last = p;
+	for (const char *q = p; *q; q++)
+		if (*q == '/') last = q;
+	size_t dirlen = (size_t)(last - p);
+	if (dirlen == 0) dirlen = 1;
+	if (dirlen >= dirsz) return -1;
+	for (size_t i = 0; i < dirlen; i++) dirbuf[i] = p[i];
+	dirbuf[dirlen] = '\0';
+	*base_out = last + 1;
+	return 0;
+}
+
+int sys_mkdir_impl(const char *path)
+{
+	char dirbuf[128], pathbuf[128];
+	const char *base;
+	if (resolve_parent(path, dirbuf, sizeof(dirbuf), &base,
+			   pathbuf, sizeof(pathbuf)) < 0) {
+		kprintf("sys_mkdir: bad path\n");
+		return -1;
+	}
+	if (!*base) return -1;
+	struct dentry *d = vfs_lookup(dirbuf);
+	if (!d || !d->d_inode) return -1;
+	struct inode *parent = d->d_inode;
+	if (parent->i_type != INODE_DIR || !parent->i_fops ||
+	    !parent->i_fops->mkdir)
+		return -1;
+	return parent->i_fops->mkdir(parent, base);
+}
+
+int sys_unlink_impl(const char *path)
+{
+	char dirbuf[128], pathbuf[128];
+	const char *base;
+	if (resolve_parent(path, dirbuf, sizeof(dirbuf), &base,
+			   pathbuf, sizeof(pathbuf)) < 0)
+		return -1;
+	if (!*base) return -1;
+	struct dentry *d = vfs_lookup(dirbuf);
+	if (!d || !d->d_inode) return -1;
+	struct inode *parent = d->d_inode;
+	if (!parent->i_fops || !parent->i_fops->unlink) {
+		kprintf("sys_unlink: '%s' has no unlink op\n", dirbuf);
+		return -1;
+	}
+	int rc = parent->i_fops->unlink(parent, base);
+	if (rc == 0)
+		vfs_remove_child(d, base);
+	return rc;
+}
+
+int sys_rmdir_impl(const char *path)
+{
+	char dirbuf[128], pathbuf[128];
+	const char *base;
+	if (resolve_parent(path, dirbuf, sizeof(dirbuf), &base,
+			   pathbuf, sizeof(pathbuf)) < 0)
+		return -1;
+	if (!*base) return -1;
+	struct dentry *d = vfs_lookup(dirbuf);
+	if (!d || !d->d_inode) return -1;
+	struct inode *parent = d->d_inode;
+	if (!parent->i_fops || !parent->i_fops->rmdir) {
+		kprintf("sys_rmdir: '%s' has no rmdir op\n", dirbuf);
+		return -1;
+	}
+	int rc = parent->i_fops->rmdir(parent, base);
+	if (rc == 0)
+		vfs_remove_child(d, base);
+	return rc;
+}
+
+int vfs_remove_child(struct dentry *parent, const char *name)
+{
+	if (!parent || !parent->d_child) return -1;
+	struct dentry **link = &parent->d_child;
+	while (*link) {
+		struct dentry *cur = *link;
+		size_t i;
+		for (i = 0; cur->d_name[i] && cur->d_name[i] == name[i]; i++)
+			;
+		if (cur->d_name[i] == '\0' && name[i] == '\0') {
+			*link = cur->d_sibling;
+			return 0;
+		}
+		link = &cur->d_sibling;
+	}
+	return -1;
+}
+
 int sys_close_impl(int fd)
 {
 	struct file *f = fd_get(fd);
 	if (!f)
 		return -1;
-	if (f->f_ops->close)
-		f->f_ops->close(f);
 	fd_free(fd);
-	kfree(f);
+	file_put(f);
 	return 0;
 }
 
@@ -392,4 +560,77 @@ long sys_getmsg_impl(int fd, struct strbuf *c,
 	if (!f || !f->f_ops->getmsg)
 		return -1;
 	return f->f_ops->getmsg(f, c, d, flagsp);
+}
+
+long sys_seek_impl(int fd, long offset, int whence)
+{
+	struct file *f = fd_get(fd);
+	if (!f || !f->f_ops->seek)
+		return -1;
+	return f->f_ops->seek(f, offset, whence);
+}
+
+/*
+ * Split a path like "/etc/foo" into the parent dentry "/etc" and the
+ * basename "foo".  Returns 0 on success.  Lives at the bottom of
+ * sys_creat_impl since that's the only caller today.
+ */
+static int split_parent(const char *path, char *dir, size_t dirsz,
+			const char **base)
+{
+	if (!path || path[0] != '/')
+		return -1;
+	const char *last = path;
+	for (const char *p = path; *p; p++)
+		if (*p == '/')
+			last = p;
+	size_t dirlen = (size_t)(last - path);
+	if (dirlen == 0) dirlen = 1;	/* parent is "/" itself */
+	if (dirlen >= dirsz)
+		return -1;
+	for (size_t i = 0; i < dirlen; i++)
+		dir[i] = path[i];
+	dir[dirlen] = '\0';
+	*base = last + 1;
+	return 0;
+}
+
+int sys_creat_impl(const char *path)
+{
+	char kpath[128];
+	const char *p;
+	if (syscall_from_user) {
+		if (strncpy_from_user(kpath, path, sizeof(kpath)) < 0) {
+			kprintf("sys_creat: rejected user path\n");
+			return -1;
+		}
+		p = kpath;
+	} else {
+		if (!path) return -1;
+		p = path;
+	}
+
+	char dirbuf[128];
+	const char *basename;
+	if (split_parent(p, dirbuf, sizeof(dirbuf), &basename) < 0) {
+		kprintf("sys_creat: bad path '%s'\n", p);
+		return -1;
+	}
+	if (!*basename) {
+		kprintf("sys_creat: empty basename\n");
+		return -1;
+	}
+
+	struct dentry *d = vfs_lookup(dirbuf);
+	if (!d || !d->d_inode) {
+		kprintf("sys_creat: parent '%s' not found\n", dirbuf);
+		return -1;
+	}
+	struct inode *parent = d->d_inode;
+	if (parent->i_type != INODE_DIR || !parent->i_fops ||
+	    !parent->i_fops->creat) {
+		kprintf("sys_creat: '%s' does not support create\n", dirbuf);
+		return -1;
+	}
+	return parent->i_fops->creat(parent, basename);
 }

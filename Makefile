@@ -17,6 +17,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/arch/aarch64/mailbox.o \
         $(BUILD)/arch/aarch64/framebuffer.o \
         $(BUILD)/arch/aarch64/font8x8.o \
+        $(BUILD)/arch/aarch64/fbcon.o \
         $(BUILD)/arch/aarch64/userblob.o
     # User-side init binary, linked at VA 0x10000000 and incbin'd
     # into userblob.S so the kernel ELF carries the raw bytes.
@@ -32,6 +33,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/kernel/streams.o \
         $(BUILD)/kernel/klog.o \
         $(BUILD)/kernel/vfs.o \
+        $(BUILD)/kernel/cdevsw.o \
         $(BUILD)/kernel/stream_head.o \
         $(BUILD)/kernel/syscall.o \
         $(BUILD)/kernel/uaccess.o \
@@ -66,6 +68,7 @@ else ifeq ($(ARCH),arm)
         $(BUILD)/kernel/streams.o \
         $(BUILD)/kernel/klog.o \
         $(BUILD)/kernel/vfs.o \
+        $(BUILD)/kernel/cdevsw.o \
         $(BUILD)/kernel/stream_head.o \
         $(BUILD)/kernel/syscall.o \
         $(BUILD)/kernel/uaccess.o \

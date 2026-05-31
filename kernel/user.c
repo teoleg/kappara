@@ -96,7 +96,8 @@ static unsigned char user_storage[USER_SIZE];
 extern char user_blob_start[];
 extern char user_blob_end[];
 
-extern void aarch64_enter_userspace(uint64_t entry, uint64_t sp_el0);
+extern void aarch64_enter_userspace(uint64_t entry, uint64_t sp_el0,
+				    uint64_t arg);
 
 void user_init(void)
 {
@@ -138,11 +139,94 @@ static void user_thread_main(void *arg)
 	(void)arg;
 	kprintf("user: kthread entering EL0 (entry=0x%lx, sp=0x%lx)\n",
 		(unsigned long)USER_VA, (unsigned long)USER_STACK_TOP);
-	aarch64_enter_userspace(USER_VA, USER_STACK_TOP);
+	aarch64_enter_userspace(USER_VA, USER_STACK_TOP, 0);
 	/* unreachable */
 }
 
 void user_spawn(void)
 {
 	kthread_create("user-init", user_thread_main, NULL);
+}
+
+/*
+ * Multi-process support.  Every spawned user thread shares the same
+ * user address space (single 2 MB region at USER_VA), but each gets
+ * its own user-mode stack carved out from the top of that region.
+ * Stack 0 (USER_STACK_TOP) belongs to init; the spawn pool sits
+ * below it at 64 KB intervals.
+ *
+ *     USER_VA + USER_SIZE  --+
+ *                            |  64 KB  init stack
+ *                            +--
+ *                            |  64 KB  spawn[0] stack
+ *                            +--
+ *                            |  64 KB  spawn[1] stack
+ *                            +-- ...
+ *
+ * With 64 KB stacks we get (USER_SIZE / 64 KB) - 1 = 31 spawn slots.
+ * Plenty for a learning OS.
+ */
+
+#define SPAWN_STACK_SIZE	0x10000UL
+#define SPAWN_MAX		((USER_SIZE / SPAWN_STACK_SIZE) - 1)
+
+static unsigned spawn_next;
+
+struct spawn_args {
+	uint64_t entry;
+	uint64_t sp;
+	uint64_t arg;
+};
+
+static void spawn_thread_main(void *p)
+{
+	struct spawn_args a = *(struct spawn_args *)p;
+	kfree(p);
+	kprintf("user: spawn entering EL0 (entry=0x%lx, sp=0x%lx, arg=0x%lx)\n",
+		(unsigned long)a.entry, (unsigned long)a.sp,
+		(unsigned long)a.arg);
+	aarch64_enter_userspace(a.entry, a.sp, a.arg);
+	/* unreachable */
+}
+
+long sys_spawn_impl(uint64_t entry, uint64_t arg)
+{
+	if (spawn_next >= SPAWN_MAX) {
+		kprintf("sys_spawn: pool exhausted\n");
+		return -1;
+	}
+	/* Reject entry points outside the user code region.  Bounds
+	 * are the same 2 MB block we publish to EL0. */
+	if (entry < USER_VA || entry >= USER_VA + USER_SIZE) {
+		kprintf("sys_spawn: entry 0x%lx not in user range\n",
+			(unsigned long)entry);
+		return -1;
+	}
+
+	unsigned slot = ++spawn_next;	/* 1..SPAWN_MAX */
+	struct spawn_args *a = kmalloc(sizeof(*a));
+	if (!a) return -1;
+	a->entry = entry;
+	a->sp    = USER_VA + USER_SIZE - (uint64_t)slot * SPAWN_STACK_SIZE;
+	a->arg   = arg;
+
+	struct kthread *t = kthread_create("spawn", spawn_thread_main, a);
+	if (!t) return -1;
+
+	/* Hand the child a copy of the parent's fd table so it inherits
+	 * pipes, the console, and anything else the parent had open --
+	 * the fork()-ish piece of spawn that makes pipework actually
+	 * compose. */
+	kthread_inherit_fds(t, cur);
+	return (long)t->tid;
+}
+
+void sys_exit_impl(void) __attribute__((noreturn));
+void sys_exit_impl(void)
+{
+	kthread_exit();
+	/* kthread_exit doesn't return, but the attribute helps the
+	 * caller's control-flow analysis. */
+	for (;;)
+		;
 }

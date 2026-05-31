@@ -1,27 +1,43 @@
 /*
- * kernel/kfs.c -- read-only mount for the v1 kappara filesystem
+ * kernel/kfs.c -- mount / mkimage for the v2 kappara filesystem
  * =============================================================
  *
  * See include/kappara/kfs.h for the on-disk layout.  This file:
  *
- *   1. kfs_mkimage(bd)   formats `bd` with a known set of files
- *                        (built-in payloads since we have no `mkfs`).
- *   2. kfs_mount(bd, dp) reads the superblock + directory off the
- *                        device and creates a regfile inode under
- *                        the VFS directory `dp` for each entry.
- *   3. regfile_fops       file_ops for those inodes: open allocates
- *                        a position cursor; read pulls one block at
- *                        a time via bd->bd_read until the offset
- *                        reaches the file's size.
+ *   1. kfs_mkimage(bd)   formats `bd`: superblock at block 0, the
+ *                        free-block bitmap at block 1, the root
+ *                        dirent table at block 2, then a fixed
+ *                        KFS_BLOCKS_PER_FILE-block run per built-in
+ *                        payload.  Every allocated block is marked
+ *                        used in the bitmap before it is flushed.
+ *   2. kfs_mount(bd, dp) reads superblock + bitmap off the device,
+ *                        walks the root dirent table, and creates
+ *                        an inode under the VFS directory `dp` for
+ *                        each entry (recursively for subdirs).
+ *   3. regfile_fops       file_ops for files: open/close manage a
+ *                        position cursor; read/write/seek move
+ *                        bytes one block at a time via bd_read /
+ *                        bd_write; O_TRUNC zeroes size on open.
+ *   4. kfs_dir_fops       file_ops for directories: creat / mkdir /
+ *                        unlink / rmdir allocate or free runs via
+ *                        kfs_alloc_block_zero / kfs_free_blocks and
+ *                        update the parent dirent table.
  *
- * Limitations of this first cut
- * -----------------------------
- *   - read-only.  No write/truncate/append yet.
- *   - one read per call returns up to (BLK_SIZE - offset_in_block)
- *     bytes; user/init.c's read loop with chunked sys_read drains
- *     the whole file across multiple syscalls.
- *   - flat namespace per kfs mount (no subdirs within kfs).
- *   - no buffer cache; every read goes straight to the block device.
+ * v2 vs v1
+ * --------
+ * v1's "allocator" was a monotonic counter (next_free_block) in the
+ * superblock.  Deleted files leaked their blocks forever -- rm
+ * cleared the dirent but never reclaimed storage.  v2 swaps that
+ * counter for a real bitmap so kfs_alloc_block_zero can find any
+ * contiguous run of free blocks and rm / rmdir can return them to
+ * the pool.
+ *
+ * Limitations still here
+ * ----------------------
+ *   - per-file allocation is fixed at mkimage / creat time
+ *     (KFS_BLOCKS_PER_FILE blocks).  Append past that returns EIO.
+ *   - no buffer cache: every read/write hits the block device.
+ *   - bitmap holds only the first 4096 blocks (one 512 B page).
  */
 
 #include <stddef.h>
@@ -49,6 +65,19 @@ static int regfile_open(struct file *f)
 	c->kf  = (struct kfs_file *)f->f_inode->i_private;
 	c->pos = 0;
 	f->f_private = c;
+
+	/* O_TRUNC: zero size + push to disk so subsequent reads see EOF
+	 * immediately and `echo` style overwrites don't leak the tail of
+	 * the previous content. */
+	if (f->f_flags & O_TRUNC) {
+		struct kfs_file *kf = c->kf;
+		kf->size_bytes = 0;
+		struct kfs_dirent dir[KFS_DIRENTS];
+		if (kf->bd->bd_read(kf->bd, kf->dir_block, dir) == 0) {
+			dir[kf->dirent_idx].size_bytes = 0;
+			kf->bd->bd_write(kf->bd, kf->dir_block, dir);
+		}
+	}
 	return 0;
 }
 
@@ -132,12 +161,29 @@ static long regfile_write(struct file *f, const void *buf, size_t len)
 		kf->size_bytes = c->pos;
 		/* Push the new size back to the directory entry on disk. */
 		struct kfs_dirent dir[KFS_DIRENTS];
-		if (kf->bd->bd_read(kf->bd, 1, dir) == 0) {
+		if (kf->bd->bd_read(kf->bd, kf->dir_block, dir) == 0) {
 			dir[kf->dirent_idx].size_bytes = kf->size_bytes;
-			kf->bd->bd_write(kf->bd, 1, dir);
+			kf->bd->bd_write(kf->bd, kf->dir_block, dir);
 		}
 	}
 	return (long)written;
+}
+
+static long regfile_seek(struct file *f, long offset, int whence)
+{
+	struct regfile_cursor *c  = f->f_private;
+	struct kfs_file       *kf = c->kf;
+	long newpos;
+	switch (whence) {
+	case 0: newpos = offset; break;			/* SEEK_SET */
+	case 1: newpos = (long)c->pos + offset; break;	/* SEEK_CUR */
+	case 2: newpos = (long)kf->size_bytes + offset; break;	/* SEEK_END */
+	default: return -1;
+	}
+	if (newpos < 0)
+		return -1;
+	c->pos = (uint32_t)newpos;
+	return newpos;
 }
 
 static struct file_ops regfile_fops = {
@@ -145,6 +191,307 @@ static struct file_ops regfile_fops = {
 	.close = regfile_close,
 	.read  = regfile_read,
 	.write = regfile_write,
+	.seek  = regfile_seek,
+};
+
+/*
+ * Per-mount state.  Single static since we have one kfs mount today;
+ * the bitmap cache is loaded at mount and written back on every
+ * allocation/free.
+ */
+static struct {
+	struct block_device *bd;
+	uint8_t              bitmap[BLK_SIZE];
+} kfs_mnt;
+
+static struct file_ops kfs_dir_fops;	/* fwd; defined below */
+
+static int  kfs_bit_get(uint32_t blk)
+{
+	return (kfs_mnt.bitmap[blk / 8] >> (blk % 8)) & 1;
+}
+
+static void kfs_bit_set(uint32_t blk, int val)
+{
+	if (val)
+		kfs_mnt.bitmap[blk / 8] |=  (uint8_t)(1u << (blk % 8));
+	else
+		kfs_mnt.bitmap[blk / 8] &= (uint8_t)~(1u << (blk % 8));
+}
+
+static void kfs_bitmap_save(void)
+{
+	if (kfs_mnt.bd)
+		kfs_mnt.bd->bd_write(kfs_mnt.bd,
+				     KFS_BITMAP_BLOCK, kfs_mnt.bitmap);
+}
+
+/*
+ * Find the first run of `count` contiguous free blocks and mark them
+ * allocated.  Returns the starting block number, or 0 (which is the
+ * superblock so never a valid data block) on failure.
+ *
+ * Also zeroes the freshly-allocated blocks so they read as 0 if
+ * something pulls them up before they're written.
+ */
+static uint32_t kfs_alloc_block_zero(struct block_device *bd, uint32_t count)
+{
+	uint32_t total = bd->bd_nblocks;
+	if (total > BLK_SIZE * 8) total = BLK_SIZE * 8;	/* bitmap cap */
+
+	for (uint32_t start = KFS_ROOT_BLOCK + 1;
+	     start + count <= total; start++) {
+		unsigned ok = 1;
+		for (uint32_t i = 0; i < count; i++) {
+			if (kfs_bit_get(start + i)) { ok = 0; break; }
+		}
+		if (!ok) continue;
+
+		for (uint32_t i = 0; i < count; i++)
+			kfs_bit_set(start + i, 1);
+		kfs_bitmap_save();
+
+		unsigned char zero[BLK_SIZE];
+		for (size_t i = 0; i < BLK_SIZE; i++) zero[i] = 0;
+		for (uint32_t b = 0; b < count; b++)
+			if (bd->bd_write(bd, start + b, zero) < 0) return 0;
+		return start;
+	}
+	kprintf("kfs_alloc: no contiguous %u-block run available\n",
+		(unsigned)count);
+	return 0;
+}
+
+static void kfs_free_blocks(uint32_t start, uint32_t count)
+{
+	for (uint32_t i = 0; i < count; i++)
+		kfs_bit_set(start + i, 0);
+	kfs_bitmap_save();
+}
+
+/* Look up the dir_block to operate on for a directory inode.  The
+ * inode's i_private points at a struct kfs_dir we set up at mount
+ * (or kfs_dir_mkdir) time. */
+static struct kfs_dir *kfs_dir_of(struct inode *dir)
+{
+	return (struct kfs_dir *)dir->i_private;
+}
+
+/* Scan a dirent block for a free slot and reject duplicates.
+ * Returns the slot index or -1.  Caller already loaded dir_blk. */
+static int kfs_dir_find_slot(struct kfs_dirent *dir_blk, const char *name)
+{
+	int slot = -1;
+	size_t nlen = 0;
+	while (name[nlen]) nlen++;
+	if (nlen >= KFS_NAME_MAX) return -1;
+	for (unsigned i = 0; i < KFS_DIRENTS; i++) {
+		if (dir_blk[i].name[0] == '\0') {
+			if (slot < 0) slot = (int)i;
+			continue;
+		}
+		size_t k;
+		for (k = 0; k < KFS_NAME_MAX && dir_blk[i].name[k] == name[k]; k++)
+			if (name[k] == '\0') break;
+		if (k < KFS_NAME_MAX && dir_blk[i].name[k] == name[k])
+			return -1;	/* duplicate */
+	}
+	return slot;
+}
+
+static char *kfs_dup_name(const char *name)
+{
+	char *nm = kmalloc(KFS_NAME_MAX);
+	if (!nm) return NULL;
+	size_t i = 0;
+	for (; i < KFS_NAME_MAX - 1 && name[i]; i++) nm[i] = name[i];
+	nm[i] = '\0';
+	return nm;
+}
+
+static int kfs_dir_creat(struct inode *dir, const char *name)
+{
+	struct kfs_dir *d = kfs_dir_of(dir);
+	if (!d) return -1;
+	struct block_device *bd = d->bd;
+
+	struct kfs_dirent dir_blk[KFS_DIRENTS];
+	if (bd->bd_read(bd, d->dir_block, dir_blk) < 0) return -1;
+
+	int slot = kfs_dir_find_slot(dir_blk, name);
+	if (slot < 0) { kprintf("kfs_creat: full or dup\n"); return -1; }
+
+	uint32_t start = kfs_alloc_block_zero(bd, KFS_BLOCKS_PER_FILE);
+	if (!start) return -1;
+
+	for (size_t i = 0; i < KFS_NAME_MAX; i++) dir_blk[slot].name[i] = 0;
+	for (size_t i = 0; name[i] && i < KFS_NAME_MAX - 1; i++)
+		dir_blk[slot].name[i] = name[i];
+	dir_blk[slot].start_block = start;
+	dir_blk[slot].size_bytes  = 0;
+	dir_blk[slot].type        = KFS_TYPE_FILE;
+	if (bd->bd_write(bd, d->dir_block, dir_blk) < 0) return -1;
+
+	struct kfs_file *kf = kmalloc(sizeof(*kf));
+	char *nm = kfs_dup_name(name);
+	if (!kf || !nm) return -1;
+	kf->bd           = bd;
+	kf->start_block  = start;
+	kf->size_bytes   = 0;
+	kf->alloc_blocks = KFS_BLOCKS_PER_FILE;
+	kf->dir_block    = d->dir_block;
+	kf->dirent_idx   = (uint8_t)slot;
+	vfs_mknod_regfile(d->dentry, nm, &regfile_fops, kf);
+
+	kprintf("kfs_creat: '%s' in dir_block=%u slot=%d blocks=%u..%u\n",
+		name, d->dir_block, slot, start,
+		start + KFS_BLOCKS_PER_FILE - 1);
+	return 0;
+}
+
+static int kfs_dir_mkdir(struct inode *dir, const char *name)
+{
+	struct kfs_dir *d = kfs_dir_of(dir);
+	if (!d) return -1;
+	struct block_device *bd = d->bd;
+
+	struct kfs_dirent dir_blk[KFS_DIRENTS];
+	if (bd->bd_read(bd, d->dir_block, dir_blk) < 0) return -1;
+
+	int slot = kfs_dir_find_slot(dir_blk, name);
+	if (slot < 0) { kprintf("kfs_mkdir: full or dup\n"); return -1; }
+
+	uint32_t subblk = kfs_alloc_block_zero(bd, 1);
+	if (!subblk) return -1;
+
+	for (size_t i = 0; i < KFS_NAME_MAX; i++) dir_blk[slot].name[i] = 0;
+	for (size_t i = 0; name[i] && i < KFS_NAME_MAX - 1; i++)
+		dir_blk[slot].name[i] = name[i];
+	dir_blk[slot].start_block = subblk;
+	dir_blk[slot].size_bytes  = 0;
+	dir_blk[slot].type        = KFS_TYPE_DIR;
+	if (bd->bd_write(bd, d->dir_block, dir_blk) < 0) return -1;
+
+	/* Hook into VFS: a new directory dentry whose i_fops route
+	 * subsequent creat/mkdir back here and whose i_private knows
+	 * the new dirent block. */
+	char *nm = kfs_dup_name(name);
+	struct kfs_dir *sub = kmalloc(sizeof(*sub));
+	if (!nm || !sub) return -1;
+	struct dentry *sub_dentry = vfs_mkdir(d->dentry, nm);
+	if (!sub_dentry) return -1;
+	sub->bd        = bd;
+	sub->dir_block = subblk;
+	sub->dentry    = sub_dentry;
+	sub_dentry->d_inode->i_fops    = &kfs_dir_fops;
+	sub_dentry->d_inode->i_private = sub;
+
+	kprintf("kfs_mkdir: '%s' dirent_block=%u under dir_block=%u slot=%d\n",
+		name, subblk, d->dir_block, slot);
+	return 0;
+}
+
+/* Scan a directory block for an entry matching `name`.  Returns the
+ * slot index or -1.  Compares up to the first NUL on either side. */
+static int kfs_dir_find_named(const struct kfs_dirent *dir_blk,
+			      const char *name)
+{
+	for (unsigned i = 0; i < KFS_DIRENTS; i++) {
+		if (dir_blk[i].name[0] == '\0')
+			continue;
+		size_t k = 0;
+		while (k < KFS_NAME_MAX
+		       && dir_blk[i].name[k] == name[k]
+		       && name[k]
+		       && dir_blk[i].name[k])
+			k++;
+		if (k < KFS_NAME_MAX
+		    && dir_blk[i].name[k] == '\0'
+		    && name[k] == '\0')
+			return (int)i;
+	}
+	return -1;
+}
+
+static int kfs_dir_unlink(struct inode *dir, const char *name)
+{
+	struct kfs_dir *d = kfs_dir_of(dir);
+	if (!d) return -1;
+	struct block_device *bd = d->bd;
+
+	struct kfs_dirent dir_blk[KFS_DIRENTS];
+	if (bd->bd_read(bd, d->dir_block, dir_blk) < 0) return -1;
+	int slot = kfs_dir_find_named(dir_blk, name);
+	if (slot < 0) {
+		kprintf("kfs_unlink: '%s' not found in dir_block=%u\n",
+			name, d->dir_block);
+		return -1;
+	}
+	if (dir_blk[slot].type != KFS_TYPE_FILE) {
+		kprintf("kfs_unlink: '%s' is not a regular file\n", name);
+		return -1;
+	}
+	/* Reclaim the file's data blocks via the bitmap, then clear the
+	 * dirent (name[0]=0 marks empty). */
+	uint32_t reclaim_start = dir_blk[slot].start_block;
+	for (size_t i = 0; i < KFS_NAME_MAX; i++) dir_blk[slot].name[i] = 0;
+	dir_blk[slot].start_block = 0;
+	dir_blk[slot].size_bytes  = 0;
+	dir_blk[slot].type        = 0;
+	if (bd->bd_write(bd, d->dir_block, dir_blk) < 0) return -1;
+	if (reclaim_start) kfs_free_blocks(reclaim_start, KFS_BLOCKS_PER_FILE);
+
+	kprintf("kfs_unlink: '%s' from dir_block=%u slot=%d (freed blocks %u..%u)\n",
+		name, d->dir_block, slot, reclaim_start,
+		reclaim_start + KFS_BLOCKS_PER_FILE - 1);
+	return 0;
+}
+
+static int kfs_dir_rmdir(struct inode *dir, const char *name)
+{
+	struct kfs_dir *d = kfs_dir_of(dir);
+	if (!d) return -1;
+	struct block_device *bd = d->bd;
+
+	struct kfs_dirent dir_blk[KFS_DIRENTS];
+	if (bd->bd_read(bd, d->dir_block, dir_blk) < 0) return -1;
+	int slot = kfs_dir_find_named(dir_blk, name);
+	if (slot < 0) {
+		kprintf("kfs_rmdir: '%s' not found\n", name);
+		return -1;
+	}
+	if (dir_blk[slot].type != KFS_TYPE_DIR) {
+		kprintf("kfs_rmdir: '%s' is not a directory\n", name);
+		return -1;
+	}
+	/* Refuse to remove a non-empty dir. */
+	struct kfs_dirent sub[KFS_DIRENTS];
+	uint32_t sub_block = dir_blk[slot].start_block;
+	if (bd->bd_read(bd, sub_block, sub) < 0) return -1;
+	for (unsigned i = 0; i < KFS_DIRENTS; i++) {
+		if (sub[i].name[0] != '\0') {
+			kprintf("kfs_rmdir: '%s' is not empty\n", name);
+			return -1;
+		}
+	}
+
+	for (size_t i = 0; i < KFS_NAME_MAX; i++) dir_blk[slot].name[i] = 0;
+	dir_blk[slot].start_block = 0;
+	dir_blk[slot].size_bytes  = 0;
+	dir_blk[slot].type        = 0;
+	if (bd->bd_write(bd, d->dir_block, dir_blk) < 0) return -1;
+	kfs_free_blocks(sub_block, 1);
+
+	kprintf("kfs_rmdir: '%s' from dir_block=%u slot=%d (freed block %u)\n",
+		name, d->dir_block, slot, sub_block);
+	return 0;
+}
+
+static struct file_ops kfs_dir_fops = {
+	.creat  = kfs_dir_creat,
+	.mkdir  = kfs_dir_mkdir,
+	.unlink = kfs_dir_unlink,
+	.rmdir  = kfs_dir_rmdir,
 };
 
 /* ---- mkimage: build a fresh fs in `bd` from baked-in files --------- */
@@ -168,24 +515,34 @@ static const struct payload payloads[] = {
 
 void kfs_mkimage(struct block_device *bd)
 {
-	/* Superblock at block 0. */
+	/* Build the bitmap in memory as we lay things out, then flush
+	 * it to KFS_BITMAP_BLOCK at the end.  We use the static
+	 * kfs_mnt.bitmap as scratch -- kfs_mount will clobber it from
+	 * disk anyway. */
+	kmemset(kfs_mnt.bitmap, 0, sizeof(kfs_mnt.bitmap));
+	kfs_mnt.bd = bd;
+	/* Reserve super, bitmap, root dir. */
+	kfs_bit_set(KFS_SUPER_BLOCK,  1);
+	kfs_bit_set(KFS_BITMAP_BLOCK, 1);
+	kfs_bit_set(KFS_ROOT_BLOCK,   1);
+
 	struct kfs_super sb;
 	kmemset(&sb, 0, sizeof(sb));
 	sb.magic     = KFS_MAGIC;
 	sb.num_files = NPAYLOADS;
-	bd->bd_write(bd, 0, &sb);
+	bd->bd_write(bd, KFS_SUPER_BLOCK, &sb);
 
-	/* Directory at block 1; up to KFS_DIRENTS entries. */
 	struct kfs_dirent dir[KFS_DIRENTS];
 	kmemset(dir, 0, sizeof(dir));
 
 	/*
 	 * Each file gets a fixed KFS_BLOCKS_PER_FILE-block slot so it
 	 * can be overwritten or extended in place up to that size, with
-	 * no free-block management needed.  Unused trailing blocks are
-	 * zeroed so they read as zeros if the file later grows into them.
+	 * no indirect-block management needed.  Unused trailing blocks
+	 * are zeroed so they read as zeros if the file later grows into
+	 * them.
 	 */
-	uint32_t cur_block = 2;
+	uint32_t cur_block = KFS_ROOT_BLOCK + 1;
 	for (unsigned i = 0; i < NPAYLOADS && i < KFS_DIRENTS; i++) {
 		const struct payload *p = &payloads[i];
 		size_t nlen = 0;
@@ -196,6 +553,7 @@ void kfs_mkimage(struct block_device *bd)
 		dir[i].name[nlen]    = '\0';
 		dir[i].start_block   = cur_block;
 		dir[i].size_bytes    = p->size;
+		dir[i].type          = KFS_TYPE_FILE;
 
 		const char *src = p->data;
 		uint32_t    rem = p->size;
@@ -209,10 +567,14 @@ void kfs_mkimage(struct block_device *bd)
 				rem -= n;
 			}
 			bd->bd_write(bd, cur_block + b, buf);
+			kfs_bit_set(cur_block + b, 1);
 		}
 		cur_block += KFS_BLOCKS_PER_FILE;
 	}
-	bd->bd_write(bd, 1, dir);
+	bd->bd_write(bd, KFS_ROOT_BLOCK, dir);
+
+	/* Flush the bitmap. */
+	bd->bd_write(bd, KFS_BITMAP_BLOCK, kfs_mnt.bitmap);
 
 	kprintf("kfs: mkimage wrote %u files (blocks used: 0..%u)\n",
 		(unsigned)NPAYLOADS, (unsigned)(cur_block - 1));
@@ -220,10 +582,54 @@ void kfs_mkimage(struct block_device *bd)
 
 /* ---- mount: pull metadata off the device, attach to the VFS -------- */
 
+/* Recursively walk a dir block and populate the VFS subtree rooted
+ * at vfs_parent.  Subdirectories get their own dir block + kfs_dir
+ * metadata so creat/mkdir on them lands in the right place. */
+static void kfs_mount_dir(struct block_device *bd,
+			  uint32_t dir_block,
+			  struct dentry *vfs_parent)
+{
+	struct kfs_dirent dir[KFS_DIRENTS];
+	if (bd->bd_read(bd, dir_block, dir) < 0)
+		return;
+
+	for (unsigned i = 0; i < KFS_DIRENTS; i++) {
+		if (dir[i].name[0] == '\0')
+			continue;
+
+		char *nm = kfs_dup_name(dir[i].name);
+		if (!nm) continue;
+
+		if (dir[i].type == KFS_TYPE_DIR) {
+			struct kfs_dir *sub = kmalloc(sizeof(*sub));
+			if (!sub) { kfree(nm); continue; }
+			struct dentry *sd = vfs_mkdir(vfs_parent, nm);
+			if (!sd) { kfree(nm); kfree(sub); continue; }
+			sub->bd        = bd;
+			sub->dir_block = dir[i].start_block;
+			sub->dentry    = sd;
+			sd->d_inode->i_fops    = &kfs_dir_fops;
+			sd->d_inode->i_private = sub;
+			kfs_mount_dir(bd, dir[i].start_block, sd);
+		} else {
+			struct kfs_file *kf = kmalloc(sizeof(*kf));
+			if (!kf) { kfree(nm); continue; }
+			kf->bd           = bd;
+			kf->start_block  = dir[i].start_block;
+			kf->size_bytes   = dir[i].size_bytes;
+			kf->alloc_blocks = KFS_BLOCKS_PER_FILE;
+			kf->dir_block    = dir_block;
+			kf->dirent_idx   = (uint8_t)i;
+			vfs_mknod_regfile(vfs_parent, nm,
+					  &regfile_fops, kf);
+		}
+	}
+}
+
 int kfs_mount(struct block_device *bd, struct dentry *mountpoint)
 {
 	struct kfs_super sb;
-	if (bd->bd_read(bd, 0, &sb) < 0) {
+	if (bd->bd_read(bd, KFS_SUPER_BLOCK, &sb) < 0) {
 		kprintf("kfs_mount: superblock read failed\n");
 		return -1;
 	}
@@ -233,38 +639,26 @@ int kfs_mount(struct block_device *bd, struct dentry *mountpoint)
 		return -1;
 	}
 
-	struct kfs_dirent dir[KFS_DIRENTS];
-	if (bd->bd_read(bd, 1, dir) < 0) {
-		kprintf("kfs_mount: directory read failed\n");
+	kfs_mnt.bd = bd;
+	if (bd->bd_read(bd, KFS_BITMAP_BLOCK, kfs_mnt.bitmap) < 0) {
+		kprintf("kfs_mount: bitmap read failed\n");
 		return -1;
 	}
 
-	unsigned n = sb.num_files;
-	if (n > KFS_DIRENTS) n = KFS_DIRENTS;
+	/* Publish creat/mkdir on the mountpoint's inode and stash a
+	 * kfs_dir so kfs_dir_creat / kfs_dir_mkdir know which dir
+	 * block to operate on. */
+	struct kfs_dir *root = kmalloc(sizeof(*root));
+	if (!root) return -1;
+	root->bd        = bd;
+	root->dir_block = KFS_ROOT_BLOCK;
+	root->dentry    = mountpoint;
+	mountpoint->d_inode->i_fops    = &kfs_dir_fops;
+	mountpoint->d_inode->i_private = root;
 
-	for (unsigned i = 0; i < n; i++) {
-		struct kfs_file *kf = kmalloc(sizeof(*kf));
-		if (!kf) continue;
-		kf->bd           = bd;
-		kf->start_block  = dir[i].start_block;
-		kf->size_bytes   = dir[i].size_bytes;
-		kf->alloc_blocks = KFS_BLOCKS_PER_FILE;
-		kf->dirent_idx   = (uint8_t)i;
+	kfs_mount_dir(bd, KFS_ROOT_BLOCK, mountpoint);
 
-		/* dir[i].name is in our stack-local buffer; the dentry
-		 * stores d_name as a raw pointer (callers like vfs_mkdir
-		 * usually pass string literals).  Make a kmalloc copy
-		 * with stable lifetime. */
-		char *nm = kmalloc(KFS_NAME_MAX);
-		if (!nm) { kfree(kf); continue; }
-		for (int j = 0; j < KFS_NAME_MAX; j++)
-			nm[j] = dir[i].name[j];
-		nm[KFS_NAME_MAX - 1] = '\0';
-
-		vfs_mknod_regfile(mountpoint, nm, &regfile_fops, kf);
-	}
-
-	kprintf("kfs: mounted '%s' on /%s (%u files)\n",
-		bd->bd_name, mountpoint->d_name, n);
+	kprintf("kfs: mounted '%s' on /%s\n",
+		bd->bd_name, mountpoint->d_name);
 	return 0;
 }

@@ -50,6 +50,7 @@
 #include "kappara/streams.h"
 #include "kappara/syscall.h"
 #include "kappara/uaccess.h"
+#include "kappara/user.h"
 #include "kappara/vfs.h"
 
 typedef long (*syscall_fn)(long, long, long, long, long, long);
@@ -97,8 +98,39 @@ static long sys_yield(long a0, long a1, long a2, long a3, long a4, long a5)
 
 static long sys_open(long a0, long a1, long a2, long a3, long a4, long a5)
 {
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	return (long)sys_open_impl((const char *)(uintptr_t)a0, (int)a1);
+}
+
+static long sys_mkdir(long a0, long a1, long a2, long a3, long a4, long a5)
+{
 	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-	return (long)sys_open_impl((const char *)(uintptr_t)a0);
+	return (long)sys_mkdir_impl((const char *)(uintptr_t)a0);
+}
+
+static long sys_spawn(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_spawn_impl((uint64_t)a0, (uint64_t)a1);
+}
+
+static long sys_exit(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	sys_exit_impl();
+	return 0;	/* unreachable */
+}
+
+static long sys_unlink(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return (long)sys_unlink_impl((const char *)(uintptr_t)a0);
+}
+
+static long sys_rmdir(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return (long)sys_rmdir_impl((const char *)(uintptr_t)a0);
 }
 
 static long sys_close(long a0, long a1, long a2, long a3, long a4, long a5)
@@ -141,6 +173,18 @@ static long sys_getmsg(long a0, long a1, long a2, long a3, long a4, long a5)
 			       (struct strbuf *)(uintptr_t)a1,
 			       (struct strbuf *)(uintptr_t)a2,
 			       (int *)(uintptr_t)a3);
+}
+
+static long sys_creat(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return (long)sys_creat_impl((const char *)(uintptr_t)a0);
+}
+
+static long sys_seek(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a3; (void)a4; (void)a5;
+	return sys_seek_impl((int)a0, (long)a1, (int)a2);
 }
 
 static long sys_pipe(long a0, long a1, long a2, long a3, long a4, long a5)
@@ -209,6 +253,13 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_getmsg] = sys_getmsg,
 	[SYS_ls]     = sys_ls,
 	[SYS_pipe]   = sys_pipe,
+	[SYS_creat]  = sys_creat,
+	[SYS_seek]   = sys_seek,
+	[SYS_mkdir]  = sys_mkdir,
+	[SYS_spawn]  = sys_spawn,
+	[SYS_exit]   = sys_exit,
+	[SYS_unlink] = sys_unlink,
+	[SYS_rmdir]  = sys_rmdir,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

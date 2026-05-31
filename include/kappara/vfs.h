@@ -52,6 +52,7 @@
 #define KAPPARA_VFS_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "kappara/stream_head.h"	/* struct strbuf */
 
@@ -75,12 +76,28 @@ struct file_ops {
 			const struct strbuf *d, int flags);
 	long  (*getmsg)(struct file *f, struct strbuf *c,
 			struct strbuf *d, int *flagsp);
+	long  (*seek)  (struct file *f, long offset, int whence);
+	/* Directory-side ops: create a regular file or a subdirectory
+	 * named `name` under the inode `dir`.  Only meaningful on
+	 * directory inodes whose underlying filesystem supports it. */
+	int   (*creat) (struct inode *dir, const char *name);
+	int   (*mkdir) (struct inode *dir, const char *name);
+	int   (*unlink)(struct inode *dir, const char *name);
+	int   (*rmdir) (struct inode *dir, const char *name);
 };
+
+/* sys_open / file open flags. */
+#define O_TRUNC		0x01	/* size -> 0 on open */
 
 struct inode {
 	enum inode_type   i_type;
 	struct file_ops  *i_fops;
-	void             *i_private;	/* chrdev: streamtab *  */
+	void             *i_private;	/* dir/reg: FS-specific meta  */
+	/* For CHRDEV inodes: the SVR4 device id.  MAJOR(i_rdev) indexes
+	 * the cdevsw[]; MINOR distinguishes instances of the same
+	 * driver (think /dev/tty0 vs /dev/tty1).  Unused for dirs and
+	 * regular files. */
+	uint32_t          i_rdev;
 };
 
 struct dentry {
@@ -96,6 +113,7 @@ struct file {
 	struct inode    *f_inode;
 	void            *f_private;
 	int              f_refs;
+	int              f_flags;	/* O_TRUNC | ...  set by sys_open */
 };
 
 /* ---- Tree management ------------------------------------------------- */
@@ -104,8 +122,14 @@ void           vfs_init(void);
 struct dentry *vfs_root(void);
 struct dentry *vfs_lookup(const char *path);
 struct dentry *vfs_mkdir(struct dentry *parent, const char *name);
+/* Create a character-device dentry.  `rdev` is the SVR4 dev_t --
+ * MAJOR(rdev) must already be registered in cdevsw[] (see
+ * cdevsw.h).  The VFS open path uses MAJOR(rdev) to find the
+ * driver's streamtab; MINOR is passed to whatever driver-specific
+ * open hook cares.  The inode's i_fops is set to a stock chrdev
+ * vtable that funnels through STREAMS. */
 struct dentry *vfs_mknod_chrdev(struct dentry *parent, const char *name,
-				struct file_ops *fops, void *priv);
+				uint32_t rdev);
 
 /* Same shape as mknod_chrdev but creates an INODE_REG -- used by
  * filesystem drivers (kfs today) to publish files they discovered
@@ -130,9 +154,23 @@ int           fd_alloc(struct file *f);
 void          fd_free(int fd);
 struct file  *fd_get(int fd);
 
+/* Close every fd still open in the dying thread.  Called from
+ * kthread_exit; declared here so sched.c can call it without pulling
+ * the per-thread fdt details into its headers. */
+struct kthread;
+void          vfs_drain_fds(struct kthread *t);
+
 /* ---- Syscall implementations (dispatch through f_ops) --------------- */
 
-int   sys_open_impl(const char *path);
+int   sys_open_impl(const char *path, int flags);
+int   sys_mkdir_impl(const char *path);
+int   sys_unlink_impl(const char *path);
+int   sys_rmdir_impl(const char *path);
+
+/* VFS-level helper: remove the dentry named `name` from `parent`'s
+ * child list.  Does not free the inode/dentry (memory leak for now);
+ * just unlinks from the tree so lookups fail. */
+int   vfs_remove_child(struct dentry *parent, const char *name);
 int   sys_close_impl(int fd);
 long  sys_read_impl(int fd, void *buf, size_t len);
 long  sys_write_impl(int fd, const void *buf, size_t len);
@@ -148,5 +186,13 @@ long  sys_getmsg_impl(int fd, struct strbuf *c,
  * whose head_wq.q_next points at the peer's head_rq, so a write on
  * one side enqueues an mblk on the peer's read deferred list. */
 long  sys_pipe_impl(int fds[2]);
+
+int   sys_creat_impl(const char *path);
+long  sys_seek_impl (int fd, long offset, int whence);
+
+/* Whence constants matching POSIX. */
+#define SEEK_SET	0
+#define SEEK_CUR	1
+#define SEEK_END	2
 
 #endif

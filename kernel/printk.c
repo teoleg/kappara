@@ -62,20 +62,25 @@
 #include <stdarg.h>
 #include <stdint.h>
 
+#include "kappara/fbcon.h"
 #include "kappara/klog.h"
 #include "kappara/printk.h"
 #include "kappara/uart.h"
 
 /*
- * Every byte that kprintf would emit goes out the UART AND into the
- * kernel-log ring.  uart_putc stays the raw MMIO primitive (used by
- * panic paths, console_wq_putp, etc); kputc is the kprintf-local
- * wrapper that tees.
+ * Every byte that kprintf would emit goes three places at once:
+ *   uart_putc  -- serial console (always)
+ *   klog_putc  -- in-RAM boot log ring (always)
+ *   fbcon_putc_tee -- framebuffer console (no-op until the GPU
+ *                     framebuffer is up; live for the rest of boot
+ *                     so the kernel log scrolls down the HDMI screen
+ *                     alongside the splash artwork)
  */
 static void kputc(char c)
 {
 	uart_putc(c);
 	klog_putc(c);
+	fbcon_putc_tee(c);
 }
 
 static void emit_str(const char *s)
@@ -200,6 +205,9 @@ void kprintf(const char *fmt, ...)
 	va_start(ap, fmt);
 	vkprintf(fmt, ap);
 	va_end(ap);
+	/* One batched fb flush per kprintf call -- amortises the
+	 * 3 MB dc cvac sweep across many characters. */
+	fbcon_tee_flush();
 }
 
 void kpanic(const char *msg)

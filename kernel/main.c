@@ -25,6 +25,7 @@
 #include <stdint.h>
 
 #include "kappara/blkdev.h"
+#include "kappara/fbcon.h"
 #include "kappara/framebuffer.h"
 #include "kappara/kfs.h"
 #include "kappara/kmem.h"
@@ -45,8 +46,46 @@
 
 extern char __kernel_end[];
 
-/* Pmm stops where the SoC's peripheral window begins -- per-platform. */
+/* Upper bound for pmm.  PLAT_RAM_END is the start of the SoC's
+ * peripheral window (0x3F000000 on Pi 3, 0xFE000000 on Pi 4); the
+ * GPU's memory split lives just below it.  pmm_carve_gpu() trims
+ * this further once the firmware tells us where the framebuffer
+ * actually landed.  See discover_gpu_reserve(). */
 #define AARCH64_RAM_END	PLAT_RAM_END
+
+/* Find the top of usable RAM after carving out everything the GPU
+ * owns.  On a real Pi the firmware reserves the top N MiB of RAM for
+ * itself (config.txt's `gpu_mem=`); the framebuffer is allocated out
+ * of that block, so its PA is a safe lower bound for "GPU territory".
+ * Anything we hand to pmm above that boundary could be silently
+ * overwritten by the firmware -- which is the exact bug that makes
+ * "boots in QEMU, crashes on Pi" so popular.
+ *
+ * QEMU's raspi3b honours the same mailbox protocol and returns a PA
+ * inside the modelled RAM (typically 0x3c100000 for a 1024x768 FB),
+ * so the same code path exercises the carve in the emulator. */
+static uintptr_t discover_gpu_reserve(void)
+{
+	uintptr_t end = AARCH64_RAM_END;
+	if (framebuffer_init(1024, 768) == 0) {
+		const struct framebuffer *fb = framebuffer_get();
+		uintptr_t fb_pa = (uintptr_t)fb->fb;
+		if (fb_pa && fb_pa < end) {
+			end = fb_pa & ~(PAGE_SIZE - 1);
+			kprintf("pmm: GPU owns [0x%lx..0x%lx); trimming pmm "
+				"upper bound from 0x%lx to 0x%lx\n",
+				(unsigned long)fb_pa,
+				(unsigned long)AARCH64_RAM_END,
+				(unsigned long)AARCH64_RAM_END,
+				(unsigned long)end);
+		}
+	} else {
+		kprintf("pmm: framebuffer_init failed; assuming no GPU "
+			"reserve (pmm cap = 0x%lx)\n",
+			(unsigned long)end);
+	}
+	return end;
+}
 
 static unsigned current_el(void)
 {
@@ -179,7 +218,12 @@ void kmain(void)
 		current_el(), PLAT_NAME);
 
 	mmu_init();
-	pmm_init((uintptr_t)__kernel_end, AARCH64_RAM_END);
+
+	/* framebuffer_init must run before pmm_init so we can exclude
+	 * the GPU's reserved region from the freelist.  See the comment
+	 * on discover_gpu_reserve(). */
+	uintptr_t pmm_end = discover_gpu_reserve();
+	pmm_init((uintptr_t)__kernel_end, pmm_end);
 	kmem_init();
 
 	vfs_init();
@@ -195,9 +239,10 @@ void kmain(void)
 	struct dentry *etc = vfs_mkdir(vfs_root(), "etc");
 	kfs_mount(ramdisk_get(), etc);
 
-	/* Ask the GPU for a 1024x768 framebuffer.  No-op visually on
-	 * `-display none`; pops up an HDMI image on real hardware. */
-	if (framebuffer_init(1024, 768) == 0) {
+	/* Draw the boot splash now that everything else is up.  The FB
+	 * was already negotiated by discover_gpu_reserve(); if that
+	 * succeeded, framebuffer_get() returns the descriptor. */
+	if (framebuffer_get()) {
 		/* Splash:
 		 *   - navy background
 		 *   - "kappara" centered near the top at 8x scale (64-pixel
@@ -226,6 +271,12 @@ void kmain(void)
 		framebuffer_rect(768, 760, 256, 8, 0xffe0c45cu);
 
 		framebuffer_flush();
+
+		/* Position the fbcon cursor below the splash so the
+		 * teed kprintf output and any /dev/console writes land
+		 * in the lower half of the screen, scrolling under the
+		 * "kappara" title rather than over it. */
+		fbcon_init_cursor(320);
 	}
 
 	kprintf("\n");

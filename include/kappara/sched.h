@@ -22,6 +22,12 @@ enum kt_state {
 	KT_BLOCKED,
 };
 
+/* Per-thread fd table size.  Stays in lockstep with FD_MAX in vfs.c;
+ * kept here to avoid pulling all of vfs.h into sched.h. */
+#define KT_FD_MAX	16
+
+struct file;	/* fwd; defined in vfs.h */
+
 struct kthread {
 	void          *sp;		/* saved kernel SP for context switch */
 	void          *stack_base;	/* page allocated for the kernel stack */
@@ -29,6 +35,10 @@ struct kthread {
 	unsigned       tid;
 	enum kt_state  state;
 	struct kthread *next;
+	/* Per-thread open files.  Each entry is either NULL or a
+	 * struct file * whose f_refs counts how many fd slots (across
+	 * all threads) still point at it.  See kernel/vfs.c. */
+	struct file   *fdt[KT_FD_MAX];
 };
 
 extern struct kthread *cur;
@@ -38,6 +48,14 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg);
 void            kthread_yield(void);
 void            kthread_exit(void) __attribute__((noreturn));
 void            sched_tick(void);
+
+/* Make `child` inherit `parent`'s open files: each non-NULL slot is
+ * copied over and the file's refcount is bumped so closing in one
+ * thread doesn't pull the rug out from under the other.  Used by
+ * sys_spawn so a worker thread sees the fds its parent set up
+ * (pipes, console, ...). */
+void            kthread_inherit_fds(struct kthread *child,
+				    const struct kthread *parent);
 
 /*
  * Arch-specific hook implemented in arch/<arch>/thread.c.  Lays

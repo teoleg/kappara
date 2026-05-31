@@ -34,13 +34,22 @@
  * -----------------------
  * pmm_init walks every 4 KB page in:
  *
- *     [align_up(__kernel_end, 4K)  ..  align_down(PMM_LIMIT, 4K))
+ *     [align_up(__kernel_end, 4K)  ..  align_down(end, 4K))
  *
  * and frees it.  __kernel_end comes from the linker script, just
- * past BSS and rounded up to a page.  PMM_LIMIT is the start of the
- * BCM2837 peripheral window (0x3F000000) -- everything above that
- * is MMIO, not RAM.  On a 1 GB Pi 3 that's about 257k free pages
- * (~1 GB) once the kernel image is removed.
+ * past BSS and rounded up to a page.  The caller (kernel/main.c)
+ * picks `end` so that two things stay out of the freelist:
+ *
+ *   - the SoC peripheral window (0x3F000000 on Pi 3, 0xFE000000 on
+ *     Pi 4) -- that's MMIO, not RAM.
+ *   - the GPU's reserved block, discovered at runtime by asking the
+ *     firmware for a framebuffer and trimming `end` down to the FB
+ *     PA.  Without this trim, kmalloc would eventually hand out a
+ *     page the GPU is also using, and the resulting corruption is
+ *     the classic "boots in QEMU, crashes on Pi" failure.
+ *
+ * On a 1 GB Pi 3 with the default ~64 MiB gpu_mem split that leaves
+ * roughly 953 MiB of free RAM after kernel image + GPU reserve.
  *
  * Why free high-to-low
  * --------------------

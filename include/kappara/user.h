@@ -17,7 +17,18 @@
 #ifndef KAPPARA_USER_H
 #define KAPPARA_USER_H
 
+#include <stdint.h>
+
 void user_init(void);
 void user_spawn(void);
+
+/* sys_spawn -- create a new user-mode thread that shares the address
+ * space with init.  `entry` must lie inside the user 2 MB region;
+ * the new thread starts at EL0 with x0 = arg and SP_EL0 pointing
+ * into its own 64 KB stack slot.  Returns tid on success, -1. */
+long sys_spawn_impl(uint64_t entry, uint64_t arg);
+
+/* sys_exit -- terminate the calling thread.  Does not return. */
+void sys_exit_impl(void) __attribute__((noreturn));
 
 #endif

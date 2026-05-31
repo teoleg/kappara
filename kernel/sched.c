@@ -86,6 +86,7 @@
 #include "kappara/printk.h"
 #include "kappara/streams.h"
 #include "kappara/sched.h"
+#include "kappara/vfs.h"
 
 extern void context_switch(void **save_sp, void *new_sp);
 
@@ -175,6 +176,10 @@ void sched_tick(void)
 
 void kthread_exit(void)
 {
+	/* Release every file the dying thread still holds.  pipe ends
+	 * inherited from the parent get their refcount dropped here so
+	 * the pipe goes away naturally when both ends are closed. */
+	vfs_drain_fds(cur);
 	kprintf("kthread: tid=%u (%s) exited\n", cur->tid, cur->name);
 	for (;;)
 		__asm__ volatile ("wfe");
