@@ -43,6 +43,7 @@
 
 #include <stdint.h>
 
+#include "kappara/kallsyms.h"
 #include "kappara/printk.h"
 #include "kappara/syscall.h"
 #include "kappara/timer.h"
@@ -146,6 +147,16 @@ void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 	}
 	kprintf("   x30=0x%016lx  sp0=0x%016lx\n",
 		(unsigned long)tf->x[30], (unsigned long)tf->sp_el0);
+
+	/* Decode the faulting PC and walk the call stack via the saved
+	 * (x29, x30) pair so the trace covers the faulting code, not
+	 * the trap handler.  ksym_lookup turns each address into a
+	 * function name + offset. */
+	uint64_t off = 0;
+	const char *name = ksym_lookup(tf->elr, &off);
+	kprintf("   at %s+0x%lx\n",
+		name ? name : "?", (unsigned long)off);
+	kernel_backtrace_from(tf->x[29], tf->x[30]);
 
 	kpanic("unhandled trap");
 }

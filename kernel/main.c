@@ -27,6 +27,7 @@
 #include "kappara/blkdev.h"
 #include "kappara/fbcon.h"
 #include "kappara/framebuffer.h"
+#include "kappara/kallsyms.h"
 #include "kappara/kfs.h"
 #include "kappara/kmem.h"
 #include "kappara/mmu.h"
@@ -284,6 +285,12 @@ void kmain(void)
 
 	sched_init();
 	timer_init(100);
+
+	/* Smoke-test the kallsyms table by walking our own frame chain
+	 * once -- proves the post-build symbol table is wired up and
+	 * the lookup binary-searches correctly.  Trap path uses the
+	 * same kernel_backtrace_from() on every unhandled exception. */
+	kernel_backtrace();
 
 	/* Console RX feeder: polls PL011 RX FIFO and putnext's received
 	 * bytes into /dev/console's read chain.  Spawned before ksh so

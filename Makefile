@@ -39,8 +39,12 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/kernel/uaccess.o \
         $(BUILD)/kernel/ramdisk.o \
         $(BUILD)/kernel/kfs.o \
+        $(BUILD)/kernel/kallsyms.o \
         $(BUILD)/kernel/user.o \
         $(BUILD)/kernel/main.o
+    KSYM_STUB_OBJ := $(BUILD)/arch/aarch64/kallsyms_stub.o
+    KSYM_OBJ      := $(BUILD)/arch/aarch64/kallsyms.o
+    KSYM_SRC      := $(BUILD)/arch/aarch64/kallsyms.S
     ELF           := $(BUILD)/kernel8.elf
     KERNEL        := $(BUILD)/kernel8.img
     QEMU          := qemu-system-aarch64
@@ -113,8 +117,34 @@ $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+ifeq ($(ARCH),aarch64)
+
+# Two-pass link for kallsyms.  Pass 1 uses the stub (empty table) so
+# we have an ELF to nm; tools/gen_kallsyms.sh emits the populated
+# table; pass 2 relinks with the real .kallsyms object.  The .kallsyms
+# section is placed after BSS in the linker script so growing it does
+# not shift any code/data addresses between passes -- the addresses
+# captured in pass 1 stay valid in pass 2.
+
+$(BUILD)/kernel8.tmp.elf: $(OBJS) $(KSYM_STUB_OBJ) $(LINKER_LD)
+	$(LD) $(LDFLAGS) -T $(LINKER_LD) -o $@ $(OBJS) $(KSYM_STUB_OBJ) $(LIBGCC)
+
+$(KSYM_SRC): $(BUILD)/kernel8.tmp.elf tools/gen_kallsyms.sh
+	@mkdir -p $(dir $@)
+	./tools/gen_kallsyms.sh $(CROSS)nm $< > $@
+
+$(KSYM_OBJ): $(KSYM_SRC)
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+$(ELF): $(OBJS) $(KSYM_OBJ) $(LINKER_LD)
+	$(LD) $(LDFLAGS) -T $(LINKER_LD) -o $@ $(OBJS) $(KSYM_OBJ) $(LIBGCC)
+
+else
+
 $(ELF): $(OBJS) $(LINKER_LD)
 	$(LD) $(LDFLAGS) -T $(LINKER_LD) -o $@ $(OBJS) $(LIBGCC)
+
+endif
 
 $(KERNEL): $(ELF)
 	$(OBJCOPY) -O binary $< $@
