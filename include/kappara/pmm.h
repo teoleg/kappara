@@ -3,8 +3,9 @@
  *
  * Vending machine for raw 4 KB pages of RAM.  All sized in PAGE_SIZE
  * chunks; no contiguous-N-pages allocator yet.  See kernel/pmm.c for
- * the freelist implementation and how __kernel_end / PMM_LIMIT define
- * the managed range.
+ * the freelist implementation and how the caller picks [start, end)
+ * so that both the SoC peripheral window and the GPU's reserve stay
+ * out of the freelist.
  */
 #ifndef KAPPARA_PMM_H
 #define KAPPARA_PMM_H
