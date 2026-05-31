@@ -810,6 +810,12 @@ struct file_ops klog_fops = {
 
 /* ---- Boot-time registration ------------------------------------------ */
 
+/* Defined in arch/aarch64/fbcon.c; not present on ARMv7 (no framebuffer yet).
+ * Conditional on __aarch64__ so the ARMv7 build links cleanly. */
+#ifdef __aarch64__
+extern struct streamtab fbcon_streamtab;
+#endif
+
 void streams_head_init(void)
 {
 	/* Bring up the mblk/dblk/queue slab caches.  Must run before
@@ -822,6 +828,9 @@ void streams_head_init(void)
 	streams_register("klog",    &klog_streamtab);
 	streams_register("upper",   &upper_streamtab);
 	streams_register("delay",   &delay_streamtab);
+#ifdef __aarch64__
+	streams_register("fbcon",   &fbcon_streamtab);
+#endif
 
 	/* Publish drivers as character-special files under /dev.
 	 * Modules ("upper", "delay") stay registry-only -- they
@@ -833,6 +842,9 @@ void streams_head_init(void)
 	vfs_mknod_chrdev(dev, "null",    &stream_fops, &null_streamtab);
 	vfs_mknod_chrdev(dev, "console", &stream_fops, &console_streamtab);
 	vfs_mknod_chrdev(dev, "klog",    &klog_fops,   &klog_streamtab);
+#ifdef __aarch64__
+	vfs_mknod_chrdev(dev, "fbcon",   &stream_fops, &fbcon_streamtab);
+#endif
 
 	kprintf("stream_head: registered modules:");
 	for (struct stmod_entry *e = registry; e; e = e->next)
