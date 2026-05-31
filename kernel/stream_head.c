@@ -106,12 +106,26 @@ void streams_for_each(void (*cb)(const char *name, struct streamtab *st,
 
 static int sh_rq_putp(queue_t *q, mblk_t *mp)
 {
+	struct stdata *sd = q->q_ptr;
+	/* M_HANGUP from below means "no more data is coming" -- procfs
+	 * and klog send it after their one-shot snapshot is queued.
+	 * Set SD_EOF so the next sys_read returns 0 and any
+	 * blocked reader wakes to see EOF.  This is the SVR4 stream
+	 * head's job: M_HANGUP doesn't get queued for the reader, it
+	 * mutates head state. */
+	if (mp->b_datap->db_type == M_HANGUP) {
+		freemsg(mp);
+		if (sd) {
+			sd->sd_flags |= SD_EOF;
+			kthread_wake_all(&sd->sd_readwait);
+		}
+		return 0;
+	}
 	putq(q, mp);
 	/* Wake any reader parked on this stream head's read queue.
 	 * q_ptr was wired to the owning stdata in stream_build so we
 	 * can hop back from the queue to its waitq without a global
 	 * lookup. */
-	struct stdata *sd = q->q_ptr;
 	if (sd)
 		kthread_wake_all(&sd->sd_readwait);
 	return 0;
@@ -939,6 +953,14 @@ static int klog_rq_qopen(queue_t *q)
 		size_t got = klog_copy((char *)mp->b_wptr, off, want);
 		mp->b_wptr += got;
 		putnext(q, mp);
+	}
+	/* Snapshot is done -- no more data will be queued, so signal
+	 * EOF to any reader.  M_HANGUP travels up like any other
+	 * message and the stream head turns it into SD_EOF. */
+	mblk_t *hup = allocb(1, 0);
+	if (hup) {
+		hup->b_datap->db_type = M_HANGUP;
+		putnext(q, hup);
 	}
 	return 0;
 }

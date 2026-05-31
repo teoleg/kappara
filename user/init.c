@@ -93,21 +93,65 @@ static int  hist_count;	/* 0..HIST_MAX -- how many slots are filled */
 
 /* Combine cwd + arg into out so commands accept relative paths.
  * Absolute paths (start with '/') pass through. */
+/* Canonicalize an absolute path in place: strip "." segments, pop on
+ * "..", collapse "//" runs.  The result always starts with '/' and
+ * has no trailing slash (except the root itself).  Done with a small
+ * starts[] stack so we can pop a segment without rescanning. */
+static void path_canon(char *p)
+{
+	if (p[0] != '/') return;
+
+	char   out[128];
+	size_t starts[32];
+	int    nseg = 0;
+	size_t o = 1;
+	out[0] = '/';
+
+	size_t i = 1;
+	for (;;) {
+		while (p[i] == '/') i++;
+		if (!p[i]) break;
+		size_t start = i;
+		while (p[i] && p[i] != '/') i++;
+		size_t len = i - start;
+
+		if (len == 1 && p[start] == '.') {
+			continue;
+		}
+		if (len == 2 && p[start] == '.' && p[start + 1] == '.') {
+			if (nseg > 0) {
+				nseg--;
+				o = starts[nseg];
+			}
+			continue;
+		}
+		if (nseg >= 32 || o + len + 2 >= sizeof(out)) break;
+		starts[nseg++] = o;
+		for (size_t k = 0; k < len; k++) out[o++] = p[start + k];
+		out[o++] = '/';
+	}
+	if (o > 1 && out[o - 1] == '/') o--;	/* drop trailing slash */
+	out[o] = '\0';
+
+	for (size_t k = 0; k <= o; k++) p[k] = out[k];
+}
+
 static void resolve_path(const char *arg, char *out, size_t cap)
 {
 	if (arg[0] == '/') {
 		size_t i = 0;
 		while (arg[i] && i + 1 < cap) { out[i] = arg[i]; i++; }
 		out[i] = '\0';
-		return;
+	} else {
+		size_t i = 0;
+		while (cwd[i] && i + 1 < cap) { out[i] = cwd[i]; i++; }
+		/* Add a slash separator unless cwd is "/" (already ends in '/'). */
+		if (i > 1 && i + 1 < cap) out[i++] = '/';
+		size_t j = 0;
+		while (arg[j] && i + 1 < cap) out[i++] = arg[j++];
+		out[i] = '\0';
 	}
-	size_t i = 0;
-	while (cwd[i] && i + 1 < cap) { out[i] = cwd[i]; i++; }
-	/* Add a slash separator unless cwd is "/" (which ends in '/'). */
-	if (i > 1 && i + 1 < cap) out[i++] = '/';
-	size_t j = 0;
-	while (arg[j] && i + 1 < cap) out[i++] = arg[j++];
-	out[i] = '\0';
+	path_canon(out);
 }
 
 /* -------- console output helpers -------- */
