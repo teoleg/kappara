@@ -142,6 +142,12 @@ int           fd_alloc(struct file *f);
 void          fd_free(int fd);
 struct file  *fd_get(int fd);
 
+/* Close every fd still open in the dying thread.  Called from
+ * kthread_exit; declared here so sched.c can call it without pulling
+ * the per-thread fdt details into its headers. */
+struct kthread;
+void          vfs_drain_fds(struct kthread *t);
+
 /* ---- Syscall implementations (dispatch through f_ops) --------------- */
 
 int   sys_open_impl(const char *path, int flags);

@@ -8,8 +8,11 @@
  *      vfs_mkdir, vfs_mknod_chrdev).  Real filesystems will plug in
  *      next to this.
  *
- *   2. Own the global fd table.  fd_alloc / fd_free / fd_get; small
- *      fixed-size array indexed by fd integer.
+ *   2. Drive the per-thread fd table.  fd_alloc / fd_free / fd_get
+ *      operate on cur->fdt[], so each thread sees its own fds; spawn
+ *      copies the parent's table over and bumps f_refs on every
+ *      inherited file so a close in one thread doesn't free the
+ *      file out from under the other.
  *
  *   3. Provide the sys_*_impl entry points that the syscall layer
  *      calls into.  These do the path lookup, find the file_ops via
@@ -54,6 +57,7 @@
 
 #include "kappara/kmem.h"
 #include "kappara/printk.h"
+#include "kappara/sched.h"
 #include "kappara/string.h"
 #include "kappara/uaccess.h"
 #include "kappara/vfs.h"
@@ -235,15 +239,16 @@ long vfs_listdir(struct dentry *dir, char *out, size_t cap)
 
 /* ---- fd table --------------------------------------------------------- */
 
-#define FD_MAX	16
-
-static struct file *fd_table[FD_MAX];
+/* Per-thread fdt lives in struct kthread (KT_FD_MAX slots).  The
+ * symbols below operate on whichever thread is currently scheduled,
+ * which is the right thing for the syscall path. */
 
 int fd_alloc(struct file *f)
 {
-	for (int i = 0; i < FD_MAX; i++) {
-		if (!fd_table[i]) {
-			fd_table[i] = f;
+	if (!cur) return -1;
+	for (int i = 0; i < KT_FD_MAX; i++) {
+		if (!cur->fdt[i]) {
+			cur->fdt[i] = f;
 			return i;
 		}
 	}
@@ -252,16 +257,52 @@ int fd_alloc(struct file *f)
 
 void fd_free(int fd)
 {
-	if (fd < 0 || fd >= FD_MAX)
+	if (!cur || fd < 0 || fd >= KT_FD_MAX)
 		return;
-	fd_table[fd] = NULL;
+	cur->fdt[fd] = NULL;
 }
 
 struct file *fd_get(int fd)
 {
-	if (fd < 0 || fd >= FD_MAX)
+	if (!cur || fd < 0 || fd >= KT_FD_MAX)
 		return NULL;
-	return fd_table[fd];
+	return cur->fdt[fd];
+}
+
+/* Drop one reference; on the last reference call the file's close op
+ * and free the struct file.  Used by both sys_close and the implicit
+ * close-all on thread exit. */
+static void file_put(struct file *f)
+{
+	if (!f) return;
+	if (--f->f_refs > 0) return;
+	if (f->f_ops && f->f_ops->close)
+		f->f_ops->close(f);
+	kfree(f);
+}
+
+void kthread_inherit_fds(struct kthread *child, const struct kthread *parent)
+{
+	if (!child || !parent) return;
+	for (int i = 0; i < KT_FD_MAX; i++) {
+		struct file *f = parent->fdt[i];
+		child->fdt[i] = f;
+		if (f) f->f_refs++;
+	}
+}
+
+/* Called from kthread_exit on the dying thread.  Releases every fd
+ * the thread still holds, so exiting cleanly is enough to close any
+ * pipe ends or open files the thread inherited or opened. */
+void vfs_drain_fds(struct kthread *t)
+{
+	if (!t) return;
+	for (int i = 0; i < KT_FD_MAX; i++) {
+		struct file *f = t->fdt[i];
+		if (!f) continue;
+		t->fdt[i] = NULL;
+		file_put(f);
+	}
 }
 
 /* ---- Syscall entry points -------------------------------------------- */
@@ -434,10 +475,8 @@ int sys_close_impl(int fd)
 	struct file *f = fd_get(fd);
 	if (!f)
 		return -1;
-	if (f->f_ops->close)
-		f->f_ops->close(f);
 	fd_free(fd);
-	kfree(f);
+	file_put(f);
 	return 0;
 }
 

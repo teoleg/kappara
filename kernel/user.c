@@ -211,7 +211,14 @@ long sys_spawn_impl(uint64_t entry, uint64_t arg)
 	a->arg   = arg;
 
 	struct kthread *t = kthread_create("spawn", spawn_thread_main, a);
-	return t ? (long)t->tid : -1;
+	if (!t) return -1;
+
+	/* Hand the child a copy of the parent's fd table so it inherits
+	 * pipes, the console, and anything else the parent had open --
+	 * the fork()-ish piece of spawn that makes pipework actually
+	 * compose. */
+	kthread_inherit_fds(t, cur);
+	return (long)t->tid;
 }
 
 void sys_exit_impl(void) __attribute__((noreturn));
