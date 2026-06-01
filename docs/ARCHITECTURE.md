@@ -271,43 +271,85 @@ addresses captured in pass 1 stay valid in pass 2.
 walks the AArch64 x29 frame chain.  `trap_dispatch` uses both on
 unhandled faults so the panic dump tells you the function + offset.
 
-## SMP (foundation only)
+## SMP
 
-Boot leaves cores 1-3 in QEMU's ARM spin-table at PA `0xE0`, `0xE8`,
-`0xF0`.  Each polls its slot; writing the address of `secondary_start`
-into the slot and issuing `DSB SY` + `SEV` releases that core.
+All four Cortex-A53 cores run in EL1 with the MMU on, sharing the
+single set of page tables built by core 0.  Each core has its own
+`struct cpu` (the Solaris `cpu_t` shape) stored in the static
+`cpus[4]` array in `kernel/sched.c`; TPIDR_EL1 on each core holds
+the address of its slot.  `curcpu()` is a single `mrs` instruction.
+
+### Wake sequence
 
 `smp_wake_secondary(cpu)` in `kernel/main.c`:
-1. `pmm_alloc`s a 4 KB kernel stack for the new CPU.
+1. `pmm_alloc`s a 4 KB kernel stack for the new core.
 2. Stores the stack top in `smp_stacks[cpu]`.
-3. Writes the entry into both our own `smp_release[cpu]` table (used
-   if a future PSCI boot path ever has the cores park in our
-   `.Lpark` first) and into the QEMU spin-table at
-   `0xE0 + (cpu-1)*8`.
-4. `dc cvac` on each slot so the secondary (MMU + cache off) reads
-   the freshest value from RAM.
-5. `dsb sy; sev` wakes anyone WFE-blocked.
+3. Writes `secondary_start` into both our own `smp_release[cpu]`
+   table and the QEMU/BCM2837 spin-table at `0xE0 + (cpu-1)*8`.
+4. `dc cvac` flushes the cache lines so the secondary (MMU/cache
+   off at this point) reads the freshest value from RAM.
+5. `dsb sy; sev` wakes any WFE-blocked core.
 
-The asm entry `secondary_start` (boot.S) reads its own MPIDR for
-the CPU id, picks up its stack from `smp_stacks[cpu]`, and `bl`s
-`secondary_main` in C.  The C side prints `smp: cpu N` and drops
-into `for (;;) wfi`.
+### Secondary core boot (`arch/aarch64/boot.S` — `secondary_start`)
 
-This is the foundation — the cores are alive, executing C code, and
-asleep on WFI.  What's still missing for a real SMP kernel:
+1. Read MPIDR to get `cpu_id` into x0.
+2. Load stack top from `smp_stacks[cpu_id]` into x2.
+3. Check CurrentEL: raspi3b QEMU drops secondaries at EL2.
+4. If EL2: set `sp_el1 = x2`, program CNTHCTL_EL2, HCR_EL2.RW,
+   SCTLR_EL1 (res1 bits, MMU off), SPSR_EL2 = EL1h+DAIF, ERET to
+   `.Lsec_el1_entry`.
+5. At `.Lsec_el1_entry`: x0 = cpu_id (GPRs not banked per EL in
+   AArch64, so x0 survives the ERET), call `secondary_main(cpu_id)`.
 
-| Step                                     | Why we don't have it yet                  |
-|------------------------------------------|-------------------------------------------|
-| Per-CPU `cur` via TPIDR_EL1              | Today `cur` is a single global            |
-| Spinlock on ready queue                  | Single-CPU never needed it                |
-| Each CPU in the scheduler loop           | Secondaries idle, don't pull threads      |
-| Per-CPU generic timer setup              | Only core 0 has CNTPNSIRQ routed          |
-| IPI for cross-CPU wake                   | No ready-queue wake needed yet            |
-| Cache-coherent locking primitives        | No shared mutable state yet               |
-| MMU + EL1 drop for secondaries           | They stay at EL2 with MMU off             |
+### `secondary_main` (`kernel/main.c`)
 
-That list is the next session.  At boot you'll see four lines (one
-per CPU including core 0) interleaved at the byte level on the UART
-because every core writes through the same `uart_putc` with no lock
-— harmless, expected, will be the first thing a `kprintf_lock`
-fixes.
+```
+mmu_enable_this_cpu()   -- point TTBR0_EL1 at shared tables, enable M+C+I
+trap_init()             -- msr vbar_el1 (same vector table as core 0)
+sched_secondary_init()  -- struct cpu, idle kthread, set_curcpu()
+msr daifclr, #2         -- unmask IRQs
+for (;;) { kthread_yield(); wfi; }   -- idle loop
+```
+
+### Per-CPU scheduler state
+
+`sched_secondary_init(cpu_id)` in `kernel/sched.c`:
+- Allocates a `kthread` for the idle thread (via `kmalloc`); this
+  kthread represents the current execution context on this CPU.
+- Sets `c->cpu_id`, `c->cpu_thread = idle`, `c->cpu_idle = idle`.
+- Calls `set_curcpu(c)` to publish the struct via TPIDR_EL1.
+- The idle thread's `stack_base` is NULL (the stack was allocated by
+  `smp_wake_secondary` and lives forever).
+
+### Dispatch queues and idle steal
+
+Each `struct cpu` has a FIFO `cpu_dispq` guarded by `cpu_disp_lock`.
+`kthread_create` pushes the new thread onto the creating CPU's queue.
+`switch_to_next` pops the local queue first; if empty it calls
+`try_steal`, which scans `cpus[]` and pops one thread from the first
+non-empty remote queue (under that CPU's lock).  If steal also returns
+nothing:
+
+- `requeue_current=1` (yield): keep running the current thread.
+- `requeue_current=0` (block / exit): switch to `c->cpu_idle` so the
+  core can WFI rather than spin.
+
+Lock discipline: `switch_to_next` holds `cpu_disp_lock` for the
+queue mutations and `cur` swap; IRQs stay masked throughout (the
+lock is acquired with `spin_lock_irq_save` and only the spinlock is
+released before `context_switch` — IRQs are restored from the saved
+`flags` at the end of the function, after `context_switch` returns).
+
+### What's still missing
+
+| Gap                             | Notes                                       |
+|---------------------------------|---------------------------------------------|
+| Per-CPU generic timer           | Only core 0 has CNTPNSIRQ routed; secondaries never get timer ticks |
+| IPI for cross-CPU wake          | Woken threads land on the waker's CPU; idle steal redistributes lazily |
+| UART kprintf lock               | Boot messages from all four cores interleave at the byte level |
+| User-mode on secondaries        | Works (EL0 ERET from any core), untested under load |
+
+At boot you will see four lines (`sched: cpu N up`) interleaved on
+the UART because all four cores call `kprintf` without a lock.  This
+is harmless and expected; a `kprintf_lock` (spinlock around the UART
+putc loop) is the planned fix.

@@ -221,16 +221,43 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 	return t;
 }
 
+/*
+ * Idle steal: scan other CPUs' dispatch queues and pull one thread.
+ * Called with IRQs already masked (we only reach here after
+ * spin_lock_irq_save + spin_unlock on our own lock, so DAIF is still
+ * set).  spin_lock_irq_save on the victim lock is idempotent when IRQs
+ * are already masked -- save captures the masked state, restore keeps
+ * it.
+ *
+ * Quick lockless peek at cpu_dispq_head before acquiring the victim's
+ * lock; a stale NULL just costs one missed steal, which is harmless.
+ */
+static struct kthread *try_steal(struct cpu *my_cpu)
+{
+	for (unsigned i = 0; i < KSCHED_NCPU; i++) {
+		struct cpu *v = &cpus[i];
+		if (v == my_cpu)            continue;
+		if (!v->cpu_dispq_head)     continue;  /* racy but harmless */
+		unsigned long f = spin_lock_irq_save(&v->cpu_disp_lock);
+		struct kthread *t = dispq_pop_locked(v);
+		spin_unlock_irq_restore(&v->cpu_disp_lock, f);
+		if (t) return t;
+	}
+	return NULL;
+}
+
 /* Common scheduler step.  If requeue_current is set, the outgoing
  * thread goes back on THIS CPU's dispatch queue (cooperative yield);
  * if not, it has already been parked somewhere else (a wait queue,
  * exit limbo, ...) and we MUST NOT put it back.
  *
- * The lock dance: take cpu_disp_lock for the queue mutations and
- * the cur=next swap, release before the actual context_switch so
- * the incoming thread doesn't inherit a held lock.  IRQs stay
- * masked across the switch since context_switch saves/restores
- * per-thread DAIF (commit 0929814). */
+ * Lock discipline: spin_lock_irq_save at entry masks IRQs for the
+ * entire switch; spin_unlock releases the queue lock but KEEPS IRQs
+ * masked until the end.  When the local queue is empty we release the
+ * queue lock (keeping IRQs masked) and try to steal from another CPU.
+ * If that also turns up nothing we fall through to the per-CPU idle
+ * thread so the CPU can WFI rather than spin.
+ */
 static void switch_to_next(int requeue_current)
 {
 	struct cpu *c = curcpu();
@@ -238,27 +265,45 @@ static void switch_to_next(int requeue_current)
 
 	struct kthread *next = dispq_pop_locked(c);
 	if (!next) {
-		spin_unlock_irq_restore(&c->cpu_disp_lock, flags);
-		if (requeue_current)
-			return;
-		/* Nobody runnable AND the caller is about to block.
-		 * That's a deadlock for now (no idle thread of our
-		 * own).  Park on WFE so an IRQ can wake us into a
-		 * wake path. */
-		kprintf("sched: cpu %u nothing to run; deadlock\n",
-			c->cpu_id);
-		for (;;)
-			__asm__ volatile ("wfe");
+		/* Release queue lock; keep IRQs masked for try_steal. */
+		spin_unlock(&c->cpu_disp_lock);
+		next = try_steal(c);
+		if (!next) {
+			if (requeue_current) {
+				/* Yield with nothing to do: keep running. */
+				__asm__ volatile ("msr daif, %0"
+						  :: "r"(flags) : "memory");
+				return;
+			}
+			/* Thread is blocking or exiting.  Run the CPU's
+			 * idle thread so the core can WFI rather than
+			 * burning cycles. */
+			next = c->cpu_idle;
+		}
+		if (!next) {
+			kprintf("sched: cpu %u nothing to run; deadlock\n",
+				c->cpu_id);
+			for (;;)
+				__asm__ volatile ("wfe");
+		}
+		/* Re-acquire the lock for the thread swap below. */
+		spin_lock(&c->cpu_disp_lock);
 	}
 
 	struct kthread *prev = c->cpu_thread;
+	if (next == prev) {
+		/* Idle→idle or steal returned current thread: no-op. */
+		spin_unlock(&c->cpu_disp_lock);
+		__asm__ volatile ("msr daif, %0" :: "r"(flags) : "memory");
+		return;
+	}
 	if (requeue_current) {
 		dispq_push_locked(c, prev);
 		prev->state = KT_READY;
 	}
 	next->state = KT_RUNNING;
 	c->cpu_thread = next;
-	/* Release the lock; keep IRQs masked across the switch. */
+	/* Release the queue lock; keep IRQs masked across context_switch. */
 	spin_unlock(&c->cpu_disp_lock);
 
 	context_switch(&prev->sp, next->sp);
@@ -434,6 +479,53 @@ void sched_tick(void)
 	/* Each tick: drain any deferred STREAMS work, then rotate. */
 	streams_run();
 	kthread_yield();
+}
+
+/*
+ * Per-secondary-CPU scheduler bring-up.  Called from secondary_main
+ * (kernel/main.c) once the core is in EL1 with MMU on and VBAR_EL1
+ * installed.
+ *
+ * The current execution context (running on the stack allocated by
+ * smp_wake_secondary) becomes this CPU's idle thread.  The idle thread
+ * is never put on the dispatch queue; it's the fallback that runs when
+ * there is nothing else and lets the core WFI.
+ *
+ * stack_base is left NULL: the stack page belongs to the idle thread
+ * for the lifetime of the kernel and is never reaped.
+ */
+void sched_secondary_init(unsigned cpu_id)
+{
+	if (cpu_id >= KSCHED_NCPU) return;
+	struct cpu *c = &cpus[cpu_id];
+
+	struct kthread *idle = kmalloc(sizeof(*idle));
+	if (!idle) {
+		kprintf("sched: cpu %u: idle alloc failed -- parking\n",
+			cpu_id);
+		for (;;) __asm__ volatile ("wfi");
+	}
+	kmemset(idle, 0, sizeof(*idle));
+
+	{
+		unsigned long f = spin_lock_irq_save(&tid_lock);
+		idle->tid = next_tid++;
+		if (idle->tid < KSCHED_MAX_TID)
+			tid_table[idle->tid] = idle;
+		spin_unlock_irq_restore(&tid_lock, f);
+	}
+	idle->name       = "idle";
+	idle->state      = KT_RUNNING;
+	idle->stack_base = NULL;	/* never reaped; stack lives forever */
+
+	c->cpu_id     = cpu_id;
+	c->cpu_thread = idle;
+	c->cpu_idle   = idle;
+
+	/* Publish: after this, curcpu() / curthread are valid on this core. */
+	set_curcpu(c);
+
+	kprintf("sched: cpu %u up  idle tid=%u\n", cpu_id, idle->tid);
 }
 
 void kthread_exit(void)

@@ -122,20 +122,66 @@ smp_stacks:
 
 /*
  * Entry point branched to from the spin-table by a freshly-woken
- * secondary core.  Sets a per-core SP from smp_stacks[], then drops
- * into secondary_main (C).  Stays at EL2 with MMU off for now -- the
- * MMU + EL1 transition for secondary cores is a follow-up.  All we
- * want here is "the core is alive and executing C code."
+ * secondary core.  Drops from EL2 to EL1 (same sequence core 0 runs
+ * in .Lfrom_el2), installs the stack from smp_stacks[], then calls
+ * secondary_main(cpu_id) which enables the MMU, installs VBAR_EL1,
+ * sets up the per-CPU scheduler state, and enters the idle loop.
+ *
+ * AArch64 general-purpose registers (x0-x30) are NOT banked per EL,
+ * so x0 = cpu_id is live across the eret.
  *
  * The C function never returns; if it ever does, fall back to wfi.
  */
 .global secondary_start
 secondary_start:
+	/* x0 = cpu_id; x2 = stack top for this core */
 	mrs	x0, mpidr_el1
 	and	x0, x0, #0xff
 	adr	x1, smp_stacks
 	ldr	x2, [x1, x0, lsl #3]
+
+	/* Check EL: QEMU raspi3b drops secondary cores at EL2. */
+	mrs	x3, CurrentEL
+	lsr	x3, x3, #2
+	cmp	x3, #2
+	bne	.Lsec_already_el1
+
+	/* --- EL2 -> EL1 transition (mirrors .Lfrom_el2 for core 0) --- */
+
+	/* Point sp_el1 at the pre-allocated stack so EL1 is ready immediately
+	 * after the eret without needing an extra move. */
+	msr	sp_el1, x2
+
+	/* Allow EL1/EL0 access to the physical and virtual counters. */
+	mrs	x3, cnthctl_el2
+	orr	x3, x3, #(1 << 0)		/* EL1PCTEN */
+	orr	x3, x3, #(1 << 1)		/* EL1PCEN  */
+	msr	cnthctl_el2, x3
+	msr	cntvoff_el2, xzr
+
+	/* EL1 runs as AArch64 (HCR_EL2.RW = 1). */
+	mov	x3, #(1 << 31)
+	msr	hcr_el2, x3
+
+	/* SCTLR_EL1 = res-1 bits only, MMU/caches off; C code enables them. */
+	mov	x3, #0x0800
+	movk	x3, #0x30d0, lsl #16
+	msr	sctlr_el1, x3
+
+	/* Return to EL1h with all DAIF masked (C unmasks IRQs later). */
+	mov	x3, #0x03C5
+	msr	spsr_el2, x3
+	adr	x3, .Lsec_el1_entry
+	msr	elr_el2, x3
+	eret				/* jumps to .Lsec_el1_entry at EL1 */
+
+.Lsec_already_el1:
+	/* Already at EL1 -- shouldn't occur on raspi3b QEMU, but be safe. */
 	mov	sp, x2
+
+.Lsec_el1_entry:
+	/* x0 = cpu_id (preserved across eret; GPRs not banked per EL).
+	 * sp  = stack top (set via sp_el1 or the mov above). */
 	bl	secondary_main
 1:	wfi
 	b	1b
