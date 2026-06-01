@@ -33,6 +33,7 @@ The prompt shows the current working directory: `kappara:/etc#`.
 | `spawn [arg]`              | Spawn a long-running worker thread (returns its tid).       |
 | `kill <tid> [sig]`         | Send a signal (POSIX numbers).  Default is `SIGTERM=15`.    |
 | `crash`                    | Spawn a thread that dereferences NULL (tests SIGSEGV path). |
+| `halt`                     | Ask QEMU to exit (semihosting SYS_EXIT). Run targets in the Makefile pass `-semihosting-config enable=on,target=native`. |
 
 ## Streams / device I/O
 
