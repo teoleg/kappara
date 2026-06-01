@@ -335,7 +335,8 @@ static void cmd_help(void)
 		"  spawn [arg]            sys_spawn a worker thread\r\n"
 		"  pipework               sys_pipe + two spawned workers\r\n"
 		"  kill <tid> [sig]       POSIX signal numbers (default SIGTERM=15)\r\n"
-		"  crash                  spawn a thread that dereferences NULL\r\n");
+		"  crash                  spawn a thread that dereferences NULL\r\n"
+		"  halt                   ask QEMU to exit (semihosting)\r\n");
 }
 
 static void cmd_pid(void)
@@ -937,6 +938,18 @@ static void cmd_crash(int argc, char *argv[])
 	cwrite("crash: spawned tid="); cprint_long(tid); cwrite("\r\n");
 }
 
+/* halt -- ask QEMU to exit via ARM semihosting.  Only does anything
+ * useful when QEMU was started with -semihosting-config enable=on;
+ * make run-thrifty / run-gui pass that flag.  Otherwise the host
+ * sees an illegal-instruction trap from EL1, which still terminates
+ * the run, just less tidily. */
+static void cmd_halt(int argc, char *argv[])
+{
+	(void)argc; (void)argv;
+	cwrite("halt: requesting QEMU exit...\r\n");
+	sys_halt();
+}
+
 /* kill <tid> [sig]  -- POSIX numbering; default is SIGTERM (15). */
 static void cmd_kill(int argc, char *argv[])
 {
@@ -1085,6 +1098,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "spawn"))  cmd_spawn(argc, argv);
 	else if (!ustrcmp(argv[0], "kill"))   cmd_kill(argc, argv);
 	else if (!ustrcmp(argv[0], "crash"))  cmd_crash(argc, argv);
+	else if (!ustrcmp(argv[0], "halt"))   cmd_halt(argc, argv);
 	else if (!ustrcmp(argv[0], "pipework")) cmd_pipework();
 	else {
 		cwrite(argv[0]); cwrite(": command not found\r\n");
