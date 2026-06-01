@@ -172,7 +172,8 @@ void sched_init(void)
 	main_thread.next  = NULL;
 
 	/* Initialize core 0's per-CPU struct and publish via TPIDR_EL1
-	 * before anything touches curcpu/curthread. */
+	 * before anything touches curcpu/curthread.  Spinlocks live
+	 * in the bss-zeroed `cpus` array so they start unlocked. */
 	cpus[0].cpu_id        = 0;
 	cpus[0].cpu_thread    = &main_thread;
 	cpus[0].cpu_idle      = &main_thread;	/* main IS our idle */
