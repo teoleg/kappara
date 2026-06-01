@@ -93,9 +93,13 @@ for `FREE` going down without `TOTAL` going up.
 
 ### /proc/streams
 
+Two sections.  First the static registry (anything `streams_register`'d
+at boot); second the **live** stdata list, one row per open stream,
+showing refcount + the module name walk from the stream head down.
+
 ```
 kappara:/# cat /proc/streams
-registered STREAMS modules/drivers:
+registered modules/drivers:
   fbcon
   delay
   upper
@@ -103,12 +107,22 @@ registered STREAMS modules/drivers:
   console
   null
   loop
+
+open streams:
+  console    refs= 1  stack: strhead -> console
+  loop       refs= 1  stack: strhead -> upper -> loop
+  pipe-a     refs= 2  stack: strhead  [pipe]
 ```
 
-Lists everything registered via `streams_register()`.  Drivers (with a
-cdevsw major) are listed alongside push-only modules (`upper`,
-`delay`) which have no /dev node but can be `I_PUSH`'d onto an open
-stream.
+The `[pipe]` tag marks the two ends of a `sys_pipe`; their write side
+points at the peer's read queue instead of a driver, so the stack
+walk stops after the head.  `[EOF]` shows up when `SD_EOF` is set
+(peer closed; M_HANGUP was processed).
+
+You can correlate this with `lsl /dev` and `lsl /proc` — every chrdev
+inode under those is *potentially* an open here, but only the ones
+someone has called `sys_open` on (or which the pipe constructor
+built) show up.
 
 ## How to add a new /proc entry
 
