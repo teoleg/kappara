@@ -65,27 +65,22 @@
 #include "kappara/fbcon.h"
 #include "kappara/klog.h"
 #include "kappara/printk.h"
-#include "kappara/spinlock.h"
 #include "kappara/uart.h"
 
 /*
- * One kprintf at a time across all CPUs.  Without this, every core
- * writes through uart_putc concurrently and the UART output ends up
- * with bytes from different lines interleaved -- you cannot read
- * boot messages from secondary cores.
- *
- * Locking granularity is whole-kprintf, not per-character: it costs
- * the same lock acquire either way, and a complete line shows up
- * intact instead of being smeared across all callers' output.
+ * Serialisation: kprintf acquires uart_lock (held across the entire
+ * call), and feeds bytes via uart_putc_unlocked.  The console driver
+ * (kernel/stream_head.c) does the same shape around each mblk it
+ * writes.  Because both paths share the same lock, kprintf-vs-
+ * kprintf, kprintf-vs-console, and console-vs-console output stay
+ * contiguous on the UART without per-character lock contention.
  *
  * IRQ-save: kprintf is called from any context including the timer
  * IRQ (sched_tick uses kprintf for diagnostic prints).  Without
  * masking, an IRQ that preempts a holder on the same CPU and tries
  * to print itself would deadlock spinning on its own lock.  Panic
- * path deliberately bypasses the lock (a stuck CPU must not silence
- * the panic message).
+ * path bypasses the lock entirely via uart_puts_panic.
  */
-static spinlock_t kprintf_lock = SPINLOCK_INIT;
 
 /*
  * Every byte that kprintf would emit goes three places at once:
@@ -96,9 +91,15 @@ static spinlock_t kprintf_lock = SPINLOCK_INIT;
  *                     so the kernel log scrolls down the HDMI screen
  *                     alongside the splash artwork)
  */
+/*
+ * Inner emit -- called from inside vkprintf with uart_lock already
+ * held by the kprintf wrapper.  Uses uart_putc_unlocked so each
+ * character does not pay the lock cost separately; the kprintf-call
+ * boundary owns the lock.
+ */
 static void kputc(char c)
 {
-	uart_putc(c);
+	uart_putc_unlocked(c);
 	klog_putc(c);
 	fbcon_putc_tee(c);
 }
@@ -222,26 +223,26 @@ void vkprintf(const char *fmt, va_list ap)
 void kprintf(const char *fmt, ...)
 {
 	va_list ap;
-	unsigned long flags = spin_lock_irq_save(&kprintf_lock);
+	unsigned long flags = uart_acquire();
 	va_start(ap, fmt);
 	vkprintf(fmt, ap);
 	va_end(ap);
 	/* One batched fb flush per kprintf call -- amortises the
 	 * 3 MB dc cvac sweep across many characters. */
 	fbcon_tee_flush();
-	spin_unlock_irq_restore(&kprintf_lock, flags);
+	uart_release(flags);
 }
 
 void kpanic(const char *msg)
 {
 	/*
-	 * Panic bypasses kprintf's lock: another CPU may have crashed
-	 * while holding it, and the whole point of a panic message is
-	 * that it gets out no matter what.  Best-effort direct uart.
+	 * Panic bypasses kprintf's lock AND the uart_lock: another CPU
+	 * may have crashed while holding either, and the whole point of
+	 * a panic message is that it gets out no matter what.
 	 */
-	uart_puts("\npanic: ");
-	uart_puts(msg);
-	uart_puts("\n");
+	uart_puts_panic("\npanic: ");
+	uart_puts_panic(msg);
+	uart_puts_panic("\n");
 	for (;;)
 		__asm__ volatile ("wfe");
 }

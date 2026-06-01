@@ -39,7 +39,28 @@
 
 #include <stdint.h>
 
+#include "kappara/spinlock.h"
 #include "platform.h"
+
+/*
+ * Serialise UART access across CPUs.  Two output paths reach
+ * uart_putc: kprintf (already serialised at kprintf-call level) and
+ * the console-driver write path (sys_write -> STREAMS -> console
+ * stream head -> uart_putc).  Without a UART-level lock the two
+ * paths can interleave their characters when they happen on
+ * different CPUs at the same time.
+ *
+ * We use uart_puts as the lock boundary: per-character locking is
+ * way too fine-grained, per-puts gives a complete fragment.
+ * Single-character uart_putc still locks per char because we don't
+ * know how much the caller intends to emit; the caller typically
+ * loops over uart_putc itself, so a per-char lock there is the
+ * worst case.
+ *
+ * IRQ-save: the UART can be called from any context including IRQ
+ * handlers (kprintf from inside an ISR is fair game).
+ */
+static spinlock_t uart_lock = SPINLOCK_INIT;
 
 #define PL011_BASE	PLAT_PL011_BASE
 
@@ -81,19 +102,65 @@ void uart_init(void)
 	mmio_write(UART_CR, CR_UARTEN | CR_TXE | CR_RXE);
 }
 
-void uart_putc(char c)
+/*
+ * Lock primitives, exposed so callers that emit a logical "line" of
+ * output can grab the UART for the whole line and stream its bytes
+ * via uart_putc_unlocked without each char paying the lock cost AND
+ * without other CPUs sneaking bytes in between.
+ *
+ * kprintf does this around vkprintf; the console driver
+ * (console_wq_putp) does it around each mblk it dispatches.
+ */
+unsigned long uart_acquire(void)
+{
+	return spin_lock_irq_save(&uart_lock);
+}
+
+void uart_release(unsigned long flags)
+{
+	spin_unlock_irq_restore(&uart_lock, flags);
+}
+
+void uart_putc_unlocked(char c)
 {
 	while (mmio_read(UART_FR) & FR_TXFF) { }
 	mmio_write(UART_DR, (uint32_t)(unsigned char)c);
 }
 
+void uart_putc(char c)
+{
+	unsigned long f = uart_acquire();
+	uart_putc_unlocked(c);
+	uart_release(f);
+}
+
 void uart_puts(const char *s)
 {
+	unsigned long f = uart_acquire();
 	while (*s) {
 		if (*s == '\n')
-			uart_putc('\r');
-		uart_putc(*s++);
+			uart_putc_unlocked('\r');
+		uart_putc_unlocked(*s++);
 	}
+	uart_release(f);
+}
+
+/* Lock-bypass send for kpanic.  If the UART lock is held by another
+ * CPU that just died, the locked variant would deadlock and silence
+ * the panic message -- the one thing it must never do.  IRQs stay
+ * masked across the whole sequence so we don't interleave with our
+ * own ISR. */
+void uart_puts_panic(const char *s)
+{
+	unsigned long daif;
+	__asm__ volatile ("mrs %0, daif" : "=r"(daif));
+	__asm__ volatile ("msr daifset, #2" ::: "memory");
+	while (*s) {
+		if (*s == '\n')
+			uart_putc_unlocked('\r');
+		uart_putc_unlocked(*s++);
+	}
+	__asm__ volatile ("msr daif, %0" :: "r"(daif) : "memory");
 }
 
 int uart_getc_nonblock(void)

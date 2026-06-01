@@ -178,13 +178,20 @@ static struct qinit sh_winit = {
 static int console_wq_putp(queue_t *q, mblk_t *mp)
 {
 	(void)q;
+	/* Hold the UART lock for the whole mblk so a write() shows up
+	 * as one uninterrupted run of bytes -- otherwise per-character
+	 * uart_putc calls would interleave with kprintf output on other
+	 * CPUs.  Shares the same lock with kprintf for ordering across
+	 * both paths. */
+	unsigned long f = uart_acquire();
 	for (mblk_t *m = mp; m; m = m->b_cont) {
 		for (unsigned char *p = m->b_rptr; p < m->b_wptr; p++) {
-			uart_putc((char)*p);
+			uart_putc_unlocked((char)*p);
 			fbcon_putc_tee((char)*p);
 		}
 	}
 	fbcon_tee_flush();
+	uart_release(f);
 	freemsg(mp);
 	return 0;
 }
