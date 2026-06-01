@@ -28,6 +28,7 @@
 #include <stdint.h>
 
 #include "kappara/cdevsw.h"
+#include "kappara/ftrace.h"
 #include "kappara/kmem.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
@@ -275,16 +276,86 @@ PROC_DRIVER(mem,    proc_mem_qopen);
 PROC_DRIVER(slab,   proc_slab_qopen);
 PROC_DRIVER(stream, proc_stream_qopen);
 
+/* ---- /proc/ftrace --------------------------------------------------- */
+
+/*
+ * Unlike the other /proc entries we don't go through procbuf -- a full
+ * trace dump is many KB, and ftrace_dump_to_q already streams its own
+ * 1 KB mblks + an M_HANGUP at the end.  Just hand the read queue
+ * straight to the tracer.
+ */
+static int proc_ftrace_qopen(queue_t *q)
+{
+	ftrace_dump_to_q(q, 0);
+	return 0;
+}
+
+/*
+ * Write side: ASCII control messages.  Recognised verbs:
+ *
+ *   off    disable recording (ring is preserved -- next cat shows it)
+ *   on     re-enable recording
+ *   reset  drop all events, head/total counters back to zero
+ *
+ * Match is on the first few non-whitespace characters so a trailing
+ * newline from `echo "off"` is fine.  Anything else is silently
+ * dropped (no error -- this is a debug tool, keep the noise floor
+ * low).
+ */
+static int ftrace_match(const char *buf, size_t n, const char *verb)
+{
+	size_t i = 0;
+	while (i < n && (buf[i] == ' ' || buf[i] == '\t')) i++;
+	size_t j = 0;
+	while (verb[j] && i + j < n && buf[i + j] == verb[j]) j++;
+	if (verb[j] != '\0') return 0;
+	/* Verb matched; next byte (if any) must be a separator. */
+	size_t k = i + j;
+	if (k >= n) return 1;
+	char c = buf[k];
+	return c == '\0' || c == '\n' || c == '\r' || c == ' ' || c == '\t';
+}
+
+static int proc_ftrace_wq_putp(queue_t *q, mblk_t *mp)
+{
+	(void)q;
+	if (mp && mp->b_datap && mp->b_datap->db_type == M_DATA) {
+		const char *buf = (const char *)mp->b_rptr;
+		size_t      n   = (size_t)(mp->b_wptr - mp->b_rptr);
+		if      (ftrace_match(buf, n, "off"))   ftrace_disable();
+		else if (ftrace_match(buf, n, "on"))    ftrace_enable();
+		else if (ftrace_match(buf, n, "reset")) ftrace_reset();
+	}
+	freemsg(mp);
+	return 0;
+}
+
+static struct qinit ftrace_rinit = {
+	.qi_putp  = proc_rq_putp,
+	.qi_qopen = proc_ftrace_qopen,
+	.qi_minfo = &proc_minfo,
+};
+static struct qinit ftrace_winit = {
+	.qi_putp  = proc_ftrace_wq_putp,
+	.qi_minfo = &proc_minfo,
+};
+static struct streamtab ftrace_streamtab = {
+	.st_rdinit = &ftrace_rinit,
+	.st_wrinit = &ftrace_winit,
+};
+
 void proc_init(void)
 {
 	cdev_register(CDEV_MAJ_PROC_PS,     "proc-ps",     &ps_streamtab);
 	cdev_register(CDEV_MAJ_PROC_MEM,    "proc-mem",    &mem_streamtab);
 	cdev_register(CDEV_MAJ_PROC_SLAB,   "proc-slab",   &slab_streamtab);
 	cdev_register(CDEV_MAJ_PROC_STREAM, "proc-stream", &stream_streamtab);
+	cdev_register(CDEV_MAJ_PROC_FTRACE, "proc-ftrace", &ftrace_streamtab);
 
 	struct dentry *proc = vfs_mkdir(vfs_root(), "proc");
 	vfs_mknod_chrdev(proc, "ps",       MKDEV(CDEV_MAJ_PROC_PS,     0));
 	vfs_mknod_chrdev(proc, "meminfo",  MKDEV(CDEV_MAJ_PROC_MEM,    0));
 	vfs_mknod_chrdev(proc, "slabinfo", MKDEV(CDEV_MAJ_PROC_SLAB,   0));
 	vfs_mknod_chrdev(proc, "streams",  MKDEV(CDEV_MAJ_PROC_STREAM, 0));
+	vfs_mknod_chrdev(proc, "ftrace",   MKDEV(CDEV_MAJ_PROC_FTRACE, 0));
 }

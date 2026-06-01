@@ -13,6 +13,7 @@
 #define KAPPARA_TIMER_H
 
 void timer_init(unsigned hz);
+void timer_init_this_cpu(void);
 void irq_dispatch(void);
 
 #endif

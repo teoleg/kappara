@@ -27,6 +27,8 @@
 #include "kappara/blkdev.h"
 #include "kappara/fbcon.h"
 #include "kappara/framebuffer.h"
+#include "kappara/ftrace.h"
+#include "kappara/ipi.h"
 #include "kappara/kallsyms.h"
 #include "kappara/kfs.h"
 #include "kappara/kmem.h"
@@ -228,22 +230,31 @@ extern uint64_t smp_release[4];
 extern uint64_t smp_stacks[4];
 extern void     secondary_start(void);	/* boot.S */
 
-/* Per-cpu "hello" + idle.  Called from secondary_start at EL2 with
- * MMU off; uart_putc is just MMIO so it works fine in that state. */
-extern void uart_putc(char c);
-void secondary_main(void)
+/*
+ * Per-secondary-CPU C entry.  Called from secondary_start (boot.S)
+ * at EL1 with DAIF all masked; cpu is the MPIDR Aff0 field (1..3).
+ *
+ * Bring-up order mirrors kmain for core 0:
+ *   1. MMU + caches on  (same tables core 0 built; just enable for us)
+ *   2. VBAR_EL1 installed so our exceptions land on the right vectors
+ *   3. Per-CPU scheduler state: struct cpu, idle kthread, TPIDR_EL1
+ *   4. Unmask IRQs -- timer ticks may now preempt us
+ *   5. Idle loop: yield (giving the scheduler a steal opportunity)
+ *      then WFI when there is nothing to run
+ */
+void secondary_main(unsigned cpu)
 {
-	uint64_t mpidr;
-	__asm__ volatile ("mrs %0, mpidr_el1" : "=r"(mpidr));
-	unsigned cpu = (unsigned)(mpidr & 0xff);
-	/* Use uart_putc directly -- printk's formatter walks data in
-	 * .rodata which is fine MMU-off (PA=VA identity), but keeping
-	 * the early-life print bare-bones makes any wedge obvious. */
-	uart_putc('s'); uart_putc('m'); uart_putc('p'); uart_putc(':');
-	uart_putc(' '); uart_putc('c'); uart_putc('p'); uart_putc('u');
-	uart_putc(' '); uart_putc('0' + cpu);
-	uart_putc('\r'); uart_putc('\n');
-	for (;;) __asm__ volatile ("wfi");
+	mmu_enable_this_cpu();
+	trap_init();
+	sched_secondary_init(cpu);
+	timer_init_this_cpu();	/* arm CNTPNSIRQ + route to this core's IRQ */
+	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ */
+	__asm__ volatile ("msr daifclr, #2");
+	kprintf("smp: cpu %u entering scheduler\n", cpu);
+	for (;;) {
+		kthread_yield();
+		__asm__ volatile ("wfi");
+	}
 }
 
 static void smp_dc_cvac(void *p)
@@ -302,6 +313,13 @@ void kmain(void)
 {
 	uart_init();
 	trap_init();
+
+	/* Arm the function tracer as early as possible.  ftrace_init
+	 * only touches BSS (zeroed by boot.S) and is safe pre-mmu/
+	 * pre-pmm.  When the kernel is built without TRACE=1 the
+	 * cyg-profile hooks are never emitted, so this is a no-op
+	 * apart from zeroing four small ring buffers. */
+	ftrace_init();
 
 	kprintf("\nkappara: hello from aarch64\n");
 	kprintf("        no soup for you, only streams\n");
@@ -376,6 +394,7 @@ void kmain(void)
 
 	sched_init();
 	timer_init(100);
+	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ on core 0 */
 
 	/* Smoke-test the kallsyms table by walking our own frame chain
 	 * once -- proves the post-build symbol table is wired up and

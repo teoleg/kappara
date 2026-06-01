@@ -12,6 +12,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/arch/aarch64/trap.o \
         $(BUILD)/arch/aarch64/mmu.o \
         $(BUILD)/arch/aarch64/timer.o \
+        $(BUILD)/arch/aarch64/ipi.o \
         $(BUILD)/arch/aarch64/switch.o \
         $(BUILD)/arch/aarch64/thread.o \
         $(BUILD)/arch/aarch64/mailbox.o \
@@ -42,6 +43,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/kernel/ramdisk.o \
         $(BUILD)/kernel/kfs.o \
         $(BUILD)/kernel/kallsyms.o \
+        $(BUILD)/kernel/ftrace.o \
         $(BUILD)/kernel/user.o \
         $(BUILD)/kernel/main.o
     KSYM_STUB_OBJ := $(BUILD)/arch/aarch64/kallsyms_stub.o
@@ -80,6 +82,7 @@ else ifeq ($(ARCH),arm)
         $(BUILD)/kernel/uaccess.o \
         $(BUILD)/kernel/ramdisk.o \
         $(BUILD)/kernel/kfs.o \
+        $(BUILD)/kernel/ftrace.o \
         $(BUILD)/kernel/ksh.o
     ELF           := $(BUILD)/kernel-arm.elf
     KERNEL        := $(BUILD)/kernel-arm.img
@@ -101,7 +104,39 @@ CFLAGS  := -Wall -Wextra -Werror -std=gnu11 \
            -MMD -MP \
            -O2 -g
 
-ASFLAGS := $(CFLAGS)
+# Function tracing: `make TRACE=1` turns on gcc's -finstrument-functions
+# so every C function entry/exit calls into kernel/ftrace.c.  A handful
+# of TUs MUST opt out -- otherwise the hook recurses through them while
+# recording or while dumping the trace itself.  The opt-out list is the
+# trace plumbing + everything it uses transitively:
+#   ftrace.c    the tracer itself (would recurse on its own hooks)
+#   printk.c    used by kprintf-based dump path
+#   uart.c      used by printk
+#   string.c    kmemset/kmemcpy are called from every code path; tracing
+#               them would multiply event volume for zero diagnostic value
+#   kallsyms.c  used by the dump's symbol-name formatter
+TRACE ?= 0
+ifeq ($(TRACE),1)
+    CFLAGS += -finstrument-functions
+endif
+
+# Files that must NEVER be instrumented (whether TRACE is on or off):
+NOINST_OBJS := \
+    $(BUILD)/kernel/ftrace.o \
+    $(BUILD)/kernel/printk.o \
+    $(BUILD)/kernel/string.o \
+    $(BUILD)/kernel/kallsyms.o
+ifeq ($(ARCH),aarch64)
+    NOINST_OBJS += $(BUILD)/arch/aarch64/uart.o
+else ifeq ($(ARCH),arm)
+    NOINST_OBJS += $(BUILD)/arch/arm/uart.o
+endif
+
+$(NOINST_OBJS): CFLAGS += -fno-instrument-functions
+
+# Strip -finstrument-functions from .S compilation: it is a C-only
+# pass that GCC complains about when asked to handle an assembly file.
+ASFLAGS := $(filter-out -finstrument-functions, $(CFLAGS))
 LDFLAGS := -nostdlib -static
 
 LIBGCC  := $(shell $(CC) -print-libgcc-file-name)

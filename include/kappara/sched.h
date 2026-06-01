@@ -118,6 +118,13 @@ static inline struct cpu *curcpu(void) { return _only_cpu; }
 #endif
 
 void            sched_init(void);
+
+/* Per-secondary-CPU initialisation.  Called once per secondary core
+ * after that core has its MMU on and VBAR_EL1 installed.  Allocates
+ * the per-CPU idle kthread, writes TPIDR_EL1, and makes curcpu() /
+ * curthread valid on that core. */
+void            sched_secondary_init(unsigned cpu_id);
+
 struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg);
 void            kthread_yield(void);
 void            kthread_exit(void) __attribute__((noreturn));

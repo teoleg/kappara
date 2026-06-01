@@ -13,8 +13,21 @@
 #define KAPPARA_UART_H
 
 void uart_init(void);
-void uart_putc(char c);
-void uart_puts(const char *s);
-int  uart_getc_nonblock(void);	/* -1 if RX FIFO is empty */
+void uart_putc(char c);			/* locked single-byte send */
+void uart_puts(const char *s);		/* locked NUL-terminated send */
+void uart_puts_panic(const char *s);	/* lock-bypass send, for kpanic */
+int  uart_getc_nonblock(void);		/* -1 if RX FIFO is empty */
+
+/* Lock-then-stream variants for callers that emit many bytes in a
+ * loop and want them to land contiguously without other CPUs slipping
+ * bytes between.  Pattern:
+ *
+ *     unsigned long f = uart_acquire();
+ *     while (...) uart_putc_unlocked(c);
+ *     uart_release(f);
+ */
+unsigned long uart_acquire(void);
+void          uart_release(unsigned long flags);
+void          uart_putc_unlocked(char c);
 
 #endif
