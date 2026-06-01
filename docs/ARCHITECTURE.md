@@ -271,6 +271,31 @@ addresses captured in pass 1 stay valid in pass 2.
 walks the AArch64 x29 frame chain.  `trap_dispatch` uses both on
 unhandled faults so the panic dump tells you the function + offset.
 
+## ftrace
+
+`kernel/ftrace.c` implements GCC `-finstrument-functions` hooks
+(`__cyg_profile_func_{enter,exit}`) backed by a per-CPU 256-event
+ring in BSS.  When the kernel is built with `make TRACE=1` every
+non-excluded C function entry/exit becomes one event:
+
+```
+{ ts = CNTPCT_EL0,  fn,  caller,  cpu_id|kind }
+```
+
+`ftrace_init()` runs as the very first line of `kmain` so events
+are captured from before `mmu_init` / `pmm_init`.  The hooks only
+touch BSS (zeroed by `boot.S`) plus `CNTPCT_EL0` / `MPIDR_EL1`
+system registers — no MMU, no pmm, no locks.  Each CPU writes only
+its own ring (`cpu = MPIDR_EL1.Aff0`); no cross-CPU synchronisation.
+
+A handful of TUs are compiled with `-fno-instrument-functions` to
+prevent recursion or runaway noise: `ftrace.c`, `printk.c`,
+`uart.c`, `string.c`, `kallsyms.c`.
+
+`/proc/ftrace` is a STREAMS chrdev: read formats the ring with
+`kallsyms`-resolved names, write parses `on` / `off` / `reset` ASCII
+verbs.  See `docs/FTRACE.md`.
+
 ## SMP
 
 All four Cortex-A53 cores run in EL1 with the MMU on, sharing the

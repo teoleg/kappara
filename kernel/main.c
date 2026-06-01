@@ -27,6 +27,7 @@
 #include "kappara/blkdev.h"
 #include "kappara/fbcon.h"
 #include "kappara/framebuffer.h"
+#include "kappara/ftrace.h"
 #include "kappara/kallsyms.h"
 #include "kappara/kfs.h"
 #include "kappara/kmem.h"
@@ -309,6 +310,13 @@ void kmain(void)
 {
 	uart_init();
 	trap_init();
+
+	/* Arm the function tracer as early as possible.  ftrace_init
+	 * only touches BSS (zeroed by boot.S) and is safe pre-mmu/
+	 * pre-pmm.  When the kernel is built without TRACE=1 the
+	 * cyg-profile hooks are never emitted, so this is a no-op
+	 * apart from zeroing four small ring buffers. */
+	ftrace_init();
 
 	kprintf("\nkappara: hello from aarch64\n");
 	kprintf("        no soup for you, only streams\n");

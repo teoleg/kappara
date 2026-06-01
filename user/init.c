@@ -337,7 +337,8 @@ static void cmd_help(void)
 		"  pipework               sys_pipe + two spawned workers\r\n"
 		"  kill <tid> [sig]       POSIX signal numbers (default SIGTERM=15)\r\n"
 		"  crash                  spawn a thread that dereferences NULL\r\n"
-		"  halt                   ask QEMU to exit (semihosting)\r\n");
+		"  halt                   ask QEMU to exit (semihosting)\r\n"
+		"  ftrace [on|off|reset|dump]  per-CPU function tracer\r\n");
 }
 
 static void cmd_pid(void)
@@ -1386,6 +1387,32 @@ static void cmd_halt(int argc, char *argv[])
 	sys_halt();
 }
 
+/* ftrace <on|off|reset|dump>  -- control the per-CPU function tracer.
+ *
+ *   on / off   flip the global recording switch
+ *   reset      drop all events
+ *   dump       cat /proc/ftrace (default if no arg)
+ *
+ * Writes the verb to /proc/ftrace; the kernel side parses it.  When
+ * the kernel was built without TRACE=1 the ring is permanently empty
+ * but the verbs still work (they just flip a no-op flag).
+ */
+static void cmd_ftrace(int argc, char *argv[])
+{
+	const char *verb = (argc >= 2) ? argv[1] : "dump";
+	if (!ustrcmp(verb, "dump")) {
+		char *catargv[2] = { "cat", "/proc/ftrace" };
+		cmd_cat(2, catargv);
+		return;
+	}
+	long fd = sys_open("/proc/ftrace", 0);
+	if (fd < 0) { cwrite("ftrace: cannot open /proc/ftrace\r\n"); return; }
+	long w = sys_write((int)fd, verb, ustrlen(verb));
+	sys_close((int)fd);
+	cwrite("ftrace: "); cwrite(verb); cwrite(" -> ");
+	cprint_long(w); cwrite("\r\n");
+}
+
 /* kill <tid> [sig]  -- POSIX numbering; default is SIGTERM (15). */
 static void cmd_kill(int argc, char *argv[])
 {
@@ -1536,6 +1563,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "kill"))   cmd_kill(argc, argv);
 	else if (!ustrcmp(argv[0], "crash"))  cmd_crash(argc, argv);
 	else if (!ustrcmp(argv[0], "halt"))   cmd_halt(argc, argv);
+	else if (!ustrcmp(argv[0], "ftrace")) cmd_ftrace(argc, argv);
 	else if (!ustrcmp(argv[0], "pipework")) cmd_pipework();
 	else {
 		cwrite(argv[0]); cwrite(": command not found\r\n");

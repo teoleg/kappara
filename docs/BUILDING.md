@@ -22,8 +22,22 @@
 make                 # build/aarch64/kernel8.img
 make ARCH=aarch64    # same, explicit
 make ARCH=arm        # build/arm/kernel-arm.img (broken right now)
+make TRACE=1         # build with gcc -finstrument-functions for ftrace
 make clean
 ```
+
+### `TRACE=1` — function tracing
+
+Passing `TRACE=1` turns on gcc's `-finstrument-functions` for the
+whole kernel except a handful of TUs that sit on the tracer's own
+path (`kernel/ftrace.c`, `kernel/printk.c`, `arch/aarch64/uart.c`,
+`kernel/string.c`, `kernel/kallsyms.c`).  Each instrumented function
+entry and exit becomes an event in a per-CPU ring buffer; `cat
+/proc/ftrace` formats the buffer with symbol names + offsets.
+
+This is a debug build — instrumentation forces de-inlining of
+`static inline` helpers, slows the kernel materially, and is not
+intended for the default build.  See `docs/FTRACE.md`.
 
 The AArch64 build does a **two-pass link** to populate the symbol
 table for backtraces — first link produces a temp ELF, `tools/gen_kallsyms.sh`

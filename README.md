@@ -72,7 +72,8 @@ To quit:
 | `kernel/vfs.c`                 | In-memory dentry/inode tree, fd table, vnode v_count              |
 | `kernel/kfs.c`                 | "kappara filesystem" — superblock + bitmap + dirent table         |
 | `kernel/ramdisk.c`             | Block device backing kfs                                          |
-| `kernel/proc.c`                | `/proc/{ps,meminfo,slabinfo,streams}`                             |
+| `kernel/proc.c`                | `/proc/{ps,meminfo,slabinfo,streams,ftrace}`                      |
+| `kernel/ftrace.c`              | Per-CPU function tracer (`make TRACE=1`)                          |
 | `kernel/syscall.c`             | Syscall table + dispatcher                                        |
 | `kernel/kallsyms.c`            | Symbol-name lookup, frame-pointer backtrace                       |
 | `kernel/user.c`                | EL0 setup, `sys_spawn` / `sys_exit`, per-thread user stacks       |
@@ -92,6 +93,7 @@ To quit:
 | `docs/PROCFS.md`         | What every `/proc/*` and `/dev/*` exposes                 |
 | `docs/ARCHITECTURE.md`   | Kernel internals: boot, MMU, scheduler, STREAMS, VFS, signals |
 | `docs/BUILDING.md`       | Toolchain, build flags, run modes, QEMU quirks            |
+| `docs/FTRACE.md`         | Per-CPU function tracer (`make TRACE=1`)                  |
 
 ## License
 

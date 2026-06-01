@@ -124,6 +124,25 @@ inode under those is *potentially* an open here, but only the ones
 someone has called `sys_open` on (or which the pipe constructor
 built) show up.
 
+### /proc/ftrace
+
+Per-CPU function tracer; see `docs/FTRACE.md` for the full story.
+Unlike the rest of `/proc` this entry also accepts **writes** — an
+ASCII verb (`on`, `off`, `reset`) flips the tracer's runtime switch:
+
+```
+kappara:/# ftrace off
+ftrace: off -> 3
+kappara:/# ftrace dump          # alias for `cat /proc/ftrace`
+ftrace: disabled  ring_per_cpu=256
+[cpu 0] events=538004 (dropped=537748) shown=256
+[250535828] e stream_write  <- sys_write_impl+0x7c
+...
+```
+
+When the kernel is built without `TRACE=1`, the ring is permanently
+empty and the verbs are no-ops; the entry still exists.
+
 ## How to add a new /proc entry
 
 Three steps:
