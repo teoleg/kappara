@@ -209,6 +209,95 @@ static void syscall_demo(void)
 }
 #endif
 
+/* ---- SMP foundation -------------------------------------------------
+ *
+ * boot.S puts secondary cores in a spin-table loop on smp_release[N];
+ * writing a non-zero entry + DSB + SEV wakes core N and makes it jump
+ * to that address with sp=smp_stacks[N].  For this commit "wake" just
+ * means "boot the secondary into a hello-then-idle C function" --
+ * full SMP scheduling (per-CPU cur, ready-queue lock, IPI) is the
+ * follow-up.
+ *
+ * The spin-table entries are accessed by the secondary core with its
+ * MMU OFF, so writes from core 0 (cached) need an explicit dc cvac +
+ * dsb sy to be visible.  Once each secondary has its MMU on, this
+ * goes away.
+ */
+
+extern uint64_t smp_release[4];
+extern uint64_t smp_stacks[4];
+extern void     secondary_start(void);	/* boot.S */
+
+/* Per-cpu "hello" + idle.  Called from secondary_start at EL2 with
+ * MMU off; uart_putc is just MMIO so it works fine in that state. */
+extern void uart_putc(char c);
+void secondary_main(void)
+{
+	uint64_t mpidr;
+	__asm__ volatile ("mrs %0, mpidr_el1" : "=r"(mpidr));
+	unsigned cpu = (unsigned)(mpidr & 0xff);
+	/* Use uart_putc directly -- printk's formatter walks data in
+	 * .rodata which is fine MMU-off (PA=VA identity), but keeping
+	 * the early-life print bare-bones makes any wedge obvious. */
+	uart_putc('s'); uart_putc('m'); uart_putc('p'); uart_putc(':');
+	uart_putc(' '); uart_putc('c'); uart_putc('p'); uart_putc('u');
+	uart_putc(' '); uart_putc('0' + cpu);
+	uart_putc('\r'); uart_putc('\n');
+	for (;;) __asm__ volatile ("wfi");
+}
+
+static void smp_dc_cvac(void *p)
+{
+	uintptr_t a = (uintptr_t)p & ~63UL;
+	__asm__ volatile ("dc cvac, %0" :: "r"(a) : "memory");
+}
+
+/* Standard ARM spin-table addresses for raspi3b in QEMU (also the
+ * BCM2837 convention).  Each core polls its slot at the listed PA;
+ * writing a non-zero address there + DSB + SEV releases it.
+ *
+ *   PA 0xE0 -- core 1 release address
+ *   PA 0xE8 -- core 2 release address
+ *   PA 0xF0 -- core 3 release address
+ *
+ * Our boot.S also has its own .Lpark spin-table (used in case a
+ * secondary core ever DOES reach our code -- e.g. a future PSCI
+ * boot path), but on QEMU the cores never get there; they wait at
+ * the QEMU spin-table from reset.  We write both for robustness. */
+#define SMP_SPINTABLE_BASE	0xE0UL
+
+/* Wake one secondary core.  Allocates a kernel stack for it,
+ * writes the per-core release address + stack-top into both our
+ * own spin-table and QEMU's, flushes the lines so the secondary
+ * (MMU/cache off) sees them, then DSB SY + SEV. */
+void smp_wake_secondary(unsigned cpu)
+{
+	if (cpu == 0 || cpu >= 4) return;
+	void *stack = pmm_alloc();
+	if (!stack) {
+		kprintf("smp: pmm_alloc failed for cpu %u\n", cpu);
+		return;
+	}
+	uint64_t entry = (uintptr_t)secondary_start;
+	uint64_t top   = (uintptr_t)stack + PAGE_SIZE;
+
+	/* Our own spin-table (boot.S .Lpark reads from this).  Harmless
+	 * on QEMU since secondaries don't reach it. */
+	smp_stacks[cpu]  = top;
+	smp_release[cpu] = entry;
+	smp_dc_cvac(&smp_release[cpu]);
+	smp_dc_cvac(&smp_stacks[cpu]);
+
+	/* QEMU/BCM2837 spin-table at PA 0xE0 + (cpu-1)*8.  This is
+	 * where the cores are actually waiting. */
+	volatile uint64_t *qemu_slot =
+		(volatile uint64_t *)(SMP_SPINTABLE_BASE + (cpu - 1) * 8);
+	*qemu_slot = entry;
+	smp_dc_cvac((void *)qemu_slot);
+
+	__asm__ volatile ("dsb sy; sev" ::: "memory");
+}
+
 void kmain(void)
 {
 	uart_init();
@@ -304,6 +393,13 @@ void kmain(void)
 	 * into EL0 at user/init.c's _start, opens /dev/console, and
 	 * runs the shell entirely in userspace from there on. */
 	user_spawn();
+
+	/* SMP foundation: wake cores 1..3 into a per-core "hello +
+	 * idle" entry.  They stay at EL2 with MMU off for now; the
+	 * actual EL drop + MMU setup + scheduler participation is the
+	 * follow-up.  This commit just proves we can light them up. */
+	for (unsigned cpu = 1; cpu < 4; cpu++)
+		smp_wake_secondary(cpu);
 
 	__asm__ volatile ("msr daifclr, #2");
 
