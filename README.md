@@ -85,6 +85,7 @@ To quit:
 |--------------------------|-----------------------------------------------------------|
 | `docs/SHELL.md`          | Every `ksh` command, with examples                        |
 | `docs/KED.md`            | The tiny ed-like editor                                   |
+| `docs/VI.md`             | The modal vi-lite editor                                  |
 | `docs/PROCFS.md`         | What every `/proc/*` and `/dev/*` exposes                 |
 | `docs/ARCHITECTURE.md`   | Kernel internals: boot, MMU, scheduler, STREAMS, VFS, signals |
 | `docs/BUILDING.md`       | Toolchain, build flags, run modes, QEMU quirks            |

@@ -24,6 +24,7 @@ The prompt shows the current working directory: `kappara:/etc#`.
 | `rm <path>`                | Remove a regular file (kfs blocks reclaimed via the bitmap).|
 | `rmdir <path>`             | Remove an empty directory.                                  |
 | `ked <path>`               | Tiny ed-like line editor.  See [KED.md](KED.md).             |
+| `vi <path>`                | Modal full-screen editor (vi-lite).  See [VI.md](VI.md).     |
 
 ## Processes
 
