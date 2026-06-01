@@ -65,7 +65,27 @@
 #include "kappara/fbcon.h"
 #include "kappara/klog.h"
 #include "kappara/printk.h"
+#include "kappara/spinlock.h"
 #include "kappara/uart.h"
+
+/*
+ * One kprintf at a time across all CPUs.  Without this, every core
+ * writes through uart_putc concurrently and the UART output ends up
+ * with bytes from different lines interleaved -- you cannot read
+ * boot messages from secondary cores.
+ *
+ * Locking granularity is whole-kprintf, not per-character: it costs
+ * the same lock acquire either way, and a complete line shows up
+ * intact instead of being smeared across all callers' output.
+ *
+ * IRQ-save: kprintf is called from any context including the timer
+ * IRQ (sched_tick uses kprintf for diagnostic prints).  Without
+ * masking, an IRQ that preempts a holder on the same CPU and tries
+ * to print itself would deadlock spinning on its own lock.  Panic
+ * path deliberately bypasses the lock (a stuck CPU must not silence
+ * the panic message).
+ */
+static spinlock_t kprintf_lock = SPINLOCK_INIT;
 
 /*
  * Every byte that kprintf would emit goes three places at once:
@@ -202,17 +222,26 @@ void vkprintf(const char *fmt, va_list ap)
 void kprintf(const char *fmt, ...)
 {
 	va_list ap;
+	unsigned long flags = spin_lock_irq_save(&kprintf_lock);
 	va_start(ap, fmt);
 	vkprintf(fmt, ap);
 	va_end(ap);
 	/* One batched fb flush per kprintf call -- amortises the
 	 * 3 MB dc cvac sweep across many characters. */
 	fbcon_tee_flush();
+	spin_unlock_irq_restore(&kprintf_lock, flags);
 }
 
 void kpanic(const char *msg)
 {
-	kprintf("panic: %s\n", msg);
+	/*
+	 * Panic bypasses kprintf's lock: another CPU may have crashed
+	 * while holding it, and the whole point of a panic message is
+	 * that it gets out no matter what.  Best-effort direct uart.
+	 */
+	uart_puts("\npanic: ");
+	uart_puts(msg);
+	uart_puts("\n");
 	for (;;)
 		__asm__ volatile ("wfe");
 }
