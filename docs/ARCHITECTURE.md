@@ -365,16 +365,66 @@ lock is acquired with `spin_lock_irq_save` and only the spinlock is
 released before `context_switch` — IRQs are restored from the saved
 `flags` at the end of the function, after `context_switch` returns).
 
+### Per-CPU timer
+
+The ARMv8 generic timer is per-core: each `mrs CNTP_CTL_EL0` / `mrs
+CNTP_TVAL_EL0` lands on the executing core's banked register.  The
+BCM2836 ARM-local block routes each core's CNTPNSIRQ to that core's
+IRQ line via `TIMER_CONTROL(N) = 0x40000040 + 4N`.  `irq_dispatch`
+reads `IRQ_SOURCE(N) = 0x40000060 + 4N` to know who fired.
+
+`timer_init_this_cpu()` (arch/aarch64/timer.c) writes the per-core
+timer-control register, reloads CNTP_TVAL_EL0, and enables the
+timer.  Core 0 calls it from `timer_init(hz)`; each secondary calls
+it from `secondary_main` after MMU + traps are up.
+
+Result: all four cores get scheduler ticks at the same rate.
+
+### IPI (BCM2836 mailbox)
+
+Inter-processor interrupts on BCM2836 use the mailbox MMIO at
+`0x40000080..0xC0`.  Each core has four 32-bit write-set / read-clear
+mailbox slots; writing to a peer's slot raises an IRQ on the peer if
+the peer enabled that mailbox in `MBOX_IRQ_CTL(N) = 0x40000050+4N`.
+
+`arch/aarch64/ipi.c`:
+- `ipi_init_this_cpu()` enables mailbox 0 IRQ for the calling core.
+- `ipi_send(cpu)` writes to a peer's mailbox 0 set + DSB SY.
+- `ipi_handle()` clears the pending bit.  No payload is needed --
+  the IRQ itself is the signal; returning from it drops back into
+  the scheduler which retries `try_steal`.
+- `ipi_wake_idle()` reads `sched_idle_mask()` and pokes every CPU
+  currently parked on its idle thread.
+
+The scheduler maintains `cpu_idle_mask`: a 4-bit bitmask, one bit
+per core, set whenever a CPU switches TO its idle thread and cleared
+when it leaves.  Updates happen under the per-CPU `cpu_disp_lock`.
+Each `dispq_push` (from `kthread_create`, wake_one/wake_all,
+`kthread_signal`, …) calls `ipi_wake_idle()` so idle cores notice
+new work immediately instead of waiting for their next 10 ms tick.
+
+### Idle thread is not a runqueue citizen
+
+`c->cpu_idle` is a singleton owned by the CPU; it never goes on
+`cpu_dispq`.  `switch_to_next` skips the requeue when the outgoing
+thread IS the idle thread.  The empty-queue path returns to
+`cpu_idle` directly whenever neither the local queue nor a remote
+steal turn up real work.
+
+### UART kprintf lock
+
+`kernel/printk.c` holds `kprintf_lock` (IRQ-save spinlock) for the
+duration of one `kprintf` call.  Without it, every CPU writes to
+`uart_putc` concurrently and bytes from different lines interleave.
+`kpanic` deliberately bypasses the lock and writes via `uart_puts`
+directly: another CPU may have crashed while holding the lock, and
+the panic message must get out.
+
 ### What's still missing
 
 | Gap                             | Notes                                       |
 |---------------------------------|---------------------------------------------|
-| Per-CPU generic timer           | Only core 0 has CNTPNSIRQ routed; secondaries never get timer ticks |
-| IPI for cross-CPU wake          | Woken threads land on the waker's CPU; idle steal redistributes lazily |
-| UART kprintf lock               | Boot messages from all four cores interleave at the byte level |
-| User-mode on secondaries        | Works (EL0 ERET from any core), untested under load |
-
-At boot you will see four lines (`sched: cpu N up`) interleaved on
-the UART because all four cores call `kprintf` without a lock.  This
-is harmless and expected; a `kprintf_lock` (spinlock around the UART
-putc loop) is the planned fix.
+| Per-thread CPU affinity         | Pushes onto the waker's CPU and lets idle steal redistribute |
+| Push-side load balancing        | Currently only pull-side (idle steal); a busy CPU's queue gets long-ish before another core grabs from it |
+| Pi 4 GICv2 backend              | The Pi 3 BCM2836 mailbox/timer-routing block is replaced by a real GIC on Pi 4 |
+| Per-CPU `printk_buffered`       | The kprintf lock serialises but a CPU spinning waiting for the lock burns cycles -- per-CPU ring + a flusher would be lock-free |

@@ -12,6 +12,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/arch/aarch64/trap.o \
         $(BUILD)/arch/aarch64/mmu.o \
         $(BUILD)/arch/aarch64/timer.o \
+        $(BUILD)/arch/aarch64/ipi.o \
         $(BUILD)/arch/aarch64/switch.o \
         $(BUILD)/arch/aarch64/thread.o \
         $(BUILD)/arch/aarch64/mailbox.o \

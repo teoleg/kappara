@@ -52,9 +52,44 @@
  * temperatures, set clocks, etc. */
 #define PLAT_MBOX_BASE			(PLAT_PERIPH_BASE + 0x0000B880UL)
 
-/* BCM2836 per-core timer routing (offsets from PLAT_LOCAL_PERIPH_BASE). */
-#define PLAT_TIMER_CONTROL		(PLAT_LOCAL_PERIPH_BASE + 0x40UL)
-#define PLAT_TIMER_IRQ_SOURCE		(PLAT_LOCAL_PERIPH_BASE + 0x60UL)
+/* BCM2836 per-core timer routing (offsets from PLAT_LOCAL_PERIPH_BASE).
+ *
+ * The BCM2836 has one timer-control + one irq-source register per core,
+ * at +0x40 and +0x60 respectively, packed 4 bytes apart.  Core N's
+ * registers live at +0x40+4N and +0x60+4N.
+ *
+ *   Core(N) Timer Control:  0x40 + 4N   (TIMERnCTL)
+ *   Core(N) Mailbox  IRQs:  0x50 + 4N   (MBOXnCTL)
+ *   Core(N) IRQ Source:     0x60 + 4N
+ *   Core(N) FIQ Source:     0x70 + 4N
+ *
+ * Bit positions inside each register are uniform across all four cores;
+ * we only ever set bit 1 (CNTPNSIRQ -> IRQ).
+ */
+#define PLAT_TIMER_CONTROL(cpu)		\
+	(PLAT_LOCAL_PERIPH_BASE + 0x40UL + 4UL * (cpu))
+#define PLAT_TIMER_IRQ_SOURCE(cpu)	\
+	(PLAT_LOCAL_PERIPH_BASE + 0x60UL + 4UL * (cpu))
 #define PLAT_TIMER_CNTPNSIRQ_BIT	(1u << 1)
+
+/* BCM2836 inter-processor mailboxes.  Each core has four 32-bit
+ * write-set / read-clear mailbox slots.  We use mailbox 0 as the
+ * single-bit "wake-up IPI" reason; reasons beyond "the IRQ fired"
+ * are not encoded -- the IRQ itself is what kicks WFI'd cores.
+ *
+ *   Core(N) MailboxN-IRQ Ctrl:    0x50 + 4N  (bit M = enable mailbox M)
+ *   Core(N) Mailbox M Set:        0x80 + 0x10*N + 4M  (write to send IPI)
+ *   Core(N) Mailbox M Read/Clear: 0xC0 + 0x10*N + 4M  (write-1-to-clear)
+ *
+ * IRQ_SOURCE bit positions for mailbox pendings: bit (4+M) for mailbox M
+ * on this core.  Mailbox 0 pending therefore shows up at IRQ_SOURCE bit 4.
+ */
+#define PLAT_MBOX_IRQ_CTL(cpu)		\
+	(PLAT_LOCAL_PERIPH_BASE + 0x50UL + 4UL * (cpu))
+#define PLAT_MBOX_SET(cpu, mbox)	\
+	(PLAT_LOCAL_PERIPH_BASE + 0x80UL + 0x10UL * (cpu) + 4UL * (mbox))
+#define PLAT_MBOX_RDCLR(cpu, mbox)	\
+	(PLAT_LOCAL_PERIPH_BASE + 0xC0UL + 0x10UL * (cpu) + 4UL * (mbox))
+#define PLAT_IRQSRC_MBOX0_BIT		(1u << 4)
 
 #endif

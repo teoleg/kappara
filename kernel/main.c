@@ -28,6 +28,7 @@
 #include "kappara/fbcon.h"
 #include "kappara/framebuffer.h"
 #include "kappara/ftrace.h"
+#include "kappara/ipi.h"
 #include "kappara/kallsyms.h"
 #include "kappara/kfs.h"
 #include "kappara/kmem.h"
@@ -246,6 +247,8 @@ void secondary_main(unsigned cpu)
 	mmu_enable_this_cpu();
 	trap_init();
 	sched_secondary_init(cpu);
+	timer_init_this_cpu();	/* arm CNTPNSIRQ + route to this core's IRQ */
+	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ */
 	__asm__ volatile ("msr daifclr, #2");
 	kprintf("smp: cpu %u entering scheduler\n", cpu);
 	for (;;) {
@@ -391,6 +394,7 @@ void kmain(void)
 
 	sched_init();
 	timer_init(100);
+	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ on core 0 */
 
 	/* Smoke-test the kallsyms table by walking our own frame chain
 	 * once -- proves the post-build symbol table is wired up and

@@ -81,6 +81,7 @@
 
 #include <stdint.h>
 
+#include "kappara/ipi.h"
 #include "kappara/kmem.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
@@ -122,6 +123,21 @@ static struct kthread *to_reap;
 static spinlock_t      to_reap_lock = SPINLOCK_INIT;
 
 /*
+ * Bitmask of CPUs currently running their idle thread.  Wakers use
+ * ipi_wake_idle() to nudge idle CPUs to come look for work without
+ * waiting up to one tick for them to notice on their own.  Plain
+ * read/write -- a stale bit just costs one wasted IPI or one missed
+ * IPI, neither of which is a correctness issue (the next tick covers
+ * both).
+ */
+static volatile uint32_t cpu_idle_mask;
+
+uint32_t sched_idle_mask(void)
+{
+	return cpu_idle_mask;
+}
+
+/*
  * Sparse table from tid -> kthread *.  next_tid increments by 1
  * each kthread_create; we don't recycle slots when threads die, so
  * tid values are unique within a boot and grow monotonically.  Cap
@@ -155,12 +171,21 @@ static struct kthread *dispq_pop_locked(struct cpu *c)
 	return t;
 }
 
-/* Lock + push (used by wake paths from outside switch_to_next). */
+/* Lock + push (used by wake paths from outside switch_to_next).
+ *
+ * After pushing, send a wake-up IPI to every CPU currently in its
+ * idle thread.  We don't know whether the newly-queued thread is
+ * destined for THIS CPU or will get stolen, so the cheap thing to
+ * do is poke everyone parked on WFI; whoever wakes first gets to
+ * steal.  ipi_wake_idle skips self automatically.
+ */
 static void dispq_push(struct cpu *c, struct kthread *t)
 {
 	unsigned long f = spin_lock_irq_save(&c->cpu_disp_lock);
 	dispq_push_locked(c, t);
 	spin_unlock_irq_restore(&c->cpu_disp_lock, f);
+	if (cpu_idle_mask)
+		ipi_wake_idle();
 }
 
 void sched_init(void)
@@ -178,6 +203,9 @@ void sched_init(void)
 	cpus[0].cpu_thread    = &main_thread;
 	cpus[0].cpu_idle      = &main_thread;	/* main IS our idle */
 	set_curcpu(&cpus[0]);
+
+	/* Core 0 starts on its idle (== main) thread.  Mark it so. */
+	cpu_idle_mask |= (1u << 0);
 
 	tid_table[0] = &main_thread;
 	kprintf("sched: cpu 0 main thread is tid=0\n");
@@ -297,12 +325,26 @@ static void switch_to_next(int requeue_current)
 		__asm__ volatile ("msr daif, %0" :: "r"(flags) : "memory");
 		return;
 	}
-	if (requeue_current) {
+	if (requeue_current && prev != c->cpu_idle) {
+		/* The per-CPU idle thread is a singleton fallback, not a
+		 * runqueue citizen.  When idle yields and we find real
+		 * work to switch to, we leave idle "off" the queue so the
+		 * empty-queue path can return to it whenever needed. */
 		dispq_push_locked(c, prev);
 		prev->state = KT_READY;
 	}
 	next->state = KT_RUNNING;
 	c->cpu_thread = next;
+	/* Maintain the global idle mask used by IPI wake.  Setting/
+	 * clearing under cpu_disp_lock means a remote waker either sees
+	 * the bit set BEFORE this CPU committed to idle (so the IPI is
+	 * a no-op because the CPU was about to drain its own queue
+	 * anyway) or AFTER (so the IPI wakes the WFI in the idle loop). */
+	uint32_t mybit = 1u << c->cpu_id;
+	if (next == c->cpu_idle)
+		cpu_idle_mask |=  mybit;
+	else if (prev == c->cpu_idle)
+		cpu_idle_mask &= ~mybit;
 	/* Release the queue lock; keep IRQs masked across context_switch. */
 	spin_unlock(&c->cpu_disp_lock);
 
@@ -521,6 +563,10 @@ void sched_secondary_init(unsigned cpu_id)
 	c->cpu_id     = cpu_id;
 	c->cpu_thread = idle;
 	c->cpu_idle   = idle;
+
+	/* Mark this CPU as starting in its idle thread so a waker on
+	 * another core knows to send a wake-up IPI when it parks work. */
+	cpu_idle_mask |= (1u << cpu_id);
 
 	/* Publish: after this, curcpu() / curthread are valid on this core. */
 	set_curcpu(c);
