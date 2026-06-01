@@ -1,7 +1,10 @@
 # kappara
 
 A small SVR4-flavored Unix-like operating system for AArch64 (Raspberry Pi 3
-on QEMU today, eventually real Pi 4 hardware).
+on QEMU today, eventually real Pi 4 hardware).  All four cores boot —
+core 0 runs the kernel + scheduler, cores 1-3 are released into a tiny
+"hello + idle" entry through the standard ARM spin-table at PA 0xE0/E8/F0.
+Real per-CPU scheduling is the next big step.
 
 The kernel uses SVR4 STREAMS for character I/O — pipes, console, /dev/loop,
 /dev/klog, /proc/* — with module push/pop, queues, and message blocks all
@@ -85,6 +88,7 @@ To quit:
 |--------------------------|-----------------------------------------------------------|
 | `docs/SHELL.md`          | Every `ksh` command, with examples                        |
 | `docs/KED.md`            | The tiny ed-like editor                                   |
+| `docs/VI.md`             | The modal vi-lite editor                                  |
 | `docs/PROCFS.md`         | What every `/proc/*` and `/dev/*` exposes                 |
 | `docs/ARCHITECTURE.md`   | Kernel internals: boot, MMU, scheduler, STREAMS, VFS, signals |
 | `docs/BUILDING.md`       | Toolchain, build flags, run modes, QEMU quirks            |

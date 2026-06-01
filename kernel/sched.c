@@ -92,22 +92,34 @@
 
 extern void context_switch(void **save_sp, void *new_sp);
 
-struct kthread *cur;
+/*
+ * Per-CPU dispatcher state.  One slot per core; cpu_id is the
+ * index.  Core 0's slot is set up in sched_init; secondary cores
+ * (next commit) initialize their own and write TPIDR_EL1 at
+ * bring-up time.
+ *
+ * This is the SVR4 dispatcher shape: each CPU has its own runqueue
+ * + lock, so the common case (this CPU schedules its own threads)
+ * touches no shared state.  Cross-CPU traffic (idle steal, wake-
+ * other-cpu) is bounded and goes through the target's lock.
+ */
+#define KSCHED_NCPU	4
+static struct cpu cpus[KSCHED_NCPU];
 
-static struct kthread *ready_head;
-static struct kthread *ready_tail;
-static unsigned        next_tid = 1;
+#ifndef __aarch64__
+struct cpu *_only_cpu = &cpus[0];
+#endif
+
+static unsigned next_tid = 1;
 
 /*
  * Threads that called kthread_exit but haven't been reaped yet.
- * A thread can't free its own kernel stack while running on it; it
- * adds itself here and yields.  The very next switch_to_next call
- * runs after we've switched OFF the dying thread, on the new
- * thread's stack -- safe to free the body now.  Single linked list
- * via kthread.next, same as the ready queue (the two are mutually
- * exclusive: dead threads aren't ready).
+ * Stays global -- any CPU can reap any dying thread, the only rule
+ * is "don't reap while standing on the dying thread's stack."
+ * to_reap_lock guards the list.
  */
 static struct kthread *to_reap;
+static spinlock_t      to_reap_lock = SPINLOCK_INIT;
 
 /*
  * Sparse table from tid -> kthread *.  next_tid increments by 1
@@ -117,27 +129,38 @@ static struct kthread *to_reap;
  */
 #define KSCHED_MAX_TID	256
 static struct kthread *tid_table[KSCHED_MAX_TID];
+static spinlock_t      tid_lock = SPINLOCK_INIT;
 
-static void ready_push(struct kthread *t)
+/* Append t to CPU c's dispatch queue.  Caller MUST hold c->cpu_disp_lock. */
+static void dispq_push_locked(struct cpu *c, struct kthread *t)
 {
 	t->next = NULL;
-	if (ready_tail)
-		ready_tail->next = t;
+	if (c->cpu_dispq_tail)
+		c->cpu_dispq_tail->next = t;
 	else
-		ready_head = t;
-	ready_tail = t;
+		c->cpu_dispq_head = t;
+	c->cpu_dispq_tail = t;
 }
 
-static struct kthread *ready_pop(void)
+/* Pop the head of CPU c's dispatch queue.  Caller MUST hold the lock. */
+static struct kthread *dispq_pop_locked(struct cpu *c)
 {
-	struct kthread *t = ready_head;
+	struct kthread *t = c->cpu_dispq_head;
 	if (t) {
-		ready_head = t->next;
-		if (!ready_head)
-			ready_tail = NULL;
+		c->cpu_dispq_head = t->next;
+		if (!c->cpu_dispq_head)
+			c->cpu_dispq_tail = NULL;
 		t->next = NULL;
 	}
 	return t;
+}
+
+/* Lock + push (used by wake paths from outside switch_to_next). */
+static void dispq_push(struct cpu *c, struct kthread *t)
+{
+	unsigned long f = spin_lock_irq_save(&c->cpu_disp_lock);
+	dispq_push_locked(c, t);
+	spin_unlock_irq_restore(&c->cpu_disp_lock, f);
 }
 
 void sched_init(void)
@@ -147,9 +170,17 @@ void sched_init(void)
 	main_thread.tid   = 0;
 	main_thread.state = KT_RUNNING;
 	main_thread.next  = NULL;
-	cur = &main_thread;
+
+	/* Initialize core 0's per-CPU struct and publish via TPIDR_EL1
+	 * before anything touches curcpu/curthread.  Spinlocks live
+	 * in the bss-zeroed `cpus` array so they start unlocked. */
+	cpus[0].cpu_id        = 0;
+	cpus[0].cpu_thread    = &main_thread;
+	cpus[0].cpu_idle      = &main_thread;	/* main IS our idle */
+	set_curcpu(&cpus[0]);
+
 	tid_table[0] = &main_thread;
-	kprintf("sched: main thread is tid=0\n");
+	kprintf("sched: cpu 0 main thread is tid=0\n");
 }
 
 struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
@@ -169,67 +200,92 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 	}
 
 	t->name       = name;
-	t->tid        = next_tid++;
+	{
+		unsigned long f = spin_lock_irq_save(&tid_lock);
+		t->tid = next_tid++;
+		if (t->tid < KSCHED_MAX_TID)
+			tid_table[t->tid] = t;
+		spin_unlock_irq_restore(&tid_lock, f);
+	}
 	t->stack_base = stack;
 	t->state      = KT_READY;
 	t->next       = NULL;
 	t->sp         = arch_thread_init_frame((char *)stack + PAGE_SIZE,
 					       fn, arg);
 
-	if (t->tid < KSCHED_MAX_TID)
-		tid_table[t->tid] = t;
-	ready_push(t);
+	/* For now, every new thread lands on the creator's CPU.
+	 * Cross-CPU load balancing (idle steal) is a separate step. */
+	dispq_push(curcpu(), t);
 	kprintf("sched: created tid=%u name=%s stack=%p fn=%p\n",
 		t->tid, name, stack, (void *)(uintptr_t)fn);
 	return t;
 }
 
 /* Common scheduler step.  If requeue_current is set, the outgoing
- * thread goes back on the ready queue (cooperative yield); if not,
- * it has already been parked somewhere else (a wait queue, exit
- * limbo, ...) and we MUST NOT put it back on the ready queue or
- * the scheduler will think it's runnable. */
+ * thread goes back on THIS CPU's dispatch queue (cooperative yield);
+ * if not, it has already been parked somewhere else (a wait queue,
+ * exit limbo, ...) and we MUST NOT put it back.
+ *
+ * The lock dance: take cpu_disp_lock for the queue mutations and
+ * the cur=next swap, release before the actual context_switch so
+ * the incoming thread doesn't inherit a held lock.  IRQs stay
+ * masked across the switch since context_switch saves/restores
+ * per-thread DAIF (commit 0929814). */
 static void switch_to_next(int requeue_current)
 {
-	struct kthread *next = ready_pop();
+	struct cpu *c = curcpu();
+	unsigned long flags = spin_lock_irq_save(&c->cpu_disp_lock);
+
+	struct kthread *next = dispq_pop_locked(c);
 	if (!next) {
+		spin_unlock_irq_restore(&c->cpu_disp_lock, flags);
 		if (requeue_current)
 			return;
 		/* Nobody runnable AND the caller is about to block.
-		 * That's a deadlock for now (no idle thread).  Park
-		 * on WFE so an IRQ -- specifically the timer or a
-		 * future device interrupt -- can wake us into a wake
-		 * path that puts somebody on the ready queue. */
-		kprintf("sched: nothing to run; deadlock or pure idle\n");
+		 * That's a deadlock for now (no idle thread of our
+		 * own).  Park on WFE so an IRQ can wake us into a
+		 * wake path. */
+		kprintf("sched: cpu %u nothing to run; deadlock\n",
+			c->cpu_id);
 		for (;;)
 			__asm__ volatile ("wfe");
 	}
-	struct kthread *prev = cur;
+
+	struct kthread *prev = c->cpu_thread;
 	if (requeue_current) {
-		ready_push(prev);
+		dispq_push_locked(c, prev);
 		prev->state = KT_READY;
 	}
 	next->state = KT_RUNNING;
-	cur = next;
+	c->cpu_thread = next;
+	/* Release the lock; keep IRQs masked across the switch. */
+	spin_unlock(&c->cpu_disp_lock);
+
 	context_switch(&prev->sp, next->sp);
 
-	/* We're now running as `next` (cur = next, but that's the same
-	 * pointer the OLD context had).  Drain the to-reap list: any
+	/* We're now running as `next`.  Drain the to-reap list: any
 	 * thread that called kthread_exit added itself here and we're
-	 * guaranteed to be on a DIFFERENT stack now, so freeing those
-	 * pages is safe.  The main thread is a static struct with no
-	 * pmm-allocated stack, so we use stack_base != NULL as the
-	 * "safe to free" marker. */
-	while (to_reap) {
-		struct kthread *t = to_reap;
-		to_reap = t->next;
+	 * guaranteed to be on a DIFFERENT stack now, so freeing is safe. */
+	unsigned long f2 = spin_lock_irq_save(&to_reap_lock);
+	struct kthread *grab = to_reap;
+	to_reap = NULL;
+	spin_unlock_irq_restore(&to_reap_lock, f2);
+	while (grab) {
+		struct kthread *t = grab;
+		grab = t->next;
 		if (t->stack_base) {
-			if (t->tid < KSCHED_MAX_TID)
+			if (t->tid < KSCHED_MAX_TID) {
+				unsigned long f3 = spin_lock_irq_save(&tid_lock);
 				tid_table[t->tid] = NULL;
+				spin_unlock_irq_restore(&tid_lock, f3);
+			}
 			pmm_free(t->stack_base);
 			kfree(t);
 		}
 	}
+
+	/* Restore the IRQ state from when we entered switch_to_next. */
+	__asm__ volatile ("msr daif, %0" :: "r"(flags) : "memory");
 }
 
 void kthread_yield(void)
@@ -259,17 +315,18 @@ static inline void irq_restore(unsigned long daif)
 void kthread_sleep_on(struct wait_queue *wq)
 {
 	unsigned long flags = irq_save_and_disable();
-	cur->state      = KT_BLOCKED;
-	cur->waiting_on = wq;
-	cur->next       = wq->head;
-	wq->head        = cur;
+	struct kthread *t = curthread;
+	t->state      = KT_BLOCKED;
+	t->waiting_on = wq;
+	t->next       = wq->head;
+	wq->head      = t;
 	switch_to_next(0);
 	/* Reached here after someone called kthread_wake_*; the new
 	 * DAIF that context_switch restored is whatever this thread
 	 * had at the moment it slept (masked) -- so restore the
 	 * pre-sleep state explicitly to put us back at the caller's
 	 * IRQ-mask level. */
-	cur->waiting_on = NULL;
+	curthread->waiting_on = NULL;
 	irq_restore(flags);
 }
 
@@ -278,15 +335,18 @@ void kthread_wake_all(struct wait_queue *wq)
 	unsigned long flags = irq_save_and_disable();
 	struct kthread *t = wq->head;
 	wq->head = NULL;
+	irq_restore(flags);
+	/* Wake each onto the WAKER's CPU.  Cross-CPU scheduling will
+	 * pick it up via idle steal later; for now, locality. */
+	struct cpu *c = curcpu();
 	while (t) {
 		struct kthread *n = t->next;
 		t->next       = NULL;
 		t->waiting_on = NULL;
 		t->state      = KT_READY;
-		ready_push(t);
+		dispq_push(c, t);
 		t = n;
 	}
-	irq_restore(flags);
 }
 
 void kthread_wake_one(struct wait_queue *wq)
@@ -298,15 +358,18 @@ void kthread_wake_one(struct wait_queue *wq)
 		t->next       = NULL;
 		t->waiting_on = NULL;
 		t->state      = KT_READY;
-		ready_push(t);
 	}
 	irq_restore(flags);
+	if (t)
+		dispq_push(curcpu(), t);
 }
 
 struct kthread *kthread_find(unsigned tid)
 {
 	if (tid >= KSCHED_MAX_TID) return NULL;
+	unsigned long f = spin_lock_irq_save(&tid_lock);
 	struct kthread *t = tid_table[tid];
+	spin_unlock_irq_restore(&tid_lock, f);
 	if (t && t->state == KT_DEAD) return NULL;
 	return t;
 }
@@ -336,12 +399,13 @@ const char *kthread_state_name(enum kt_state s)
 int kthread_signal(struct kthread *t, unsigned sig)
 {
 	if (!t || sig == 0 || sig >= NSIG) return -1;
+	int needs_dispq_push = 0;
 	unsigned long flags = irq_save_and_disable();
 	t->sig_pending |= SIGBIT(sig);
 	/* If t is sleeping on a wait queue, surgically unlink it and
-	 * put it on the ready queue so it wakes and observes the
-	 * signal.  The blocking primitive is expected to re-check
-	 * cur->sig_pending after sleep_on returns. */
+	 * mark it READY so it wakes and observes the signal.  The
+	 * blocking primitive is expected to re-check sig_pending
+	 * after sleep_on returns. */
 	if (t->state == KT_BLOCKED && t->waiting_on) {
 		struct wait_queue *wq = t->waiting_on;
 		if (wq->head == t) {
@@ -357,9 +421,11 @@ int kthread_signal(struct kthread *t, unsigned sig)
 		t->next       = NULL;
 		t->waiting_on = NULL;
 		t->state      = KT_READY;
-		ready_push(t);
+		needs_dispq_push = 1;
 	}
 	irq_restore(flags);
+	if (needs_dispq_push)
+		dispq_push(curcpu(), t);
 	return 0;
 }
 
@@ -372,18 +438,20 @@ void sched_tick(void)
 
 void kthread_exit(void)
 {
+	struct kthread *me = curthread;
 	/* Release every file the dying thread still holds.  pipe ends
 	 * inherited from the parent get their refcount dropped here so
 	 * the pipe goes away naturally when both ends are closed. */
-	vfs_drain_fds(cur);
-	kprintf("kthread: tid=%u (%s) exited\n", cur->tid, cur->name);
+	vfs_drain_fds(me);
+	kprintf("kthread: tid=%u (%s) exited\n", me->tid, me->name);
 
 	/* Park ourselves on the to-reap list -- some other thread will
 	 * free our stack + kthread once we've context-switched away. */
-	unsigned long flags = irq_save_and_disable();
-	cur->state = KT_DEAD;
-	cur->next  = to_reap;
-	to_reap    = cur;
+	unsigned long flags = spin_lock_irq_save(&to_reap_lock);
+	me->state = KT_DEAD;
+	me->next  = to_reap;
+	to_reap   = me;
+	spin_unlock_irq_restore(&to_reap_lock, flags);
 	switch_to_next(0);
 	/* unreachable: switch_to_next with requeue=0 never returns
 	 * once cur is no longer in the ready queue and never woken. */

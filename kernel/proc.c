@@ -183,20 +183,51 @@ static int proc_slab_qopen(queue_t *q)
 
 static struct procbuf stream_pb;
 
-static void stream_one(const char *name, struct streamtab *st, void *arg)
+static void stream_one_registered(const char *name, struct streamtab *st,
+				   void *arg)
 {
-	(void)arg;
-	(void)st;
+	(void)arg; (void)st;
 	pb_str(&stream_pb, "  ");
 	pb_str(&stream_pb, name);
+	pb_putc(&stream_pb, '\n');
+}
+
+/* Walk one open stream's write-side queue stack from the head down,
+ * stopping at the driver pair (which ends the chain for normal
+ * streams; for pipes there's no driver, so we stop after the head). */
+static void stream_one_open(struct stdata *sd, void *arg)
+{
+	(void)arg;
+	const char *name = sd->sd_name ? sd->sd_name : "?";
+	pb_str(&stream_pb, "  ");
+	pb_pad_str(&stream_pb, name, 10);
+	pb_str(&stream_pb, " refs=");
+	pb_pad_dec(&stream_pb, sd->sd_refs, 2);
+	pb_str(&stream_pb, "  stack:");
+	/* Walk wq downward.  Each q's qinfo->minfo gives a module
+	 * name.  Pipes (sd_drv_wq == NULL) just show the head; their
+	 * sd_wq->q_next points at the peer's rq which isn't ours. */
+	for (queue_t *q = sd->sd_wq; q;
+	     q = (sd->sd_drv_wq && q == sd->sd_drv_wq) ? NULL : q->q_next) {
+		const char *mn = (q->q_qinfo && q->q_qinfo->qi_minfo)
+				 ? q->q_qinfo->qi_minfo->mi_idname : "?";
+		pb_str(&stream_pb, " ");
+		pb_str(&stream_pb, mn);
+		if (q->q_next && (!sd->sd_drv_wq || q != sd->sd_drv_wq))
+			pb_str(&stream_pb, " ->");
+	}
+	if (sd->sd_flags & SD_EOF) pb_str(&stream_pb, "  [EOF]");
+	if (sd->sd_peer)           pb_str(&stream_pb, "  [pipe]");
 	pb_putc(&stream_pb, '\n');
 }
 
 static int proc_stream_qopen(queue_t *q)
 {
 	pb_reset(&stream_pb);
-	pb_str(&stream_pb, "registered STREAMS modules/drivers:\n");
-	streams_for_each(stream_one, NULL);
+	pb_str(&stream_pb, "registered modules/drivers:\n");
+	streams_for_each(stream_one_registered, NULL);
+	pb_str(&stream_pb, "\nopen streams:\n");
+	streams_for_each_open(stream_one_open, NULL);
 	pb_flush_to_q(&stream_pb, q);
 	return 0;
 }

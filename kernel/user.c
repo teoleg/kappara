@@ -217,7 +217,7 @@ long sys_spawn_impl(uint64_t entry, uint64_t arg)
 	 * pipes, the console, and anything else the parent had open --
 	 * the fork()-ish piece of spawn that makes pipework actually
 	 * compose. */
-	kthread_inherit_fds(t, cur);
+	kthread_inherit_fds(t, curthread);
 	return (long)t->tid;
 }
 

@@ -67,6 +67,9 @@ struct stdata {
 	struct stdata	*sd_peer;	/* pipe peer; non-NULL only for
 					 * the two ends of a sys_pipe.    */
 	struct wait_queue sd_readwait;	/* readers blocked on empty sd_rq */
+	struct stdata	*sd_all_next;	/* global list link -- every live
+					 * stdata is on it so /proc/streams
+					 * can walk all open instances    */
 };
 
 void streams_head_init(void);
@@ -88,6 +91,12 @@ void              streams_for_each(void (*cb)(const char *name,
 					      struct streamtab *st,
 					      void *arg),
 				   void *arg);
+
+/* Walk every open stream (every live stdata).  Used by /proc/streams
+ * to list active opens with their queue stacks. */
+void              streams_for_each_open(void (*cb)(struct stdata *sd,
+						   void *arg),
+					void *arg);
 
 /* sys_open / sys_close / sys_read / sys_write / sys_ioctl / sys_putmsg /
  * sys_getmsg now live in include/kappara/vfs.h -- they dispatch via the

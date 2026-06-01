@@ -52,30 +52,29 @@ any laptop where you don't want QEMU TCG to spin all cores).
 
 ## Quitting QEMU
 
-`make run-thrifty` shares stdio with QEMU (monitor + serial both on
-your terminal).  Standard escapes:
+The `make run-thrifty` and `make run-gui` targets use **plain
+`-serial stdio`** (no `mon:` prefix), so:
 
-| Sequence       | What it does                                       |
-|----------------|----------------------------------------------------|
-| `Ctrl-A x`     | Quit QEMU                                          |
-| `Ctrl-A c`     | Switch to QEMU monitor (then `q` to quit, `c` to resume) |
-| `Ctrl-A h`     | Show all Ctrl-A escapes                            |
+| What you type     | What happens                                       |
+|-------------------|----------------------------------------------------|
+| `Ctrl-C`          | Sends SIGINT to QEMU -- QEMU exits immediately     |
+| `halt` in the shell | Runs `sys_halt`, which triggers ARM semihosting SYS_EXIT; QEMU exits with status 0 |
+| `make stop` (other terminal) | `pkill -x` any running QEMU                  |
 
-### When Ctrl-A doesn't work
+Both `Ctrl-C` and the `halt` shell command work from the same
+terminal QEMU is running in, so you don't need a second window.
+`halt` requires `-semihosting-config enable=on,target=native`,
+which both run targets already pass.
 
-If you're in `screen`, `tmux`, or some SSH wrappers, `Ctrl-A` is
-intercepted before QEMU sees it.  Workarounds:
+### What changed from earlier versions
 
-- **screen**: `Ctrl-A a x` — the first `Ctrl-A a` sends a literal
-  `Ctrl-A` into the inner program (QEMU), and `x` is QEMU's quit.
-- **tmux**: depending on prefix config, similar — escape your tmux
-  prefix and send a raw Ctrl-A.
-- **From another terminal**: `make stop` `pkill`s qemu cleanly.
-
-`Ctrl-C` does **not** quit QEMU when stdio is shared; it gets
-forwarded into the guest as a regular 0x03 byte.  The kappara shell
-doesn't yet handle 0x03 as SIGINT (would need a controlling-terminal
-concept), so it just appears in the line buffer.
+The original `-serial mon:stdio` mode reserved `Ctrl-A` for QEMU
+monitor escapes (`Ctrl-A x` to quit, `Ctrl-A c` to enter the
+monitor).  In `screen` and `tmux` Ctrl-A is normally the prefix
+key, so it gets eaten before QEMU sees it, and the only way out was
+killing QEMU from another window.  Dropping `mon:` removes monitor
+access but gives us the much friendlier `Ctrl-C` exit and lets
+`halt` work too.
 
 ## QEMU on a Raspberry Pi host
 

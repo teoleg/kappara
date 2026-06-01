@@ -73,6 +73,11 @@ struct stmod_entry {
 
 static struct stmod_entry *registry;
 
+/* Head of the singly linked list of every live stdata.  stream_build
+ * and pipe_end push here; stream_close removes.  /proc/streams walks
+ * it to show what's currently open. */
+static struct stdata *all_open_streams;
+
 void streams_register(const char *name, struct streamtab *st)
 {
 	struct stmod_entry *e = kmalloc(sizeof(*e));
@@ -100,6 +105,13 @@ void streams_for_each(void (*cb)(const char *name, struct streamtab *st,
 {
 	for (struct stmod_entry *e = registry; e; e = e->next)
 		cb(e->name, e->st, arg);
+}
+
+void streams_for_each_open(void (*cb)(struct stdata *sd, void *arg),
+			   void *arg)
+{
+	for (struct stdata *sd = all_open_streams; sd; sd = sd->sd_all_next)
+		cb(sd, arg);
 }
 
 /* ---- Stream-head queue procedures ------------------------------------- */
@@ -506,6 +518,12 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name)
 	if (drv_st == &console_streamtab && !console_active)
 		console_active = sd;
 
+	/* Link onto the global open-streams list so /proc/streams can
+	 * see this instance.  Singly linked, head-insert; removal is
+	 * O(N) but the list is short (handful at most). */
+	sd->sd_all_next = all_open_streams;
+	all_open_streams = sd;
+
 	/* SVR4 streams call the driver's qi_qopen on the read side at
 	 * open time.  klog uses this to prime the queue with the ring
 	 * buffer contents; most drivers leave it NULL. */
@@ -603,6 +621,12 @@ static int stream_close(struct file *f)
 		kfree(sd->sd_drv_wq);
 	}
 
+	/* Splice out of the global open-streams list before freeing
+	 * so /proc/streams can never dereference a stale pointer. */
+	struct stdata **link = &all_open_streams;
+	while (*link && *link != sd) link = &(*link)->sd_all_next;
+	if (*link == sd) *link = sd->sd_all_next;
+
 	kfree(sd->sd_rq);
 	kfree(sd->sd_wq);
 	kfree(sd);
@@ -650,11 +674,11 @@ static long stream_read(struct file *f, void *buf, size_t len)
 		 * thread can exit cleanly in check_signals on the way
 		 * back out of the syscall.  Mirrors EINTR on real Unix
 		 * (we don't surface errno yet). */
-		if (cur && (cur->sig_pending & SIG_FATAL_MASK))
-			return -1;
+		{ struct kthread *me = curthread;
+		  if (me && (me->sig_pending & SIG_FATAL_MASK)) return -1; }
 		kthread_sleep_on(&sd->sd_readwait);
-		if (cur && (cur->sig_pending & SIG_FATAL_MASK))
-			return -1;
+		{ struct kthread *me = curthread;
+		  if (me && (me->sig_pending & SIG_FATAL_MASK)) return -1; }
 	}
 
 	/*
@@ -871,6 +895,8 @@ static struct stdata *pipe_end(const char *name)
 	sd->sd_readwait.head = NULL;
 	rq->q_ptr = sd;	/* so sh_rq_putp can wake readers */
 	wq->q_ptr = sd;
+	sd->sd_all_next = all_open_streams;
+	all_open_streams = sd;
 	return sd;
 }
 

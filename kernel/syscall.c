@@ -83,8 +83,8 @@ static long sys_log(long arg0, long a1, long a2, long a3, long a4, long a5)
 static long sys_getpid(long a0, long a1, long a2, long a3, long a4, long a5)
 {
 	(void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-	extern struct kthread *cur;
-	return cur ? (long)cur->tid : 0;
+	struct kthread *t = curthread;
+	return t ? (long)t->tid : 0;
 }
 
 static long sys_yield(long a0, long a1, long a2, long a3, long a4, long a5)
@@ -138,6 +138,32 @@ static long sys_kill(long a0, long a1, long a2, long a3, long a4, long a5)
 {
 	(void)a2; (void)a3; (void)a4; (void)a5;
 	return (long)sys_kill_impl((int)a0, (int)a1);
+}
+
+/*
+ * sys_halt -- ARM semihosting SYS_EXIT.
+ *
+ * On QEMU run with `-semihosting-config enable=on,target=native`, an
+ * `hlt #0xf000` trap at EL1 with x0=0x18 (SYS_EXIT) makes QEMU exit
+ * cleanly.  Lets the user kill QEMU from inside the shell when the
+ * stdio Ctrl-C path isn't available (terminal multiplexer ate it).
+ *
+ * If semihosting isn't enabled on the host QEMU, the HLT instruction
+ * generates a normal SIGILL / trap from EL1 that hits trap_dispatch
+ * and panics -- which still ends the run, just less tidily.
+ */
+__attribute__((noreturn))
+static long sys_halt(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	kprintf("halt: requesting QEMU exit via semihosting\n");
+	register long x0 __asm__("x0") = 0x18;      /* SYS_EXIT          */
+	register long x1 __asm__("x1") = 0x20026;   /* ApplicationExit   */
+	__asm__ volatile ("hlt #0xf000"
+			  : : "r"(x0), "r"(x1) : "memory");
+	/* Should not return.  If semihosting is disabled the HLT
+	 * triggers an exception; either way we stop here. */
+	for (;;) __asm__ volatile ("wfi");
 }
 
 static long sys_lsl(long a0, long a1, long a2, long a3, long a4, long a5)
@@ -302,6 +328,7 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_rmdir]  = sys_rmdir,
 	[SYS_kill]   = sys_kill,
 	[SYS_lsl]    = sys_lsl,
+	[SYS_halt]   = sys_halt,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

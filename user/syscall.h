@@ -32,6 +32,7 @@
 #define SYS_rmdir	18
 #define SYS_kill	19
 #define SYS_lsl		20
+#define SYS_halt	21
 
 /* POSIX signal numbers -- mirror include/kappara/signal.h. */
 #define SIGHUP		1
@@ -177,6 +178,14 @@ static inline long sys_lsl(const char *path, char *out, size_t cap)
 			 (long)(unsigned long)path,
 			 (long)(unsigned long)out,
 			 (long)cap);
+}
+
+static inline void sys_halt(void) __attribute__((noreturn));
+static inline void sys_halt(void)
+{
+	register long x8 __asm__("x8") = SYS_halt;
+	__asm__ volatile ("svc #0" :: "r"(x8) : "memory");
+	__builtin_unreachable();
 }
 
 static inline long sys_pipe(int fds[2])

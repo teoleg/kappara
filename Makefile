@@ -169,14 +169,16 @@ ifeq ($(ARCH),aarch64)
 .PHONY: run-thrifty run-gui
 run-thrifty: $(KERNEL)
 	$(QEMU) -M raspi3b -display none -accel tcg,thread=single \
-	        -serial mon:stdio -serial null -kernel $(KERNEL)
+	        -semihosting-config enable=on,target=native \
+	        -serial stdio -serial null -kernel $(KERNEL)
 
 # Boot with the splash window.  Only safe where QEMU's display
 # backend works (X / Wayland with the right libs); on some headless
-# / Pi setups the GTK init segfaults the QEMU process.  Falls back
-# to -serial mon:stdio for the shell.
+# / Pi setups the GTK init segfaults the QEMU process.  Ctrl-C from
+# the host terminal still kills QEMU (signal=on default on stdio).
 run-gui: $(KERNEL)
-	$(QEMU) -M raspi3b -serial mon:stdio -kernel $(KERNEL)
+	$(QEMU) -M raspi3b -semihosting-config enable=on,target=native \
+	        -serial stdio -kernel $(KERNEL)
 endif
 
 clean:

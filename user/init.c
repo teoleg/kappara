@@ -326,6 +326,7 @@ static void cmd_help(void)
 		"  cat <path>             dump file to console\r\n"
 		"  echo <path> <text>     write text to file (overwrite)\r\n"
 		"  ked <path>             tiny ed-like line editor\r\n"
+		"  vi <path>              modal full-screen editor (vi-lite)\r\n"
 		"  touch <path>           create empty file (kfs only)\r\n"
 		"  mkdir <path>           create directory (kfs only)\r\n"
 		"  rm <path>              remove file\r\n"
@@ -335,7 +336,8 @@ static void cmd_help(void)
 		"  spawn [arg]            sys_spawn a worker thread\r\n"
 		"  pipework               sys_pipe + two spawned workers\r\n"
 		"  kill <tid> [sig]       POSIX signal numbers (default SIGTERM=15)\r\n"
-		"  crash                  spawn a thread that dereferences NULL\r\n");
+		"  crash                  spawn a thread that dereferences NULL\r\n"
+		"  halt                   ask QEMU to exit (semihosting)\r\n");
 }
 
 static void cmd_pid(void)
@@ -870,6 +872,441 @@ static void cmd_ked(int argc, char *argv[])
 	}
 }
 
+/* -------- vi: tiny modal editor -------- */
+
+/*
+ * vi is a stripped-down modal editor in the spirit of vi(1).  Three
+ * modes (NORMAL / INSERT / COMMAND), a fixed line buffer (same shape
+ * as ked), a VT100 status bar at the bottom of the screen.
+ *
+ *   NORMAL  -- hjkl + arrows move; 0/$ jump; gg/G jump file edges;
+ *              i/a/I/A open INSERT at various positions; o/O open a
+ *              line; x deletes the char under the cursor; dd deletes
+ *              the line; : opens COMMAND mode.
+ *   INSERT  -- printable chars typed in at the cursor; backspace
+ *              eats one; ESC returns to NORMAL.
+ *   COMMAND -- after `:`, type `w` to save, `q`/`q!` to quit,
+ *              `wq` (or `x`) to save and quit; ESC or Enter on an
+ *              empty line cancels.
+ *
+ * Display assumes a 24x80 VT100-style terminal -- it doesn't query
+ * the actual size, just clears the screen and positions glyphs by
+ * row/column with `ESC [ row ; col H`.  Status bar pinned at row 24.
+ *
+ * No undo, no search, no yank/paste, no movement repeats (3w etc).
+ * Plenty of headroom for follow-ups.
+ */
+
+#define VI_MAX_LINES	64
+#define VI_MAX_LINE	120
+#define VI_ROWS		23	/* content rows; row 24 is the status bar */
+#define VI_COLS		80
+
+enum vi_mode { VI_NORMAL, VI_INSERT, VI_COMMAND };
+
+static struct {
+	char	path[64];
+	char	lines[VI_MAX_LINES][VI_MAX_LINE];
+	int	nlines;
+	int	cy;		/* cursor line, 0-based */
+	int	cx;		/* cursor column, 0-based */
+	int	top;		/* topmost visible line index */
+	int	dirty;
+	enum vi_mode mode;
+	char	cmdbuf[40];	/* COMMAND-mode line being typed */
+	int	cmdlen;
+	char	status[80];	/* one-shot status message */
+} vi;
+
+/* VT100 helpers.  Direct UART path -- we don't want history or echo
+ * interfering. */
+static void vt_clear_screen(void) { cwrite("\033[2J\033[H"); }
+static void vt_move(int row, int col)
+{
+	/* row/col are 1-based here. */
+	cwrite("\033[");
+	cprint_long(row);
+	cputc(';');
+	cprint_long(col);
+	cputc('H');
+}
+static void vt_clear_eol(void) { cwrite("\033[K"); }
+static void vt_invert_on(void)  { cwrite("\033[7m"); }
+static void vt_invert_off(void) { cwrite("\033[0m"); }
+
+static void vi_copy_str(char *dst, const char *src, size_t cap)
+{
+	size_t i = 0;
+	for (; src[i] && i < cap - 1; i++) dst[i] = src[i];
+	dst[i] = '\0';
+}
+
+/* Same load path as ked. */
+static int vi_load(const char *path)
+{
+	vi.nlines = 0; vi.cy = vi.cx = vi.top = 0; vi.dirty = 0;
+	vi.mode = VI_NORMAL; vi.cmdlen = 0; vi.status[0] = '\0';
+	vi_copy_str(vi.path, path, sizeof(vi.path));
+
+	long fd = sys_open(path, 0);
+	if (fd < 0) return 0;	/* new file is fine */
+	char buf[256];
+	int  li = 0, col = 0;
+	long n;
+	while ((n = sys_read((int)fd, buf, sizeof(buf))) > 0) {
+		for (long i = 0; i < n; i++) {
+			char c = buf[i];
+			if (c == '\n') {
+				if (li < VI_MAX_LINES) {
+					vi.lines[li][col] = '\0';
+					li++;
+				}
+				col = 0;
+			} else if (col < VI_MAX_LINE - 1
+				   && li < VI_MAX_LINES) {
+				vi.lines[li][col++] = c;
+			}
+		}
+	}
+	if (col > 0 && li < VI_MAX_LINES) {
+		vi.lines[li][col] = '\0';
+		li++;
+	}
+	sys_close((int)fd);
+	vi.nlines = li;
+	if (vi.nlines == 0) {
+		vi.lines[0][0] = '\0';
+		vi.nlines = 1;
+	}
+	return 0;
+}
+
+static int vi_save(void)
+{
+	long fd = sys_open(vi.path, O_TRUNC);
+	if (fd < 0) {
+		if (sys_creat(vi.path) < 0) return -1;
+		fd = sys_open(vi.path, O_TRUNC);
+		if (fd < 0) return -1;
+	}
+	long total = 0;
+	for (int i = 0; i < vi.nlines; i++) {
+		size_t l = ustrlen(vi.lines[i]);
+		sys_write((int)fd, vi.lines[i], l);
+		sys_write((int)fd, "\n", 1);
+		total += (long)l + 1;
+	}
+	sys_close((int)fd);
+	vi.dirty = 0;
+	/* Format a status: "saved N bytes". */
+	char *p = vi.status;
+	const char *s = "saved ";
+	while (*s) *p++ = *s++;
+	p = udec(p, total);
+	*p++ = ' '; *p++ = 'b'; *p++ = 'y'; *p++ = 't'; *p++ = 'e'; *p++ = 's';
+	*p = '\0';
+	return 0;
+}
+
+/* Adjust top so the cursor is visible on screen. */
+static void vi_scroll_into_view(void)
+{
+	if (vi.cy < vi.top) vi.top = vi.cy;
+	if (vi.cy >= vi.top + VI_ROWS) vi.top = vi.cy - VI_ROWS + 1;
+}
+
+static void vi_draw(void)
+{
+	vt_clear_screen();
+	for (int r = 0; r < VI_ROWS; r++) {
+		int li = vi.top + r;
+		vt_move(r + 1, 1);
+		if (li < vi.nlines) {
+			cwrite(vi.lines[li]);
+		} else {
+			cputc('~');	/* vi's empty-buffer marker */
+		}
+		vt_clear_eol();
+	}
+	/* Status bar at row 24 in reverse video. */
+	vt_move(24, 1);
+	vt_invert_on();
+	const char *m = vi.mode == VI_NORMAL  ? "-- NORMAL --"
+		      : vi.mode == VI_INSERT  ? "-- INSERT --"
+		      :                         "-- COMMAND --";
+	cwrite(m);
+	cputc(' ');
+	cwrite(vi.path);
+	if (vi.dirty) cwrite(" [+]");
+	/* line:col on the right side -- approximate at row 24 */
+	cputc(' ');
+	cputc(' ');
+	cprint_long(vi.cy + 1);
+	cputc(':');
+	cprint_long(vi.cx + 1);
+	if (vi.status[0]) { cputc(' '); cputc(' '); cwrite(vi.status); }
+	vt_clear_eol();
+	vt_invert_off();
+	if (vi.mode == VI_COMMAND) {
+		vt_move(24, VI_COLS - vi.cmdlen - 2);
+		cputc(':');
+		for (int i = 0; i < vi.cmdlen; i++) cputc(vi.cmdbuf[i]);
+	} else {
+		/* Position the on-screen cursor over the buffer cursor.
+		 * Clamp x to the line length to avoid wandering past
+		 * trailing whitespace. */
+		int len = (int)ustrlen(vi.lines[vi.cy]);
+		int cx  = vi.cx > len ? len : vi.cx;
+		vt_move((vi.cy - vi.top) + 1, cx + 1);
+	}
+}
+
+/* ---- key handling ---- */
+
+static void vi_clamp_cx(void)
+{
+	int len = (int)ustrlen(vi.lines[vi.cy]);
+	if (vi.cx > len) vi.cx = len;
+	if (vi.cx < 0)   vi.cx = 0;
+}
+
+static void vi_move_left(void)  { if (vi.cx > 0) vi.cx--; }
+static void vi_move_right(void) { vi.cx++; vi_clamp_cx(); }
+static void vi_move_up(void)
+{
+	if (vi.cy > 0) { vi.cy--; vi_clamp_cx(); }
+}
+static void vi_move_down(void)
+{
+	if (vi.cy + 1 < vi.nlines) { vi.cy++; vi_clamp_cx(); }
+}
+
+static void vi_insert_char(char c)
+{
+	char *ln = vi.lines[vi.cy];
+	int len = (int)ustrlen(ln);
+	if (len + 1 >= VI_MAX_LINE) return;
+	for (int i = len + 1; i > vi.cx; i--) ln[i] = ln[i - 1];
+	ln[vi.cx] = c;
+	vi.cx++;
+	vi.dirty = 1;
+}
+
+static void vi_backspace(void)
+{
+	if (vi.cx == 0) return;
+	char *ln = vi.lines[vi.cy];
+	int len = (int)ustrlen(ln);
+	for (int i = vi.cx - 1; i < len; i++) ln[i] = ln[i + 1];
+	vi.cx--;
+	vi.dirty = 1;
+}
+
+static void vi_delete_char(void)
+{
+	char *ln = vi.lines[vi.cy];
+	int len = (int)ustrlen(ln);
+	if (vi.cx >= len) return;
+	for (int i = vi.cx; i < len; i++) ln[i] = ln[i + 1];
+	vi.dirty = 1;
+}
+
+static void vi_delete_line(void)
+{
+	if (vi.nlines == 1) { vi.lines[0][0] = '\0'; vi.cx = 0; vi.dirty = 1; return; }
+	for (int i = vi.cy; i < vi.nlines - 1; i++)
+		vi_copy_str(vi.lines[i], vi.lines[i + 1], VI_MAX_LINE);
+	vi.nlines--;
+	if (vi.cy >= vi.nlines) vi.cy = vi.nlines - 1;
+	vi_clamp_cx();
+	vi.dirty = 1;
+}
+
+static void vi_open_line_below(void)
+{
+	if (vi.nlines >= VI_MAX_LINES) return;
+	for (int i = vi.nlines; i > vi.cy + 1; i--)
+		vi_copy_str(vi.lines[i], vi.lines[i - 1], VI_MAX_LINE);
+	vi.nlines++;
+	vi.cy++;
+	vi.lines[vi.cy][0] = '\0';
+	vi.cx = 0;
+	vi.dirty = 1;
+	vi.mode = VI_INSERT;
+}
+
+static void vi_open_line_above(void)
+{
+	if (vi.nlines >= VI_MAX_LINES) return;
+	for (int i = vi.nlines; i > vi.cy; i--)
+		vi_copy_str(vi.lines[i], vi.lines[i - 1], VI_MAX_LINE);
+	vi.nlines++;
+	vi.lines[vi.cy][0] = '\0';
+	vi.cx = 0;
+	vi.dirty = 1;
+	vi.mode = VI_INSERT;
+}
+
+/* Returns 1 to quit ("q" / "q!" / "wq" / "x"), 0 to stay. */
+static int vi_run_command(const char *cmd)
+{
+	if (cmd[0] == '\0') return 0;
+	if (!ustrcmp(cmd, "w"))   { vi_save(); return 0; }
+	if (!ustrcmp(cmd, "wq") || !ustrcmp(cmd, "x")) { vi_save(); return 1; }
+	if (!ustrcmp(cmd, "q!"))  { return 1; }
+	if (!ustrcmp(cmd, "q")) {
+		if (vi.dirty) {
+			vi_copy_str(vi.status,
+				    "unsaved changes (use q!)",
+				    sizeof(vi.status));
+			return 0;
+		}
+		return 1;
+	}
+	vi_copy_str(vi.status, "?", sizeof(vi.status));
+	return 0;
+}
+
+static int vi_normal_key(int c, int prev_g)
+{
+	vi.status[0] = '\0';	/* clear stale status on next key */
+	switch (c) {
+	case 'h': vi_move_left(); break;
+	case 'l': vi_move_right(); break;
+	case 'k': vi_move_up(); break;
+	case 'j': vi_move_down(); break;
+	case '0': vi.cx = 0; break;
+	case '$':
+		vi.cx = (int)ustrlen(vi.lines[vi.cy]);
+		if (vi.cx > 0) vi.cx--;
+		break;
+	case 'G': vi.cy = vi.nlines - 1; vi_clamp_cx(); break;
+	case 'g':
+		if (prev_g) { vi.cy = 0; vi_clamp_cx(); }
+		return 'g';	/* tell caller we saw the first g */
+	case 'i': vi.mode = VI_INSERT; break;
+	case 'a': if (vi.cx < (int)ustrlen(vi.lines[vi.cy])) vi.cx++;
+		  vi.mode = VI_INSERT; break;
+	case 'I': vi.cx = 0; vi.mode = VI_INSERT; break;
+	case 'A': vi.cx = (int)ustrlen(vi.lines[vi.cy]);
+		  vi.mode = VI_INSERT; break;
+	case 'o': vi_open_line_below(); break;
+	case 'O': vi_open_line_above(); break;
+	case 'x': vi_delete_char(); break;
+	case 'd':
+		if (prev_g == 'd') vi_delete_line();
+		else               return 'd';
+		break;
+	case ':':
+		vi.mode = VI_COMMAND;
+		vi.cmdlen = 0;
+		break;
+	default: break;
+	}
+	return 0;
+}
+
+static void cmd_vi(int argc, char *argv[])
+{
+	if (argc < 2) { cwrite("usage: vi <path>\r\n"); return; }
+	char path[128];
+	resolve_path(argv[1], path, sizeof(path));
+	if (vi_load(path) < 0) { cwrite("vi: load failed\r\n"); return; }
+
+	int prev_g = 0;
+	int in_esc = 0, in_csi = 0;
+	for (;;) {
+		vi_scroll_into_view();
+		vi_draw();
+
+		int c = read_one();
+		if (c < 0) { sys_yield(); continue; }
+
+		if (in_csi) {
+			in_csi = 0;
+			/* Arrow keys translate to hjkl */
+			if (vi.mode != VI_INSERT) {
+				if      (c == 'A') vi_move_up();
+				else if (c == 'B') vi_move_down();
+				else if (c == 'C') vi_move_right();
+				else if (c == 'D') vi_move_left();
+			}
+			prev_g = 0;
+			continue;
+		}
+		if (in_esc) {
+			in_esc = 0;
+			if (c == '[') { in_csi = 1; continue; }
+			/* lone ESC: return to NORMAL */
+			vi.mode = VI_NORMAL;
+			prev_g = 0;
+			continue;
+		}
+		if (c == 0x1B) {	/* ESC */
+			if (vi.mode == VI_COMMAND) {
+				vi.mode = VI_NORMAL;
+				vi.cmdlen = 0;
+				continue;
+			}
+			in_esc = 1;
+			continue;
+		}
+
+		if (vi.mode == VI_INSERT) {
+			if (c == '\r' || c == '\n') {
+				/* Split the line at cx. */
+				if (vi.nlines >= VI_MAX_LINES) continue;
+				char *ln = vi.lines[vi.cy];
+				char tail[VI_MAX_LINE];
+				vi_copy_str(tail, ln + vi.cx, sizeof(tail));
+				ln[vi.cx] = '\0';
+				for (int i = vi.nlines; i > vi.cy + 1; i--)
+					vi_copy_str(vi.lines[i],
+						    vi.lines[i - 1],
+						    VI_MAX_LINE);
+				vi.nlines++;
+				vi.cy++;
+				vi_copy_str(vi.lines[vi.cy], tail, VI_MAX_LINE);
+				vi.cx = 0;
+				vi.dirty = 1;
+				continue;
+			}
+			if (c == 0x08 || c == 0x7F) {
+				vi_backspace();
+				continue;
+			}
+			if (c >= 0x20 && c < 0x7F) vi_insert_char((char)c);
+			continue;
+		}
+
+		if (vi.mode == VI_COMMAND) {
+			if (c == '\r' || c == '\n') {
+				vi.cmdbuf[vi.cmdlen] = '\0';
+				int quit = vi_run_command(vi.cmdbuf);
+				vi.cmdlen = 0;
+				vi.mode = VI_NORMAL;
+				if (quit) break;
+				continue;
+			}
+			if (c == 0x08 || c == 0x7F) {
+				if (vi.cmdlen > 0) vi.cmdlen--;
+				continue;
+			}
+			if (c >= 0x20 && c < 0x7F
+			    && vi.cmdlen + 1 < (int)sizeof(vi.cmdbuf)) {
+				vi.cmdbuf[vi.cmdlen++] = (char)c;
+			}
+			continue;
+		}
+
+		/* NORMAL mode */
+		prev_g = vi_normal_key(c, prev_g);
+	}
+	/* Restore the terminal -- clear and put the cursor below. */
+	vt_clear_screen();
+	vt_move(1, 1);
+}
+
 /*
  * Spawnable worker.  cmd_spawn hands sys_spawn a function pointer to
  * this; the kernel sets the new thread up at EL0 with arg in x0.
@@ -935,6 +1372,18 @@ static void cmd_crash(int argc, char *argv[])
 	(void)argc; (void)argv;
 	long tid = sys_spawn(crash_main, 0);
 	cwrite("crash: spawned tid="); cprint_long(tid); cwrite("\r\n");
+}
+
+/* halt -- ask QEMU to exit via ARM semihosting.  Only does anything
+ * useful when QEMU was started with -semihosting-config enable=on;
+ * make run-thrifty / run-gui pass that flag.  Otherwise the host
+ * sees an illegal-instruction trap from EL1, which still terminates
+ * the run, just less tidily. */
+static void cmd_halt(int argc, char *argv[])
+{
+	(void)argc; (void)argv;
+	cwrite("halt: requesting QEMU exit...\r\n");
+	sys_halt();
 }
 
 /* kill <tid> [sig]  -- POSIX numbering; default is SIGTERM (15). */
@@ -1076,6 +1525,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "cat"))    cmd_cat(argc, argv);
 	else if (!ustrcmp(argv[0], "echo"))   cmd_echo(argc, argv);
 	else if (!ustrcmp(argv[0], "ked"))    cmd_ked(argc, argv);
+	else if (!ustrcmp(argv[0], "vi"))     cmd_vi(argc, argv);
 	else if (!ustrcmp(argv[0], "touch"))  cmd_touch(argc, argv);
 	else if (!ustrcmp(argv[0], "mkdir"))  cmd_mkdir(argc, argv);
 	else if (!ustrcmp(argv[0], "rm"))     cmd_rm(argc, argv);
@@ -1085,6 +1535,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "spawn"))  cmd_spawn(argc, argv);
 	else if (!ustrcmp(argv[0], "kill"))   cmd_kill(argc, argv);
 	else if (!ustrcmp(argv[0], "crash"))  cmd_crash(argc, argv);
+	else if (!ustrcmp(argv[0], "halt"))   cmd_halt(argc, argv);
 	else if (!ustrcmp(argv[0], "pipework")) cmd_pipework();
 	else {
 		cwrite(argv[0]); cwrite(": command not found\r\n");

@@ -270,3 +270,44 @@ addresses captured in pass 1 stay valid in pass 2.
 `ksym_lookup(addr)` binary-searches; `kernel_backtrace_from(fp, lr)`
 walks the AArch64 x29 frame chain.  `trap_dispatch` uses both on
 unhandled faults so the panic dump tells you the function + offset.
+
+## SMP (foundation only)
+
+Boot leaves cores 1-3 in QEMU's ARM spin-table at PA `0xE0`, `0xE8`,
+`0xF0`.  Each polls its slot; writing the address of `secondary_start`
+into the slot and issuing `DSB SY` + `SEV` releases that core.
+
+`smp_wake_secondary(cpu)` in `kernel/main.c`:
+1. `pmm_alloc`s a 4 KB kernel stack for the new CPU.
+2. Stores the stack top in `smp_stacks[cpu]`.
+3. Writes the entry into both our own `smp_release[cpu]` table (used
+   if a future PSCI boot path ever has the cores park in our
+   `.Lpark` first) and into the QEMU spin-table at
+   `0xE0 + (cpu-1)*8`.
+4. `dc cvac` on each slot so the secondary (MMU + cache off) reads
+   the freshest value from RAM.
+5. `dsb sy; sev` wakes anyone WFE-blocked.
+
+The asm entry `secondary_start` (boot.S) reads its own MPIDR for
+the CPU id, picks up its stack from `smp_stacks[cpu]`, and `bl`s
+`secondary_main` in C.  The C side prints `smp: cpu N` and drops
+into `for (;;) wfi`.
+
+This is the foundation — the cores are alive, executing C code, and
+asleep on WFI.  What's still missing for a real SMP kernel:
+
+| Step                                     | Why we don't have it yet                  |
+|------------------------------------------|-------------------------------------------|
+| Per-CPU `cur` via TPIDR_EL1              | Today `cur` is a single global            |
+| Spinlock on ready queue                  | Single-CPU never needed it                |
+| Each CPU in the scheduler loop           | Secondaries idle, don't pull threads      |
+| Per-CPU generic timer setup              | Only core 0 has CNTPNSIRQ routed          |
+| IPI for cross-CPU wake                   | No ready-queue wake needed yet            |
+| Cache-coherent locking primitives        | No shared mutable state yet               |
+| MMU + EL1 drop for secondaries           | They stay at EL2 with MMU off             |
+
+That list is the next session.  At boot you'll see four lines (one
+per CPU including core 0) interleaved at the byte level on the UART
+because every core writes through the same `uart_putc` with no lock
+— harmless, expected, will be the first thing a `kprintf_lock`
+fixes.

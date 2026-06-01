@@ -324,10 +324,11 @@ long vfs_listdir_long(struct dentry *dir, char *out, size_t cap)
 
 int fd_alloc(struct file *f)
 {
-	if (!cur) return -1;
+	struct kthread *me = curthread;
+	if (!me) return -1;
 	for (int i = 0; i < KT_FD_MAX; i++) {
-		if (!cur->fdt[i]) {
-			cur->fdt[i] = f;
+		if (!me->fdt[i]) {
+			me->fdt[i] = f;
 			return i;
 		}
 	}
@@ -336,16 +337,18 @@ int fd_alloc(struct file *f)
 
 void fd_free(int fd)
 {
-	if (!cur || fd < 0 || fd >= KT_FD_MAX)
+	struct kthread *me = curthread;
+	if (!me || fd < 0 || fd >= KT_FD_MAX)
 		return;
-	cur->fdt[fd] = NULL;
+	me->fdt[fd] = NULL;
 }
 
 struct file *fd_get(int fd)
 {
-	if (!cur || fd < 0 || fd >= KT_FD_MAX)
+	struct kthread *me = curthread;
+	if (!me || fd < 0 || fd >= KT_FD_MAX)
 		return NULL;
-	return cur->fdt[fd];
+	return me->fdt[fd];
 }
 
 /* Drop one reference; on the last reference call the file's close op

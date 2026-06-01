@@ -61,6 +61,8 @@
 
 #include "kappara/kmem.h"
 #include "kappara/printk.h"
+#include "kappara/sched.h"	/* curcpu, cpu_srvq_* */
+#include "kappara/spinlock.h"
 #include "kappara/streams.h"
 #include "kappara/string.h"
 
@@ -246,60 +248,84 @@ int putnext(queue_t *q, mblk_t *mp)
 /* ---- Service procedure scheduling -------------------------------------- */
 
 /*
- * runqueue: a singly-linked list of queues whose service procedures
- * we owe a call to.  Threaded via q->q_runlink; QENAB in q_flag is
- * the "I am already on the runqueue" sentinel that makes qenable
- * idempotent.
+ * Per-CPU service-procedure runqueue.  Each cpu_t (sched.h) carries
+ * cpu_srvq_head + cpu_srvq_tail + cpu_srvq_lock.  qenable pushes
+ * onto the CALLING CPU's runqueue; streams_run drains the CALLING
+ * CPU's runqueue.
+ *
+ * This is the SVR4-natural alignment for STREAMS on SMP: service
+ * work follows the producer.  A driver that calls qenable from an
+ * IRQ pinned to CPU N has its srvp drained on CPU N -- the data
+ * cache locality of the mblks just stays where the work was done.
+ * No cross-CPU runqueue contention in the common case.
+ *
+ * Threaded via q->q_runlink; QENAB in q_flag is the "I am already
+ * on SOMEONE's runqueue" sentinel.  Note QENAB doesn't say WHICH
+ * CPU; the migration story (qenable bound to CPU A while srvp
+ * drains on CPU B because the queue moved) is a follow-up.  For
+ * now a queue stays on whatever CPU first qenable'd it.
  */
-static queue_t *runq_head;
-static queue_t *runq_tail;
-
 void qenable(queue_t *q)
 {
 	if (!q || !q->q_qinfo || !q->q_qinfo->qi_srvp)
 		return;
-	if (q->q_flag & QENAB)
+	struct cpu *c = curcpu();
+	unsigned long f = spin_lock_irq_save(&c->cpu_srvq_lock);
+	if (q->q_flag & QENAB) {
+		spin_unlock_irq_restore(&c->cpu_srvq_lock, f);
 		return;
+	}
 	q->q_flag |= QENAB;
 	q->q_runlink = NULL;
-	if (runq_tail)
-		runq_tail->q_runlink = q;
+	if (c->cpu_srvq_tail)
+		c->cpu_srvq_tail->q_runlink = q;
 	else
-		runq_head = q;
-	runq_tail = q;
+		c->cpu_srvq_head = q;
+	c->cpu_srvq_tail = q;
+	spin_unlock_irq_restore(&c->cpu_srvq_lock, f);
 }
 
 /*
- * Reentrancy guard.  Now that syscalls run with IRQs unmasked the
- * timer can preempt a thread that's already inside streams_run (via
- * sys_yield).  Without this, the IRQ-driven sched_tick would walk
- * the same runqueue from underneath us and corrupt the linked list.
+ * Per-CPU re-entrancy guard.  Now that syscalls run with IRQs
+ * unmasked the timer can preempt a thread that's already inside
+ * streams_run (via sys_yield); without this the IRQ-driven
+ * sched_tick would walk the same runqueue from underneath us.
+ * Keyed off cpu_id so different CPUs' streams_run calls don't
+ * exclude each other.
  */
-static int streams_running;
+static volatile int streams_running[4];
 
 void streams_run(void)
 {
-	if (streams_running)
+	struct cpu *c = curcpu();
+	if (streams_running[c->cpu_id])
 		return;
-	streams_running = 1;
+	streams_running[c->cpu_id] = 1;
 
-	while (runq_head) {
-		queue_t *q = runq_head;
-		runq_head = q->q_runlink;
-		if (!runq_head)
-			runq_tail = NULL;
+	for (;;) {
+		unsigned long f = spin_lock_irq_save(&c->cpu_srvq_lock);
+		queue_t *q = c->cpu_srvq_head;
+		if (!q) {
+			spin_unlock_irq_restore(&c->cpu_srvq_lock, f);
+			break;
+		}
+		c->cpu_srvq_head = q->q_runlink;
+		if (!c->cpu_srvq_head)
+			c->cpu_srvq_tail = NULL;
 		q->q_runlink = NULL;
 		q->q_flag &= ~QENAB;
+		spin_unlock_irq_restore(&c->cpu_srvq_lock, f);
 
 		/*
-		 * srvp may call putnext -> downstream putp -> putq + qenable,
-		 * which appends to the runqueue we're walking.  That's the
-		 * whole point of having a worklist: those appends get
-		 * picked up by the next iteration.
+		 * srvp may call putnext -> downstream putp -> putq +
+		 * qenable, which (on this same CPU) appends to our own
+		 * runqueue.  That's the whole point of having a
+		 * worklist: those appends get picked up by the next
+		 * iteration.  Call srvp with NO locks held.
 		 */
 		if (q->q_qinfo->qi_srvp)
 			q->q_qinfo->qi_srvp(q);
 	}
 
-	streams_running = 0;
+	streams_running[c->cpu_id] = 0;
 }

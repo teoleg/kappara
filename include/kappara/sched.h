@@ -18,6 +18,8 @@
 
 #include <stdint.h>
 
+#include "kappara/spinlock.h"
+
 enum kt_state {
 	KT_READY = 0,
 	KT_RUNNING,
@@ -56,7 +58,64 @@ struct kthread {
 	struct file   *fdt[KT_FD_MAX];
 };
 
-extern struct kthread *cur;
+/*
+ * SVR4-style per-CPU dispatcher state -- one struct cpu per core.
+ *
+ * Solaris terminology: this is the kernel's `cpu_t`.  Each CPU has
+ * its own dispatch queue (so the scheduler doesn't contend on a
+ * single global ready queue), its own idle thread, and -- because
+ * STREAMS service work is naturally local to whichever CPU
+ * qenable'd it -- its own service-procedure runqueue.  The
+ * `cpu_thread` field is the per-CPU "currently running" -- what we
+ * used to call `cur` and still expose as `curthread`.
+ *
+ * Lookup is via TPIDR_EL1: each core writes the address of its
+ * own `struct cpu` there at bring-up time, then `curcpu()` is one
+ * MRS instruction.  `curthread` is sugar for `curcpu()->cpu_thread`.
+ *
+ * The cpu_disp_lock guards cpu_dispq + the queue links of every
+ * thread that's currently on it (kthread.next).  Other CPUs touch
+ * this lock only when stealing work or migrating a thread; the
+ * common case is uncontended.
+ */
+struct queue;	/* fwd; STREAMS queue_t -- see kappara/streams.h */
+
+struct cpu {
+	unsigned         cpu_id;
+	struct kthread  *cpu_thread;	/* currently running on this CPU   */
+	struct kthread  *cpu_idle;	/* this CPU's idle thread          */
+	spinlock_t       cpu_disp_lock;
+	struct kthread  *cpu_dispq_head;
+	struct kthread  *cpu_dispq_tail;
+	/* STREAMS service-procedure runqueue, drained from this CPU's
+	 * sched_tick + sys_yield.  qenable on this CPU pushes here;
+	 * the per-CPU drain is what gives us "natural" SVR4 streams
+	 * scheduling on SMP. */
+	struct queue    *cpu_srvq_head;
+	struct queue    *cpu_srvq_tail;
+	spinlock_t       cpu_srvq_lock;
+};
+
+#ifdef __aarch64__
+static inline struct cpu *curcpu(void)
+{
+	struct cpu *c;
+	__asm__ volatile ("mrs %0, tpidr_el1" : "=r"(c));
+	return c;
+}
+static inline void set_curcpu(struct cpu *c)
+{
+	__asm__ volatile ("msr tpidr_el1, %0" :: "r"(c) : "memory");
+}
+#define curthread		(curcpu()->cpu_thread)
+#define set_curthread(t)	do { curcpu()->cpu_thread = (t); } while (0)
+#else
+/* ARMv7 fallback: pretend there's one CPU, keep cur in a global. */
+extern struct cpu  *_only_cpu;
+static inline struct cpu *curcpu(void) { return _only_cpu; }
+#define curthread		(curcpu()->cpu_thread)
+#define set_curthread(t)	do { curcpu()->cpu_thread = (t); } while (0)
+#endif
 
 void            sched_init(void);
 struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg);

@@ -74,23 +74,71 @@ _start:
 	b	.Lin_el1
 
 .Lpark:
-	/* Park the secondary cores until SMP arrives.
+	/* Park-with-spin-table.  Each secondary core (1..3) checks its
+	 * own slot in smp_release[] (defined in C).  If it's still
+	 * zero, WFE until something happens; if it's non-zero, branch
+	 * to that address (which sets up the per-core MMU / stack and
+	 * calls into secondary_main).
 	 *
-	 * Use WFI, not WFE.  WFE wakes on the global event register
-	 * which gets set by any DSB/STREX/SEV anywhere in the system,
-	 * so the old "wfe; b ." loop burned a host CPU per vCPU under
-	 * QEMU TCG.  WFI sleeps until a real interrupt, and since
-	 * timer_init routes CNTPNSIRQ only to core 0, secondary cores
-	 * have nothing wired and stay asleep.
-	 *
-	 * Don't touch DAIF here -- secondary cores are still at EL2
-	 * at this point (boot.S only drops to EL1 on core 0), and at
-	 * least one QEMU TCG version segfaults on "msr daifset; wfi"
-	 * from EL2 on the raspi3b model.  WFI on its own is enough:
-	 * the cores in EL2 have no interrupts routed in either, so
-	 * they sleep just as well without the explicit mask. */
-	wfi
+	 * WFE here (not WFI) so that an SEV from core 0 -- issued by
+	 * the wake function -- actually wakes us; WFI would also work
+	 * but requires routing an IRQ.  The spin-then-WFE shape is
+	 * the same boot protocol real Pi 3 firmware uses for its own
+	 * spin-table at PA 0xD8, so when we eventually run on metal we
+	 * just need to hook into that. */
+	mrs	x0, mpidr_el1
+	and	x0, x0, #0xff	/* cpu id 1..3 */
+	adr	x1, smp_release
+	ldr	x2, [x1, x0, lsl #3]
+	cbz	x2, 1f
+	br	x2		/* jump to per-core entry */
+1:	wfe
 	b	.Lpark
+
+/*
+ * Spin-table release addresses, one slot per core.  Slot 0 is
+ * unused (core 0 doesn't park).  Slots 1..3 are written by
+ * smp_wake_secondary() from C; the secondary core polling .Lpark
+ * sees the new value, jumps to it, and never returns here.
+ *
+ * Placed in .data so it's BSS-zero-initialised at boot.  The label
+ * is global so the C code can address it.
+ */
+	.section ".data"
+	.balign 8
+	.global	smp_release
+smp_release:
+	.quad	0
+	.quad	0
+	.quad	0
+	.quad	0
+	.global smp_stacks
+smp_stacks:
+	.quad	0	/* slot 0 unused (core 0 has main stack) */
+	.quad	0
+	.quad	0
+	.quad	0
+	.section ".text"
+
+/*
+ * Entry point branched to from the spin-table by a freshly-woken
+ * secondary core.  Sets a per-core SP from smp_stacks[], then drops
+ * into secondary_main (C).  Stays at EL2 with MMU off for now -- the
+ * MMU + EL1 transition for secondary cores is a follow-up.  All we
+ * want here is "the core is alive and executing C code."
+ *
+ * The C function never returns; if it ever does, fall back to wfi.
+ */
+.global secondary_start
+secondary_start:
+	mrs	x0, mpidr_el1
+	and	x0, x0, #0xff
+	adr	x1, smp_stacks
+	ldr	x2, [x1, x0, lsl #3]
+	mov	sp, x2
+	bl	secondary_main
+1:	wfi
+	b	1b
 
 	/* EL3 -> EL2 transition (only used if firmware drops us in EL3). */
 .Lfrom_el3:
