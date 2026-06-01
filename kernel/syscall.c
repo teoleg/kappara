@@ -83,8 +83,8 @@ static long sys_log(long arg0, long a1, long a2, long a3, long a4, long a5)
 static long sys_getpid(long a0, long a1, long a2, long a3, long a4, long a5)
 {
 	(void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-	extern struct kthread *cur;
-	return cur ? (long)cur->tid : 0;
+	struct kthread *t = curthread;
+	return t ? (long)t->tid : 0;
 }
 
 static long sys_yield(long a0, long a1, long a2, long a3, long a4, long a5)

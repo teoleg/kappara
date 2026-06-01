@@ -92,7 +92,9 @@
 
 extern void context_switch(void **save_sp, void *new_sp);
 
-struct kthread *cur;
+#ifndef __aarch64__
+struct kthread *curthread;	/* AArch64 keeps it in TPIDR_EL1 (sched.h) */
+#endif
 
 static struct kthread *ready_head;
 static struct kthread *ready_tail;
@@ -147,7 +149,7 @@ void sched_init(void)
 	main_thread.tid   = 0;
 	main_thread.state = KT_RUNNING;
 	main_thread.next  = NULL;
-	cur = &main_thread;
+	set_curthread(&main_thread);
 	tid_table[0] = &main_thread;
 	kprintf("sched: main thread is tid=0\n");
 }
@@ -204,17 +206,16 @@ static void switch_to_next(int requeue_current)
 		for (;;)
 			__asm__ volatile ("wfe");
 	}
-	struct kthread *prev = cur;
+	struct kthread *prev = curthread;
 	if (requeue_current) {
 		ready_push(prev);
 		prev->state = KT_READY;
 	}
 	next->state = KT_RUNNING;
-	cur = next;
+	set_curthread(next);
 	context_switch(&prev->sp, next->sp);
 
-	/* We're now running as `next` (cur = next, but that's the same
-	 * pointer the OLD context had).  Drain the to-reap list: any
+	/* We're now running as `next`.  Drain the to-reap list: any
 	 * thread that called kthread_exit added itself here and we're
 	 * guaranteed to be on a DIFFERENT stack now, so freeing those
 	 * pages is safe.  The main thread is a static struct with no
@@ -259,17 +260,18 @@ static inline void irq_restore(unsigned long daif)
 void kthread_sleep_on(struct wait_queue *wq)
 {
 	unsigned long flags = irq_save_and_disable();
-	cur->state      = KT_BLOCKED;
-	cur->waiting_on = wq;
-	cur->next       = wq->head;
-	wq->head        = cur;
+	struct kthread *t = curthread;
+	t->state      = KT_BLOCKED;
+	t->waiting_on = wq;
+	t->next       = wq->head;
+	wq->head      = t;
 	switch_to_next(0);
 	/* Reached here after someone called kthread_wake_*; the new
 	 * DAIF that context_switch restored is whatever this thread
 	 * had at the moment it slept (masked) -- so restore the
 	 * pre-sleep state explicitly to put us back at the caller's
 	 * IRQ-mask level. */
-	cur->waiting_on = NULL;
+	curthread->waiting_on = NULL;
 	irq_restore(flags);
 }
 
@@ -372,18 +374,19 @@ void sched_tick(void)
 
 void kthread_exit(void)
 {
+	struct kthread *me = curthread;
 	/* Release every file the dying thread still holds.  pipe ends
 	 * inherited from the parent get their refcount dropped here so
 	 * the pipe goes away naturally when both ends are closed. */
-	vfs_drain_fds(cur);
-	kprintf("kthread: tid=%u (%s) exited\n", cur->tid, cur->name);
+	vfs_drain_fds(me);
+	kprintf("kthread: tid=%u (%s) exited\n", me->tid, me->name);
 
 	/* Park ourselves on the to-reap list -- some other thread will
 	 * free our stack + kthread once we've context-switched away. */
 	unsigned long flags = irq_save_and_disable();
-	cur->state = KT_DEAD;
-	cur->next  = to_reap;
-	to_reap    = cur;
+	me->state = KT_DEAD;
+	me->next  = to_reap;
+	to_reap   = me;
 	switch_to_next(0);
 	/* unreachable: switch_to_next with requeue=0 never returns
 	 * once cur is no longer in the ready queue and never woken. */

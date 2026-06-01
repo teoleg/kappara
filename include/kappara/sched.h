@@ -56,7 +56,34 @@ struct kthread {
 	struct file   *fdt[KT_FD_MAX];
 };
 
-extern struct kthread *cur;
+/*
+ * `curthread` -- the currently running thread on THIS CPU.
+ *
+ * Backed by TPIDR_EL1, the AArch64 kernel-private scratch register
+ * (Solaris naming, since the rest of the kernel leans SVR4).  Reads
+ * compile to a single MRS, writes (via set_curthread) to a single
+ * MSR.  Going per-CPU is what lets each core run a different
+ * thread under whatever scheduler we end up with.  Before this
+ * register is set on a given core, reads will return whatever it
+ * powered up with -- so don't touch curthread before sched_init /
+ * the secondary setup writes it.
+ */
+#ifdef __aarch64__
+static inline struct kthread *curthread_read(void)
+{
+	struct kthread *t;
+	__asm__ volatile ("mrs %0, tpidr_el1" : "=r"(t));
+	return t;
+}
+static inline void set_curthread(struct kthread *t)
+{
+	__asm__ volatile ("msr tpidr_el1, %0" :: "r"(t) : "memory");
+}
+#define curthread	(curthread_read())
+#else
+extern struct kthread *curthread;
+#define set_curthread(t)	do { curthread = (t); } while (0)
+#endif
 
 void            sched_init(void);
 struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg);

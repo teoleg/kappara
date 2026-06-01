@@ -674,11 +674,11 @@ static long stream_read(struct file *f, void *buf, size_t len)
 		 * thread can exit cleanly in check_signals on the way
 		 * back out of the syscall.  Mirrors EINTR on real Unix
 		 * (we don't surface errno yet). */
-		if (cur && (cur->sig_pending & SIG_FATAL_MASK))
-			return -1;
+		{ struct kthread *me = curthread;
+		  if (me && (me->sig_pending & SIG_FATAL_MASK)) return -1; }
 		kthread_sleep_on(&sd->sd_readwait);
-		if (cur && (cur->sig_pending & SIG_FATAL_MASK))
-			return -1;
+		{ struct kthread *me = curthread;
+		  if (me && (me->sig_pending & SIG_FATAL_MASK)) return -1; }
 	}
 
 	/*

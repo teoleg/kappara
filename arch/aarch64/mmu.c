@@ -230,10 +230,13 @@ void mmu_map_user_2mb(uint64_t va, uint64_t pa)
 		: : "r"(va >> 12) : "memory");
 }
 
-void mmu_init(void)
+/* Per-CPU MMU enable: program the SYSREGs from the same shared
+ * page tables core 0 built, then turn the MMU on.  Secondary cores
+ * call this from their EL1 entry after dropping from EL2.  No
+ * page-table builds here; that's a once-per-boot step done from
+ * mmu_init on core 0. */
+void mmu_enable_this_cpu(void)
 {
-	build_identity_map();
-
 	uint64_t ttbr0 = (uint64_t)(uintptr_t)l0_table;
 
 	__asm__ volatile (
@@ -262,9 +265,14 @@ void mmu_init(void)
 		:
 		: "r"(sctlr)
 		: "memory");
+}
 
+void mmu_init(void)
+{
+	build_identity_map();
+	mmu_enable_this_cpu();
 	kprintf("mmu: enabled (ttbr0=0x%lx tcr=0x%lx mair=0x%lx)\n",
-		(unsigned long)ttbr0,
+		(unsigned long)(uintptr_t)l0_table,
 		(unsigned long)TCR_VALUE,
 		(unsigned long)MAIR_VALUE);
 }

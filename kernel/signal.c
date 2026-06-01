@@ -34,8 +34,9 @@ int sys_kill_impl(int tid, int sig)
 
 void check_signals(void)
 {
-	if (!cur) return;
-	uint32_t pending = cur->sig_pending;
+	struct kthread *t = curthread;
+	if (!t) return;
+	uint32_t pending = t->sig_pending;
 	if (!pending) return;
 
 	/* SIGKILL is never blockable or catchable.  Everything else
@@ -48,11 +49,11 @@ void check_signals(void)
 		for (sig = 1; sig < NSIG; sig++)
 			if ((pending & SIG_FATAL_MASK) & SIGBIT(sig)) break;
 		kprintf("kthread: tid=%u killed by signal %u\n",
-			cur->tid, sig);
+			t->tid, sig);
 		sys_exit_impl();
 		/* unreachable */
 	}
 	/* Non-fatal pending bits get cleared so we don't keep checking
 	 * them.  Once sigaction lands they'll dispatch instead. */
-	cur->sig_pending = 0;
+	t->sig_pending = 0;
 }

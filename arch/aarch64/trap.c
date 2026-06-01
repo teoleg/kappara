@@ -174,9 +174,10 @@ void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 	 * table; the alternative VEC_SYNC_LO32 (AArch32) isn't
 	 * reachable since we never enter EL0 in AArch32 mode. */
 	if (vec_id == VEC_SYNC_LO64) {
+		struct kthread *t = curthread;
 		kprintf("   killing tid=%u with SIGSEGV\n",
-			cur ? cur->tid : 0);
-		if (cur) cur->sig_pending |= SIGBIT(SIGSEGV);
+			t ? t->tid : 0);
+		if (t) t->sig_pending |= SIGBIT(SIGSEGV);
 		sys_exit_impl();
 		/* unreachable: sys_exit_impl never returns */
 	}

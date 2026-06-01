@@ -12,6 +12,13 @@
 void mmu_init(void);
 
 #ifdef __aarch64__
+/* Per-CPU MMU enable for secondaries: program SYSREGs from the
+ * shared page tables core 0 already built, then turn the MMU on.
+ * Same effect as the per-CPU portion of mmu_init(). */
+void mmu_enable_this_cpu(void);
+#endif
+
+#ifdef __aarch64__
 /* Remap one 2 MB region (va must be 2 MB aligned, must lie in the
  * low 1 GB on AArch64) as a Normal-cacheable user-RW block.
  * Used to publish a user code/data page so EL0 can read+execute it. */
