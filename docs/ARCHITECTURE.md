@@ -469,14 +469,35 @@ for (;;) { kthread_yield(); wfi; }   -- idle loop
 - The idle thread's `stack_base` is NULL (the stack was allocated by
   `smp_wake_secondary` and lives forever).
 
-### Dispatch queues and idle steal
+### Dispatch queues, push-side balance, and idle steal
 
-Each `struct cpu` has a FIFO `cpu_dispq` guarded by `cpu_disp_lock`.
-`kthread_create` pushes the new thread onto the creating CPU's queue.
-`switch_to_next` pops the local queue first; if empty it calls
-`try_steal`, which scans `cpus[]` and pops one thread from the first
-non-empty remote queue (under that CPU's lock).  If steal also returns
-nothing:
+Each `struct cpu` has a FIFO `cpu_dispq` (head + tail + length)
+guarded by `cpu_disp_lock`.  Both directions of load balancing are
+in play:
+
+**Push-side** (`dispq_push` / `pick_push_target`).  When a thread
+becomes runnable — `kthread_create` for a new thread,
+`kthread_wake_all` / `kthread_signal` for a waker — we don't blindly
+queue on the caller's CPU.  `pick_push_target` reads
+`cpu_idle_mask` first; if any CPU is parked on its idle thread it
+gets the work (and an IPI wakes it within microseconds).
+Otherwise, if the caller's own queue already has ≥2 threads
+waiting, we scan `cpus[]` for a strictly-shorter queue elsewhere
+and push there.  Single-shot wakes onto an empty local queue stay
+local for cache locality.
+
+The remote `cpu_dispq_len` reads are unlocked — a single word, so
+they're atomic on AArch64.  A stale value just means a slightly
+worse pick; the subsequent locked push lands on whatever target
+we chose, which is correct either way.
+
+**Pull-side** (`try_steal`, in `switch_to_next`).  When a CPU has
+nothing in its own queue, it scans `cpus[]` and pops one thread
+from the first non-empty remote queue (under that CPU's lock).
+This is the catch-net for cases push-side missed (e.g. the waker
+guessed wrong, or a thread is now blocking too long on another
+CPU and a sibling went idle in the meantime).  If steal also
+returns nothing:
 
 - `requeue_current=1` (yield): keep running the current thread.
 - `requeue_current=0` (block / exit): switch to `c->cpu_idle` so the
@@ -487,6 +508,9 @@ queue mutations and `cur` swap; IRQs stay masked throughout (the
 lock is acquired with `spin_lock_irq_save` and only the spinlock is
 released before `context_switch` — IRQs are restored from the saved
 `flags` at the end of the function, after `context_switch` returns).
+`dispq_push` acquires the *target* CPU's lock — possibly a remote
+one — but it's a leaf lock (nothing else is held while it's held)
+so cross-CPU deadlock isn't possible.
 
 ### Per-CPU timer
 
@@ -547,7 +571,6 @@ the panic message must get out.
 
 | Gap                             | Notes                                       |
 |---------------------------------|---------------------------------------------|
-| Per-thread CPU affinity         | Pushes onto the waker's CPU and lets idle steal redistribute |
-| Push-side load balancing        | Currently only pull-side (idle steal); a busy CPU's queue gets long-ish before another core grabs from it |
+| Per-thread CPU affinity         | No affinity: push-side balancer picks the least-loaded CPU; idle steal redistributes |
 | Pi 4 GICv2 backend              | The Pi 3 BCM2836 mailbox/timer-routing block is replaced by a real GIC on Pi 4 |
 | Per-CPU `printk_buffered`       | The kprintf lock serialises but a CPU spinning waiting for the lock burns cycles -- per-CPU ring + a flusher would be lock-free |

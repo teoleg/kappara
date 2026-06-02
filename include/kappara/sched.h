@@ -103,6 +103,13 @@ struct cpu {
 	spinlock_t       cpu_disp_lock;
 	struct kthread  *cpu_dispq_head;
 	struct kthread  *cpu_dispq_tail;
+	/* Maintained alongside head/tail by every push/pop on the
+	 * dispatch queue.  The push-side load balancer (`dispq_push`)
+	 * reads this WITHOUT taking the remote CPU's lock -- a stale
+	 * value just means we pick a slightly-suboptimal target, the
+	 * subsequent locked push/pop is correct either way.  Lockless
+	 * reads of a single word are atomic on AArch64. */
+	unsigned         cpu_dispq_len;
 	/* STREAMS service-procedure runqueue, drained from this CPU's
 	 * sched_tick + sys_yield.  qenable on this CPU pushes here;
 	 * the per-CPU drain is what gives us "natural" SVR4 streams

@@ -156,6 +156,7 @@ static void dispq_push_locked(struct cpu *c, struct kthread *t)
 	else
 		c->cpu_dispq_head = t;
 	c->cpu_dispq_tail = t;
+	c->cpu_dispq_len++;
 }
 
 /* Pop the head of CPU c's dispatch queue.  Caller MUST hold the lock. */
@@ -167,23 +168,79 @@ static struct kthread *dispq_pop_locked(struct cpu *c)
 		if (!c->cpu_dispq_head)
 			c->cpu_dispq_tail = NULL;
 		t->next = NULL;
+		c->cpu_dispq_len--;
 	}
 	return t;
 }
 
+/*
+ * Pick a target CPU for a newly-runnable thread.
+ *
+ * Default policy until now: always queue on the caller's CPU and let
+ * idle steal redistribute.  Pull-side only.  That works for the
+ * common case where one CPU is keeping up but degrades badly when a
+ * burst of wakeups (e.g. timer expiries hitting many sleeping
+ * threads at once) all hit the same source CPU faster than the
+ * idlers can steal them -- the source's dispq grows long while
+ * other CPUs sit empty for a tick.
+ *
+ * Push-side selection: prefer an idle CPU if there is one (idle
+ * mask is a single volatile word, cheap to read); otherwise pick
+ * the CPU with the shortest dispatch queue.  Ties go to the caller
+ * so steady-state behaviour matches the old policy when load is
+ * balanced.  All reads of cpu_dispq_len are unlocked -- a stale
+ * value just costs us a slightly worse pick, the subsequent locked
+ * push lands on whatever CPU we settled on.
+ *
+ * The threshold (`>= 2 local-queued threads`) avoids spreading
+ * single short-running work items across cores -- a one-off wake
+ * stays on the waker's CPU for cache locality.  Only when there's
+ * a real pile-up do we hand work off.
+ */
+static struct cpu *pick_push_target(struct cpu *caller)
+{
+	/* Path 1: any CPU idle?  ipi_wake_idle handles the wake. */
+	uint32_t idle = cpu_idle_mask & ~(1u << caller->cpu_id);
+	if (idle) {
+		for (unsigned i = 0; i < KSCHED_NCPU; i++) {
+			if (idle & (1u << i))
+				return &cpus[i];
+		}
+	}
+
+	/* Path 2: every CPU busy.  Hand the new thread to the
+	 * least-loaded CPU only if our own queue is non-trivial --
+	 * otherwise keep it local for cache locality. */
+	if (caller->cpu_dispq_len < 2)
+		return caller;
+
+	struct cpu *best   = caller;
+	unsigned    best_n = caller->cpu_dispq_len;
+	for (unsigned i = 0; i < KSCHED_NCPU; i++) {
+		struct cpu *v = &cpus[i];
+		if (v == caller) continue;
+		unsigned n = v->cpu_dispq_len;
+		if (n + 1 < best_n) {	/* strict: avoid bouncing on ties */
+			best   = v;
+			best_n = n;
+		}
+	}
+	return best;
+}
+
 /* Lock + push (used by wake paths from outside switch_to_next).
  *
- * After pushing, send a wake-up IPI to every CPU currently in its
- * idle thread.  We don't know whether the newly-queued thread is
- * destined for THIS CPU or will get stolen, so the cheap thing to
- * do is poke everyone parked on WFI; whoever wakes first gets to
- * steal.  ipi_wake_idle skips self automatically.
+ * Push-side load balancing: instead of always queuing on `c` (the
+ * caller's CPU), pick_push_target may redirect to an idle peer or
+ * a less-loaded peer.  After pushing, IPI any idle CPUs so the
+ * pick reaches WFI'd cores immediately.
  */
 static void dispq_push(struct cpu *c, struct kthread *t)
 {
-	unsigned long f = spin_lock_irq_save(&c->cpu_disp_lock);
-	dispq_push_locked(c, t);
-	spin_unlock_irq_restore(&c->cpu_disp_lock, f);
+	struct cpu *tgt = pick_push_target(c);
+	unsigned long f = spin_lock_irq_save(&tgt->cpu_disp_lock);
+	dispq_push_locked(tgt, t);
+	spin_unlock_irq_restore(&tgt->cpu_disp_lock, f);
 	if (cpu_idle_mask)
 		ipi_wake_idle();
 }
