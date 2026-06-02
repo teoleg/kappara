@@ -25,7 +25,7 @@ The prompt shows the current working directory: `kappara:/etc#`.
 | `rmdir <path>`             | Remove an empty directory.                                  |
 | `ked <path>`               | Tiny ed-like line editor.  See [KED.md](KED.md).             |
 | `vi <path>`                | Modal full-screen editor (vi-lite).  See [VI.md](VI.md).     |
-| `kc`                       | Two-panel file manager, Norton-Commander-style.  Green background, F-keys along the bottom.  See the `kc` section below. |
+| `kc`                       | Two-panel file manager, Norton-Commander-style.  Blue background, F-keys along the bottom.  See the `kc` section below. |
 
 ## Processes
 
@@ -120,9 +120,10 @@ Hardcoded 80x24:
 +-----------------------------------------------------------------+
 ```
 
-Background is green (ANSI `\033[42m`); active-panel header is bold
-black-on-white; selected row is black-on-yellow; directories show
-their name in bright-yellow; the function-key footer is black-on-cyan.
+Classic Norton Commander palette: panel background is **blue** (ANSI
+`\033[44m`), regular files in light grey, directories in bold
+bright-white, selected entry inverted to black-on-cyan, active-panel
+header bold black-on-white, function-key footer black-on-cyan.
 
 ### Keys
 
