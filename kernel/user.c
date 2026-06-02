@@ -65,6 +65,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kappara/elf.h"
 #include "kappara/kmem.h"
 #include "kappara/mmu.h"
 #include "kappara/pmm.h"
@@ -73,6 +74,7 @@
 #include "kappara/string.h"
 #include "kappara/syscall.h"
 #include "kappara/user.h"
+#include "kappara/vfs.h"
 
 /* User VA where we'll publish the program.  Must be 2 MB aligned. */
 #define USER_VA		0x10000000UL
@@ -229,4 +231,259 @@ void sys_exit_impl(void)
 	 * caller's control-flow analysis. */
 	for (;;)
 		;
+}
+
+/* =========================================================================
+ * Exec address space and ELF loader
+ * =========================================================================
+ *
+ * A second pair of 2 MB windows lets exec'd programs live separately from
+ * init without per-process page tables.  Layout:
+ *
+ *   0x20000000 .. 0x20200000   EXEC_VA       code + data (exec_storage)
+ *   0x20200000 .. 0x20400000   EXEC_STACK_VA stack backing (exec_stack_storage)
+ *
+ * Both windows are mapped once at exec_space_init time and reused for every
+ * exec call (only one exec'd process at a time; the shell waits with
+ * sys_wait before accepting the next command).
+ *
+ * Blob file ops
+ * -------------
+ * /bin programs are NOT stored on the kfs ramdisk -- they're ELF files
+ * incbin'd into the kernel image itself (arch/aarch64/helloblob.S) and
+ * registered in the VFS as read-only blob inodes.  No ramdisk
+ * block-size constraints, no bitmap management.
+ */
+
+#define EXEC_VA        0x20000000UL
+#define EXEC_SIZE      0x00200000UL	/* 2 MB code region */
+#define EXEC_STACK_VA  0x20200000UL
+#define EXEC_STACK_TOP 0x20400000UL	/* SP starts here, grows down */
+
+__attribute__((aligned(0x200000)))
+static unsigned char exec_storage[EXEC_SIZE];
+
+__attribute__((aligned(0x200000)))
+static unsigned char exec_stack_storage[EXEC_SIZE];
+
+/* ---- blob file_ops ---- */
+
+struct blob_priv {
+	const unsigned char *data;
+	size_t               size;
+};
+
+struct blob_cursor {
+	struct blob_priv *bp;
+	size_t            pos;
+};
+
+static int blob_open(struct file *f)
+{
+	struct blob_cursor *c = kmalloc(sizeof(*c));
+	if (!c) return -1;
+	c->bp  = f->f_inode->i_private;
+	c->pos = 0;
+	f->f_private = c;
+	return 0;
+}
+
+static int blob_close(struct file *f)
+{
+	kfree(f->f_private);
+	f->f_private = NULL;
+	return 0;
+}
+
+static long blob_read(struct file *f, void *buf, size_t len)
+{
+	struct blob_cursor *c = f->f_private;
+	size_t avail = c->bp->size - c->pos;
+	if (len > avail) len = avail;
+	kmemcpy(buf, c->bp->data + c->pos, len);
+	c->pos += len;
+	return (long)len;
+}
+
+static long blob_seek(struct file *f, long off, int whence)
+{
+	struct blob_cursor *c  = f->f_private;
+	long               sz  = (long)c->bp->size;
+	long               np;
+	if      (whence == 0) np = off;
+	else if (whence == 1) np = (long)c->pos + off;
+	else                  np = sz + off;
+	if (np < 0 || np > sz) return -1;
+	c->pos = (size_t)np;
+	return np;
+}
+
+static long blob_size(struct inode *ino)
+{
+	return (long)((struct blob_priv *)ino->i_private)->size;
+}
+
+static struct file_ops blob_fops = {
+	.open  = blob_open,
+	.close = blob_close,
+	.read  = blob_read,
+	.seek  = blob_seek,
+	.size  = blob_size,
+};
+
+/* ---- /bin population ---- */
+
+extern char hello_blob_start[];
+extern char hello_blob_end[];
+
+static struct blob_priv hello_priv;
+
+void exec_space_init(void)
+{
+	/* Map exec code and stack windows to EL0. */
+	mmu_map_user_2mb(EXEC_VA,       (uintptr_t)exec_storage);
+	mmu_map_user_2mb(EXEC_STACK_VA, (uintptr_t)exec_stack_storage);
+
+	/* Create /bin and register embedded ELF blobs. */
+	struct dentry *bin = vfs_mkdir(vfs_root(), "bin");
+	hello_priv.data = (const unsigned char *)hello_blob_start;
+	hello_priv.size = (size_t)(hello_blob_end - hello_blob_start);
+	vfs_mknod_regfile(bin, "hello", &blob_fops, &hello_priv);
+
+	kprintf("exec: code=0x%lx stack_top=0x%lx, /bin/hello %lu bytes\n",
+		(unsigned long)EXEC_VA,
+		(unsigned long)EXEC_STACK_TOP,
+		(unsigned long)hello_priv.size);
+}
+
+/* ---- ELF loader ---- */
+
+/*
+ * Read an entire VFS regular file into a kernel buffer, going directly
+ * through f_ops->read so the destination buffer can be anywhere in
+ * kernel address space (skipping the copy_to_user path in sys_read_impl).
+ */
+static long read_file_kernel(const char *path, void *buf, size_t maxsz)
+{
+	struct dentry *d = vfs_lookup(path);
+	if (!d) { kprintf("execve: ENOENT '%s'\n", path); return -1; }
+	struct inode *ino = d->d_inode;
+	if (!ino || ino->i_type != INODE_REG || !ino->i_fops) return -1;
+
+	/* Manually open without touching the fd table. */
+	struct file *f = kmalloc(sizeof(*f));
+	if (!f) return -1;
+	f->f_ops     = ino->i_fops;
+	f->f_inode   = ino;
+	f->f_private = NULL;
+	f->f_refs    = 1;
+	f->f_flags   = 0;
+	vfs_iget(ino);
+	if (f->f_ops->open && f->f_ops->open(f) < 0) {
+		vfs_iput(ino); kfree(f); return -1;
+	}
+
+	size_t pos = 0;
+	while (pos < maxsz) {
+		long n = f->f_ops->read(f, (char *)buf + pos, maxsz - pos);
+		if (n <= 0) break;
+		pos += (size_t)n;
+	}
+	if (f->f_ops->close) f->f_ops->close(f);
+	vfs_iput(ino);
+	kfree(f);
+	return (long)pos;
+}
+
+/* Per-exec thread launch arguments. */
+struct exec_args {
+	uint64_t entry;
+	uint64_t sp;
+};
+
+static void exec_thread_main(void *p)
+{
+	struct exec_args a = *(struct exec_args *)p;
+	kfree(p);
+	kprintf("exec: EL0 entry=0x%lx sp=0x%lx\n",
+		(unsigned long)a.entry, (unsigned long)a.sp);
+	aarch64_enter_userspace(a.entry, a.sp, 0);
+	/* unreachable */
+}
+
+/*
+ * 256 KB static read buffer.  aarch64-linux-gnu-ld pads ELFs to 4 KB
+ * (with -z max-page-size=4096) or 64 KB (default) before the first LOAD
+ * segment; 256 KB leaves plenty of headroom for the padding plus code.
+ * Static so it lives in BSS rather than on the kernel stack.
+ */
+static unsigned char elf_read_buf[256 * 1024];
+
+long sys_execve_impl(const char *path)
+{
+	long elf_sz = read_file_kernel(path, elf_read_buf, sizeof(elf_read_buf));
+	if (elf_sz < (long)sizeof(Elf64_Ehdr)) {
+		kprintf("execve: read failed (%ld bytes)\n", elf_sz);
+		return -1;
+	}
+
+	Elf64_Ehdr *eh = (Elf64_Ehdr *)elf_read_buf;
+	if (eh->e_ident[EI_MAG0] != 0x7f ||
+	    eh->e_ident[EI_MAG1] != 'E'  ||
+	    eh->e_ident[EI_MAG2] != 'L'  ||
+	    eh->e_ident[EI_MAG3] != 'F') {
+		kprintf("execve: bad ELF magic\n"); return -1;
+	}
+	if (eh->e_ident[EI_CLASS] != 2 || /* ELF64 */
+	    eh->e_ident[EI_DATA]  != 1 || /* LE    */
+	    eh->e_machine != EM_AARCH64 ||
+	    eh->e_type    != ET_EXEC) {
+		kprintf("execve: not an AArch64 ET_EXEC ELF\n"); return -1;
+	}
+	if (eh->e_phoff == 0 || eh->e_phnum == 0) {
+		kprintf("execve: no program headers\n"); return -1;
+	}
+
+	/* Zero exec storage so BSS segments start clean. */
+	kmemset(exec_storage,       0, EXEC_SIZE);
+	kmemset(exec_stack_storage, 0, EXEC_SIZE);
+
+	/* Copy PT_LOAD segments into exec_storage. */
+	for (unsigned i = 0; i < eh->e_phnum; i++) {
+		Elf64_Phdr *ph = (Elf64_Phdr *)(elf_read_buf +
+				 eh->e_phoff + (uint64_t)i * eh->e_phentsize);
+		if (ph->p_type != PT_LOAD || ph->p_filesz == 0) continue;
+
+		if (ph->p_vaddr < EXEC_VA ||
+		    ph->p_vaddr + ph->p_filesz > EXEC_VA + EXEC_SIZE) {
+			kprintf("execve: LOAD segment 0x%lx+0x%lx "
+				"outside exec window\n",
+				(unsigned long)ph->p_vaddr,
+				(unsigned long)ph->p_filesz);
+			return -1;
+		}
+		size_t dst_off = (size_t)(ph->p_vaddr - EXEC_VA);
+		kmemcpy(exec_storage + dst_off,
+			elf_read_buf + ph->p_offset,
+			(size_t)ph->p_filesz);
+	}
+
+	/* Flush D-cache and invalidate I-cache for the new code pages. */
+	__asm__ volatile (
+		"dsb  ish\n"
+		"ic   iallu\n"
+		"dsb  ish\n"
+		"isb\n"
+		::: "memory");
+
+	struct exec_args *a = kmalloc(sizeof(*a));
+	if (!a) return -1;
+	a->entry = eh->e_entry;
+	a->sp    = EXEC_STACK_TOP;
+
+	struct kthread *t = kthread_create("exec", exec_thread_main, a);
+	if (!t) { kfree(a); return -1; }
+	/* Inherit fd table so the exec'd program has /dev/console on fd 1. */
+	kthread_inherit_fds(t, curthread);
+	return (long)t->tid;
 }

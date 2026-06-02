@@ -36,23 +36,37 @@
 #include "kappara/printk.h"
 #include "kappara/uaccess.h"
 
-/* The user-mapped window.  Keep in sync with kernel/user.c. */
+/*
+ * Recognised user windows.  Keep in sync with kernel/user.c.
+ *
+ *   init window  0x10000000 .. 0x10200000  (2 MB: code + spawn stacks)
+ *   exec window  0x20000000 .. 0x20400000  (4 MB: 2 MB code + 2 MB stack)
+ *
+ * When we grow to per-process page tables this becomes a per-task
+ * range check; for now two static windows is correct.
+ */
 #define USER_VA		0x10000000UL
 #define USER_SIZE	0x00200000UL
+
+#define EXEC_VA		0x20000000UL
+#define EXEC_TOTAL	0x00400000UL	/* code region + stack region */
 
 int syscall_from_user;
 
 int user_ptr_ok(const void *p, size_t n)
 {
 	uintptr_t a = (uintptr_t)p;
-	if (n == 0)
-		return a >= USER_VA && a < USER_VA + USER_SIZE;
-	if (a < USER_VA)
-		return 0;
 	uintptr_t end;
 	if (__builtin_add_overflow(a, n, &end))
 		return 0;
-	return end <= USER_VA + USER_SIZE;
+	if (n == 0)
+		end = a + 1;	/* treat zero-length as a 1-byte probe */
+
+	if (a >= USER_VA && end <= USER_VA + USER_SIZE)
+		return 1;
+	if (a >= EXEC_VA && end <= EXEC_VA + EXEC_TOTAL)
+		return 1;
+	return 0;
 }
 
 long copy_from_user(void *dst, const void *usrc, size_t n)

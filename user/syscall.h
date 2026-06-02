@@ -38,6 +38,7 @@
 #define SYS_sigprocmask	24
 #define SYS_sigsuspend	25
 #define SYS_wait	26
+#define SYS_execve	27
 
 #define SIG_BLOCK	0
 #define SIG_UNBLOCK	1
@@ -258,6 +259,11 @@ static inline long sys_sigsuspend(unsigned int mask)
 static inline long sys_wait(int tid)
 {
 	return _syscall1(SYS_wait, (long)tid);
+}
+
+static inline long sys_execve(const char *path)
+{
+	return _syscall1(SYS_execve, (long)(unsigned long)path);
 }
 
 /* ioctl commands -- mirror include/kappara/stream_head.h. */

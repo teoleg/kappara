@@ -111,6 +111,48 @@ peripheral window (0x3F000000..0x40000000 on Pi 3) is Device-nGnRE.
 attributes (AP[2:1] = 01).  That's the userspace 2 MB at VA
 0x10000000.
 
+### User address space layout
+
+```
+VA              Size    Purpose
+0x10000000      2 MB    init binary (user_storage BSS + mmu_map_user_2mb)
+                        Stack top = 0x10200000; spawned threads share this window
+0x20000000      2 MB    exec code (exec_storage BSS + mmu_map_user_2mb)
+0x20200000      2 MB    exec stack (exec_stack_storage BSS + mmu_map_user_2mb)
+                        Stack top = 0x20400000
+```
+
+The init and exec windows are both mapped once at boot (`user_init` /
+`exec_space_init`) and reused for every process.  Only one exec'd
+program runs at a time (the shell calls `sys_wait` before accepting the
+next command).
+
+### ELF loader (sys_execve)
+
+`sys_execve_impl` in `kernel/user.c`:
+
+1. Opens the VFS path via `read_file_kernel` (bypasses the fd table so
+   the 256 KB static `elf_read_buf` can be written directly without a
+   `copy_to_user` round-trip).
+2. Validates the ELF64 header: magic, ELF64 class, LE, `EM_AARCH64`,
+   `ET_EXEC`.
+3. Zeroes `exec_storage` and `exec_stack_storage` (BSS-clean start).
+4. Copies each PT_LOAD segment from `elf_read_buf` into `exec_storage`
+   at `p_vaddr - EXEC_VA`.  Segments outside `[0x20000000, 0x20200000)`
+   are rejected.
+5. `dsb ish; ic iallu; dsb ish; isb` — D→I cache coherence.
+6. Spawns an `exec` kthread with `kthread_inherit_fds` (so fd 0/1/2 are
+   all `/dev/console`) and calls `aarch64_enter_userspace(e_entry, 0x20400000, 0)`.
+
+Programs in `/bin` are stored as ELF blobs incbin'd into the kernel
+image (`arch/aarch64/helloblob.S`) and served through `blob_fops` in
+the VFS — no ramdisk block overhead.
+
+The shell opens `/dev/console` three times at startup to fill fds 0
+(stdin), 1 (stdout), and 2 (stderr).  Exec'd programs inherit these so
+`sys_write(1, ...)` works without the exec'd binary needing to open the
+console itself.
+
 ## Scheduling
 
 `struct kthread` lives in `include/kappara/sched.h`.  Each has:

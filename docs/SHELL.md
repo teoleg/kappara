@@ -39,6 +39,7 @@ The prompt shows the current working directory: `kappara:/etc#`.
 | `masktest`                 | Round-trip `sigprocmask` + `sigsuspend`: block SIGTERM, send to self, then unblock-and-wait atomically; handler runs inside `sigsuspend` and the original mask comes back on the way out. |
 | `waittest`                 | Spawn a short-lived worker and call `sys_wait` for it; demonstrates the join shape. |
 | `segvtest`                 | Install a SIGSEGV handler in a spawned worker, deref NULL, prove the handler runs once (`SA_RESETHAND` is auto-applied for EL0 fault delivery). |
+| `exec <path>`              | Load an ELF64 executable (e.g. `/bin/hello`) into the exec address space (VA 0x20000000), spawn an exec thread, and `sys_wait` for it to exit.  The exec'd program inherits the shell's fd table so stdout (fd 1) goes to `/dev/console`. |
 | `halt`                     | Ask QEMU to exit (semihosting SYS_EXIT). Run targets in the Makefile pass `-semihosting-config enable=on,target=native`. |
 | `ftrace [on\|off\|reset\|dump]` | Per-CPU function tracer.  No arg = `dump` (alias for `cat /proc/ftrace`).  Only meaningful when the kernel was built with `make TRACE=1`.  See `docs/FTRACE.md`. |
 

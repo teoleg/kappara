@@ -331,6 +331,19 @@ static long sys_wait(long a0, long a1, long a2, long a3, long a4, long a5)
 	return sys_wait_impl((int)a0);
 }
 
+static long sys_execve(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	char kpath[128];
+	const char *path = (const char *)(uintptr_t)a0;
+	if (syscall_from_user) {
+		if (strncpy_from_user(kpath, path, sizeof(kpath)) < 0)
+			return -1;
+		path = kpath;
+	}
+	return sys_execve_impl(path);
+}
+
 /*
  * SYS_sigreturn is intentionally NOT in this table.  It needs to
  * mutate the trap frame in place, so arch/aarch64/trap.c special-
@@ -365,6 +378,7 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_sigprocmask] = sys_sigprocmask,
 	[SYS_sigsuspend]  = sys_sigsuspend,
 	[SYS_wait]        = sys_wait,
+	[SYS_execve]      = sys_execve,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

@@ -390,6 +390,7 @@ static void cmd_help(void)
 		"  masktest               sigprocmask + sigsuspend round trip\r\n"
 		"  waittest               spawn a worker and sys_wait for it\r\n"
 		"  segvtest               install SIGSEGV handler in a worker; deref NULL; handler is one-shot\r\n"
+		"  exec <path>            load & run an ELF from /bin (or any path)\r\n"
 		"  halt                   ask QEMU to exit (semihosting)\r\n"
 		"  ftrace [on|off|reset|dump]  per-CPU function tracer\r\n");
 }
@@ -1653,6 +1654,23 @@ static void cmd_halt(int argc, char *argv[])
 	sys_halt();
 }
 
+/* exec <path> [args] -- load and run an ELF from /bin (or any path).
+ * Spawns a new thread for the ELF, inherits fds, then blocks until
+ * the process exits.  Like a real shell's fork+exec+wait but without
+ * the fork (single address space for now). */
+static void cmd_exec(int argc, char *argv[])
+{
+	if (argc < 2) { cwrite("usage: exec <path>\r\n"); return; }
+	char path[128];
+	resolve_path(argv[1], path, sizeof(path));
+	long tid = sys_execve(path);
+	if (tid < 0) {
+		cwrite("exec: failed to load '"); cwrite(path); cwrite("'\r\n");
+		return;
+	}
+	sys_wait((int)tid);
+}
+
 /* ftrace <on|off|reset|dump>  -- control the per-CPU function tracer.
  *
  *   on / off   flip the global recording switch
@@ -1843,6 +1861,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "masktest")) cmd_masktest(argc, argv);
 	else if (!ustrcmp(argv[0], "waittest")) cmd_waittest(argc, argv);
 	else if (!ustrcmp(argv[0], "segvtest")) cmd_segvtest(argc, argv);
+	else if (!ustrcmp(argv[0], "exec"))   cmd_exec(argc, argv);
 	else if (!ustrcmp(argv[0], "halt"))   cmd_halt(argc, argv);
 	else if (!ustrcmp(argv[0], "ftrace")) cmd_ftrace(argc, argv);
 	else if (!ustrcmp(argv[0], "pipework")) cmd_pipework();
@@ -1884,11 +1903,13 @@ void _start(void)
 		sys_log(buf);
 	}
 
-	fd_console = (int)sys_open("/dev/console", 0);
+	fd_console = (int)sys_open("/dev/console", 0); /* fd 0 = stdin  */
 	if (fd_console < 0) {
 		sys_log("init: open /dev/console failed");
 		for (;;) sys_yield();
 	}
+	sys_open("/dev/console", 0); /* fd 1 = stdout (for exec'd programs) */
+	sys_open("/dev/console", 0); /* fd 2 = stderr */
 
 	/*
 	 * Catch Ctrl-C.  The console driver intercepts byte 0x03,

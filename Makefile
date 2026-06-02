@@ -19,7 +19,8 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/arch/aarch64/framebuffer.o \
         $(BUILD)/arch/aarch64/font8x8.o \
         $(BUILD)/arch/aarch64/fbcon.o \
-        $(BUILD)/arch/aarch64/userblob.o
+        $(BUILD)/arch/aarch64/userblob.o \
+        $(BUILD)/arch/aarch64/helloblob.o
     # User-side init binary, linked at VA 0x10000000 and incbin'd
     # into userblob.S so the kernel ELF carries the raw bytes.
     USER_BUILD    := build/user
@@ -214,11 +215,27 @@ $(USER_BUILD)/init.elf: $(USER_BUILD)/init.o user/linker.ld
 $(USER_BIN): $(USER_BUILD)/init.elf
 	$(OBJCOPY) -O binary $< $@
 
+# ---- Standalone ELF user programs (loaded via sys_execve) ---------------
+# hello: minimal "Hello from exec'd ELF" smoke test.
+# Linked at 0x20000000 (EXEC_VA) via prog_linker.ld, kept as a full ELF
+# (not stripped to binary) so the kernel ELF loader can parse program
+# headers and map PT_LOAD segments.  Stripped to remove debug sections
+# so the 64 KB elf_read_buf in sys_execve_impl is more than sufficient.
+
+HELLO_ELF := $(USER_BUILD)/hello.elf
+
+$(USER_BUILD)/hello.o: user/hello.c user/syscall.h | $(USER_BUILD)
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+$(HELLO_ELF): $(USER_BUILD)/hello.o user/prog_linker.ld
+	$(USER_LD) -nostdlib -static -s -z max-page-size=4096 -T user/prog_linker.ld -o $@ $<
+
 $(USER_BUILD):
 	mkdir -p $@
 
-# Tell make that userblob.o depends on the binary it incbin's.
-$(BUILD)/arch/aarch64/userblob.o: $(USER_BIN)
+# Tell make that userblob.o / helloblob.o depend on the files they incbin.
+$(BUILD)/arch/aarch64/userblob.o:  $(USER_BIN)
+$(BUILD)/arch/aarch64/helloblob.o: $(HELLO_ELF)
 
 endif
 

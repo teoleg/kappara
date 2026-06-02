@@ -56,8 +56,9 @@
 #define SYS_sigsuspend	25	/* (uint32_t mask) -> -1 (after handler)   */
 #define SYS_wait	26	/* (int tid) -> 0 once tid has exited,     *
 				 * -1 on bad tid or interruption          */
+#define SYS_execve	27	/* (const char *path) -> tid / -1          */
 
-#define SYS_MAX		27
+#define SYS_MAX		28
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);
