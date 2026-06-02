@@ -327,6 +327,7 @@ static void cmd_help(void)
 		"  echo <path> <text>     write text to file (overwrite)\r\n"
 		"  ked <path>             tiny ed-like line editor\r\n"
 		"  vi <path>              modal full-screen editor (vi-lite)\r\n"
+		"  kc                     two-panel file manager (Norton-Commander-style)\r\n"
 		"  touch <path>           create empty file (kfs only)\r\n"
 		"  mkdir <path>           create directory (kfs only)\r\n"
 		"  rm <path>              remove file\r\n"
@@ -1529,6 +1530,16 @@ static void cmd_pipework(void)
 	cwrite("\r\n");
 }
 
+/* -------- kc: Norton-Commander-style two-panel file manager --------
+ *
+ * Textual include keeps kc.c isolated as its own file while sharing
+ * cwd / cwrite / cputc / vt_move / path_canon / resolve_path / udec
+ * / ustrlen with the shell.  Defining kc_main here as a function (not
+ * a separate exec) means the shell can call it without our nascent
+ * spawn-and-wait model getting involved.
+ */
+#include "kc.c"
+
 /* -------- dispatch -------- */
 
 static void dispatch(char *line)
@@ -1553,6 +1564,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "echo"))   cmd_echo(argc, argv);
 	else if (!ustrcmp(argv[0], "ked"))    cmd_ked(argc, argv);
 	else if (!ustrcmp(argv[0], "vi"))     cmd_vi(argc, argv);
+	else if (!ustrcmp(argv[0], "kc"))     cmd_kc(argc, argv);
 	else if (!ustrcmp(argv[0], "touch"))  cmd_touch(argc, argv);
 	else if (!ustrcmp(argv[0], "mkdir"))  cmd_mkdir(argc, argv);
 	else if (!ustrcmp(argv[0], "rm"))     cmd_rm(argc, argv);
