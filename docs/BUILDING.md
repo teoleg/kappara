@@ -21,7 +21,7 @@
 ```
 make                 # build/aarch64/kernel8.img
 make ARCH=aarch64    # same, explicit
-make ARCH=arm        # build/arm/kernel-arm.img (broken right now)
+make ARCH=arm        # bit-rotted; Makefile refuses with a pointer to what's needed
 make TRACE=1         # build with gcc -finstrument-functions for ftrace
 make clean
 ```

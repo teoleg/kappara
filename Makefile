@@ -54,40 +54,23 @@ ifeq ($(ARCH),aarch64)
     QEMU          := qemu-system-aarch64
     QEMU_ARGS     := -M raspi3b -serial mon:stdio -serial null -display none
 else ifeq ($(ARCH),arm)
-    CROSS         ?= arm-linux-gnueabi-
-    ARCH_CFLAGS   := -mcpu=cortex-a15 -marm -mfloat-abi=soft -mgeneral-regs-only
-    LINKER_LD     := arch/arm/linker.ld
-    ARCH_OBJS     := \
-        $(BUILD)/arch/arm/boot.o \
-        $(BUILD)/arch/arm/uart.o \
-        $(BUILD)/arch/arm/vectors.o \
-        $(BUILD)/arch/arm/trap.o \
-        $(BUILD)/arch/arm/mmu.o \
-        $(BUILD)/arch/arm/switch.o \
-        $(BUILD)/arch/arm/thread.o \
-        $(BUILD)/arch/arm/timer.o \
-        $(BUILD)/arch/arm/main.o
-    KERNEL_OBJS   := \
-        $(BUILD)/kernel/printk.o \
-        $(BUILD)/kernel/pmm.o \
-        $(BUILD)/kernel/string.o \
-        $(BUILD)/kernel/kmem.o \
-        $(BUILD)/kernel/sched.o \
-        $(BUILD)/kernel/streams.o \
-        $(BUILD)/kernel/klog.o \
-        $(BUILD)/kernel/vfs.o \
-        $(BUILD)/kernel/cdevsw.o \
-        $(BUILD)/kernel/stream_head.o \
-        $(BUILD)/kernel/syscall.o \
-        $(BUILD)/kernel/uaccess.o \
-        $(BUILD)/kernel/ramdisk.o \
-        $(BUILD)/kernel/kfs.o \
-        $(BUILD)/kernel/ftrace.o \
-        $(BUILD)/kernel/ksh.o
-    ELF           := $(BUILD)/kernel-arm.elf
-    KERNEL        := $(BUILD)/kernel-arm.img
-    QEMU          := qemu-system-arm
-    QEMU_ARGS     := -M virt -cpu cortex-a15 -m 256 -nographic
+    # The ARMv7 port is currently bit-rotted.  The SMP refactor
+    # (struct cpu + per-CPU dispatch queues, set_curcpu via TPIDR_EL1,
+    # AArch64 spinlock implementations using W-registers) and the
+    # sigaction work both landed without ARM-side equivalents, so
+    # `make ARCH=arm` link-fails in several places.  Rather than
+    # produce a cryptic wall of errors, refuse early with a clear
+    # pointer to what's needed for a revival.  The arch/arm/ source
+    # is intentionally kept so the work isn't lost.
+    $(error \
+ARCH=arm is not currently maintained -- AArch64 only.  \
+The ARMv7 port needs: an ARM-flavoured spinlock_t (the current \
+include/kappara/spinlock.h is AArch64 LDAXR/STXR with W-registers); \
+a single-CPU curcpu()/set_curcpu() (the aarch64 path uses \
+TPIDR_EL1); a syscall wrapper in kernel/syscall.c that doesn't \
+hardcode x0..x8 register names; and ARM stubs for sys_spawn_impl / \
+sys_exit_impl.  See arch/aarch64/*.c for the reference shapes. \
+Use `make ARCH=aarch64` for the working build.)
 else
     $(error Unknown ARCH=$(ARCH); use ARCH=aarch64 or ARCH=arm)
 endif
