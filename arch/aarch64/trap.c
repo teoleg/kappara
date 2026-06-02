@@ -128,17 +128,38 @@ void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 		 * are USER pointers that need bounds checking. */
 		syscall_from_user = ((tf->spsr & 0xf) == 0) ? 1 : 0;
 		__asm__ volatile ("msr daifclr, #2" ::: "memory");
+
+		/*
+		 * SYS_sigreturn is short-circuited here because it needs
+		 * to mutate `tf` in place -- the generic dispatcher only
+		 * sees register arguments, not the frame.  The handler
+		 * restores everything from the user-stack sigframe and
+		 * returns the (already-restored) x[0] so the standard
+		 * "tf->x[0] = dispatch(...)" pattern is a no-op.
+		 *
+		 * Also: we deliberately skip check_signals on the way
+		 * out -- we just unwound the previous delivery, kicking
+		 * another one here would re-loop endlessly if the same
+		 * signal is still pending.
+		 */
+		if ((long)tf->x[8] == SYS_sigreturn) {
+			tf->x[0] = (uint64_t)sys_sigreturn_impl(tf);
+			syscall_from_user = 0;
+			return;
+		}
+
 		tf->x[0] = (uint64_t)syscall_dispatch(
 				(long)tf->x[8],
 				(long)tf->x[0], (long)tf->x[1], (long)tf->x[2],
 				(long)tf->x[3], (long)tf->x[4], (long)tf->x[5]);
 		syscall_from_user = 0;
-		/* DEC/BSD reliable-signal delivery point: if a sys_kill
-		 * landed while this syscall was running (or while the
-		 * thread was blocked inside it), check_signals takes
-		 * the default action -- currently always "exit" for
-		 * fatal signals -- before we eret back to user. */
-		check_signals();
+		/* DEC/BSD reliable-signal delivery point: check_signals
+		 * walks pending&~mask, takes the configured disposition
+		 * (default / ignore / user handler via sendsig), and on
+		 * the user-handler path rewrites tf so ERET vectors
+		 * into the handler instead of back to the syscall site.
+		 */
+		check_signals(tf);
 		return;
 	}
 

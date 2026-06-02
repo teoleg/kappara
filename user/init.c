@@ -338,6 +338,7 @@ static void cmd_help(void)
 		"  pipework               sys_pipe + two spawned workers\r\n"
 		"  kill <tid> [sig]       POSIX signal numbers (default SIGTERM=15)\r\n"
 		"  crash                  spawn a thread that dereferences NULL\r\n"
+		"  sigtest                install a SIGTERM handler and signal self (smoke test)\r\n"
 		"  halt                   ask QEMU to exit (semihosting)\r\n"
 		"  ftrace [on|off|reset|dump]  per-CPU function tracer\r\n");
 }
@@ -1385,6 +1386,72 @@ static void cmd_crash(int argc, char *argv[])
 	cwrite("crash: spawned tid="); cprint_long(tid); cwrite("\r\n");
 }
 
+/*
+ * sigtest -- prove sigaction / sendsig / sigreturn end-to-end.
+ *
+ * Install a SIGTERM handler that bumps a global marker, then send
+ * SIGTERM to ourselves.  check_signals on the way out of sys_kill
+ * rewrites our trap frame so the next instruction the CPU executes
+ * is the handler -- not the line after the kill().  When the handler
+ * returns, the kernel-emitted trampoline (sitting in the sigframe on
+ * our stack) issues SYS_sigreturn, the kernel unwinds the saved tf,
+ * and execution resumes here.  If we get past the kill() with the
+ * marker bumped, the whole chain worked.
+ */
+static volatile int sigtest_marker;
+
+__attribute__((used))
+static void sigtest_handler(int sig)
+{
+	cwrite("sigtest: handler running, sig=");
+	cprint_long(sig);
+	cwrite("\r\n");
+	sigtest_marker = 0xC0DE;
+}
+
+static void cmd_sigtest(int argc, char *argv[])
+{
+	(void)argc; (void)argv;
+
+	struct sigaction sa, old;
+	sa.sa_handler = sigtest_handler;
+	sa.sa_mask    = 0;
+	sa.sa_flags   = 0;
+
+	if (sys_sigaction(SIGTERM, &sa, &old) < 0) {
+		cwrite("sigtest: sigaction(SIGTERM) failed\r\n");
+		return;
+	}
+
+	cwrite("sigtest: handler installed; sending SIGTERM to self\r\n");
+	sigtest_marker = 0;
+	long pid = sys_getpid();
+	sys_kill((int)pid, SIGTERM);
+
+	/* Execution resumes here AFTER the handler ran (signal was
+	 * delivered on the way out of sys_kill itself). */
+	cwrite("sigtest: back in cmd_sigtest, marker=0x");
+	{
+		char buf[16];
+		int v = sigtest_marker;
+		int n = 0;
+		char tmp[16];
+		if (v == 0) tmp[n++] = '0';
+		while (v) { tmp[n++] = "0123456789abcdef"[v & 0xF]; v >>= 4; }
+		for (int i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
+		cwriten(buf, (size_t)n);
+	}
+	cwrite("\r\n");
+
+	/* Restore the default disposition.  Future SIGTERMs to this
+	 * shell will kill it the BSD way. */
+	struct sigaction restore;
+	restore.sa_handler = (void (*)(int))0;	/* SIG_DFL */
+	restore.sa_mask    = 0;
+	restore.sa_flags   = 0;
+	sys_sigaction(SIGTERM, &restore, 0);
+}
+
 /* halt -- ask QEMU to exit via ARM semihosting.  Only does anything
  * useful when QEMU was started with -semihosting-config enable=on;
  * make run-thrifty / run-gui pass that flag.  Otherwise the host
@@ -1583,6 +1650,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "spawn"))  cmd_spawn(argc, argv);
 	else if (!ustrcmp(argv[0], "kill"))   cmd_kill(argc, argv);
 	else if (!ustrcmp(argv[0], "crash"))  cmd_crash(argc, argv);
+	else if (!ustrcmp(argv[0], "sigtest")) cmd_sigtest(argc, argv);
 	else if (!ustrcmp(argv[0], "halt"))   cmd_halt(argc, argv);
 	else if (!ustrcmp(argv[0], "ftrace")) cmd_ftrace(argc, argv);
 	else if (!ustrcmp(argv[0], "pipework")) cmd_pipework();

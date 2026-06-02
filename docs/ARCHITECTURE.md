@@ -244,17 +244,72 @@ the pool (see commit `fb3f938`).
 
 ## Signals
 
-Per-thread `sig_pending` bitmap.  POSIX numbers
-(SIGHUP=1, SIGINT=2, SIGKILL=9, SIGSEGV=11, SIGTERM=15, ...).
+Per-thread state: `sig_pending` (bitmap), `sig_mask` (blocked bits),
+and `sig_actions[NSIG]` (per-signal disposition, lazy-allocated on
+first `sigaction()` call so threads that never install a handler pay
+nothing).  POSIX numbering (SIGHUP=1, SIGINT=2, SIGKILL=9, SIGSEGV=11,
+SIGTERM=15, …).
 
-Delivery happens on the syscall-return path (`check_signals` from
-`trap_dispatch`).  A pending fatal signal causes `sys_exit_impl` on
-the current thread.  No user-defined handlers yet — that needs
-sendsig / sigreturn frame surgery, planned but not implemented.
+Delivery happens on the syscall-return path: `check_signals(tf)` runs
+in `trap_dispatch`'s SVC handler after the impl returns and before
+ERET.  It walks `pending & ~mask | pending & SIGBIT(SIGKILL)` — so
+SIGKILL ignores the mask — picks the lowest bit, then takes one of:
+
+- **`SIG_DFL`**: terminate (for `SIG_FATAL_MASK` signals) or drop.
+- **`SIG_IGN`**: drop, clear pending bit.
+- **user handler**: `sendsig(tf, sig, handler)` rewrites the trap
+  frame so ERET vectors into the handler with `x0 = signo` and `x30`
+  pointing at a kernel-emitted trampoline.
+
+### sendsig / sigreturn frame surgery
+
+`sendsig` carves a `struct sigframe` off the top of the user stack
+(16-byte aligned), populated with:
+
+- A two-instruction trampoline:
+  ```
+  MOVZ x8, #SYS_sigreturn
+  SVC  #0
+  ```
+- The signal number (for debug).
+- The saved `sig_mask`.
+- The full saved trap frame (`x[0..30]`, `sp_el0`, `elr`, `spsr`).
+
+The user region is mapped RWX (see `arch/aarch64/mmu.c`), so
+executing the trampoline from stack is legal.  We do `DC CVAU` +
+`IC IVAU` + `DSB` + `ISB` against the trampoline address after
+writing, so real hardware sees the new instructions; QEMU TCG
+doesn't strictly need it.
+
+When the handler returns (`ret` → `x30` → trampoline), the trampoline
+issues `SYS_sigreturn`.  That syscall is special-cased in `trap.c`
+before generic dispatch because it has to mutate `tf` in place:
+`sys_sigreturn_impl(tf)` copies the saved state out of the user
+sigframe back into `tf`, restores `sig_mask`, and returns `tf->x[0]`
+so the standard `tf->x[0] = dispatch(...)` assignment in trap.c is a
+no-op.  `check_signals` is skipped on the way out — kicking another
+delivery here would loop endlessly if the same signal is still
+pending.
+
+### Masking
+
+`sa_mask` (caller-supplied) + `SIGBIT(sig)` (the signal itself) are
+ORed into `sig_mask` before vectoring into the handler.  Sigreturn
+restores `sig_mask` from the sigframe.  SIGKILL is never blockable
+or catchable — enforced in both `sys_sigaction` (rejects the install)
+and `check_signals` (OR-merges SIGKILL bits past the mask).
+
+### EL0 faults
 
 EL0 synchronous faults (page faults from user code) route through
-trap_dispatch into `check_signals` via setting SIGSEGV — the kernel
-stays alive, only the faulting thread dies.
+`trap_dispatch`, which sets SIGSEGV pending on the offending thread
+and calls `sys_exit_impl` directly — the kernel stays alive, the
+thread dies.  A caught SIGSEGV handler installed via `sigaction`
+would currently never run on a real EL0 fault; making that path
+delivery-aware is straightforward (set pending, return into
+`check_signals`) but raises livelock concerns (the faulting
+instruction re-executes on handler return) so it's left for a
+follow-up.
 
 ## kallsyms + backtrace
 

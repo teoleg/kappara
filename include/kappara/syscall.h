@@ -47,8 +47,12 @@
 				/* size name\n" rows (ls -l style)         */
 #define SYS_halt	21	/* ARM semihosting SYS_EXIT -- asks QEMU   */
 				/* to terminate cleanly (no return)        */
+#define SYS_sigaction	22	/* (int sig, const sigaction *act,         *
+				 *  sigaction *oldact) -> 0/-1            */
+#define SYS_sigreturn	23	/* (void) -- restores sigframe; only       *
+				 * the kernel-built trampoline issues it   */
 
-#define SYS_MAX		22
+#define SYS_MAX		24
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

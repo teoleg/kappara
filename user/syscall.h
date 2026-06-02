@@ -33,6 +33,8 @@
 #define SYS_kill	19
 #define SYS_lsl		20
 #define SYS_halt	21
+#define SYS_sigaction	22
+#define SYS_sigreturn	23
 
 /* POSIX signal numbers -- mirror include/kappara/signal.h. */
 #define SIGHUP		1
@@ -201,6 +203,31 @@ static inline long sys_creat(const char *path)
 static inline long sys_seek(int fd, long offset, int whence)
 {
 	return _syscall3(SYS_seek, fd, offset, whence);
+}
+
+/* Signal disposition struct.  Layout MUST match struct sigaction_k in
+ * include/kappara/signal.h (the kernel does a single memcpy off this).
+ * sigset_t is uint32_t since NSIG = 32. */
+struct sigaction {
+	void    (*sa_handler)(int);	/* SIG_DFL (=0) and SIG_IGN (=1) allowed */
+	unsigned int sa_mask;
+	unsigned int sa_flags;
+};
+
+#define SIG_DFL_PTR	((void (*)(int))0)
+#define SIG_IGN_PTR	((void (*)(int))1)
+
+static inline long sys_sigaction(int sig, const struct sigaction *act,
+				 struct sigaction *oldact)
+{
+	register long x0 __asm__("x0") = (long)sig;
+	register long x1 __asm__("x1") = (long)(unsigned long)act;
+	register long x2 __asm__("x2") = (long)(unsigned long)oldact;
+	register long x8 __asm__("x8") = SYS_sigaction;
+	__asm__ volatile ("svc #0"
+			  : "+r"(x0) : "r"(x1), "r"(x2), "r"(x8)
+			  : "memory", "cc");
+	return x0;
 }
 
 /* ioctl commands -- mirror include/kappara/stream_head.h. */

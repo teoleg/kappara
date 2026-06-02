@@ -35,6 +35,7 @@ The prompt shows the current working directory: `kappara:/etc#`.
 | `spawn [arg]`              | Spawn a long-running worker thread (returns its tid).       |
 | `kill <tid> [sig]`         | Send a signal (POSIX numbers).  Default is `SIGTERM=15`.    |
 | `crash`                    | Spawn a thread that dereferences NULL (tests SIGSEGV path). |
+| `sigtest`                  | Install a SIGTERM handler, signal self, prove handler ran and execution resumed (smoke test for `sigaction`/`sendsig`/`sigreturn`). |
 | `halt`                     | Ask QEMU to exit (semihosting SYS_EXIT). Run targets in the Makefile pass `-semihosting-config enable=on,target=native`. |
 | `ftrace [on\|off\|reset\|dump]` | Per-CPU function tracer.  No arg = `dump` (alias for `cat /proc/ftrace`).  Only meaningful when the kernel was built with `make TRACE=1`.  See `docs/FTRACE.md`. |
 

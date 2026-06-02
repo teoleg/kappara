@@ -37,6 +37,12 @@ enum kt_state {
 struct file;		/* fwd; defined in vfs.h */
 struct wait_queue;	/* fwd; defined later in this file */
 
+/* Forward decl: per-signal disposition, defined in signal.h.
+ * We don't pull signal.h in here -- it'd be a circular include
+ * (signal.h needs struct trap_frame -> trap.h, kthread is too
+ * far up the chain to start dragging that). */
+struct sigaction_k;
+
 struct kthread {
 	void          *sp;		/* saved kernel SP for context switch */
 	void          *stack_base;	/* page allocated for the kernel stack */
@@ -48,6 +54,16 @@ struct kthread {
 	 * (from trap_dispatch's SVC return) consumes them.  See
 	 * include/kappara/signal.h for the layout and SIGBIT(). */
 	uint32_t       sig_pending;
+	/* Currently-blocked signals.  pending & ~mask is what
+	 * check_signals will actually deliver.  SIGKILL bypasses
+	 * this mask -- enforced inside check_signals. */
+	uint32_t       sig_mask;
+	/* Per-signal dispositions.  Indexed by signal number 1..NSIG-1
+	 * (entry [0] is unused).  We embed the array inline so a
+	 * sigaction() call is a one-field copy under no extra lock.
+	 * sizeof(sigaction_k) is 16, NSIG is 32 -> 512 bytes per
+	 * thread.  The size-1024 slab cache absorbs it. */
+	struct sigaction_k *sig_actions;	/* allocated on first sigaction call */
 	/* The wait queue this thread is parked on, or NULL.  Lets
 	 * sys_kill surgically extract a sleeping thread from its
 	 * queue so it wakes and observes the signal. */
