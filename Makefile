@@ -244,7 +244,7 @@ USER_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
                -mcpu=cortex-a53 -mgeneral-regs-only \
                -O2 -g
 
-$(USER_BUILD)/init.o: user/init.c user/syscall.h | $(USER_BUILD)
+$(USER_BUILD)/init.o: user/init.c user/syscall.h user/kc.c | $(USER_BUILD)
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
 $(USER_BUILD)/init.elf: $(USER_BUILD)/init.o user/linker.ld

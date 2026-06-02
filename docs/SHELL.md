@@ -25,6 +25,7 @@ The prompt shows the current working directory: `kappara:/etc#`.
 | `rmdir <path>`             | Remove an empty directory.                                  |
 | `ked <path>`               | Tiny ed-like line editor.  See [KED.md](KED.md).             |
 | `vi <path>`                | Modal full-screen editor (vi-lite).  See [VI.md](VI.md).     |
+| `kc`                       | Two-panel file manager, Norton-Commander-style.  Green background, F-keys along the bottom.  See the `kc` section below. |
 
 ## Processes
 
@@ -94,6 +95,74 @@ kappara:/# cat /proc/ps
     1  READY   uart_rx
     2  RUN     user-init
 ```
+
+## `kc` — Norton Commander-style file manager
+
+Two-panel file manager.  Lives in `user/kc.c`, textually `#include`d
+from `user/init.c` so it shares the shell's helpers (`cwrite`,
+`cputc`, `cwd`, `resolve_path`, `path_canon`, ...) without a separate
+user binary.
+
+### Layout
+
+Hardcoded 80x24:
+
+```
++--------- Row 1: header bar -------------+-----------------------+
+|/path/of/left          /path/of/right                            |
++ Rows 2..21: 20 entries per panel ------+-----------------------+
+| ..                            DIR     | etc                DIR  |
+| motd                           31     | proc               DIR  |
+| readme                         93     | dev                DIR  |
++----- Row 22: separator -----------------------------------------+
+| Row 23: status -- /selected/path  31 bytes                      |
+| Row 24: 1Help 2Menu 3View 4Edit 5Copy 6RenMv 7Mkdir 8Delet ...   |
++-----------------------------------------------------------------+
+```
+
+Background is green (ANSI `\033[42m`); active-panel header is bold
+black-on-white; selected row is black-on-yellow; directories show
+their name in bright-yellow; the function-key footer is black-on-cyan.
+
+### Keys
+
+| Key                | Action                                        |
+|--------------------|-----------------------------------------------|
+| Arrow up / down    | Move cursor within active panel.              |
+| Arrow left / right | Same as up / down (vim-style not yet wired).  |
+| PgUp / PgDn        | Page through entries.                         |
+| Home / End         | Jump to first / last entry.                   |
+| `Tab`              | Switch active panel.                          |
+| `Enter`            | Enter directory; on a regular file, view it.  |
+| `F1` or `1`        | Help overlay.                                 |
+| `F3` or `3`        | View file (pager: `q`/Esc to dismiss).        |
+| `F4` or `4`        | Edit -- stub (quit and use `ked`/`vi`).       |
+| `F5` or `5`        | Copy selected file to the other panel's dir.  |
+| `F6` or `6`        | Move / rename (copy + unlink, no rename syscall yet). |
+| `F7` or `7`        | Make directory (prompts for name).            |
+| `F8` or `8`        | Delete (file → `unlink`, dir → `rmdir`).      |
+| `F9`, `F2`         | Pull-down menu / panel menu -- stubs.         |
+| `F10`, `q`, `Esc`  | Quit and return to the shell.                 |
+
+F-key escape sequences accepted: VT100 `ESC O P/Q/R/S` (F1..F4) and
+xterm `ESC [ 11~ ... 21~` (F1..F10).  Number keys 1..0 fire F1..F10
+unconditionally as a fallback for terminals whose function keys send
+something exotic.
+
+### Implementation notes
+
+- Listing is parsed from `sys_lsl`'s output.  The size field is
+  8-char right-justified (or `MMMM,NNN` for chrdevs), so the parser
+  splits each line at the *last* space before `\n` — everything to
+  the right is the name, everything to the left is metadata.
+- All paint paths funnel through an 8 KB output buffer (`kc_obuf`)
+  flushed in 1 KB chunks (the kernel's `kmalloc` caps at the
+  size-2048 slab; bigger writes get rejected with
+  `kmalloc(N): too large`).  Without the buffer, each `cputc`
+  was its own `sys_write` and a full repaint took multiple seconds.
+- `kc` is invoked as a function call, not an exec — there is no
+  fork/exec yet.  When it returns, control goes back to the shell's
+  dispatch loop.
 
 ## How input is implemented
 
