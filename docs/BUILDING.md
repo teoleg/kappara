@@ -127,7 +127,7 @@ Edit `Makefile`:
 ```
 KERNEL_OBJS := \
     ...
-    $(BUILD)/kernel/your_new_file.o \
+    $(BUILD)/uts/os/your_new_file.o \
     ...
 ```
 

@@ -52,31 +52,31 @@ To quit:
 
 | File / dir                     | Role                                                              |
 |--------------------------------|-------------------------------------------------------------------|
-| `arch/aarch64/boot.S`          | Reset vector, EL3/EL2 → EL1 transition, secondary-core park       |
-| `arch/aarch64/vectors.S`       | Exception vector table + KERNEL_ENTRY/EXIT macros                 |
-| `arch/aarch64/trap.c`          | Trap dispatch, register dump, EL0-fault → SIGSEGV                 |
-| `arch/aarch64/mmu.c`           | Identity-map page tables, MMU enable                              |
-| `arch/aarch64/switch.S`        | `context_switch` with per-thread DAIF save/restore                |
-| `arch/aarch64/timer.c`         | Generic timer @ 100 Hz                                            |
-| `arch/aarch64/framebuffer.c`   | VC mailbox framebuffer + drawing primitives                       |
-| `arch/aarch64/fbcon.c`         | Framebuffer text console (kprintf-tee off by default)             |
-| `arch/aarch64/kallsyms_stub.S` | Pass-1 placeholder for the symbol-table link                      |
-| `kernel/pmm.c`                 | 4 KB-page freelist allocator                                      |
-| `kernel/kmem.c`                | Slab allocator + `kmalloc` size caches                            |
-| `kernel/sched.c`               | Round-robin scheduler, wait queues, reap path                     |
-| `kernel/signal.c`              | DEC/BSD reliable signals (fatal defaults today)                   |
-| `kernel/streams.c`             | mblk_t / dblk_t / queue_t / putq / getq                           |
-| `kernel/stream_head.c`         | Stream head, drivers (loop/null/console/klog/fbcon), pipes        |
-| `kernel/cdevsw.c`              | SVR4 character-device switch keyed by major number                |
-| `kernel/vfs.c`                 | In-memory dentry/inode tree, fd table, vnode v_count              |
-| `kernel/kfs.c`                 | "kappara filesystem" — superblock + bitmap + dirent table         |
-| `kernel/ramdisk.c`             | Block device backing kfs                                          |
-| `kernel/proc.c`                | `/proc/{ps,meminfo,slabinfo,streams,ftrace}`                      |
-| `kernel/ftrace.c`              | Per-CPU function tracer (`make TRACE=1`)                          |
-| `kernel/syscall.c`             | Syscall table + dispatcher                                        |
-| `kernel/kallsyms.c`            | Symbol-name lookup, frame-pointer backtrace                       |
-| `kernel/user.c`                | EL0 setup, `sys_spawn` / `sys_exit`, per-thread user stacks       |
-| `kernel/main.c`                | `kmain` orchestration                                             |
+| `uts/aarch64/boot.S`          | Reset vector, EL3/EL2 → EL1 transition, secondary-core park       |
+| `uts/aarch64/vectors.S`       | Exception vector table + KERNEL_ENTRY/EXIT macros                 |
+| `uts/aarch64/trap.c`          | Trap dispatch, register dump, EL0-fault → SIGSEGV                 |
+| `uts/aarch64/mmu.c`           | Identity-map page tables, MMU enable                              |
+| `uts/aarch64/switch.S`        | `context_switch` with per-thread DAIF save/restore                |
+| `uts/aarch64/timer.c`         | Generic timer @ 100 Hz                                            |
+| `uts/aarch64/framebuffer.c`   | VC mailbox framebuffer + drawing primitives                       |
+| `uts/aarch64/fbcon.c`         | Framebuffer text console (kprintf-tee off by default)             |
+| `uts/aarch64/kallsyms_stub.S` | Pass-1 placeholder for the symbol-table link                      |
+| `uts/os/pmm.c`                 | 4 KB-page freelist allocator                                      |
+| `uts/os/kmem.c`                | Slab allocator + `kmalloc` size caches                            |
+| `uts/os/sched.c`               | Round-robin scheduler, wait queues, reap path                     |
+| `uts/os/signal.c`              | DEC/BSD reliable signals (fatal defaults today)                   |
+| `uts/os/streams.c`             | mblk_t / dblk_t / queue_t / putq / getq                           |
+| `uts/os/stream_head.c`         | Stream head, drivers (loop/null/console/klog/fbcon), pipes        |
+| `uts/os/cdevsw.c`              | SVR4 character-device switch keyed by major number                |
+| `uts/os/vfs.c`                 | In-memory dentry/inode tree, fd table, vnode v_count              |
+| `uts/os/kfs.c`                 | "kappara filesystem" — superblock + bitmap + dirent table         |
+| `uts/os/ramdisk.c`             | Block device backing kfs                                          |
+| `uts/os/proc.c`                | `/proc/{ps,meminfo,slabinfo,streams,ftrace}`                      |
+| `uts/os/ftrace.c`              | Per-CPU function tracer (`make TRACE=1`)                          |
+| `uts/os/syscall.c`             | Syscall table + dispatcher                                        |
+| `uts/os/kallsyms.c`            | Symbol-name lookup, frame-pointer backtrace                       |
+| `uts/os/user.c`                | EL0 setup, `sys_spawn` / `sys_exit`, per-thread user stacks       |
+| `uts/os/main.c`                | `kmain` orchestration                                             |
 | `user/init.c`                  | Userspace shell (ksh) — runs at EL0 as PID 2                      |
 | `user/syscall.h`               | User-side syscall numbers + inline asm wrappers                   |
 | `tools/gen_kallsyms.sh`        | nm + awk producing the symbol-table .S after pass-1 link          |

@@ -40,7 +40,7 @@ order, so each section assumes only the layers above it.
 
 ## Boot
 
-`arch/aarch64/boot.S` is the reset vector.  All four raspi3b cores
+`uts/aarch64/boot.S` is the reset vector.  All four raspi3b cores
 enter at `_start`.  Core 0 (MPIDR_EL1.Aff0 == 0) proceeds; cores 1-3
 park in `.Lpark` at WFI (see commit `aa8759f` for why not WFE).
 
@@ -48,7 +48,7 @@ Core 0 walks the EL ladder.  raspi3b drops us at EL2, so we set
 SPSR_EL2 = EL1h, ELR_EL2 = continuation, eret.  Now at EL1 with all
 DAIF masked, we zero `.bss`, set up an initial stack, and `bl kmain`.
 
-`kmain` (in `kernel/main.c`) runs a fixed init sequence:
+`kmain` (in `uts/os/main.c`) runs a fixed init sequence:
 
 1. `uart_init` — PL011 ready for prints.
 2. `trap_init` — `msr vbar_el1`.
@@ -129,7 +129,7 @@ next command).
 
 ### ELF loader (sys_execve)
 
-`sys_execve_impl` in `kernel/user.c`:
+`sys_execve_impl` in `uts/os/user.c`:
 
 1. Opens the VFS path via `read_file_kernel` (bypasses the fd table so
    the 256 KB static `elf_read_buf` can be written directly without a
@@ -145,8 +145,8 @@ next command).
    all `/dev/console`) and calls `aarch64_enter_userspace(e_entry, 0x20400000, 0)`.
 
 Programs in `/bin` are ELF blobs incbin'd into the kernel image
-(`arch/aarch64/helloblob.S`).  Programs in `/usr/bin` are similarly
-embedded via `arch/aarch64/usrblobs.S`; source lives in `cmd/`.  Both
+(`uts/aarch64/helloblob.S`).  Programs in `/usr/bin` are similarly
+embedded via `uts/aarch64/usrblobs.S`; source lives in `cmd/`.  Both
 sets use `blob_fops` in the VFS — no ramdisk overhead.
 
 The shell opens `/dev/console` three times at startup to fill fds 0
@@ -191,7 +191,7 @@ prev->state = READY; next->state = RUNNING; cur = next
 context_switch(&prev->sp, next->sp)
 ```
 
-`context_switch` (in `arch/aarch64/switch.S`) saves callee-saved regs
+`context_switch` (in `uts/aarch64/switch.S`) saves callee-saved regs
 plus DAIF, swaps SP, restores callee-saved + DAIF from the new
 thread.  Per-thread DAIF is critical (commit `0929814`): without it, a
 thread that slept with IRQs masked would resume into whoever's DAIF
@@ -334,7 +334,7 @@ SIGKILL ignores the mask — picks the lowest bit, then takes one of:
 - The saved `sig_mask`.
 - The full saved trap frame (`x[0..30]`, `sp_el0`, `elr`, `spsr`).
 
-The user region is mapped RWX (see `arch/aarch64/mmu.c`), so
+The user region is mapped RWX (see `uts/aarch64/mmu.c`), so
 executing the trampoline from stack is legal.  We do `DC CVAU` +
 `IC IVAU` + `DSB` + `ISB` against the trampoline address after
 writing, so real hardware sees the new instructions; QEMU TCG
@@ -410,7 +410,7 @@ takes the default action (terminate) on the still-pending SIGSEGV.
 ### `sys_wait(tid)` and `thread_exit_wq`
 
 Minimal "wait for a thread to exit" primitive.  A global
-`struct wait_queue thread_exit_wq` lives in `kernel/sched.c`.
+`struct wait_queue thread_exit_wq` lives in `uts/os/sched.c`.
 `kthread_exit` sets `me->state = KT_DEAD` under `to_reap_lock` and
 then calls `kthread_wake_all(&thread_exit_wq)` -- in that order, so
 a waiter racing `kthread_find` after the wake observes
@@ -427,7 +427,7 @@ block to be used by the eventual proper `waitpid`.
 ### Ctrl-C → SIGINT
 
 A minimal TTY line-discipline lives inside `uart_rx_main`
-(`kernel/stream_head.c`).  When the PL011 RX FIFO produces a 0x03
+(`uts/os/stream_head.c`).  When the PL011 RX FIFO produces a 0x03
 byte, the kernel doesn't push it upstream as data — it sends SIGINT
 to the foreground reader of `/dev/console` instead.
 
@@ -478,8 +478,8 @@ follow-up.
 
 ### Trap-exit IRQ masking (a sharp edge worth knowing)
 
-The `KERNEL_EXIT` macro in `arch/aarch64/vectors.S` and the body of
-`aarch64_enter_userspace` in `arch/aarch64/switch.S` both do the
+The `KERNEL_EXIT` macro in `uts/aarch64/vectors.S` and the body of
+`aarch64_enter_userspace` in `uts/aarch64/switch.S` both do the
 same ERET-back-to-user dance:
 
 ```
@@ -521,7 +521,7 @@ unhandled faults so the panic dump tells you the function + offset.
 
 ## ftrace
 
-`kernel/ftrace.c` implements GCC `-finstrument-functions` hooks
+`uts/os/ftrace.c` implements GCC `-finstrument-functions` hooks
 (`__cyg_profile_func_{enter,exit}`) backed by a per-CPU 256-event
 ring in BSS.  When the kernel is built with `make TRACE=1` every
 non-excluded C function entry/exit becomes one event:
@@ -549,12 +549,12 @@ verbs.  See `docs/FTRACE.md`.
 All four Cortex-A53 cores run in EL1 with the MMU on, sharing the
 single set of page tables built by core 0.  Each core has its own
 `struct cpu` (the Solaris `cpu_t` shape) stored in the static
-`cpus[4]` array in `kernel/sched.c`; TPIDR_EL1 on each core holds
+`cpus[4]` array in `uts/os/sched.c`; TPIDR_EL1 on each core holds
 the address of its slot.  `curcpu()` is a single `mrs` instruction.
 
 ### Wake sequence
 
-`smp_wake_secondary(cpu)` in `kernel/main.c`:
+`smp_wake_secondary(cpu)` in `uts/os/main.c`:
 1. `pmm_alloc`s a 4 KB kernel stack for the new core.
 2. Stores the stack top in `smp_stacks[cpu]`.
 3. Writes `secondary_start` into both our own `smp_release[cpu]`
@@ -563,7 +563,7 @@ the address of its slot.  `curcpu()` is a single `mrs` instruction.
    off at this point) reads the freshest value from RAM.
 5. `dsb sy; sev` wakes any WFE-blocked core.
 
-### Secondary core boot (`arch/aarch64/boot.S` — `secondary_start`)
+### Secondary core boot (`uts/aarch64/boot.S` — `secondary_start`)
 
 1. Read MPIDR to get `cpu_id` into x0.
 2. Load stack top from `smp_stacks[cpu_id]` into x2.
@@ -574,7 +574,7 @@ the address of its slot.  `curcpu()` is a single `mrs` instruction.
 5. At `.Lsec_el1_entry`: x0 = cpu_id (GPRs not banked per EL in
    AArch64, so x0 survives the ERET), call `secondary_main(cpu_id)`.
 
-### `secondary_main` (`kernel/main.c`)
+### `secondary_main` (`uts/os/main.c`)
 
 ```
 mmu_enable_this_cpu()   -- point TTBR0_EL1 at shared tables, enable M+C+I
@@ -586,7 +586,7 @@ for (;;) { kthread_yield(); wfi; }   -- idle loop
 
 ### Per-CPU scheduler state
 
-`sched_secondary_init(cpu_id)` in `kernel/sched.c`:
+`sched_secondary_init(cpu_id)` in `uts/os/sched.c`:
 - Allocates a `kthread` for the idle thread (via `kmalloc`); this
   kthread represents the current execution context on this CPU.
 - Sets `c->cpu_id`, `c->cpu_thread = idle`, `c->cpu_idle = idle`.
@@ -645,7 +645,7 @@ BCM2836 ARM-local block routes each core's CNTPNSIRQ to that core's
 IRQ line via `TIMER_CONTROL(N) = 0x40000040 + 4N`.  `irq_dispatch`
 reads `IRQ_SOURCE(N) = 0x40000060 + 4N` to know who fired.
 
-`timer_init_this_cpu()` (arch/aarch64/timer.c) writes the per-core
+`timer_init_this_cpu()` (uts/aarch64/timer.c) writes the per-core
 timer-control register, reloads CNTP_TVAL_EL0, and enables the
 timer.  Core 0 calls it from `timer_init(hz)`; each secondary calls
 it from `secondary_main` after MMU + traps are up.
@@ -659,7 +659,7 @@ Inter-processor interrupts on BCM2836 use the mailbox MMIO at
 mailbox slots; writing to a peer's slot raises an IRQ on the peer if
 the peer enabled that mailbox in `MBOX_IRQ_CTL(N) = 0x40000050+4N`.
 
-`arch/aarch64/ipi.c`:
+`uts/aarch64/ipi.c`:
 - `ipi_init_this_cpu()` enables mailbox 0 IRQ for the calling core.
 - `ipi_send(cpu)` writes to a peer's mailbox 0 set + DSB SY.
 - `ipi_handle()` clears the pending bit.  No payload is needed --
@@ -685,7 +685,7 @@ steal turn up real work.
 
 ### UART kprintf lock
 
-`kernel/printk.c` holds `kprintf_lock` (IRQ-save spinlock) for the
+`uts/os/printk.c` holds `kprintf_lock` (IRQ-save spinlock) for the
 duration of one `kprintf` call.  Without it, every CPU writes to
 `uart_putc` concurrently and bytes from different lines interleave.
 `kpanic` deliberately bypasses the lock and writes via `uart_puts`
