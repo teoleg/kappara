@@ -20,7 +20,8 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/arch/aarch64/font8x8.o \
         $(BUILD)/arch/aarch64/fbcon.o \
         $(BUILD)/arch/aarch64/userblob.o \
-        $(BUILD)/arch/aarch64/helloblob.o
+        $(BUILD)/arch/aarch64/helloblob.o \
+        $(BUILD)/arch/aarch64/usrblobs.o
     # User-side init binary, linked at VA 0x10000000 and incbin'd
     # into userblob.S so the kernel ELF carries the raw bytes.
     USER_BUILD    := build/user
@@ -232,6 +233,24 @@ $(HELLO_ELF): $(USER_BUILD)/hello.o user/prog_linker.ld
 
 $(USER_BUILD):
 	mkdir -p $@
+
+# ---- /usr/bin standalone ELF programs --------------------------------
+CMD_BUILD  := build/cmd
+CMD_NAMES  := ps sigtest masktest waittest segvtest crash pipe pipework
+CMD_ELFS   := $(addprefix $(CMD_BUILD)/, $(addsuffix .elf, $(CMD_NAMES)))
+
+$(CMD_BUILD)/%.o: cmd/%.c cmd/ulib.h user/syscall.h | $(CMD_BUILD)
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+$(CMD_BUILD)/%.elf: $(CMD_BUILD)/%.o user/prog_linker.ld
+	$(USER_LD) -nostdlib -static -s -z max-page-size=4096 \
+	           -T user/prog_linker.ld -o $@ $<
+
+$(CMD_BUILD):
+	mkdir -p $@
+
+$(BUILD)/arch/aarch64/usrblobs.o: $(CMD_ELFS) arch/aarch64/usrblobs.S
+	$(CC) $(ASFLAGS) -c arch/aarch64/usrblobs.S -o $@
 
 # Tell make that userblob.o / helloblob.o depend on the files they incbin.
 $(BUILD)/arch/aarch64/userblob.o:  $(USER_BIN)

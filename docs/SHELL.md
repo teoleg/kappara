@@ -32,16 +32,36 @@ The prompt shows the current working directory: `kappara:/etc#`.
 | Command                    | What it does                                                |
 |----------------------------|-------------------------------------------------------------|
 | `pid`                      | Print the current thread id.                                |
-| `spawn [arg]`              | Spawn a long-running worker thread (returns its tid).       |
+| `spawn [arg]`              | Spawn a long-running worker thread in init space (returns its tid). |
 | `kill <tid> [sig]`         | Send a signal (POSIX numbers).  Default is `SIGTERM=15`.    |
-| `crash`                    | Spawn a thread that dereferences NULL (tests SIGSEGV path). |
-| `sigtest`                  | Install a SIGTERM handler, signal self, prove handler ran and execution resumed (smoke test for `sigaction`/`sendsig`/`sigreturn`). |
-| `masktest`                 | Round-trip `sigprocmask` + `sigsuspend`: block SIGTERM, send to self, then unblock-and-wait atomically; handler runs inside `sigsuspend` and the original mask comes back on the way out. |
-| `waittest`                 | Spawn a short-lived worker and call `sys_wait` for it; demonstrates the join shape. |
-| `segvtest`                 | Install a SIGSEGV handler in a spawned worker, deref NULL, prove the handler runs once (`SA_RESETHAND` is auto-applied for EL0 fault delivery). |
-| `exec <path>`              | Load an ELF64 executable (e.g. `/bin/hello`) into the exec address space (VA 0x20000000), spawn an exec thread, and `sys_wait` for it to exit.  The exec'd program inherits the shell's fd table so stdout (fd 1) goes to `/dev/console`. |
+| `exec <path>`              | Load an ELF64 executable into the exec address space (VA 0x20000000), spawn an exec thread, and `sys_wait` for it.  The exec'd program inherits the shell's fd table so stdout (fd 1) goes to `/dev/console`. |
 | `halt`                     | Ask QEMU to exit (semihosting SYS_EXIT). Run targets in the Makefile pass `-semihosting-config enable=on,target=native`. |
 | `ftrace [on\|off\|reset\|dump]` | Per-CPU function tracer.  No arg = `dump` (alias for `cat /proc/ftrace`).  Only meaningful when the kernel was built with `make TRACE=1`.  See `docs/FTRACE.md`. |
+| *(unknown)*                | If a command is not a builtin, the shell tries `exec /usr/bin/<name>` automatically.  Type any `/usr/bin/` binary name without the `exec` prefix. |
+
+## /usr/bin — standalone ELF programs
+
+These programs live as ELF blobs embedded in the kernel image and are
+registered at `/usr/bin/` in the VFS.  Typing their name without `exec`
+works because the shell's PATH fallback automatically tries
+`/usr/bin/<name>` for any unrecognised command.  Source lives in `cmd/`.
+
+| Program       | What it does                                                  |
+|---------------|---------------------------------------------------------------|
+| `ps`          | Read and display `/proc/ps` (thread list with TID/state/name).|
+| `sigtest`     | Install a SIGTERM handler, signal self, verify delivery (smoke test for `sigaction`/`sendsig`/`sigreturn`). |
+| `masktest`    | `sigprocmask` + `sigsuspend` round-trip: block SIGTERM, queue it, atomically unblock-and-wait. |
+| `waittest`    | Spawn a short-lived worker thread via `sys_spawn`, `sys_wait` for it. |
+| `segvtest`    | Spawn a worker that installs a SIGSEGV handler then deref NULL — proves one-shot handler delivery. |
+| `crash`       | Dereference NULL directly — no spawn.  The exec thread takes the EL0 data-abort fault, gets SIGSEGV'd, and exits. |
+| `pipe`        | Create a pipe, write a message, read it back in the same thread. |
+| `pipework`    | Spawn a writer thread and a reader thread connected by a pipe; demonstrates blocking-read EOF detection. |
+
+Exec-space programs can call `sys_spawn` to create sub-threads.  The
+kernel allocates their stacks from `exec_stack_storage` starting at
+`EXEC_STACK_TOP − slot × 64 KB` (same layout as the init-space spawn
+pool).  `exec_spawn_next` resets to 0 at the start of each `sys_execve`
+call so every exec'd program gets a fresh pool.
 
 ## Streams / device I/O
 

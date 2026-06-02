@@ -144,14 +144,31 @@ next command).
 6. Spawns an `exec` kthread with `kthread_inherit_fds` (so fd 0/1/2 are
    all `/dev/console`) and calls `aarch64_enter_userspace(e_entry, 0x20400000, 0)`.
 
-Programs in `/bin` are stored as ELF blobs incbin'd into the kernel
-image (`arch/aarch64/helloblob.S`) and served through `blob_fops` in
-the VFS — no ramdisk block overhead.
+Programs in `/bin` are ELF blobs incbin'd into the kernel image
+(`arch/aarch64/helloblob.S`).  Programs in `/usr/bin` are similarly
+embedded via `arch/aarch64/usrblobs.S`; source lives in `cmd/`.  Both
+sets use `blob_fops` in the VFS — no ramdisk overhead.
 
 The shell opens `/dev/console` three times at startup to fill fds 0
 (stdin), 1 (stdout), and 2 (stderr).  Exec'd programs inherit these so
 `sys_write(1, ...)` works without the exec'd binary needing to open the
 console itself.
+
+Exec-space programs can call `sys_spawn` to create sub-threads.
+`sys_spawn_impl` detects the entry-point range and chooses the correct
+stack pool:
+
+- Entry in `[0x10000000, 0x10200000)` → init-space stacks, counter
+  `spawn_next`.
+- Entry in `[0x20000000, 0x20200000)` → exec-space stacks from
+  `exec_stack_storage`, counter `exec_spawn_next`.  Slot 1 gets
+  SP = `0x203F0000`, slot 2 `0x203E0000`, etc.
+
+`exec_spawn_next` is reset to 0 at the start of each `sys_execve` call
+so every exec'd program starts with a fresh pool.  Convention: exec'd
+programs must `sys_wait` for sub-threads before exiting to avoid a race
+where the next `sys_execve` zeroes the exec stack storage while a stale
+sub-thread is still running.
 
 ## Scheduling
 

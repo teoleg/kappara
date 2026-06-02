@@ -169,10 +169,21 @@ void user_spawn(void)
  * Plenty for a learning OS.
  */
 
+/*
+ * Exec VA constants are declared here (before sys_spawn_impl) so the
+ * spawn function can validate exec-space entry points.  The storage
+ * arrays and MMU mapping happen later in exec_space_init.
+ */
+#define EXEC_VA        0x20000000UL
+#define EXEC_SIZE      0x00200000UL	/* 2 MB code region */
+#define EXEC_STACK_VA  0x20200000UL
+#define EXEC_STACK_TOP 0x20400000UL	/* SP starts here, grows down */
+
 #define SPAWN_STACK_SIZE	0x10000UL
 #define SPAWN_MAX		((USER_SIZE / SPAWN_STACK_SIZE) - 1)
 
 static unsigned spawn_next;
+static unsigned exec_spawn_next;
 
 struct spawn_args {
 	uint64_t entry;
@@ -193,27 +204,37 @@ static void spawn_thread_main(void *p)
 
 long sys_spawn_impl(uint64_t entry, uint64_t arg)
 {
-	if (spawn_next >= SPAWN_MAX) {
-		kprintf("sys_spawn: pool exhausted\n");
-		return -1;
-	}
-	/* Reject entry points outside the user code region.  Bounds
-	 * are the same 2 MB block we publish to EL0. */
-	if (entry < USER_VA || entry >= USER_VA + USER_SIZE) {
+	uint64_t stack_top;
+
+	if (entry >= USER_VA && entry < USER_VA + USER_SIZE) {
+		if (spawn_next >= SPAWN_MAX) {
+			kprintf("sys_spawn: init pool exhausted\n");
+			return -1;
+		}
+		unsigned slot = ++spawn_next;
+		stack_top = USER_VA + USER_SIZE - (uint64_t)slot * SPAWN_STACK_SIZE;
+	} else if (entry >= EXEC_VA && entry < EXEC_VA + EXEC_SIZE) {
+		if (exec_spawn_next >= SPAWN_MAX) {
+			kprintf("sys_spawn: exec pool exhausted\n");
+			return -1;
+		}
+		unsigned slot = ++exec_spawn_next;
+		/* slot 1 = EXEC_STACK_TOP - 64KB; main exec thread owns the top 64KB */
+		stack_top = EXEC_STACK_TOP - (uint64_t)slot * SPAWN_STACK_SIZE;
+	} else {
 		kprintf("sys_spawn: entry 0x%lx not in user range\n",
 			(unsigned long)entry);
 		return -1;
 	}
 
-	unsigned slot = ++spawn_next;	/* 1..SPAWN_MAX */
 	struct spawn_args *a = kmalloc(sizeof(*a));
 	if (!a) return -1;
 	a->entry = entry;
-	a->sp    = USER_VA + USER_SIZE - (uint64_t)slot * SPAWN_STACK_SIZE;
+	a->sp    = stack_top;
 	a->arg   = arg;
 
 	struct kthread *t = kthread_create("spawn", spawn_thread_main, a);
-	if (!t) return -1;
+	if (!t) { kfree(a); return -1; }
 
 	/* Hand the child a copy of the parent's fd table so it inherits
 	 * pipes, the console, and anything else the parent had open --
@@ -253,12 +274,10 @@ void sys_exit_impl(void)
  * incbin'd into the kernel image itself (arch/aarch64/helloblob.S) and
  * registered in the VFS as read-only blob inodes.  No ramdisk
  * block-size constraints, no bitmap management.
+ *
+ * Note: EXEC_VA, EXEC_SIZE, EXEC_STACK_VA, EXEC_STACK_TOP are defined
+ * earlier (near the spawn section) so sys_spawn_impl can check them.
  */
-
-#define EXEC_VA        0x20000000UL
-#define EXEC_SIZE      0x00200000UL	/* 2 MB code region */
-#define EXEC_STACK_VA  0x20200000UL
-#define EXEC_STACK_TOP 0x20400000UL	/* SP starts here, grows down */
 
 __attribute__((aligned(0x200000)))
 static unsigned char exec_storage[EXEC_SIZE];
@@ -331,10 +350,27 @@ static struct file_ops blob_fops = {
 	.size  = blob_size,
 };
 
-/* ---- /bin population ---- */
+/* ---- /bin and /usr/bin population ---- */
 
 extern char hello_blob_start[];
 extern char hello_blob_end[];
+
+extern char ps_blob_start[];
+extern char ps_blob_end[];
+extern char sigtest_blob_start[];
+extern char sigtest_blob_end[];
+extern char masktest_blob_start[];
+extern char masktest_blob_end[];
+extern char waittest_blob_start[];
+extern char waittest_blob_end[];
+extern char segvtest_blob_start[];
+extern char segvtest_blob_end[];
+extern char crash_blob_start[];
+extern char crash_blob_end[];
+extern char pipe_blob_start[];
+extern char pipe_blob_end[];
+extern char pipework_blob_start[];
+extern char pipework_blob_end[];
 
 static struct blob_priv hello_priv;
 
@@ -354,6 +390,42 @@ void exec_space_init(void)
 		(unsigned long)EXEC_VA,
 		(unsigned long)EXEC_STACK_TOP,
 		(unsigned long)hello_priv.size);
+
+	/* Create /usr/bin hierarchy and register /usr/bin programs. */
+	struct dentry *usr    = vfs_mkdir(vfs_root(), "usr");
+	struct dentry *usrbin = vfs_mkdir(usr, "bin");
+
+	static struct blob_priv ps_priv, sigtest_priv, masktest_priv,
+	                        waittest_priv, segvtest_priv, crash_priv,
+	                        pipe_priv, pipework_priv;
+
+#define REG(dir, name, priv, s, e) do { \
+	(priv).data = (const unsigned char *)(s); \
+	(priv).size = (size_t)((e) - (s)); \
+	vfs_mknod_regfile((dir), (name), &blob_fops, &(priv)); \
+} while (0)
+
+	REG(usrbin, "ps",       ps_priv,       ps_blob_start,       ps_blob_end);
+	REG(usrbin, "sigtest",  sigtest_priv,  sigtest_blob_start,  sigtest_blob_end);
+	REG(usrbin, "masktest", masktest_priv, masktest_blob_start, masktest_blob_end);
+	REG(usrbin, "waittest", waittest_priv, waittest_blob_start, waittest_blob_end);
+	REG(usrbin, "segvtest", segvtest_priv, segvtest_blob_start, segvtest_blob_end);
+	REG(usrbin, "crash",    crash_priv,    crash_blob_start,    crash_blob_end);
+	REG(usrbin, "pipe",     pipe_priv,     pipe_blob_start,     pipe_blob_end);
+	REG(usrbin, "pipework", pipework_priv, pipework_blob_start, pipework_blob_end);
+
+#undef REG
+
+	kprintf("exec: /usr/bin registered: ps(%lu) sigtest(%lu) masktest(%lu) "
+		"waittest(%lu) segvtest(%lu) crash(%lu) pipe(%lu) pipework(%lu)\n",
+		(unsigned long)ps_priv.size,
+		(unsigned long)sigtest_priv.size,
+		(unsigned long)masktest_priv.size,
+		(unsigned long)waittest_priv.size,
+		(unsigned long)segvtest_priv.size,
+		(unsigned long)crash_priv.size,
+		(unsigned long)pipe_priv.size,
+		(unsigned long)pipework_priv.size);
 }
 
 /* ---- ELF loader ---- */
@@ -443,6 +515,9 @@ long sys_execve_impl(const char *path)
 	if (eh->e_phoff == 0 || eh->e_phnum == 0) {
 		kprintf("execve: no program headers\n"); return -1;
 	}
+
+	/* Reset the exec-space spawn counter for the new program. */
+	exec_spawn_next = 0;
 
 	/* Zero exec storage so BSS segments start clean. */
 	kmemset(exec_storage,       0, EXEC_SIZE);
