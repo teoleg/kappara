@@ -53,26 +53,8 @@ ifeq ($(ARCH),aarch64)
     KERNEL        := $(BUILD)/kernel8.img
     QEMU          := qemu-system-aarch64
     QEMU_ARGS     := -M raspi3b -serial mon:stdio -serial null -display none
-else ifeq ($(ARCH),arm)
-    # The ARMv7 port is currently bit-rotted.  The SMP refactor
-    # (struct cpu + per-CPU dispatch queues, set_curcpu via TPIDR_EL1,
-    # AArch64 spinlock implementations using W-registers) and the
-    # sigaction work both landed without ARM-side equivalents, so
-    # `make ARCH=arm` link-fails in several places.  Rather than
-    # produce a cryptic wall of errors, refuse early with a clear
-    # pointer to what's needed for a revival.  The arch/arm/ source
-    # is intentionally kept so the work isn't lost.
-    $(error \
-ARCH=arm is not currently maintained -- AArch64 only.  \
-The ARMv7 port needs: an ARM-flavoured spinlock_t (the current \
-include/kappara/spinlock.h is AArch64 LDAXR/STXR with W-registers); \
-a single-CPU curcpu()/set_curcpu() (the aarch64 path uses \
-TPIDR_EL1); a syscall wrapper in kernel/syscall.c that doesn't \
-hardcode x0..x8 register names; and ARM stubs for sys_spawn_impl / \
-sys_exit_impl.  See arch/aarch64/*.c for the reference shapes. \
-Use `make ARCH=aarch64` for the working build.)
 else
-    $(error Unknown ARCH=$(ARCH); use ARCH=aarch64 or ARCH=arm)
+    $(error Unknown ARCH=$(ARCH); use ARCH=aarch64)
 endif
 
 CC      := $(CROSS)gcc
@@ -109,11 +91,7 @@ NOINST_OBJS := \
     $(BUILD)/kernel/printk.o \
     $(BUILD)/kernel/string.o \
     $(BUILD)/kernel/kallsyms.o
-ifeq ($(ARCH),aarch64)
-    NOINST_OBJS += $(BUILD)/arch/aarch64/uart.o
-else ifeq ($(ARCH),arm)
-    NOINST_OBJS += $(BUILD)/arch/arm/uart.o
-endif
+NOINST_OBJS += $(BUILD)/arch/aarch64/uart.o
 
 $(NOINST_OBJS): CFLAGS += -fno-instrument-functions
 
