@@ -137,6 +137,34 @@ uint32_t sched_idle_mask(void)
 	return cpu_idle_mask;
 }
 
+unsigned sched_ncpu(void)
+{
+	return KSCHED_NCPU;
+}
+
+void sched_get_cpu_info(unsigned i, struct sched_cpu_info *out)
+{
+	if (!out) return;
+	if (i >= KSCHED_NCPU) {
+		out->cpu_id    = 0;
+		out->dispq_len = 0;
+		out->idle      = 0;
+		out->cur_name  = "?";
+		return;
+	}
+	/* All single-word reads; the snapshot may be stale by the time
+	 * the caller formats it, which is fine for a diagnostic dump.
+	 * No lock is taken so /proc/cpuload doesn't contend with the
+	 * scheduler hot path. */
+	struct cpu *c = &cpus[i];
+	out->cpu_id    = c->cpu_id;
+	out->dispq_len = c->cpu_dispq_len;
+	out->idle      = (cpu_idle_mask >> i) & 1u;
+	out->cur_name  = (c->cpu_thread && c->cpu_thread->name)
+			 ? c->cpu_thread->name
+			 : "?";
+}
+
 /*
  * Sparse table from tid -> kthread *.  next_tid increments by 1
  * each kthread_create; we don't recycle slots when threads die, so
@@ -424,6 +452,9 @@ static void switch_to_next(int requeue_current)
 				spin_unlock_irq_restore(&tid_lock, f3);
 			}
 			pmm_free(t->stack_base);
+			/* Free the lazily-allocated per-signal disposition
+			 * table if this thread ever called sigaction. */
+			if (t->sig_actions) kfree(t->sig_actions);
 			kfree(t);
 		}
 	}

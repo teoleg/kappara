@@ -148,6 +148,19 @@ void            sched_init(void);
  * curthread valid on that core. */
 void            sched_secondary_init(unsigned cpu_id);
 
+/* Diagnostic snapshot of a single CPU's dispatcher state -- consumed
+ * by /proc/cpuload.  Cheap to fill (single-word reads, no locks).
+ * Stale-by-an-instant by design: this is observation, not control. */
+struct sched_cpu_info {
+	unsigned     cpu_id;
+	unsigned     dispq_len;
+	int          idle;		/* 1 if this CPU is in its idle thread */
+	const char  *cur_name;		/* curthread->name on this CPU         */
+};
+
+unsigned        sched_ncpu(void);
+void            sched_get_cpu_info(unsigned i, struct sched_cpu_info *out);
+
 struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg);
 void            kthread_yield(void);
 void            kthread_exit(void) __attribute__((noreturn));

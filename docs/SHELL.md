@@ -144,7 +144,7 @@ header bold black-on-white, function-key footer black-on-cyan.
 | `F7` or `7`        | Make directory (prompts for name).            |
 | `F8` or `8`        | Delete (file → `unlink`, dir → `rmdir`).      |
 | `F9`, `F2`         | Pull-down menu / panel menu -- stubs.         |
-| `F10`, `q`, `Esc`  | Quit and return to the shell.                 |
+| `q`, `Q`, `Esc`, `Ctrl-X`, `F10` | Quit and return to the shell.  F10 is the classic NC binding but terminals and QEMU's GTK display routinely steal it -- prefer `q` or `Ctrl-X`. |
 
 F-key escape sequences accepted: VT100 `ESC O P/Q/R/S` (F1..F4) and
 xterm `ESC [ 11~ ... 21~` (F1..F10).  Number keys 1..0 fire F1..F10

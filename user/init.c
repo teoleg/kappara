@@ -253,6 +253,32 @@ static void sigint_handler(int sig)
 	sigint_pending = 1;
 }
 
+/*
+ * Editors (ked / vi / kc) share the shell's address space, so the
+ * shell's SIGINT handler would draw "^C" over their display if the
+ * user hits Ctrl-C mid-edit.  These helpers install SIG_IGN for the
+ * duration of an edit and put the original handler back afterwards.
+ * sigint_pending is also cleared on enter (in case the shell saw a
+ * Ctrl-C that hadn't been observed yet) and on exit (any Ctrl-Cs that
+ * landed during the edit are intentionally swallowed -- the editor
+ * runs to its own quit command).
+ */
+static void editor_suspend_sigint(struct sigaction *save)
+{
+	struct sigaction ign;
+	ign.sa_handler = SIG_IGN_PTR;
+	ign.sa_mask    = 0;
+	ign.sa_flags   = 0;
+	sys_sigaction(SIGINT, &ign, save);
+	sigint_pending = 0;
+}
+
+static void editor_restore_sigint(const struct sigaction *save)
+{
+	sys_sigaction(SIGINT, save, 0);
+	sigint_pending = 0;
+}
+
 static void read_line(char *buf, size_t cap)
 {
 	size_t i = 0;
@@ -889,12 +915,15 @@ static void cmd_ked(int argc, char *argv[])
 	cwrite("ked: "); cwrite(path); cwrite(" (");
 	cprint_long(ked.nlines); cwrite(" lines)\r\n");
 
+	struct sigaction saved_sigint;
+	editor_suspend_sigint(&saved_sigint);
 	for (;;) {
 		cwrite("* ");
 		char cmd[80];
 		simple_read_line(cmd, sizeof(cmd));
 		if (ked_dispatch(cmd)) break;
 	}
+	editor_restore_sigint(&saved_sigint);
 }
 
 /* -------- vi: tiny modal editor -------- */
@@ -1238,6 +1267,9 @@ static void cmd_vi(int argc, char *argv[])
 	resolve_path(argv[1], path, sizeof(path));
 	if (vi_load(path) < 0) { cwrite("vi: load failed\r\n"); return; }
 
+	struct sigaction saved_sigint;
+	editor_suspend_sigint(&saved_sigint);
+
 	int prev_g = 0;
 	int in_esc = 0, in_csi = 0;
 	for (;;) {
@@ -1339,6 +1371,8 @@ static void cmd_vi(int argc, char *argv[])
 	/* Restore the terminal -- clear and put the cursor below. */
 	vt_clear_screen();
 	vt_move(1, 1);
+
+	editor_restore_sigint(&saved_sigint);
 }
 
 /*
