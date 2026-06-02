@@ -237,6 +237,48 @@ static void replace_line(char *buf, size_t *i_inout, const char *new_line)
  *   in_csi and 'B'    -> down arrow -> next entry / blank
  * All other bytes go through the normal echo+buffer path.
  */
+/*
+ * Set by the SIGINT handler (installed in _start) when the user hits
+ * Ctrl-C.  read_line checks it on every loop iteration, clears the
+ * partial input, and re-prompts -- so the shell feels like bash:
+ * type "ec" Ctrl-C, line gone, fresh prompt.
+ */
+static volatile int sigint_pending;
+
+__attribute__((used))
+static void sigint_handler(int sig)
+{
+	(void)sig;
+	cwrite("^C\r\n");
+	sigint_pending = 1;
+}
+
+/*
+ * Editors (ked / vi / kc) share the shell's address space, so the
+ * shell's SIGINT handler would draw "^C" over their display if the
+ * user hits Ctrl-C mid-edit.  These helpers install SIG_IGN for the
+ * duration of an edit and put the original handler back afterwards.
+ * sigint_pending is also cleared on enter (in case the shell saw a
+ * Ctrl-C that hadn't been observed yet) and on exit (any Ctrl-Cs that
+ * landed during the edit are intentionally swallowed -- the editor
+ * runs to its own quit command).
+ */
+static void editor_suspend_sigint(struct sigaction *save)
+{
+	struct sigaction ign;
+	ign.sa_handler = SIG_IGN_PTR;
+	ign.sa_mask    = 0;
+	ign.sa_flags   = 0;
+	sys_sigaction(SIGINT, &ign, save);
+	sigint_pending = 0;
+}
+
+static void editor_restore_sigint(const struct sigaction *save)
+{
+	sys_sigaction(SIGINT, save, 0);
+	sigint_pending = 0;
+}
+
 static void read_line(char *buf, size_t cap)
 {
 	size_t i = 0;
@@ -245,6 +287,12 @@ static void read_line(char *buf, size_t cap)
 	int in_csi = 0;
 
 	for (;;) {
+		if (sigint_pending) {
+			sigint_pending = 0;
+			i = 0;
+			hist_pos = -1;
+			prompt();
+		}
 		int c = read_one();
 		if (c < 0) { sys_yield(); continue; }
 
@@ -338,6 +386,10 @@ static void cmd_help(void)
 		"  pipework               sys_pipe + two spawned workers\r\n"
 		"  kill <tid> [sig]       POSIX signal numbers (default SIGTERM=15)\r\n"
 		"  crash                  spawn a thread that dereferences NULL\r\n"
+		"  sigtest                install a SIGTERM handler and signal self (smoke test)\r\n"
+		"  masktest               sigprocmask + sigsuspend round trip\r\n"
+		"  waittest               spawn a worker and sys_wait for it\r\n"
+		"  segvtest               install SIGSEGV handler in a worker; deref NULL; handler is one-shot\r\n"
 		"  halt                   ask QEMU to exit (semihosting)\r\n"
 		"  ftrace [on|off|reset|dump]  per-CPU function tracer\r\n");
 }
@@ -866,12 +918,15 @@ static void cmd_ked(int argc, char *argv[])
 	cwrite("ked: "); cwrite(path); cwrite(" (");
 	cprint_long(ked.nlines); cwrite(" lines)\r\n");
 
+	struct sigaction saved_sigint;
+	editor_suspend_sigint(&saved_sigint);
 	for (;;) {
 		cwrite("* ");
 		char cmd[80];
 		simple_read_line(cmd, sizeof(cmd));
 		if (ked_dispatch(cmd)) break;
 	}
+	editor_restore_sigint(&saved_sigint);
 }
 
 /* -------- vi: tiny modal editor -------- */
@@ -1215,6 +1270,9 @@ static void cmd_vi(int argc, char *argv[])
 	resolve_path(argv[1], path, sizeof(path));
 	if (vi_load(path) < 0) { cwrite("vi: load failed\r\n"); return; }
 
+	struct sigaction saved_sigint;
+	editor_suspend_sigint(&saved_sigint);
+
 	int prev_g = 0;
 	int in_esc = 0, in_csi = 0;
 	for (;;) {
@@ -1316,6 +1374,8 @@ static void cmd_vi(int argc, char *argv[])
 	/* Restore the terminal -- clear and put the cursor below. */
 	vt_clear_screen();
 	vt_move(1, 1);
+
+	editor_restore_sigint(&saved_sigint);
 }
 
 /*
@@ -1383,6 +1443,193 @@ static void cmd_crash(int argc, char *argv[])
 	(void)argc; (void)argv;
 	long tid = sys_spawn(crash_main, 0);
 	cwrite("crash: spawned tid="); cprint_long(tid); cwrite("\r\n");
+}
+
+/*
+ * sigtest -- prove sigaction / sendsig / sigreturn end-to-end.
+ *
+ * Install a SIGTERM handler that bumps a global marker, then send
+ * SIGTERM to ourselves.  check_signals on the way out of sys_kill
+ * rewrites our trap frame so the next instruction the CPU executes
+ * is the handler -- not the line after the kill().  When the handler
+ * returns, the kernel-emitted trampoline (sitting in the sigframe on
+ * our stack) issues SYS_sigreturn, the kernel unwinds the saved tf,
+ * and execution resumes here.  If we get past the kill() with the
+ * marker bumped, the whole chain worked.
+ */
+static volatile int sigtest_marker;
+
+__attribute__((used))
+static void sigtest_handler(int sig)
+{
+	cwrite("sigtest: handler running, sig=");
+	cprint_long(sig);
+	cwrite("\r\n");
+	sigtest_marker = 0xC0DE;
+}
+
+static void cmd_sigtest(int argc, char *argv[])
+{
+	(void)argc; (void)argv;
+
+	struct sigaction sa, old;
+	sa.sa_handler = sigtest_handler;
+	sa.sa_mask    = 0;
+	sa.sa_flags   = 0;
+
+	if (sys_sigaction(SIGTERM, &sa, &old) < 0) {
+		cwrite("sigtest: sigaction(SIGTERM) failed\r\n");
+		return;
+	}
+
+	cwrite("sigtest: handler installed; sending SIGTERM to self\r\n");
+	sigtest_marker = 0;
+	long pid = sys_getpid();
+	sys_kill((int)pid, SIGTERM);
+
+	/* Execution resumes here AFTER the handler ran (signal was
+	 * delivered on the way out of sys_kill itself). */
+	cwrite("sigtest: back in cmd_sigtest, marker=0x");
+	{
+		char buf[16];
+		int v = sigtest_marker;
+		int n = 0;
+		char tmp[16];
+		if (v == 0) tmp[n++] = '0';
+		while (v) { tmp[n++] = "0123456789abcdef"[v & 0xF]; v >>= 4; }
+		for (int i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
+		cwriten(buf, (size_t)n);
+	}
+	cwrite("\r\n");
+
+	/* Restore the default disposition.  Future SIGTERMs to this
+	 * shell will kill it the BSD way. */
+	struct sigaction restore;
+	restore.sa_handler = (void (*)(int))0;	/* SIG_DFL */
+	restore.sa_mask    = 0;
+	restore.sa_flags   = 0;
+	sys_sigaction(SIGTERM, &restore, 0);
+}
+
+/*
+ * mask test -- exercises sigprocmask + sigsuspend.
+ *
+ * Block SIGUSR1 (we don't define USR1; reuse SIGTERM=15), send it to
+ * self.  The signal sits pending because SIGTERM is masked, so the
+ * handler doesn't run yet.  Then sigsuspend() with the empty mask
+ * atomically unblocks SIGTERM, sleeps, and wakes when delivery
+ * happens.  The handler runs, sigsuspend returns -1, the original
+ * mask is restored.
+ */
+static volatile int masktest_marker;
+
+__attribute__((used))
+static void masktest_handler(int sig)
+{
+	(void)sig;
+	cwrite("masktest: handler ran (delivered via sigsuspend)\r\n");
+	masktest_marker = 1;
+}
+
+static void cmd_masktest(int argc, char *argv[])
+{
+	(void)argc; (void)argv;
+
+	struct sigaction sa, old_sa;
+	sa.sa_handler = masktest_handler;
+	sa.sa_mask    = 0;
+	sa.sa_flags   = 0;
+	if (sys_sigaction(SIGTERM, &sa, &old_sa) < 0) {
+		cwrite("masktest: sigaction failed\r\n");
+		return;
+	}
+
+	unsigned int block = 1u << (SIGTERM - 1);
+	unsigned int old_mask = 0;
+	sys_sigprocmask(SIG_BLOCK, &block, &old_mask);
+
+	cwrite("masktest: SIGTERM blocked; sending to self\r\n");
+	masktest_marker = 0;
+	sys_kill((int)sys_getpid(), SIGTERM);
+
+	cwrite("masktest: still here (signal pended); calling sigsuspend\r\n");
+	sys_sigsuspend(old_mask);	/* unblock + wait + restore */
+	cwrite("masktest: sigsuspend returned, marker=");
+	cprint_long(masktest_marker);
+	cwrite("\r\n");
+
+	sys_sigaction(SIGTERM, &old_sa, 0);
+	sys_sigprocmask(SIG_SETMASK, &old_mask, 0);
+}
+
+/*
+ * wait test -- spawn a short-lived worker, sys_wait for it.  Returns
+ * immediately when the worker has already exited; otherwise sleeps
+ * on thread_exit_wq inside the kernel and is woken when it dies.
+ */
+static void waittest_main(long arg)
+{
+	(void)arg;
+	for (int i = 0; i < 20000; i++) sys_yield();
+	sys_exit();
+}
+
+static void cmd_waittest(int argc, char *argv[])
+{
+	(void)argc; (void)argv;
+	long tid = sys_spawn(waittest_main, 0);
+	if (tid < 0) { cwrite("waittest: spawn failed\r\n"); return; }
+	cwrite("waittest: spawned tid="); cprint_long(tid);
+	cwrite(", waiting for exit...\r\n");
+	long r = sys_wait((int)tid);
+	cwrite("waittest: sys_wait returned ");
+	cprint_long(r);
+	cwrite(" (0 = exited cleanly)\r\n");
+}
+
+/*
+ * segvtest -- install a SIGSEGV handler, deliberately dereference NULL,
+ * and prove the handler runs once before the default action takes the
+ * thread down on the next fault.  Has to run in a spawned worker
+ * because a real EL0 fault terminates the thread that took it.
+ */
+__attribute__((used))
+static void segvtest_handler(int sig)
+{
+	(void)sig;
+	/* Spawned workers have an empty fd table -- they inherit the
+	 * user binary's globals (including fd_console) but no open
+	 * files.  sys_log goes straight to kprintf so it works without
+	 * any fd. */
+	sys_log("segvtest: handler caught SIGSEGV; one-shot, exiting");
+	sys_exit();
+}
+
+static void segvtest_main(long arg)
+{
+	(void)arg;
+	struct sigaction sa;
+	sa.sa_handler = segvtest_handler;
+	sa.sa_mask    = 0;
+	sa.sa_flags   = 0;
+	sys_sigaction(SIGSEGV, &sa, 0);
+
+	sys_log("segvtest: about to deref NULL");
+	volatile int *q = (volatile int *)0;
+	*q = 1;	/* SIGSEGV -- handler should run, then we exit */
+
+	sys_log("segvtest: BUG -- continued past fault");
+	sys_exit();
+}
+
+static void cmd_segvtest(int argc, char *argv[])
+{
+	(void)argc; (void)argv;
+	long tid = sys_spawn(segvtest_main, 0);
+	if (tid < 0) { cwrite("segvtest: spawn failed\r\n"); return; }
+	cwrite("segvtest: spawned tid="); cprint_long(tid); cwrite("\r\n");
+	sys_wait((int)tid);
+	cwrite("segvtest: worker exited\r\n");
 }
 
 /* halt -- ask QEMU to exit via ARM semihosting.  Only does anything
@@ -1583,6 +1830,10 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "spawn"))  cmd_spawn(argc, argv);
 	else if (!ustrcmp(argv[0], "kill"))   cmd_kill(argc, argv);
 	else if (!ustrcmp(argv[0], "crash"))  cmd_crash(argc, argv);
+	else if (!ustrcmp(argv[0], "sigtest")) cmd_sigtest(argc, argv);
+	else if (!ustrcmp(argv[0], "masktest")) cmd_masktest(argc, argv);
+	else if (!ustrcmp(argv[0], "waittest")) cmd_waittest(argc, argv);
+	else if (!ustrcmp(argv[0], "segvtest")) cmd_segvtest(argc, argv);
 	else if (!ustrcmp(argv[0], "halt"))   cmd_halt(argc, argv);
 	else if (!ustrcmp(argv[0], "ftrace")) cmd_ftrace(argc, argv);
 	else if (!ustrcmp(argv[0], "pipework")) cmd_pipework();
@@ -1628,6 +1879,21 @@ void _start(void)
 	if (fd_console < 0) {
 		sys_log("init: open /dev/console failed");
 		for (;;) sys_yield();
+	}
+
+	/*
+	 * Catch Ctrl-C.  The console driver intercepts byte 0x03,
+	 * SIGINTs whichever thread is currently parked on its read
+	 * wait queue (that's us, blocked in sys_read).  Without a
+	 * handler installed here, SIGINT's default action is to
+	 * terminate -- which would kill the shell on the first ^C.
+	 */
+	{
+		struct sigaction sa;
+		sa.sa_handler = sigint_handler;
+		sa.sa_mask    = 0;
+		sa.sa_flags   = 0;
+		sys_sigaction(SIGINT, &sa, 0);
 	}
 
 	cwrite("\r\nkappara shell (userspace) -- type 'help' for commands\r\n");

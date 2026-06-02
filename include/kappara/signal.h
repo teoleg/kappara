@@ -34,6 +34,8 @@
 
 #include <stdint.h>
 
+struct trap_frame;	/* fwd; defined in trap.h */
+
 /* POSIX signal numbers.  Gaps are intentional: SIGEMT (7), SIGBUS (10),
  * SIGUSR1/2 (16/17 on Linux, 30/31 on BSD), etc. -- we just leave the
  * slots reserved for whenever they're needed. */
@@ -65,13 +67,82 @@
 			 SIGBIT(SIGPIPE) | SIGBIT(SIGTERM) | \
 			 SIGBIT(SIGSEGV) | SIGBIT(SIGABRT))
 
+/* Magic sa_handler values, kept in the same encoding as the user's
+ * `void (*)(int)` so the dispatch can compare directly.  A 0 / 1
+ * pointer is never a valid user code address (user VA starts at
+ * 0x10000000), so these are unambiguous. */
+#define SIG_DFL		0UL
+#define SIG_IGN		1UL
+
+/* `how` values for sigprocmask. */
+#define SIG_BLOCK	0
+#define SIG_UNBLOCK	1
+#define SIG_SETMASK	2
+
+/* sa_flags bits.  Only one defined so far; reserved space for the
+ * common POSIX flags (SA_NODEFER, SA_SIGINFO, SA_RESTART) when we
+ * want them. */
+#define SA_RESETHAND	0x04	/* reset to SIG_DFL after first delivery */
+
+/*
+ * Kernel-side per-signal disposition.  Same layout as the user-visible
+ * `struct sigaction` -- 16 bytes, naturally aligned -- so we can copy
+ * the user buffer in with one memcpy.
+ */
+struct sigaction_k {
+	uint64_t  sa_handler;	/* user VA; SIG_DFL or SIG_IGN allowed */
+	uint32_t  sa_mask;	/* signals blocked across handler call */
+	uint32_t  sa_flags;	/* reserved -- pass 0 for now */
+};
+
 /* sys_kill(tid, sig).  Returns 0 on success or -1 if tid not found
  * or sig out of range.  sig==0 is the POSIX "just probe whether the
  * tid exists" form; for symmetry we accept it but it never wakes. */
 int sys_kill_impl(int tid, int sig);
 
-/* Called from the trap return path; if cur has a fatal signal
- * pending and it's not blocked, exit the thread.  Otherwise no-op. */
-void check_signals(void);
+/* sys_sigaction(sig, act, oldact): install a per-thread disposition.
+ * SIGKILL is rejected (cannot be caught or ignored, BSD/POSIX). */
+long sys_sigaction_impl(int sig,
+			const struct sigaction_k *uact,
+			struct sigaction_k *uoldact);
+
+/* sys_sigreturn: restore the saved trap frame at the top of the user
+ * stack and unwind the signal mask.  Called from the trampoline that
+ * sendsig() built into the signal frame; not exposed to user code as
+ * a callable wrapper.  Implemented inside trap.c's dispatch path
+ * because it needs to mutate tf in place. */
+long sys_sigreturn_impl(struct trap_frame *tf);
+
+/* sys_sigprocmask: change the calling thread's signal-block mask
+ * according to `how` (SIG_BLOCK | SIG_UNBLOCK | SIG_SETMASK).  Both
+ * pointer args may be NULL.  SIGKILL is silently filtered out of any
+ * incoming mask -- it cannot be blocked, BSD/POSIX guarantee. */
+long sys_sigprocmask_impl(int how, const uint32_t *uset, uint32_t *uoldset);
+
+/* sys_sigsuspend: atomically replace the calling thread's mask with
+ * `mask`, sleep until a deliverable signal lands, then restore the
+ * previous mask just before returning -1.  The standard atomic-wait
+ * primitive that race-free signal handling needs. */
+long sys_sigsuspend_impl(uint32_t mask);
+
+/* sys_wait: block until tid has exited (or return immediately if the
+ * tid is already gone).  Returns 0 on a clean observation, -1 if tid
+ * is malformed or the wait was interrupted by a fatal signal.  Lives
+ * in kernel/signal.c next to the other thread-state syscalls. */
+long sys_wait_impl(int tid);
+
+/* Trap-return signal delivery point.  Called from the SVC handler
+ * after the syscall's impl returns and before ERET.  Walks the
+ * deliverable bits in pending&~mask, picks the lowest, and either:
+ *
+ *   - takes the default action (terminate for SIG_FATAL_MASK signals,
+ *     drop everything else),
+ *   - drops on SIG_IGN,
+ *   - calls sendsig() to rewrite tf so ERET vectors into the user
+ *     handler with a sigframe pushed onto the user stack.
+ *
+ * SIGKILL is delivered unconditionally and always takes the default
+ * action -- it cannot be masked or caught. */
+void check_signals(struct trap_frame *tf);
 
 #endif

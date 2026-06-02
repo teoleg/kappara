@@ -128,17 +128,38 @@ void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 		 * are USER pointers that need bounds checking. */
 		syscall_from_user = ((tf->spsr & 0xf) == 0) ? 1 : 0;
 		__asm__ volatile ("msr daifclr, #2" ::: "memory");
+
+		/*
+		 * SYS_sigreturn is short-circuited here because it needs
+		 * to mutate `tf` in place -- the generic dispatcher only
+		 * sees register arguments, not the frame.  The handler
+		 * restores everything from the user-stack sigframe and
+		 * returns the (already-restored) x[0] so the standard
+		 * "tf->x[0] = dispatch(...)" pattern is a no-op.
+		 *
+		 * Also: we deliberately skip check_signals on the way
+		 * out -- we just unwound the previous delivery, kicking
+		 * another one here would re-loop endlessly if the same
+		 * signal is still pending.
+		 */
+		if ((long)tf->x[8] == SYS_sigreturn) {
+			tf->x[0] = (uint64_t)sys_sigreturn_impl(tf);
+			syscall_from_user = 0;
+			return;
+		}
+
 		tf->x[0] = (uint64_t)syscall_dispatch(
 				(long)tf->x[8],
 				(long)tf->x[0], (long)tf->x[1], (long)tf->x[2],
 				(long)tf->x[3], (long)tf->x[4], (long)tf->x[5]);
 		syscall_from_user = 0;
-		/* DEC/BSD reliable-signal delivery point: if a sys_kill
-		 * landed while this syscall was running (or while the
-		 * thread was blocked inside it), check_signals takes
-		 * the default action -- currently always "exit" for
-		 * fatal signals -- before we eret back to user. */
-		check_signals();
+		/* DEC/BSD reliable-signal delivery point: check_signals
+		 * walks pending&~mask, takes the configured disposition
+		 * (default / ignore / user handler via sendsig), and on
+		 * the user-handler path rewrites tf so ERET vectors
+		 * into the handler instead of back to the syscall site.
+		 */
+		check_signals(tf);
 		return;
 	}
 
@@ -168,18 +189,52 @@ void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 	kernel_backtrace_from(tf->x[29], tf->x[30]);
 
 	/* A synchronous fault FROM EL0 is a user bug, not a kernel
-	 * bug -- the right Unix response is to kill that thread with
-	 * SIGSEGV and keep the kernel running.  vec_id 8 is "Lower
-	 * EL using AArch64, synchronous" per the AArch64 vector
-	 * table; the alternative VEC_SYNC_LO32 (AArch32) isn't
-	 * reachable since we never enter EL0 in AArch32 mode. */
+	 * bug -- the right Unix response is to send SIGSEGV and keep
+	 * the kernel running.  vec_id 8 is "Lower EL using AArch64,
+	 * synchronous" per the AArch64 vector table; the alternative
+	 * VEC_SYNC_LO32 (AArch32) isn't reachable since we never
+	 * enter EL0 in AArch32 mode.
+	 *
+	 * If the thread installed a SIGSEGV handler we deliver it
+	 * via the normal check_signals -> sendsig path, BUT auto-
+	 * reset the disposition to SIG_DFL first.  Otherwise the
+	 * handler returns to the faulting instruction (sigreturn
+	 * restores tf->elr to the original user PC), the fault
+	 * re-fires, and we'd loop here forever.  One-shot semantics
+	 * let the handler save state / log / longjmp out exactly
+	 * once; a second fault kills the thread. */
 	if (vec_id == VEC_SYNC_LO64) {
 		struct kthread *t = curthread;
-		kprintf("   killing tid=%u with SIGSEGV\n",
-			t ? t->tid : 0);
-		if (t) t->sig_pending |= SIGBIT(SIGSEGV);
-		sys_exit_impl();
-		/* unreachable: sys_exit_impl never returns */
+		if (t) {
+			int caught = (t->sig_actions
+				      && t->sig_actions[SIGSEGV].sa_handler
+					 != SIG_DFL
+				      && t->sig_actions[SIGSEGV].sa_handler
+					 != SIG_IGN);
+			if (caught) {
+				/*
+				 * Force one-shot via SA_RESETHAND so the
+				 * handler runs once, sigreturn restores
+				 * the faulting tf, the instruction re-
+				 * faults, and check_signals takes
+				 * SIG_DFL on the second pass.  Without
+				 * this we'd loop in the fault forever.
+				 */
+				t->sig_actions[SIGSEGV].sa_flags |= SA_RESETHAND;
+				kprintf("   delivering catchable SIGSEGV (one-shot) to tid=%u\n",
+					t->tid);
+			} else {
+				kprintf("   killing tid=%u with SIGSEGV\n",
+					t->tid);
+			}
+			t->sig_pending |= SIGBIT(SIGSEGV);
+		}
+		/* check_signals rewrites tf for the handler delivery, or
+		 * (for SIG_DFL) tail-calls sys_exit_impl which never
+		 * returns.  Either way the trap epilogue does the right
+		 * thing on the way back out. */
+		check_signals(tf);
+		return;
 	}
 
 	/* EL1 fault = real kernel bug.  Panic so we get the dump and

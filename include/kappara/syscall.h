@@ -47,8 +47,17 @@
 				/* size name\n" rows (ls -l style)         */
 #define SYS_halt	21	/* ARM semihosting SYS_EXIT -- asks QEMU   */
 				/* to terminate cleanly (no return)        */
+#define SYS_sigaction	22	/* (int sig, const sigaction *act,         *
+				 *  sigaction *oldact) -> 0/-1            */
+#define SYS_sigreturn	23	/* (void) -- restores sigframe; only       *
+				 * the kernel-built trampoline issues it   */
+#define SYS_sigprocmask	24	/* (int how, const uint32_t *set,          *
+				 *  uint32_t *oldset) -> 0/-1             */
+#define SYS_sigsuspend	25	/* (uint32_t mask) -> -1 (after handler)   */
+#define SYS_wait	26	/* (int tid) -> 0 once tid has exited,     *
+				 * -1 on bad tid or interruption          */
 
-#define SYS_MAX		22
+#define SYS_MAX		27
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

@@ -97,6 +97,27 @@
 .endm
 
 .macro KERNEL_EXIT
+	/*
+	 * Mask IRQs across the epilogue.  The SVC handler in
+	 * trap_dispatch unmasks IRQs while running the syscall body
+	 * (so syscalls are preemptible), and returns here with IRQs
+	 * still unmasked.  If we don't re-mask, an IRQ taken between
+	 *     msr elr_el1, x10        // <-- writes user PC
+	 *     msr spsr_el1, x11       // <-- writes user PSTATE
+	 *     ...
+	 *     eret
+	 * lets the hardware OVERWRITE ELR_EL1 with the resume-here
+	 * kernel PC.  The IRQ's own KERNEL_EXIT eret's back into the
+	 * middle of OUR epilogue at that resume-here address -- which
+	 * is fine for resuming kernel execution, but the eret at the
+	 * end of our epilogue then reads the still-stale ELR_EL1 (the
+	 * outer epilogue only writes ELR_EL1 once, before the IRQ
+	 * window) and jumps EL0 to a kernel address.  Instruction
+	 * abort lower EL at trap_tail+0xc -- the canonical symptom of
+	 * this race.  Masking here makes the whole epilogue atomic
+	 * with respect to async exceptions.
+	 */
+	msr	daifset, #2
 	ldp	x10, x11, [sp, #16*16]
 	msr	elr_el1,  x10
 	msr	spsr_el1, x11

@@ -47,7 +47,7 @@ To quit:
 | `make run-gui`    | Boot with the splash window; needs working QEMU display backend    |
 | `make stop`       | `pkill` any running QEMU process                                   |
 | `make clean`      | Remove `build/`                                                    |
-| `make ARCH=arm`   | Build the ARMv7 target (currently link-broken; see TODO)           |
+| `make ARCH=arm`   | ARMv7 target (bit-rotted; refuses with a pointer to what a revival needs) |
 
 ## What's inside
 

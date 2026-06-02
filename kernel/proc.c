@@ -233,6 +233,39 @@ static int proc_stream_qopen(queue_t *q)
 	return 0;
 }
 
+/* ---- /proc/cpuload -------------------------------------------------- */
+
+/*
+ * One row per CPU: id, idle/busy, current dispatch-queue depth, and
+ * the name of the thread that CPU is currently running.  Useful for
+ * observing the push-side load balancer (`sched_get_cpu_info` in
+ * kernel/sched.c) and noticing if one CPU is doing all the work.
+ *
+ * Snapshots are unlocked single-word reads -- a sample may be stale
+ * by one instruction, which is fine for a diagnostic dump.
+ */
+static struct procbuf cpu_pb;
+
+static int proc_cpu_qopen(queue_t *q)
+{
+	pb_reset(&cpu_pb);
+	pb_str(&cpu_pb, "CPU  STATE  DISPQ  CURRENT\n");
+	for (unsigned i = 0; i < sched_ncpu(); i++) {
+		struct sched_cpu_info info;
+		sched_get_cpu_info(i, &info);
+		pb_pad_dec(&cpu_pb, info.cpu_id, 3);
+		pb_str(&cpu_pb, "  ");
+		pb_pad_str(&cpu_pb, info.idle ? "IDLE" : "BUSY", 5);
+		pb_str(&cpu_pb, "  ");
+		pb_pad_dec(&cpu_pb, info.dispq_len, 5);
+		pb_str(&cpu_pb, "  ");
+		pb_str(&cpu_pb, info.cur_name);
+		pb_putc(&cpu_pb, '\n');
+	}
+	pb_flush_to_q(&cpu_pb, q);
+	return 0;
+}
+
 /* ---- Read-side put: the head queues data; we never see reverse traffic. */
 
 static int proc_rq_putp(queue_t *q, mblk_t *mp)
@@ -275,6 +308,7 @@ PROC_DRIVER(ps,     proc_ps_qopen);
 PROC_DRIVER(mem,    proc_mem_qopen);
 PROC_DRIVER(slab,   proc_slab_qopen);
 PROC_DRIVER(stream, proc_stream_qopen);
+PROC_DRIVER(cpu,    proc_cpu_qopen);
 
 /* ---- /proc/ftrace --------------------------------------------------- */
 
@@ -351,6 +385,7 @@ void proc_init(void)
 	cdev_register(CDEV_MAJ_PROC_SLAB,   "proc-slab",   &slab_streamtab);
 	cdev_register(CDEV_MAJ_PROC_STREAM, "proc-stream", &stream_streamtab);
 	cdev_register(CDEV_MAJ_PROC_FTRACE, "proc-ftrace", &ftrace_streamtab);
+	cdev_register(CDEV_MAJ_PROC_CPU,    "proc-cpu",    &cpu_streamtab);
 
 	struct dentry *proc = vfs_mkdir(vfs_root(), "proc");
 	vfs_mknod_chrdev(proc, "ps",       MKDEV(CDEV_MAJ_PROC_PS,     0));
@@ -358,4 +393,5 @@ void proc_init(void)
 	vfs_mknod_chrdev(proc, "slabinfo", MKDEV(CDEV_MAJ_PROC_SLAB,   0));
 	vfs_mknod_chrdev(proc, "streams",  MKDEV(CDEV_MAJ_PROC_STREAM, 0));
 	vfs_mknod_chrdev(proc, "ftrace",   MKDEV(CDEV_MAJ_PROC_FTRACE, 0));
+	vfs_mknod_chrdev(proc, "cpuload",  MKDEV(CDEV_MAJ_PROC_CPU,    0));
 }

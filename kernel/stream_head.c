@@ -263,7 +263,31 @@ void uart_rx_main(void *arg)
 		}
 
 		int c = uart_getc_nonblock();
-		if (c >= 0) {
+		if (c == 0x03) {
+			/*
+			 * Ctrl-C: send SIGINT to the foreground reader of
+			 * the console.  Preferred target is whatever's on
+			 * the read wait queue right now; if it's empty
+			 * (typical: the reader is mid-loop processing the
+			 * previous byte), fall back to the most recent
+			 * reader (sd_last_reader, set by stream_read).
+			 *
+			 * kthread_signal pulls the thread off the wait
+			 * queue if blocked (so the read returns -1 with
+			 * the EINTR shape) AND sets the pending bit (so
+			 * check_signals on the way out of the syscall
+			 * dispatches to the user handler, if installed).
+			 *
+			 * No byte goes upstream -- the line-discipline
+			 * convention is that Ctrl-C is consumed.
+			 */
+			struct stdata *sd = console_active;
+			struct kthread *t = sd->sd_readwait.head;
+			if (!t && sd->sd_last_reader) {
+				t = kthread_find(sd->sd_last_reader);
+			}
+			if (t) kthread_signal(t, SIGINT);
+		} else if (c >= 0) {
 			mblk_t *mp = allocb(1, 0);
 			if (mp) {
 				*mp->b_wptr++ = (unsigned char)c;
@@ -666,6 +690,12 @@ static long stream_read(struct file *f, void *buf, size_t len)
 	struct stdata *sd = f->f_private;
 	if (!sd)
 		return -1;
+
+	/* Record this thread as the latest reader so the console's
+	 * Ctrl-C delivery (uart_rx_main below) can find a target even
+	 * when we're between sleep-and-wake at the moment 0x03 arrives.
+	 * For non-console streams this is harmless. */
+	if (curthread) sd->sd_last_reader = curthread->tid;
 
 	/* Block until something arrives on the head's read queue, or
 	 * the peer closes (SD_EOF) and the backlog is drained.  The

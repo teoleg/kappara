@@ -62,6 +62,7 @@ typedef uint32_t dev_t;
 #define CDEV_MAJ_PROC_SLAB	10	/* /proc/slabinfo  */
 #define CDEV_MAJ_PROC_STREAM	11	/* /proc/streams   */
 #define CDEV_MAJ_PROC_FTRACE	12	/* /proc/ftrace    */
+#define CDEV_MAJ_PROC_CPU	13	/* /proc/cpuload   */
 
 #define CDEV_MAX		32
 

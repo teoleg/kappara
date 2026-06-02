@@ -139,6 +139,18 @@ thread_trampoline:
  */
 .global aarch64_enter_userspace
 aarch64_enter_userspace:
+	/*
+	 * Mask IRQs across the ELR/SPSR write sequence.  The caller
+	 * (a normal kthread) runs preemptible, so an IRQ taken between
+	 * `msr elr_el1, x0` and the final `eret` would overwrite
+	 * ELR_EL1 with the resume-PC inside this function; the IRQ's
+	 * KERNEL_EXIT eret's back here fine, but our final eret then
+	 * reads that stale ELR_EL1 and lands EL0 at a kernel address.
+	 * Same shape as the trap_tail+0xc bug -- the bookkeeping cure
+	 * is the same.  ERET pops SPSR.DAIF, so the user thread still
+	 * starts with IRQs unmasked (xzr written above).
+	 */
+	msr	daifset, #2
 	msr	sp_el0,   x1
 	msr	elr_el1,  x0
 	msr	spsr_el1, xzr

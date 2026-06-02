@@ -37,6 +37,12 @@ enum kt_state {
 struct file;		/* fwd; defined in vfs.h */
 struct wait_queue;	/* fwd; defined later in this file */
 
+/* Forward decl: per-signal disposition, defined in signal.h.
+ * We don't pull signal.h in here -- it'd be a circular include
+ * (signal.h needs struct trap_frame -> trap.h, kthread is too
+ * far up the chain to start dragging that). */
+struct sigaction_k;
+
 struct kthread {
 	void          *sp;		/* saved kernel SP for context switch */
 	void          *stack_base;	/* page allocated for the kernel stack */
@@ -48,6 +54,25 @@ struct kthread {
 	 * (from trap_dispatch's SVC return) consumes them.  See
 	 * include/kappara/signal.h for the layout and SIGBIT(). */
 	uint32_t       sig_pending;
+	/* Currently-blocked signals.  pending & ~mask is what
+	 * check_signals will actually deliver.  SIGKILL bypasses
+	 * this mask -- enforced inside check_signals. */
+	uint32_t       sig_mask;
+	/* sigsuspend(2)'s "atomically restore on return" support.
+	 * sigsuspend stashes the pre-call mask here and leaves
+	 * sig_mask = the temporary mask while waiting.  sendsig
+	 * uses sig_saved_mask (instead of sig_mask) when populating
+	 * the sigframe so sigreturn unwinds to the right value;
+	 * check_signals restores it directly if no handler ran.
+	 * sig_mask_save_pending is the flag/guard. */
+	uint32_t       sig_saved_mask;
+	int            sig_mask_save_pending;
+	/* Per-signal dispositions.  Indexed by signal number 1..NSIG-1
+	 * (entry [0] is unused).  We embed the array inline so a
+	 * sigaction() call is a one-field copy under no extra lock.
+	 * sizeof(sigaction_k) is 16, NSIG is 32 -> 512 bytes per
+	 * thread.  The size-1024 slab cache absorbs it. */
+	struct sigaction_k *sig_actions;	/* allocated on first sigaction call */
 	/* The wait queue this thread is parked on, or NULL.  Lets
 	 * sys_kill surgically extract a sleeping thread from its
 	 * queue so it wakes and observes the signal. */
@@ -87,6 +112,13 @@ struct cpu {
 	spinlock_t       cpu_disp_lock;
 	struct kthread  *cpu_dispq_head;
 	struct kthread  *cpu_dispq_tail;
+	/* Maintained alongside head/tail by every push/pop on the
+	 * dispatch queue.  The push-side load balancer (`dispq_push`)
+	 * reads this WITHOUT taking the remote CPU's lock -- a stale
+	 * value just means we pick a slightly-suboptimal target, the
+	 * subsequent locked push/pop is correct either way.  Lockless
+	 * reads of a single word are atomic on AArch64. */
+	unsigned         cpu_dispq_len;
 	/* STREAMS service-procedure runqueue, drained from this CPU's
 	 * sched_tick + sys_yield.  qenable on this CPU pushes here;
 	 * the per-CPU drain is what gives us "natural" SVR4 streams
@@ -124,6 +156,19 @@ void            sched_init(void);
  * the per-CPU idle kthread, writes TPIDR_EL1, and makes curcpu() /
  * curthread valid on that core. */
 void            sched_secondary_init(unsigned cpu_id);
+
+/* Diagnostic snapshot of a single CPU's dispatcher state -- consumed
+ * by /proc/cpuload.  Cheap to fill (single-word reads, no locks).
+ * Stale-by-an-instant by design: this is observation, not control. */
+struct sched_cpu_info {
+	unsigned     cpu_id;
+	unsigned     dispq_len;
+	int          idle;		/* 1 if this CPU is in its idle thread */
+	const char  *cur_name;		/* curthread->name on this CPU         */
+};
+
+unsigned        sched_ncpu(void);
+void            sched_get_cpu_info(unsigned i, struct sched_cpu_info *out);
 
 struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg);
 void            kthread_yield(void);
@@ -165,6 +210,10 @@ struct wait_queue {
 void            kthread_sleep_on (struct wait_queue *wq);
 void            kthread_wake_all (struct wait_queue *wq);
 void            kthread_wake_one (struct wait_queue *wq);
+
+/* Broadcast wait queue woken by every kthread_exit -- sys_wait sleeps
+ * on it and re-checks the target tid on wake. */
+extern struct wait_queue thread_exit_wq;
 
 /* Return the kthread with the given tid, or NULL if no live thread
  * owns that id.  O(1) lookup via a sparse table; sys_kill uses this. */

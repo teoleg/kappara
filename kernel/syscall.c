@@ -306,6 +306,41 @@ static long sys_ls(long a0, long a1, long a2, long a3, long a4, long a5)
 	return vfs_listdir(d, out, cap);
 }
 
+static long sys_sigaction(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a3; (void)a4; (void)a5;
+	return sys_sigaction_impl((int)a0,
+				  (const struct sigaction_k *)(uintptr_t)a1,
+				  (struct sigaction_k *)(uintptr_t)a2);
+}
+
+static long sys_sigprocmask(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a3; (void)a4; (void)a5;
+	return sys_sigprocmask_impl((int)a0,
+				    (const uint32_t *)(uintptr_t)a1,
+				    (uint32_t *)(uintptr_t)a2);
+}
+
+static long sys_sigsuspend(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_sigsuspend_impl((uint32_t)a0);
+}
+
+static long sys_wait(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_wait_impl((int)a0);
+}
+
+/*
+ * SYS_sigreturn is intentionally NOT in this table.  It needs to
+ * mutate the trap frame in place, so arch/aarch64/trap.c special-
+ * cases it before reaching the generic dispatch path.  Putting a
+ * stub here would silently shadow the real handler.
+ */
+
 static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_log]    = sys_log,
 	[SYS_getpid] = sys_getpid,
@@ -327,8 +362,12 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_unlink] = sys_unlink,
 	[SYS_rmdir]  = sys_rmdir,
 	[SYS_kill]   = sys_kill,
-	[SYS_lsl]    = sys_lsl,
-	[SYS_halt]   = sys_halt,
+	[SYS_lsl]         = sys_lsl,
+	[SYS_halt]        = sys_halt,
+	[SYS_sigaction]   = sys_sigaction,
+	[SYS_sigprocmask] = sys_sigprocmask,
+	[SYS_sigsuspend]  = sys_sigsuspend,
+	[SYS_wait]        = sys_wait,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

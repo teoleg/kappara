@@ -35,6 +35,10 @@ The prompt shows the current working directory: `kappara:/etc#`.
 | `spawn [arg]`              | Spawn a long-running worker thread (returns its tid).       |
 | `kill <tid> [sig]`         | Send a signal (POSIX numbers).  Default is `SIGTERM=15`.    |
 | `crash`                    | Spawn a thread that dereferences NULL (tests SIGSEGV path). |
+| `sigtest`                  | Install a SIGTERM handler, signal self, prove handler ran and execution resumed (smoke test for `sigaction`/`sendsig`/`sigreturn`). |
+| `masktest`                 | Round-trip `sigprocmask` + `sigsuspend`: block SIGTERM, send to self, then unblock-and-wait atomically; handler runs inside `sigsuspend` and the original mask comes back on the way out. |
+| `waittest`                 | Spawn a short-lived worker and call `sys_wait` for it; demonstrates the join shape. |
+| `segvtest`                 | Install a SIGSEGV handler in a spawned worker, deref NULL, prove the handler runs once (`SA_RESETHAND` is auto-applied for EL0 fault delivery). |
 | `halt`                     | Ask QEMU to exit (semihosting SYS_EXIT). Run targets in the Makefile pass `-semihosting-config enable=on,target=native`. |
 | `ftrace [on\|off\|reset\|dump]` | Per-CPU function tracer.  No arg = `dump` (alias for `cat /proc/ftrace`).  Only meaningful when the kernel was built with `make TRACE=1`.  See `docs/FTRACE.md`. |
 
@@ -143,7 +147,7 @@ header bold black-on-white, function-key footer black-on-cyan.
 | `F7` or `7`        | Make directory (prompts for name).            |
 | `F8` or `8`        | Delete (file → `unlink`, dir → `rmdir`).      |
 | `F9`, `F2`         | Pull-down menu / panel menu -- stubs.         |
-| `F10`, `q`, `Esc`  | Quit and return to the shell.                 |
+| `q`, `Q`, `Esc`, `Ctrl-X`, `F10` | Quit and return to the shell.  F10 is the classic NC binding but terminals and QEMU's GTK display routinely steal it -- prefer `q` or `Ctrl-X`. |
 
 F-key escape sequences accepted: VT100 `ESC O P/Q/R/S` (F1..F4) and
 xterm `ESC [ 11~ ... 21~` (F1..F10).  Number keys 1..0 fire F1..F10
@@ -164,6 +168,22 @@ something exotic.
 - `kc` is invoked as a function call, not an exec — there is no
   fork/exec yet.  When it returns, control goes back to the shell's
   dispatch loop.
+
+## Ctrl-C handling
+
+The shell installs a SIGINT handler at startup.  Pressing Ctrl-C
+(byte 0x03) gets intercepted in `uart_rx_main` before the byte
+reaches the stream -- the kernel SIGINTs whichever thread is the
+foreground reader of `/dev/console` (the one blocked on the read
+wait queue, or the last reader if nobody is blocked right now).
+The shell's handler prints `^C\r\n` and sets a flag; `read_line`
+checks the flag on the next iteration, clears its partial input,
+and re-prompts.
+
+Caveats: vi / ked / kc share the SIGINT handler since they live in
+the same address space.  Don't press Ctrl-C inside an editor; use
+its own quit command.  See `docs/ARCHITECTURE.md` for the wider
+signal model.
 
 ## How input is implemented
 

@@ -143,6 +143,33 @@ ftrace: disabled  ring_per_cpu=256
 When the kernel is built without `TRACE=1`, the ring is permanently
 empty and the verbs are no-ops; the entry still exists.
 
+### /proc/cpuload
+
+One row per CPU.  Snapshot of the scheduler's per-CPU dispatcher
+state: who's running right now, whether the CPU is on its idle
+thread, and how many runnable threads are waiting in that CPU's
+dispatch queue.  Useful for watching the push-side load balancer
+do its thing.
+
+```
+kappara:/# spawn
+kappara:/# spawn
+kappara:/# spawn
+kappara:/# cat /proc/cpuload
+CPU  STATE  DISPQ  CURRENT
+  0  BUSY       0  user-init
+  1  BUSY       0  spawn
+  2  BUSY       0  spawn
+  3  BUSY       0  spawn
+```
+
+`STATE = IDLE` means that core is parked on its `cpu_idle` thread
+(WFI'd, waiting for an IPI or a tick).  `DISPQ` is the length of
+the CPU's per-CPU dispatch queue at sample time — non-zero only
+when more runnable threads exist than cores.  Single-word reads,
+no locks — the sample may be stale by one instruction, which is
+fine for a diagnostic.
+
 ## How to add a new /proc entry
 
 Three steps:

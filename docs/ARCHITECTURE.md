@@ -244,17 +244,206 @@ the pool (see commit `fb3f938`).
 
 ## Signals
 
-Per-thread `sig_pending` bitmap.  POSIX numbers
-(SIGHUP=1, SIGINT=2, SIGKILL=9, SIGSEGV=11, SIGTERM=15, ...).
+Per-thread state: `sig_pending` (bitmap), `sig_mask` (blocked bits),
+and `sig_actions[NSIG]` (per-signal disposition, lazy-allocated on
+first `sigaction()` call so threads that never install a handler pay
+nothing).  POSIX numbering (SIGHUP=1, SIGINT=2, SIGKILL=9, SIGSEGV=11,
+SIGTERM=15, …).
 
-Delivery happens on the syscall-return path (`check_signals` from
-`trap_dispatch`).  A pending fatal signal causes `sys_exit_impl` on
-the current thread.  No user-defined handlers yet — that needs
-sendsig / sigreturn frame surgery, planned but not implemented.
+Delivery happens on the syscall-return path: `check_signals(tf)` runs
+in `trap_dispatch`'s SVC handler after the impl returns and before
+ERET.  It walks `pending & ~mask | pending & SIGBIT(SIGKILL)` — so
+SIGKILL ignores the mask — picks the lowest bit, then takes one of:
+
+- **`SIG_DFL`**: terminate (for `SIG_FATAL_MASK` signals) or drop.
+- **`SIG_IGN`**: drop, clear pending bit.
+- **user handler**: `sendsig(tf, sig, handler)` rewrites the trap
+  frame so ERET vectors into the handler with `x0 = signo` and `x30`
+  pointing at a kernel-emitted trampoline.
+
+### sendsig / sigreturn frame surgery
+
+`sendsig` carves a `struct sigframe` off the top of the user stack
+(16-byte aligned), populated with:
+
+- A two-instruction trampoline:
+  ```
+  MOVZ x8, #SYS_sigreturn
+  SVC  #0
+  ```
+- The signal number (for debug).
+- The saved `sig_mask`.
+- The full saved trap frame (`x[0..30]`, `sp_el0`, `elr`, `spsr`).
+
+The user region is mapped RWX (see `arch/aarch64/mmu.c`), so
+executing the trampoline from stack is legal.  We do `DC CVAU` +
+`IC IVAU` + `DSB` + `ISB` against the trampoline address after
+writing, so real hardware sees the new instructions; QEMU TCG
+doesn't strictly need it.
+
+When the handler returns (`ret` → `x30` → trampoline), the trampoline
+issues `SYS_sigreturn`.  That syscall is special-cased in `trap.c`
+before generic dispatch because it has to mutate `tf` in place:
+`sys_sigreturn_impl(tf)` copies the saved state out of the user
+sigframe back into `tf`, restores `sig_mask`, and returns `tf->x[0]`
+so the standard `tf->x[0] = dispatch(...)` assignment in trap.c is a
+no-op.  `check_signals` is skipped on the way out — kicking another
+delivery here would loop endlessly if the same signal is still
+pending.
+
+### Masking
+
+`sa_mask` (caller-supplied) + `SIGBIT(sig)` (the signal itself) are
+ORed into `sig_mask` before vectoring into the handler.  Sigreturn
+restores `sig_mask` from the sigframe.  SIGKILL is never blockable
+or catchable — enforced in both `sys_sigaction` (rejects the install)
+and `check_signals` (OR-merges SIGKILL bits past the mask).
+
+### sigprocmask / sigsuspend
+
+`sys_sigprocmask(how, set, oldset)` does the obvious thing -- read
+and modify `sig_mask` per SIG_BLOCK / SIG_UNBLOCK / SIG_SETMASK,
+silently dropping SIGKILL out of any incoming mask.
+
+`sys_sigsuspend(mask)` is the atomic "swap mask, wait for a signal,
+restore mask, return -1" primitive POSIX needs for race-free signal
+handling.  The mask-restore is *not* done in the syscall body --
+that bug is what tanked the first masktest implementation, where
+the mask got restored before `check_signals` had a chance to
+deliver and the signal got re-blocked.  Instead, `sigsuspend`
+stashes the pre-call mask in `sig_saved_mask` and sets
+`sig_mask_save_pending`.  Then:
+
+- If a handler is installed, `sendsig` populates the sigframe's
+  `saved_mask` from `sig_saved_mask` (not the current `sig_mask`),
+  clears the pending flag, and `sigreturn` later unwinds to the
+  pre-call mask -- so the user sees `sigsuspend` return -1 with
+  the original mask back in place.
+- If no handler ran (signal was SIG_IGN'd, or the wake was
+  incidental), `check_signals` restores `sig_mask` directly from
+  `sig_saved_mask` at the end of its loop.
+
+### `SA_RESETHAND` (one-shot delivery)
+
+`sa_flags` has one bit defined so far: `SA_RESETHAND = 0x04`.  When
+`sendsig` delivers via a handler whose disposition carries this
+flag, the disposition is reset to `SIG_DFL` immediately after the
+sigframe is built.  A second occurrence of the same signal takes
+the default action.  The EL0 fault path uses this internally to
+deliver SIGSEGV one-shot (see below); user code can also set it on
+its own `sigaction()` if it wants the same semantics.
+
+### EL0 SIGSEGV is catchable
+
+A real EL0 synchronous fault (NULL deref, unmapped access, etc.)
+no longer calls `sys_exit_impl` directly.  `trap_dispatch` checks
+whether the thread installed a SIGSEGV handler and, if so, sets
+`SA_RESETHAND` on the action, marks SIGSEGV pending, and falls
+through into `check_signals(tf)`.  The handler runs exactly once
+-- if it returns into the faulting instruction (sigreturn restores
+the saved `tf->elr`), the re-fault hits a fresh `check_signals`
+which sees `SIG_DFL` and kills the thread cleanly.  Without the
+auto-reset we'd loop in the fault forever.
+
+If no handler is installed, the behaviour is unchanged: `check_signals`
+takes the default action (terminate) on the still-pending SIGSEGV.
+
+### `sys_wait(tid)` and `thread_exit_wq`
+
+Minimal "wait for a thread to exit" primitive.  A global
+`struct wait_queue thread_exit_wq` lives in `kernel/sched.c`.
+`kthread_exit` sets `me->state = KT_DEAD` under `to_reap_lock` and
+then calls `kthread_wake_all(&thread_exit_wq)` -- in that order, so
+a waiter racing `kthread_find` after the wake observes
+`state == KT_DEAD` (which `kthread_find` filters to `NULL`) and
+returns 0 instead of sleeping again with nobody left to wake it.
+`sys_wait_impl` loops: `kthread_find` → if gone, return 0; if a
+fatal signal landed, return -1 (EINTR shape); otherwise
+`kthread_sleep_on(&thread_exit_wq)`.
+
+This isn't a real `waitpid` -- no parent-child tracking, no exit
+status, no `WNOHANG` flag.  It's a `pthread_join`-shaped building
+block to be used by the eventual proper `waitpid`.
+
+### Ctrl-C → SIGINT
+
+A minimal TTY line-discipline lives inside `uart_rx_main`
+(`kernel/stream_head.c`).  When the PL011 RX FIFO produces a 0x03
+byte, the kernel doesn't push it upstream as data — it sends SIGINT
+to the foreground reader of `/dev/console` instead.
+
+Target selection has a two-tier fallback to ride out the typical
+race where the shell is mid-loop processing the previous byte:
+
+1.  The first thread on `sd->sd_readwait` if there is one (the
+    blocked reader is unambiguously "foreground").
+2.  Otherwise `sd->sd_last_reader` — the tid recorded by
+    `stream_read` on entry, so the most recent reader is still
+    findable even when the wait queue is momentarily empty.
+
+`kthread_signal` does the work: it sets the pending bit and, if the
+target is `KT_BLOCKED`, surgically extracts it from the wait queue
+and marks it READY.  The blocked `stream_read` returns -1 (EINTR
+shape) and `check_signals` on the syscall return delivers SIGINT to
+the user handler if one is installed, or takes the default action
+(terminate) otherwise.
+
+`user/init.c` installs a SIGINT handler in `_start` that prints
+`^C\r\n` and sets `sigint_pending`; `read_line` checks that flag at
+the top of every loop iteration, clears its buffer, and re-prompts
+— so the shell feels like bash on a partial input.
+
+Current limitations (worth flagging):
+
+- Only one foreground reader concept per stream; no SVR4 sessions or
+  process groups yet.  Job control (`Ctrl-Z`, `bg`/`fg`) is not on
+  the roadmap until pgrps land.
+- vi / ked / kc share the SIGINT handler with the shell (they live
+  in the same address space and same kthread).  Ctrl-C while editing
+  will print "^C" over the editor's display.  Workaround: don't
+  press Ctrl-C inside an editor; use the editor's own quit command.
+  Proper fix is to save/restore SIGINT disposition around each
+  editor invocation -- a small follow-up.
+
+### EL0 faults
 
 EL0 synchronous faults (page faults from user code) route through
-trap_dispatch into `check_signals` via setting SIGSEGV — the kernel
-stays alive, only the faulting thread dies.
+`trap_dispatch`, which sets SIGSEGV pending on the offending thread
+and calls `sys_exit_impl` directly — the kernel stays alive, the
+thread dies.  A caught SIGSEGV handler installed via `sigaction`
+would currently never run on a real EL0 fault; making that path
+delivery-aware is straightforward (set pending, return into
+`check_signals`) but raises livelock concerns (the faulting
+instruction re-executes on handler return) so it's left for a
+follow-up.
+
+### Trap-exit IRQ masking (a sharp edge worth knowing)
+
+The `KERNEL_EXIT` macro in `arch/aarch64/vectors.S` and the body of
+`aarch64_enter_userspace` in `arch/aarch64/switch.S` both do the
+same ERET-back-to-user dance:
+
+```
+msr daifset, #2        @ mask IRQs across the rest of the epilogue
+msr elr_el1, ...       @ write the user PC
+msr spsr_el1, ...      @ write the user PSTATE
+... restore GPRs ...
+eret
+```
+
+The `msr daifset, #2` at the top is load-bearing.  Without it, an
+IRQ taken between the ELR_EL1 write and the final ERET lets the
+hardware overwrite ELR_EL1 with the resume-here kernel PC.  When
+the nested IRQ's own `KERNEL_EXIT` eret's back, the outer
+epilogue's final ERET reads that stale ELR_EL1 and lands EL0 at a
+kernel address.  The symptom is an `ec=0x20` instruction abort
+with `ELR == FAR == trap_tail+0xc`, killing the user thread with
+SIGSEGV after a stress run of edit-and-save loops.
+
+The SVC handler intentionally runs preemptible (`msr daifclr, #2`
+inside `trap_dispatch`), so the path back into the epilogue
+arrives with IRQs unmasked — the explicit mask in the epilogue is
+the only thing that closes the race.
 
 ## kallsyms + backtrace
 
@@ -346,14 +535,35 @@ for (;;) { kthread_yield(); wfi; }   -- idle loop
 - The idle thread's `stack_base` is NULL (the stack was allocated by
   `smp_wake_secondary` and lives forever).
 
-### Dispatch queues and idle steal
+### Dispatch queues, push-side balance, and idle steal
 
-Each `struct cpu` has a FIFO `cpu_dispq` guarded by `cpu_disp_lock`.
-`kthread_create` pushes the new thread onto the creating CPU's queue.
-`switch_to_next` pops the local queue first; if empty it calls
-`try_steal`, which scans `cpus[]` and pops one thread from the first
-non-empty remote queue (under that CPU's lock).  If steal also returns
-nothing:
+Each `struct cpu` has a FIFO `cpu_dispq` (head + tail + length)
+guarded by `cpu_disp_lock`.  Both directions of load balancing are
+in play:
+
+**Push-side** (`dispq_push` / `pick_push_target`).  When a thread
+becomes runnable — `kthread_create` for a new thread,
+`kthread_wake_all` / `kthread_signal` for a waker — we don't blindly
+queue on the caller's CPU.  `pick_push_target` reads
+`cpu_idle_mask` first; if any CPU is parked on its idle thread it
+gets the work (and an IPI wakes it within microseconds).
+Otherwise, if the caller's own queue already has ≥2 threads
+waiting, we scan `cpus[]` for a strictly-shorter queue elsewhere
+and push there.  Single-shot wakes onto an empty local queue stay
+local for cache locality.
+
+The remote `cpu_dispq_len` reads are unlocked — a single word, so
+they're atomic on AArch64.  A stale value just means a slightly
+worse pick; the subsequent locked push lands on whatever target
+we chose, which is correct either way.
+
+**Pull-side** (`try_steal`, in `switch_to_next`).  When a CPU has
+nothing in its own queue, it scans `cpus[]` and pops one thread
+from the first non-empty remote queue (under that CPU's lock).
+This is the catch-net for cases push-side missed (e.g. the waker
+guessed wrong, or a thread is now blocking too long on another
+CPU and a sibling went idle in the meantime).  If steal also
+returns nothing:
 
 - `requeue_current=1` (yield): keep running the current thread.
 - `requeue_current=0` (block / exit): switch to `c->cpu_idle` so the
@@ -364,6 +574,9 @@ queue mutations and `cur` swap; IRQs stay masked throughout (the
 lock is acquired with `spin_lock_irq_save` and only the spinlock is
 released before `context_switch` — IRQs are restored from the saved
 `flags` at the end of the function, after `context_switch` returns).
+`dispq_push` acquires the *target* CPU's lock — possibly a remote
+one — but it's a leaf lock (nothing else is held while it's held)
+so cross-CPU deadlock isn't possible.
 
 ### Per-CPU timer
 
@@ -424,7 +637,6 @@ the panic message must get out.
 
 | Gap                             | Notes                                       |
 |---------------------------------|---------------------------------------------|
-| Per-thread CPU affinity         | Pushes onto the waker's CPU and lets idle steal redistribute |
-| Push-side load balancing        | Currently only pull-side (idle steal); a busy CPU's queue gets long-ish before another core grabs from it |
+| Per-thread CPU affinity         | No affinity: push-side balancer picks the least-loaded CPU; idle steal redistributes |
 | Pi 4 GICv2 backend              | The Pi 3 BCM2836 mailbox/timer-routing block is replaced by a real GIC on Pi 4 |
 | Per-CPU `printk_buffered`       | The kprintf lock serialises but a CPU spinning waiting for the lock burns cycles -- per-CPU ring + a flusher would be lock-free |

@@ -451,7 +451,14 @@ struct kc_fkey { const char *num; const char *lbl; };
 static const struct kc_fkey kc_fkeys[10] = {
 	{ "1", "Help"  }, { "2", "Menu"  }, { "3", "View"  }, { "4", "Edit"  },
 	{ "5", "Copy"  }, { "6", "RenMv" }, { "7", "Mkdir" }, { "8", "Delet" },
-	{ "9", "PullDn"}, { "10", "Quit" },
+	/*
+	 * Last cell advertises `q` rather than `10` because terminal
+	 * emulators and QEMU's GTK display routinely steal F10 for
+	 * their own menu shortcut.  F10 still works on terminals that
+	 * pass it through; q / Esc / Ctrl-X are the always-available
+	 * alternatives, and they're all wired up in kc_handle_key.
+	 */
+	{ "9", "PullDn"}, { "q", "Quit"  },
 };
 
 static void kc_render_footer(void)
@@ -997,7 +1004,10 @@ static void kc_op_help(void)
 	cwrite("  F1     this help                F6   move / rename\r\n");
 	cwrite("  F3     view file                F7   make directory\r\n");
 	cwrite("  F5     copy file to other panel F8   delete\r\n");
-	cwrite("  F10/q  quit                     ESC  also quit / cancel\r\n");
+	cwrite("  q / Q / Esc / Ctrl-X / F10      quit\r\n");
+	cwrite("\r\n");
+	cwrite("Note: F10 is often eaten by the terminal or QEMU GTK display;\r\n");
+	cwrite("`q` and `Ctrl-X` are reliable everywhere.\r\n");
 	cwrite("\r\n");
 	cwrite("Number keys 1..0 also fire F1..F10 if your terminal doesn't\r\n");
 	cwrite("send the function-key sequences.\r\n");
@@ -1059,6 +1069,9 @@ static void kc_handle_key(int k)
 		break;
 	case KC_KEY_F10: case '0':
 	case 'q': case 'Q':
+	case 0x18:	/* Ctrl-X -- belt-and-braces exit shortcut for
+			 * environments where F10 is eaten by the
+			 * terminal emulator / QEMU GTK display. */
 	case 0x1B:	/* Esc */
 		kc_quit = 1;
 		break;
@@ -1073,6 +1086,15 @@ static void kc_handle_key(int k)
 static void cmd_kc(int argc, char *argv[])
 {
 	(void)argc; (void)argv;
+
+	/* Inhibit SIGINT while kc owns the screen -- the shell's handler
+	 * would print "^C\r\n" over our panels.  F4 (Edit) drops into vi,
+	 * which installs its own SIG_IGN on top of ours; both restore on
+	 * the way out and we end up back at the shell's original
+	 * disposition. */
+	struct sigaction saved_sigint;
+	editor_suspend_sigint(&saved_sigint);
+
 	kc_init_panels();
 	kc_render_all();
 	while (!kc_quit) {
@@ -1085,6 +1107,8 @@ static void cmd_kc(int argc, char *argv[])
 	kc_clear_screen();
 	kc_show_cursor();
 	kc_flush();
+
+	editor_restore_sigint(&saved_sigint);
 }
 
 /*
