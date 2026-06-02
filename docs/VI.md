@@ -47,6 +47,13 @@ unsaved changes, and `line:col`.
 After typing `:`, your input shows in the status bar.  Hit Enter to
 execute, ESC or Enter on an empty line to cancel.
 
+The byte following ESC is re-dispatched as a fresh keypress -- so
+the very common sequence `ESC :wq` (return to NORMAL, then enter
+COMMAND mode) works as expected.  Older revisions of this editor
+silently swallowed the byte after a lone ESC, which made `ESC :` a
+no-op.  If you hit that, you're on a pre-fall-through build -- two
+ESCs in a row is a workaround.
+
 | Command | What it does                                  |
 |---------|-----------------------------------------------|
 | `w`     | write the buffer to the file (`saved N bytes`) |

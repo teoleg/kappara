@@ -136,7 +136,7 @@ their name in bright-yellow; the function-key footer is black-on-cyan.
 | `Enter`            | Enter directory; on a regular file, view it.  |
 | `F1` or `1`        | Help overlay.                                 |
 | `F3` or `3`        | View file (pager: `q`/Esc to dismiss).        |
-| `F4` or `4`        | Edit -- stub (quit and use `ked`/`vi`).       |
+| `F4` or `4`        | Edit selected file in `vi` (synchronous call; kc re-renders on `:wq`). |
 | `F5` or `5`        | Copy selected file to the other panel's dir.  |
 | `F6` or `6`        | Move / rename (copy + unlink, no rename syscall yet). |
 | `F7` or `7`        | Make directory (prompts for name).            |

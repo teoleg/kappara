@@ -948,13 +948,35 @@ static void kc_op_move(void)
 static void kc_op_edit(void)
 {
 	/*
-	 * We can't fork a separate program; ked/vi live as functions in
-	 * the same image.  Cleanest: tell the user to drop back to the
-	 * shell -- "F10 then ked <path>" -- because reentering vi from
-	 * within kc would share the same global vi state and that's
-	 * a debugging adventure for another day.
+	 * Hand the screen to vi for an interactive edit.  vi is a
+	 * synchronous function call in the same address space; when it
+	 * returns (`:q` / `:wq`) we re-render kc from scratch.  Its
+	 * globals (`struct vi vi`) are disjoint from kc's, so nothing
+	 * gets clobbered on the way in or out.
 	 */
-	kc_flash_msg("kc: F4 not wired (quit with F10 and use 'ked' or 'vi')");
+	struct kc_panel *p = &kc_panels[kc_active];
+	if (p->cur >= p->n) return;
+	struct kc_ent *e = &p->ents[p->cur];
+	if (e->type != 'r') {
+		kc_flash_msg("kc: only regular files can be edited");
+		return;
+	}
+
+	char path[128];
+	kc_make_path(p, e->name, path, sizeof(path));
+
+	/* Drain our buffer before vi starts writing -- otherwise kc's
+	 * pending bytes would appear on top of vi's first frame. */
+	kc_flush();
+
+	char *argv_vi[2] = { (char *)"vi", path };
+	cmd_vi(2, argv_vi);
+
+	/* The file's size (and whether it still exists) may have
+	 * changed; refresh both panels so the listing reflects it. */
+	kc_panel_load(&kc_panels[0]);
+	kc_panel_load(&kc_panels[1]);
+	kc_render_all();
 }
 
 static void kc_op_help(void)
