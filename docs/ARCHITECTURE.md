@@ -351,6 +351,34 @@ delivery-aware is straightforward (set pending, return into
 instruction re-executes on handler return) so it's left for a
 follow-up.
 
+### Trap-exit IRQ masking (a sharp edge worth knowing)
+
+The `KERNEL_EXIT` macro in `arch/aarch64/vectors.S` and the body of
+`aarch64_enter_userspace` in `arch/aarch64/switch.S` both do the
+same ERET-back-to-user dance:
+
+```
+msr daifset, #2        @ mask IRQs across the rest of the epilogue
+msr elr_el1, ...       @ write the user PC
+msr spsr_el1, ...      @ write the user PSTATE
+... restore GPRs ...
+eret
+```
+
+The `msr daifset, #2` at the top is load-bearing.  Without it, an
+IRQ taken between the ELR_EL1 write and the final ERET lets the
+hardware overwrite ELR_EL1 with the resume-here kernel PC.  When
+the nested IRQ's own `KERNEL_EXIT` eret's back, the outer
+epilogue's final ERET reads that stale ELR_EL1 and lands EL0 at a
+kernel address.  The symptom is an `ec=0x20` instruction abort
+with `ELR == FAR == trap_tail+0xc`, killing the user thread with
+SIGSEGV after a stress run of edit-and-save loops.
+
+The SVC handler intentionally runs preemptible (`msr daifclr, #2`
+inside `trap_dispatch`), so the path back into the epilogue
+arrives with IRQs unmasked — the explicit mask in the epilogue is
+the only thing that closes the race.
+
 ## kallsyms + backtrace
 
 A two-pass link.  Pass 1 produces an ELF; `tools/gen_kallsyms.sh`
