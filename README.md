@@ -20,7 +20,7 @@ No soup for you.
 Install cross toolchain + QEMU:
 
 ```
-sudo apt-get install gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi qemu-system-arm
+sudo apt-get install gcc-aarch64-linux-gnu qemu-system-aarch64
 ```
 
 Build and run (headless, gentle on host CPU):
@@ -47,7 +47,6 @@ To quit:
 | `make run-gui`    | Boot with the splash window; needs working QEMU display backend    |
 | `make stop`       | `pkill` any running QEMU process                                   |
 | `make clean`      | Remove `build/`                                                    |
-| `make ARCH=arm`   | ARMv7 target (bit-rotted; refuses with a pointer to what a revival needs) |
 
 ## What's inside
 

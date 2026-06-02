@@ -2,26 +2,21 @@
 
 ## Host requirements
 
-- Cross toolchains and QEMU:
+- Cross toolchain and QEMU:
 
   ```
-  sudo apt-get install \
-      gcc-aarch64-linux-gnu \
-      gcc-arm-linux-gnueabi \
-      qemu-system-arm
+  sudo apt-get install gcc-aarch64-linux-gnu qemu-system-aarch64
   ```
 
   Tested with Debian 12 toolchain (gcc-12).
 
-- `make` (GNU make 4.x).  Builds the AArch64 image by default; ARM
-  is currently link-broken (see TODO).
+- `make` (GNU make 4.x).
 
 ## Build
 
 ```
 make                 # build/aarch64/kernel8.img
 make ARCH=aarch64    # same, explicit
-make ARCH=arm        # bit-rotted; Makefile refuses with a pointer to what's needed
 make TRACE=1         # build with gcc -finstrument-functions for ftrace
 make clean
 ```
@@ -124,14 +119,6 @@ keep going to UART; the in-RAM ring buffer (`/dev/klog`) keeps a copy.
 kappara:/# cat /dev/klog
 ... boot log ...
 ```
-
-## ARM target (broken)
-
-`make ARCH=arm` builds object files but link fails because
-`sys_spawn_impl` and `sys_exit_impl` are AArch64-only (defined in
-`kernel/user.c`, which itself is aarch64-only).  Either stub them out
-for ARM, or move them to a shared file with arch-specific helpers.
-Not a current priority.
 
 ## Adding a new file to the build
 
