@@ -14,7 +14,7 @@ The prompt shows the current working directory: `kappara:/etc#`.
 |----------------------------|-------------------------------------------------------------|
 | `ls [path]`                | List directory entries (names only).                         |
 | `lsl [path]`               | "ls -l": each row is `type size name`.  For chrdevs the size column shows `major,minor`. |
-| `cd [path]`                | Change directory.  `.`, `..`, mixed `..` are all canonicalized.  No arg = `/`. |
+| `cd [path]`                | Change directory.  `.`, `..`, mixed `..` are all canonicalized.  No arg = `/`.  The target is probed with `sys_ls` first -- non-existent paths and regular files are rejected without mutating cwd. |
 | `pwd`                      | Print working directory.                                    |
 | `cat <path>`               | Dump a file's bytes to the console.                         |
 | `echo <path> <text>`       | Overwrite a file with `<text>` (creates if missing).        |

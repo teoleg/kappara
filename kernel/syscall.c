@@ -299,10 +299,7 @@ static long sys_ls(long a0, long a1, long a2, long a3, long a4, long a5)
 	}
 
 	struct dentry *d = vfs_lookup(path);
-	if (!d) {
-		kprintf("sys_ls: ENOENT '%s'\n", path);
-		return -1;
-	}
+	if (!d) return -1;	/* ENOENT — normal control flow, no kprintf */
 	return vfs_listdir(d, out, cap);
 }
 

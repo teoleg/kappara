@@ -449,7 +449,16 @@ static void cmd_cd(int argc, char *argv[])
 	const char *target = (argc > 1) ? argv[1] : "/";
 	char path[128];
 	resolve_path(target, path, sizeof(path));
-	/* Trust the user; subsequent commands will fail if it's bogus. */
+	/* Probe before mutating cwd: sys_ls returns -1 for both a
+	 * non-existent path and a regular file (vfs_listdir rejects
+	 * anything that isn't INODE_DIR), so a single call covers
+	 * "no such directory" without needing a stat syscall. */
+	char probe[1];
+	if (sys_ls(path, probe, sizeof(probe)) < 0) {
+		cwrite("cd: no such directory: ");
+		cwrite(path); cwrite("\r\n");
+		return;
+	}
 	size_t i = 0;
 	while (path[i] && i + 1 < sizeof(cwd)) { cwd[i] = path[i]; i++; }
 	cwd[i] = '\0';
