@@ -58,6 +58,15 @@ struct kthread {
 	 * check_signals will actually deliver.  SIGKILL bypasses
 	 * this mask -- enforced inside check_signals. */
 	uint32_t       sig_mask;
+	/* sigsuspend(2)'s "atomically restore on return" support.
+	 * sigsuspend stashes the pre-call mask here and leaves
+	 * sig_mask = the temporary mask while waiting.  sendsig
+	 * uses sig_saved_mask (instead of sig_mask) when populating
+	 * the sigframe so sigreturn unwinds to the right value;
+	 * check_signals restores it directly if no handler ran.
+	 * sig_mask_save_pending is the flag/guard. */
+	uint32_t       sig_saved_mask;
+	int            sig_mask_save_pending;
 	/* Per-signal dispositions.  Indexed by signal number 1..NSIG-1
 	 * (entry [0] is unused).  We embed the array inline so a
 	 * sigaction() call is a one-field copy under no extra lock.
@@ -201,6 +210,10 @@ struct wait_queue {
 void            kthread_sleep_on (struct wait_queue *wq);
 void            kthread_wake_all (struct wait_queue *wq);
 void            kthread_wake_one (struct wait_queue *wq);
+
+/* Broadcast wait queue woken by every kthread_exit -- sys_wait sleeps
+ * on it and re-checks the target tid on wake. */
+extern struct wait_queue thread_exit_wq;
 
 /* Return the kthread with the given tid, or NULL if no live thread
  * owns that id.  O(1) lookup via a sparse table; sys_kill uses this. */

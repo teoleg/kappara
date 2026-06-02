@@ -387,6 +387,9 @@ static void cmd_help(void)
 		"  kill <tid> [sig]       POSIX signal numbers (default SIGTERM=15)\r\n"
 		"  crash                  spawn a thread that dereferences NULL\r\n"
 		"  sigtest                install a SIGTERM handler and signal self (smoke test)\r\n"
+		"  masktest               sigprocmask + sigsuspend round trip\r\n"
+		"  waittest               spawn a worker and sys_wait for it\r\n"
+		"  segvtest               install SIGSEGV handler in a worker; deref NULL; handler is one-shot\r\n"
 		"  halt                   ask QEMU to exit (semihosting)\r\n"
 		"  ftrace [on|off|reset|dump]  per-CPU function tracer\r\n");
 }
@@ -1508,6 +1511,127 @@ static void cmd_sigtest(int argc, char *argv[])
 	sys_sigaction(SIGTERM, &restore, 0);
 }
 
+/*
+ * mask test -- exercises sigprocmask + sigsuspend.
+ *
+ * Block SIGUSR1 (we don't define USR1; reuse SIGTERM=15), send it to
+ * self.  The signal sits pending because SIGTERM is masked, so the
+ * handler doesn't run yet.  Then sigsuspend() with the empty mask
+ * atomically unblocks SIGTERM, sleeps, and wakes when delivery
+ * happens.  The handler runs, sigsuspend returns -1, the original
+ * mask is restored.
+ */
+static volatile int masktest_marker;
+
+__attribute__((used))
+static void masktest_handler(int sig)
+{
+	(void)sig;
+	cwrite("masktest: handler ran (delivered via sigsuspend)\r\n");
+	masktest_marker = 1;
+}
+
+static void cmd_masktest(int argc, char *argv[])
+{
+	(void)argc; (void)argv;
+
+	struct sigaction sa, old_sa;
+	sa.sa_handler = masktest_handler;
+	sa.sa_mask    = 0;
+	sa.sa_flags   = 0;
+	if (sys_sigaction(SIGTERM, &sa, &old_sa) < 0) {
+		cwrite("masktest: sigaction failed\r\n");
+		return;
+	}
+
+	unsigned int block = 1u << (SIGTERM - 1);
+	unsigned int old_mask = 0;
+	sys_sigprocmask(SIG_BLOCK, &block, &old_mask);
+
+	cwrite("masktest: SIGTERM blocked; sending to self\r\n");
+	masktest_marker = 0;
+	sys_kill((int)sys_getpid(), SIGTERM);
+
+	cwrite("masktest: still here (signal pended); calling sigsuspend\r\n");
+	sys_sigsuspend(old_mask);	/* unblock + wait + restore */
+	cwrite("masktest: sigsuspend returned, marker=");
+	cprint_long(masktest_marker);
+	cwrite("\r\n");
+
+	sys_sigaction(SIGTERM, &old_sa, 0);
+	sys_sigprocmask(SIG_SETMASK, &old_mask, 0);
+}
+
+/*
+ * wait test -- spawn a short-lived worker, sys_wait for it.  Returns
+ * immediately when the worker has already exited; otherwise sleeps
+ * on thread_exit_wq inside the kernel and is woken when it dies.
+ */
+static void waittest_main(long arg)
+{
+	(void)arg;
+	for (int i = 0; i < 20000; i++) sys_yield();
+	sys_exit();
+}
+
+static void cmd_waittest(int argc, char *argv[])
+{
+	(void)argc; (void)argv;
+	long tid = sys_spawn(waittest_main, 0);
+	if (tid < 0) { cwrite("waittest: spawn failed\r\n"); return; }
+	cwrite("waittest: spawned tid="); cprint_long(tid);
+	cwrite(", waiting for exit...\r\n");
+	long r = sys_wait((int)tid);
+	cwrite("waittest: sys_wait returned ");
+	cprint_long(r);
+	cwrite(" (0 = exited cleanly)\r\n");
+}
+
+/*
+ * segvtest -- install a SIGSEGV handler, deliberately dereference NULL,
+ * and prove the handler runs once before the default action takes the
+ * thread down on the next fault.  Has to run in a spawned worker
+ * because a real EL0 fault terminates the thread that took it.
+ */
+__attribute__((used))
+static void segvtest_handler(int sig)
+{
+	(void)sig;
+	/* Spawned workers have an empty fd table -- they inherit the
+	 * user binary's globals (including fd_console) but no open
+	 * files.  sys_log goes straight to kprintf so it works without
+	 * any fd. */
+	sys_log("segvtest: handler caught SIGSEGV; one-shot, exiting");
+	sys_exit();
+}
+
+static void segvtest_main(long arg)
+{
+	(void)arg;
+	struct sigaction sa;
+	sa.sa_handler = segvtest_handler;
+	sa.sa_mask    = 0;
+	sa.sa_flags   = 0;
+	sys_sigaction(SIGSEGV, &sa, 0);
+
+	sys_log("segvtest: about to deref NULL");
+	volatile int *q = (volatile int *)0;
+	*q = 1;	/* SIGSEGV -- handler should run, then we exit */
+
+	sys_log("segvtest: BUG -- continued past fault");
+	sys_exit();
+}
+
+static void cmd_segvtest(int argc, char *argv[])
+{
+	(void)argc; (void)argv;
+	long tid = sys_spawn(segvtest_main, 0);
+	if (tid < 0) { cwrite("segvtest: spawn failed\r\n"); return; }
+	cwrite("segvtest: spawned tid="); cprint_long(tid); cwrite("\r\n");
+	sys_wait((int)tid);
+	cwrite("segvtest: worker exited\r\n");
+}
+
 /* halt -- ask QEMU to exit via ARM semihosting.  Only does anything
  * useful when QEMU was started with -semihosting-config enable=on;
  * make run-thrifty / run-gui pass that flag.  Otherwise the host
@@ -1707,6 +1831,9 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "kill"))   cmd_kill(argc, argv);
 	else if (!ustrcmp(argv[0], "crash"))  cmd_crash(argc, argv);
 	else if (!ustrcmp(argv[0], "sigtest")) cmd_sigtest(argc, argv);
+	else if (!ustrcmp(argv[0], "masktest")) cmd_masktest(argc, argv);
+	else if (!ustrcmp(argv[0], "waittest")) cmd_waittest(argc, argv);
+	else if (!ustrcmp(argv[0], "segvtest")) cmd_segvtest(argc, argv);
 	else if (!ustrcmp(argv[0], "halt"))   cmd_halt(argc, argv);
 	else if (!ustrcmp(argv[0], "ftrace")) cmd_ftrace(argc, argv);
 	else if (!ustrcmp(argv[0], "pipework")) cmd_pipework();

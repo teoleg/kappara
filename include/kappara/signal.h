@@ -74,6 +74,16 @@ struct trap_frame;	/* fwd; defined in trap.h */
 #define SIG_DFL		0UL
 #define SIG_IGN		1UL
 
+/* `how` values for sigprocmask. */
+#define SIG_BLOCK	0
+#define SIG_UNBLOCK	1
+#define SIG_SETMASK	2
+
+/* sa_flags bits.  Only one defined so far; reserved space for the
+ * common POSIX flags (SA_NODEFER, SA_SIGINFO, SA_RESTART) when we
+ * want them. */
+#define SA_RESETHAND	0x04	/* reset to SIG_DFL after first delivery */
+
 /*
  * Kernel-side per-signal disposition.  Same layout as the user-visible
  * `struct sigaction` -- 16 bytes, naturally aligned -- so we can copy
@@ -102,6 +112,24 @@ long sys_sigaction_impl(int sig,
  * a callable wrapper.  Implemented inside trap.c's dispatch path
  * because it needs to mutate tf in place. */
 long sys_sigreturn_impl(struct trap_frame *tf);
+
+/* sys_sigprocmask: change the calling thread's signal-block mask
+ * according to `how` (SIG_BLOCK | SIG_UNBLOCK | SIG_SETMASK).  Both
+ * pointer args may be NULL.  SIGKILL is silently filtered out of any
+ * incoming mask -- it cannot be blocked, BSD/POSIX guarantee. */
+long sys_sigprocmask_impl(int how, const uint32_t *uset, uint32_t *uoldset);
+
+/* sys_sigsuspend: atomically replace the calling thread's mask with
+ * `mask`, sleep until a deliverable signal lands, then restore the
+ * previous mask just before returning -1.  The standard atomic-wait
+ * primitive that race-free signal handling needs. */
+long sys_sigsuspend_impl(uint32_t mask);
+
+/* sys_wait: block until tid has exited (or return immediately if the
+ * tid is already gone).  Returns 0 on a clean observation, -1 if tid
+ * is malformed or the wait was interrupted by a fatal signal.  Lives
+ * in kernel/signal.c next to the other thread-state syscalls. */
+long sys_wait_impl(int tid);
 
 /* Trap-return signal delivery point.  Called from the SVC handler
  * after the syscall's impl returns and before ERET.  Walks the

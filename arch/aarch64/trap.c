@@ -189,18 +189,52 @@ void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 	kernel_backtrace_from(tf->x[29], tf->x[30]);
 
 	/* A synchronous fault FROM EL0 is a user bug, not a kernel
-	 * bug -- the right Unix response is to kill that thread with
-	 * SIGSEGV and keep the kernel running.  vec_id 8 is "Lower
-	 * EL using AArch64, synchronous" per the AArch64 vector
-	 * table; the alternative VEC_SYNC_LO32 (AArch32) isn't
-	 * reachable since we never enter EL0 in AArch32 mode. */
+	 * bug -- the right Unix response is to send SIGSEGV and keep
+	 * the kernel running.  vec_id 8 is "Lower EL using AArch64,
+	 * synchronous" per the AArch64 vector table; the alternative
+	 * VEC_SYNC_LO32 (AArch32) isn't reachable since we never
+	 * enter EL0 in AArch32 mode.
+	 *
+	 * If the thread installed a SIGSEGV handler we deliver it
+	 * via the normal check_signals -> sendsig path, BUT auto-
+	 * reset the disposition to SIG_DFL first.  Otherwise the
+	 * handler returns to the faulting instruction (sigreturn
+	 * restores tf->elr to the original user PC), the fault
+	 * re-fires, and we'd loop here forever.  One-shot semantics
+	 * let the handler save state / log / longjmp out exactly
+	 * once; a second fault kills the thread. */
 	if (vec_id == VEC_SYNC_LO64) {
 		struct kthread *t = curthread;
-		kprintf("   killing tid=%u with SIGSEGV\n",
-			t ? t->tid : 0);
-		if (t) t->sig_pending |= SIGBIT(SIGSEGV);
-		sys_exit_impl();
-		/* unreachable: sys_exit_impl never returns */
+		if (t) {
+			int caught = (t->sig_actions
+				      && t->sig_actions[SIGSEGV].sa_handler
+					 != SIG_DFL
+				      && t->sig_actions[SIGSEGV].sa_handler
+					 != SIG_IGN);
+			if (caught) {
+				/*
+				 * Force one-shot via SA_RESETHAND so the
+				 * handler runs once, sigreturn restores
+				 * the faulting tf, the instruction re-
+				 * faults, and check_signals takes
+				 * SIG_DFL on the second pass.  Without
+				 * this we'd loop in the fault forever.
+				 */
+				t->sig_actions[SIGSEGV].sa_flags |= SA_RESETHAND;
+				kprintf("   delivering catchable SIGSEGV (one-shot) to tid=%u\n",
+					t->tid);
+			} else {
+				kprintf("   killing tid=%u with SIGSEGV\n",
+					t->tid);
+			}
+			t->sig_pending |= SIGBIT(SIGSEGV);
+		}
+		/* check_signals rewrites tf for the handler delivery, or
+		 * (for SIG_DFL) tail-calls sys_exit_impl which never
+		 * returns.  Either way the trap epilogue does the right
+		 * thing on the way back out. */
+		check_signals(tf);
+		return;
 	}
 
 	/* EL1 fault = real kernel bug.  Panic so we get the dump and

@@ -299,6 +299,72 @@ restores `sig_mask` from the sigframe.  SIGKILL is never blockable
 or catchable — enforced in both `sys_sigaction` (rejects the install)
 and `check_signals` (OR-merges SIGKILL bits past the mask).
 
+### sigprocmask / sigsuspend
+
+`sys_sigprocmask(how, set, oldset)` does the obvious thing -- read
+and modify `sig_mask` per SIG_BLOCK / SIG_UNBLOCK / SIG_SETMASK,
+silently dropping SIGKILL out of any incoming mask.
+
+`sys_sigsuspend(mask)` is the atomic "swap mask, wait for a signal,
+restore mask, return -1" primitive POSIX needs for race-free signal
+handling.  The mask-restore is *not* done in the syscall body --
+that bug is what tanked the first masktest implementation, where
+the mask got restored before `check_signals` had a chance to
+deliver and the signal got re-blocked.  Instead, `sigsuspend`
+stashes the pre-call mask in `sig_saved_mask` and sets
+`sig_mask_save_pending`.  Then:
+
+- If a handler is installed, `sendsig` populates the sigframe's
+  `saved_mask` from `sig_saved_mask` (not the current `sig_mask`),
+  clears the pending flag, and `sigreturn` later unwinds to the
+  pre-call mask -- so the user sees `sigsuspend` return -1 with
+  the original mask back in place.
+- If no handler ran (signal was SIG_IGN'd, or the wake was
+  incidental), `check_signals` restores `sig_mask` directly from
+  `sig_saved_mask` at the end of its loop.
+
+### `SA_RESETHAND` (one-shot delivery)
+
+`sa_flags` has one bit defined so far: `SA_RESETHAND = 0x04`.  When
+`sendsig` delivers via a handler whose disposition carries this
+flag, the disposition is reset to `SIG_DFL` immediately after the
+sigframe is built.  A second occurrence of the same signal takes
+the default action.  The EL0 fault path uses this internally to
+deliver SIGSEGV one-shot (see below); user code can also set it on
+its own `sigaction()` if it wants the same semantics.
+
+### EL0 SIGSEGV is catchable
+
+A real EL0 synchronous fault (NULL deref, unmapped access, etc.)
+no longer calls `sys_exit_impl` directly.  `trap_dispatch` checks
+whether the thread installed a SIGSEGV handler and, if so, sets
+`SA_RESETHAND` on the action, marks SIGSEGV pending, and falls
+through into `check_signals(tf)`.  The handler runs exactly once
+-- if it returns into the faulting instruction (sigreturn restores
+the saved `tf->elr`), the re-fault hits a fresh `check_signals`
+which sees `SIG_DFL` and kills the thread cleanly.  Without the
+auto-reset we'd loop in the fault forever.
+
+If no handler is installed, the behaviour is unchanged: `check_signals`
+takes the default action (terminate) on the still-pending SIGSEGV.
+
+### `sys_wait(tid)` and `thread_exit_wq`
+
+Minimal "wait for a thread to exit" primitive.  A global
+`struct wait_queue thread_exit_wq` lives in `kernel/sched.c`.
+`kthread_exit` sets `me->state = KT_DEAD` under `to_reap_lock` and
+then calls `kthread_wake_all(&thread_exit_wq)` -- in that order, so
+a waiter racing `kthread_find` after the wake observes
+`state == KT_DEAD` (which `kthread_find` filters to `NULL`) and
+returns 0 instead of sleeping again with nobody left to wake it.
+`sys_wait_impl` loops: `kthread_find` → if gone, return 0; if a
+fatal signal landed, return -1 (EINTR shape); otherwise
+`kthread_sleep_on(&thread_exit_wq)`.
+
+This isn't a real `waitpid` -- no parent-child tracking, no exit
+status, no `WNOHANG` flag.  It's a `pthread_join`-shaped building
+block to be used by the eventual proper `waitpid`.
+
 ### Ctrl-C → SIGINT
 
 A minimal TTY line-discipline lives inside `uart_rx_main`

@@ -122,6 +122,12 @@ static unsigned next_tid = 1;
 static struct kthread *to_reap;
 static spinlock_t      to_reap_lock = SPINLOCK_INIT;
 
+/* Global wait queue for sys_wait().  Every kthread_exit wakes
+ * everyone on it; each waiter re-checks whether ITS target tid is
+ * now gone.  A single broadcast is fine -- the cost is one yield
+ * per waiter per peer-exit, and waitpid storms aren't a hot path. */
+struct wait_queue thread_exit_wq;
+
 /*
  * Bitmask of CPUs currently running their idle thread.  Wakers use
  * ipi_wake_idle() to nudge idle CPUs to come look for work without
@@ -671,13 +677,19 @@ void kthread_exit(void)
 	vfs_drain_fds(me);
 	kprintf("kthread: tid=%u (%s) exited\n", me->tid, me->name);
 
-	/* Park ourselves on the to-reap list -- some other thread will
-	 * free our stack + kthread once we've context-switched away. */
+	/* Set state FIRST, then wake.  A waiter racing kthread_find
+	 * after the wake must see state=KT_DEAD or it'll sleep again
+	 * and nothing will wake it a second time. */
 	unsigned long flags = spin_lock_irq_save(&to_reap_lock);
 	me->state = KT_DEAD;
 	me->next  = to_reap;
 	to_reap   = me;
 	spin_unlock_irq_restore(&to_reap_lock, flags);
+
+	/* Now wake sys_wait()'ers.  kthread_find returns NULL on KT_DEAD,
+	 * so the waiter will observe "tid is gone" and return 0. */
+	kthread_wake_all(&thread_exit_wq);
+
 	switch_to_next(0);
 	/* unreachable: switch_to_next with requeue=0 never returns
 	 * once cur is no longer in the ready queue and never woken. */
