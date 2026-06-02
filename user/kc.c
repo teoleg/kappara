@@ -16,12 +16,14 @@
  *   Row 23           Info bar: selected entry's full path + size.
  *   Row 24           Function-key footer (F1..F10).
  *
- * Colors -- user wants background green
- * -------------------------------------
- *   Panel cells      bright white on green       (normal)
- *   Selected cell    black on yellow             (NC orange-on-blue)
- *   Header bar       black on cyan               (NC convention)
- *   Footer keys      black on cyan, number bold
+ * Colors -- classic Norton Commander palette
+ * ------------------------------------------
+ *   Panel cells      light grey on blue          (normal)
+ *   Directories      bold bright-white on blue
+ *   Selected cell    black on cyan               (NC inverse)
+ *   Header bar       black on cyan
+ *   Active header    bold black on white         (which panel has focus)
+ *   Footer keys      black on cyan, number white on black
  *   Status bar       black on cyan
  *
  * Function keys
@@ -165,10 +167,10 @@ static void kc_buf_wc(char c)
  * the 16-color base palette.
  */
 static void kc_attr_reset(void)    { cwrite("\033[0m"); }
-static void kc_attr_normal(void)   { cwrite("\033[0;97;42m"); }   /* bright white on green */
-static void kc_attr_select(void)   { cwrite("\033[0;30;43m"); }   /* black on yellow */
-static void kc_attr_dir(void)      { cwrite("\033[1;93;42m"); }   /* bright yellow on green */
-static void kc_attr_dir_sel(void)  { cwrite("\033[1;30;43m"); }   /* bold black on yellow */
+static void kc_attr_normal(void)   { cwrite("\033[0;37;44m"); }   /* light grey on blue (classic NC) */
+static void kc_attr_select(void)   { cwrite("\033[0;30;46m"); }   /* black on cyan -- selected entry */
+static void kc_attr_dir(void)      { cwrite("\033[1;97;44m"); }   /* bold bright-white on blue -- dirs */
+static void kc_attr_dir_sel(void)  { cwrite("\033[1;30;46m"); }   /* bold black on cyan -- selected dir */
 static void kc_attr_header(void)   { cwrite("\033[0;30;46m"); }   /* black on cyan */
 static void kc_attr_header_act(void){ cwrite("\033[1;30;47m"); }  /* bold black on white -- active panel */
 static void kc_attr_footer(void)   { cwrite("\033[0;30;46m"); }
@@ -473,7 +475,7 @@ static void kc_render_footer(void)
 static void kc_render_all(void)
 {
 	kc_hide_cursor();
-	/* Paint a full green background first so any uncovered cells inherit. */
+	/* Paint a full blue background first so any uncovered cells inherit. */
 	kc_attr_normal();
 	kc_clear_screen();
 	for (int r = 1; r <= KC_H; r++) {
@@ -948,13 +950,35 @@ static void kc_op_move(void)
 static void kc_op_edit(void)
 {
 	/*
-	 * We can't fork a separate program; ked/vi live as functions in
-	 * the same image.  Cleanest: tell the user to drop back to the
-	 * shell -- "F10 then ked <path>" -- because reentering vi from
-	 * within kc would share the same global vi state and that's
-	 * a debugging adventure for another day.
+	 * Hand the screen to vi for an interactive edit.  vi is a
+	 * synchronous function call in the same address space; when it
+	 * returns (`:q` / `:wq`) we re-render kc from scratch.  Its
+	 * globals (`struct vi vi`) are disjoint from kc's, so nothing
+	 * gets clobbered on the way in or out.
 	 */
-	kc_flash_msg("kc: F4 not wired (quit with F10 and use 'ked' or 'vi')");
+	struct kc_panel *p = &kc_panels[kc_active];
+	if (p->cur >= p->n) return;
+	struct kc_ent *e = &p->ents[p->cur];
+	if (e->type != 'r') {
+		kc_flash_msg("kc: only regular files can be edited");
+		return;
+	}
+
+	char path[128];
+	kc_make_path(p, e->name, path, sizeof(path));
+
+	/* Drain our buffer before vi starts writing -- otherwise kc's
+	 * pending bytes would appear on top of vi's first frame. */
+	kc_flush();
+
+	char *argv_vi[2] = { (char *)"vi", path };
+	cmd_vi(2, argv_vi);
+
+	/* The file's size (and whether it still exists) may have
+	 * changed; refresh both panels so the listing reflects it. */
+	kc_panel_load(&kc_panels[0]);
+	kc_panel_load(&kc_panels[1]);
+	kc_render_all();
 }
 
 static void kc_op_help(void)

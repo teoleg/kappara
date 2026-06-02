@@ -1239,10 +1239,19 @@ static void cmd_vi(int argc, char *argv[])
 		if (in_esc) {
 			in_esc = 0;
 			if (c == '[') { in_csi = 1; continue; }
-			/* lone ESC: return to NORMAL */
+			/*
+			 * Lone ESC: the prior byte was the user asking to
+			 * return to NORMAL.  Switch mode -- then FALL THROUGH
+			 * so c is dispatched as a fresh keypress.  Without
+			 * the fall-through (older code did `continue;` here)
+			 * the byte after ESC was silently swallowed -- so
+			 * ESC':' looked like a no-op instead of entering
+			 * COMMAND mode.
+			 */
 			vi.mode = VI_NORMAL;
+			vi.cmdlen = 0;
 			prev_g = 0;
-			continue;
+			/* fall through to the dispatch below */
 		}
 		if (c == 0x1B) {	/* ESC */
 			if (vi.mode == VI_COMMAND) {
