@@ -25,8 +25,8 @@ make clean
 
 Passing `TRACE=1` turns on gcc's `-finstrument-functions` for the
 whole kernel except a handful of TUs that sit on the tracer's own
-path (`kernel/ftrace.c`, `kernel/printk.c`, `arch/aarch64/uart.c`,
-`kernel/string.c`, `kernel/kallsyms.c`).  Each instrumented function
+path (`uts/os/ftrace.c`, `uts/os/printk.c`, `uts/aarch64/uart.c`,
+`uts/os/string.c`, `uts/os/kallsyms.c`).  Each instrumented function
 entry and exit becomes an event in a per-CPU ring buffer; `cat
 /proc/ftrace` formats the buffer with symbol names + offsets.
 
