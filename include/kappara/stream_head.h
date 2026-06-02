@@ -67,6 +67,13 @@ struct stdata {
 	struct stdata	*sd_peer;	/* pipe peer; non-NULL only for
 					 * the two ends of a sys_pipe.    */
 	struct wait_queue sd_readwait;	/* readers blocked on empty sd_rq */
+	unsigned	 sd_last_reader;/* tid of most recent reader, used by
+					 * the console TTY line-discipline so
+					 * Ctrl-C still finds a target when no
+					 * thread is blocked at the exact
+					 * moment 0x03 arrives -- the typical
+					 * race when a fast reader is draining
+					 * single bytes one syscall at a time */
 	struct stdata	*sd_all_next;	/* global list link -- every live
 					 * stdata is on it so /proc/streams
 					 * can walk all open instances    */

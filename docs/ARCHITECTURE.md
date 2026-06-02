@@ -299,6 +299,46 @@ restores `sig_mask` from the sigframe.  SIGKILL is never blockable
 or catchable — enforced in both `sys_sigaction` (rejects the install)
 and `check_signals` (OR-merges SIGKILL bits past the mask).
 
+### Ctrl-C → SIGINT
+
+A minimal TTY line-discipline lives inside `uart_rx_main`
+(`kernel/stream_head.c`).  When the PL011 RX FIFO produces a 0x03
+byte, the kernel doesn't push it upstream as data — it sends SIGINT
+to the foreground reader of `/dev/console` instead.
+
+Target selection has a two-tier fallback to ride out the typical
+race where the shell is mid-loop processing the previous byte:
+
+1.  The first thread on `sd->sd_readwait` if there is one (the
+    blocked reader is unambiguously "foreground").
+2.  Otherwise `sd->sd_last_reader` — the tid recorded by
+    `stream_read` on entry, so the most recent reader is still
+    findable even when the wait queue is momentarily empty.
+
+`kthread_signal` does the work: it sets the pending bit and, if the
+target is `KT_BLOCKED`, surgically extracts it from the wait queue
+and marks it READY.  The blocked `stream_read` returns -1 (EINTR
+shape) and `check_signals` on the syscall return delivers SIGINT to
+the user handler if one is installed, or takes the default action
+(terminate) otherwise.
+
+`user/init.c` installs a SIGINT handler in `_start` that prints
+`^C\r\n` and sets `sigint_pending`; `read_line` checks that flag at
+the top of every loop iteration, clears its buffer, and re-prompts
+— so the shell feels like bash on a partial input.
+
+Current limitations (worth flagging):
+
+- Only one foreground reader concept per stream; no SVR4 sessions or
+  process groups yet.  Job control (`Ctrl-Z`, `bg`/`fg`) is not on
+  the roadmap until pgrps land.
+- vi / ked / kc share the SIGINT handler with the shell (they live
+  in the same address space and same kthread).  Ctrl-C while editing
+  will print "^C" over the editor's display.  Workaround: don't
+  press Ctrl-C inside an editor; use the editor's own quit command.
+  Proper fix is to save/restore SIGINT disposition around each
+  editor invocation -- a small follow-up.
+
 ### EL0 faults
 
 EL0 synchronous faults (page faults from user code) route through

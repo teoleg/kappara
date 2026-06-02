@@ -237,6 +237,22 @@ static void replace_line(char *buf, size_t *i_inout, const char *new_line)
  *   in_csi and 'B'    -> down arrow -> next entry / blank
  * All other bytes go through the normal echo+buffer path.
  */
+/*
+ * Set by the SIGINT handler (installed in _start) when the user hits
+ * Ctrl-C.  read_line checks it on every loop iteration, clears the
+ * partial input, and re-prompts -- so the shell feels like bash:
+ * type "ec" Ctrl-C, line gone, fresh prompt.
+ */
+static volatile int sigint_pending;
+
+__attribute__((used))
+static void sigint_handler(int sig)
+{
+	(void)sig;
+	cwrite("^C\r\n");
+	sigint_pending = 1;
+}
+
 static void read_line(char *buf, size_t cap)
 {
 	size_t i = 0;
@@ -245,6 +261,12 @@ static void read_line(char *buf, size_t cap)
 	int in_csi = 0;
 
 	for (;;) {
+		if (sigint_pending) {
+			sigint_pending = 0;
+			i = 0;
+			hist_pos = -1;
+			prompt();
+		}
 		int c = read_one();
 		if (c < 0) { sys_yield(); continue; }
 
@@ -1696,6 +1718,21 @@ void _start(void)
 	if (fd_console < 0) {
 		sys_log("init: open /dev/console failed");
 		for (;;) sys_yield();
+	}
+
+	/*
+	 * Catch Ctrl-C.  The console driver intercepts byte 0x03,
+	 * SIGINTs whichever thread is currently parked on its read
+	 * wait queue (that's us, blocked in sys_read).  Without a
+	 * handler installed here, SIGINT's default action is to
+	 * terminate -- which would kill the shell on the first ^C.
+	 */
+	{
+		struct sigaction sa;
+		sa.sa_handler = sigint_handler;
+		sa.sa_mask    = 0;
+		sa.sa_flags   = 0;
+		sys_sigaction(SIGINT, &sa, 0);
 	}
 
 	cwrite("\r\nkappara shell (userspace) -- type 'help' for commands\r\n");

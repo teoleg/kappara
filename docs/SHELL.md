@@ -166,6 +166,22 @@ something exotic.
   fork/exec yet.  When it returns, control goes back to the shell's
   dispatch loop.
 
+## Ctrl-C handling
+
+The shell installs a SIGINT handler at startup.  Pressing Ctrl-C
+(byte 0x03) gets intercepted in `uart_rx_main` before the byte
+reaches the stream -- the kernel SIGINTs whichever thread is the
+foreground reader of `/dev/console` (the one blocked on the read
+wait queue, or the last reader if nobody is blocked right now).
+The shell's handler prints `^C\r\n` and sets a flag; `read_line`
+checks the flag on the next iteration, clears its partial input,
+and re-prompts.
+
+Caveats: vi / ked / kc share the SIGINT handler since they live in
+the same address space.  Don't press Ctrl-C inside an editor; use
+its own quit command.  See `docs/ARCHITECTURE.md` for the wider
+signal model.
+
 ## How input is implemented
 
 - Every keystroke arrives in the PL011 RX FIFO.
