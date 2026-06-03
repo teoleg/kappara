@@ -339,6 +339,7 @@ void kmain(void)
 	streams_head_init();
 	proc_init();
 	user_init();
+	exec_space_init();
 
 	/* Boot a ramdisk-backed kfs and mount it at /etc.
 	 * The mkimage call writes the canned files into the ramdisk

@@ -3,52 +3,54 @@ BUILD   := build/$(ARCH)
 
 ifeq ($(ARCH),aarch64)
     CROSS         ?= aarch64-linux-gnu-
-    ARCH_CFLAGS   := -mcpu=cortex-a53 -mgeneral-regs-only -Iarch/aarch64
-    LINKER_LD     := arch/aarch64/linker.ld
+    ARCH_CFLAGS   := -mcpu=cortex-a53 -mgeneral-regs-only -Iuts/aarch64
+    LINKER_LD     := uts/aarch64/linker.ld
     ARCH_OBJS     := \
-        $(BUILD)/arch/aarch64/boot.o \
-        $(BUILD)/arch/aarch64/uart.o \
-        $(BUILD)/arch/aarch64/vectors.o \
-        $(BUILD)/arch/aarch64/trap.o \
-        $(BUILD)/arch/aarch64/mmu.o \
-        $(BUILD)/arch/aarch64/timer.o \
-        $(BUILD)/arch/aarch64/ipi.o \
-        $(BUILD)/arch/aarch64/switch.o \
-        $(BUILD)/arch/aarch64/thread.o \
-        $(BUILD)/arch/aarch64/mailbox.o \
-        $(BUILD)/arch/aarch64/framebuffer.o \
-        $(BUILD)/arch/aarch64/font8x8.o \
-        $(BUILD)/arch/aarch64/fbcon.o \
-        $(BUILD)/arch/aarch64/userblob.o
+        $(BUILD)/uts/aarch64/boot.o \
+        $(BUILD)/uts/aarch64/uart.o \
+        $(BUILD)/uts/aarch64/vectors.o \
+        $(BUILD)/uts/aarch64/trap.o \
+        $(BUILD)/uts/aarch64/mmu.o \
+        $(BUILD)/uts/aarch64/timer.o \
+        $(BUILD)/uts/aarch64/ipi.o \
+        $(BUILD)/uts/aarch64/switch.o \
+        $(BUILD)/uts/aarch64/thread.o \
+        $(BUILD)/uts/aarch64/mailbox.o \
+        $(BUILD)/uts/aarch64/framebuffer.o \
+        $(BUILD)/uts/aarch64/font8x8.o \
+        $(BUILD)/uts/aarch64/fbcon.o \
+        $(BUILD)/uts/aarch64/userblob.o \
+        $(BUILD)/uts/aarch64/helloblob.o \
+        $(BUILD)/uts/aarch64/usrblobs.o
     # User-side init binary, linked at VA 0x10000000 and incbin'd
     # into userblob.S so the kernel ELF carries the raw bytes.
     USER_BUILD    := build/user
     USER_BIN      := $(USER_BUILD)/init.bin
     USERBLOB_EXTRA_DEP := $(USER_BIN)
     KERNEL_OBJS   := \
-        $(BUILD)/kernel/printk.o \
-        $(BUILD)/kernel/pmm.o \
-        $(BUILD)/kernel/string.o \
-        $(BUILD)/kernel/kmem.o \
-        $(BUILD)/kernel/sched.o \
-        $(BUILD)/kernel/streams.o \
-        $(BUILD)/kernel/klog.o \
-        $(BUILD)/kernel/vfs.o \
-        $(BUILD)/kernel/cdevsw.o \
-        $(BUILD)/kernel/stream_head.o \
-        $(BUILD)/kernel/syscall.o \
-        $(BUILD)/kernel/signal.o \
-        $(BUILD)/kernel/proc.o \
-        $(BUILD)/kernel/uaccess.o \
-        $(BUILD)/kernel/ramdisk.o \
-        $(BUILD)/kernel/kfs.o \
-        $(BUILD)/kernel/kallsyms.o \
-        $(BUILD)/kernel/ftrace.o \
-        $(BUILD)/kernel/user.o \
-        $(BUILD)/kernel/main.o
-    KSYM_STUB_OBJ := $(BUILD)/arch/aarch64/kallsyms_stub.o
-    KSYM_OBJ      := $(BUILD)/arch/aarch64/kallsyms.o
-    KSYM_SRC      := $(BUILD)/arch/aarch64/kallsyms.S
+        $(BUILD)/uts/os/printk.o \
+        $(BUILD)/uts/os/pmm.o \
+        $(BUILD)/uts/os/string.o \
+        $(BUILD)/uts/os/kmem.o \
+        $(BUILD)/uts/os/sched.o \
+        $(BUILD)/uts/os/streams.o \
+        $(BUILD)/uts/os/klog.o \
+        $(BUILD)/uts/os/vfs.o \
+        $(BUILD)/uts/os/cdevsw.o \
+        $(BUILD)/uts/os/stream_head.o \
+        $(BUILD)/uts/os/syscall.o \
+        $(BUILD)/uts/os/signal.o \
+        $(BUILD)/uts/os/proc.o \
+        $(BUILD)/uts/os/uaccess.o \
+        $(BUILD)/uts/os/ramdisk.o \
+        $(BUILD)/uts/os/kfs.o \
+        $(BUILD)/uts/os/kallsyms.o \
+        $(BUILD)/uts/os/ftrace.o \
+        $(BUILD)/uts/os/user.o \
+        $(BUILD)/uts/os/main.o
+    KSYM_STUB_OBJ := $(BUILD)/uts/aarch64/kallsyms_stub.o
+    KSYM_OBJ      := $(BUILD)/uts/aarch64/kallsyms.o
+    KSYM_SRC      := $(BUILD)/uts/aarch64/kallsyms.S
     ELF           := $(BUILD)/kernel8.elf
     KERNEL        := $(BUILD)/kernel8.img
     QEMU          := qemu-system-aarch64
@@ -70,7 +72,7 @@ CFLAGS  := -Wall -Wextra -Werror -std=gnu11 \
            -O2 -g
 
 # Function tracing: `make TRACE=1` turns on gcc's -finstrument-functions
-# so every C function entry/exit calls into kernel/ftrace.c.  A handful
+# so every C function entry/exit calls into uts/os/ftrace.c.  A handful
 # of TUs MUST opt out -- otherwise the hook recurses through them while
 # recording or while dumping the trace itself.  The opt-out list is the
 # trace plumbing + everything it uses transitively:
@@ -87,11 +89,11 @@ endif
 
 # Files that must NEVER be instrumented (whether TRACE is on or off):
 NOINST_OBJS := \
-    $(BUILD)/kernel/ftrace.o \
-    $(BUILD)/kernel/printk.o \
-    $(BUILD)/kernel/string.o \
-    $(BUILD)/kernel/kallsyms.o
-NOINST_OBJS += $(BUILD)/arch/aarch64/uart.o
+    $(BUILD)/uts/os/ftrace.o \
+    $(BUILD)/uts/os/printk.o \
+    $(BUILD)/uts/os/string.o \
+    $(BUILD)/uts/os/kallsyms.o
+NOINST_OBJS += $(BUILD)/uts/aarch64/uart.o
 
 $(NOINST_OBJS): CFLAGS += -fno-instrument-functions
 
@@ -193,7 +195,7 @@ stop:
 # --- User-side init binary (AArch64 only) ----------------------------
 # Compile user/init.c with the same cross toolchain as the kernel,
 # link with user/linker.ld at VA 0x10000000, objcopy to a raw .bin,
-# then arch/aarch64/userblob.S incbin's the result into the kernel.
+# then uts/aarch64/userblob.S incbin's the result into the kernel.
 
 ifeq ($(ARCH),aarch64)
 
@@ -214,11 +216,45 @@ $(USER_BUILD)/init.elf: $(USER_BUILD)/init.o user/linker.ld
 $(USER_BIN): $(USER_BUILD)/init.elf
 	$(OBJCOPY) -O binary $< $@
 
+# ---- Standalone ELF user programs (loaded via sys_execve) ---------------
+# hello: minimal "Hello from exec'd ELF" smoke test.
+# Linked at 0x20000000 (EXEC_VA) via prog_linker.ld, kept as a full ELF
+# (not stripped to binary) so the kernel ELF loader can parse program
+# headers and map PT_LOAD segments.  Stripped to remove debug sections
+# so the 64 KB elf_read_buf in sys_execve_impl is more than sufficient.
+
+HELLO_ELF := $(USER_BUILD)/hello.elf
+
+$(USER_BUILD)/hello.o: user/hello.c user/syscall.h | $(USER_BUILD)
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+$(HELLO_ELF): $(USER_BUILD)/hello.o user/prog_linker.ld
+	$(USER_LD) -nostdlib -static -s -z max-page-size=4096 -T user/prog_linker.ld -o $@ $<
+
 $(USER_BUILD):
 	mkdir -p $@
 
-# Tell make that userblob.o depends on the binary it incbin's.
-$(BUILD)/arch/aarch64/userblob.o: $(USER_BIN)
+# ---- /usr/bin standalone ELF programs --------------------------------
+CMD_BUILD  := build/cmd
+CMD_NAMES  := ps sigtest masktest waittest segvtest crash pipe pipework
+CMD_ELFS   := $(addprefix $(CMD_BUILD)/, $(addsuffix .elf, $(CMD_NAMES)))
+
+$(CMD_BUILD)/%.o: cmd/%.c cmd/ulib.h user/syscall.h | $(CMD_BUILD)
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+$(CMD_BUILD)/%.elf: $(CMD_BUILD)/%.o user/prog_linker.ld
+	$(USER_LD) -nostdlib -static -s -z max-page-size=4096 \
+	           -T user/prog_linker.ld -o $@ $<
+
+$(CMD_BUILD):
+	mkdir -p $@
+
+$(BUILD)/uts/aarch64/usrblobs.o: $(CMD_ELFS) uts/aarch64/usrblobs.S
+	$(CC) $(ASFLAGS) -c uts/aarch64/usrblobs.S -o $@
+
+# Tell make that userblob.o / helloblob.o depend on the files they incbin.
+$(BUILD)/uts/aarch64/userblob.o:  $(USER_BIN)
+$(BUILD)/uts/aarch64/helloblob.o: $(HELLO_ELF)
 
 endif
 

@@ -175,7 +175,7 @@ fine for a diagnostic.
 Three steps:
 
 1. **Claim a major** in `include/kappara/cdevsw.h` (`CDEV_MAJ_PROC_*`).
-2. **Write the snapshot generator** in `kernel/proc.c`.  Pattern:
+2. **Write the snapshot generator** in `uts/os/proc.c`.  Pattern:
    ```c
    static struct procbuf foo_pb;
 

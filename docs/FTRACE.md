@@ -31,7 +31,7 @@ void some_function(args) {
 }
 ```
 
-`kernel/ftrace.c` implements those two hooks. Each call writes one
+`uts/os/ftrace.c` implements those two hooks. Each call writes one
 event into a per-CPU ring buffer:
 
 ```c
@@ -81,11 +81,11 @@ would multiply event volume for no diagnostic value:
 
 | File                | Why                                        |
 |---------------------|--------------------------------------------|
-| `kernel/ftrace.c`   | the tracer itself (would recurse on its own hooks) |
-| `kernel/printk.c`   | the dump's `kprintf` path |
-| `arch/aarch64/uart.c` | `uart_putc` called from `printk` |
-| `kernel/string.c`   | `kmemset`/`kmemcpy` called from every code path |
-| `kernel/kallsyms.c` | the dump's `ksym_lookup` resolves names |
+| `uts/os/ftrace.c`   | the tracer itself (would recurse on its own hooks) |
+| `uts/os/printk.c`   | the dump's `kprintf` path |
+| `uts/aarch64/uart.c` | `uart_putc` called from `printk` |
+| `uts/os/string.c`   | `kmemset`/`kmemcpy` called from every code path |
+| `uts/os/kallsyms.c` | the dump's `ksym_lookup` resolves names |
 
 `.S` files are never instrumented (the flag is a C-only pass).
 
@@ -157,7 +157,7 @@ ftrace: enabled  ring_per_cpu=256
 
 - **256 events per CPU is small.** Suited to "what just happened?"
   not "what was happening five seconds ago?". Bump `FT_RING_SZ` in
-  `kernel/ftrace.c` if you need more (BSS cost: `4 * FT_RING_SZ * 32`
+  `uts/os/ftrace.c` if you need more (BSS cost: `4 * FT_RING_SZ * 32`
   bytes).
 - **Per-CPU only.** Cross-CPU correlation requires reading several
   rings and sorting by `ts` (CNTPCT_EL0 is system-wide on the Pi 3,

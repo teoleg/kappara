@@ -74,7 +74,7 @@
   `vec_id == VEC_SYNC_LO64` and calls `sys_exit_impl` after marking
   SIGSEGV.  EL1 faults still panic — those are kernel bugs.
 - **The trap-exit epilogue must run with IRQs masked**
-  (`arch/aarch64/vectors.S`, `KERNEL_EXIT` macro; same shape in
+  (`uts/aarch64/vectors.S`, `KERNEL_EXIT` macro; same shape in
   `aarch64_enter_userspace`).  The sequence is `msr elr_el1, …` /
   `msr spsr_el1, …` / … / `eret`.  If an IRQ fires between the
   ELR write and the ERET, AArch64 hardware silently overwrites

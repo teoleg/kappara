@@ -381,17 +381,14 @@ static void cmd_help(void)
 		"  rm <path>              remove file\r\n"
 		"  rmdir <path>           remove empty directory\r\n"
 		"  append <path> <text>   append text + newline to file\r\n"
-		"  pipe                   sys_pipe demo (write + read)\r\n"
 		"  spawn [arg]            sys_spawn a worker thread\r\n"
-		"  pipework               sys_pipe + two spawned workers\r\n"
 		"  kill <tid> [sig]       POSIX signal numbers (default SIGTERM=15)\r\n"
-		"  crash                  spawn a thread that dereferences NULL\r\n"
-		"  sigtest                install a SIGTERM handler and signal self (smoke test)\r\n"
-		"  masktest               sigprocmask + sigsuspend round trip\r\n"
-		"  waittest               spawn a worker and sys_wait for it\r\n"
-		"  segvtest               install SIGSEGV handler in a worker; deref NULL; handler is one-shot\r\n"
+		"  exec <path>            load & run an ELF from /bin (or any path)\r\n"
 		"  halt                   ask QEMU to exit (semihosting)\r\n"
-		"  ftrace [on|off|reset|dump]  per-CPU function tracer\r\n");
+		"  ftrace [on|off|reset|dump]  per-CPU function tracer\r\n"
+		"  <name>                 unknown commands look up /usr/bin/<name>\r\n"
+		"                         (ps, sigtest, masktest, waittest, segvtest,\r\n"
+		"                          crash, pipe, pipework)\r\n");
 }
 
 static void cmd_pid(void)
@@ -1433,214 +1430,6 @@ static void cmd_spawn(int argc, char *argv[])
 	cwrite("\r\n");
 }
 
-/* Spawnable bad-thread: dereferences NULL on purpose.  Used to
- * exercise the trap-from-EL0 -> SIGSEGV path without taking the
- * shell down with it. */
-__attribute__((used))
-static void crash_main(long arg)
-{
-	(void)arg;
-	sys_log("crash: about to deref NULL");
-	volatile int *p = (volatile int *)0;
-	*p = 1;	/* should trap; kernel kills us with SIGSEGV */
-	sys_log("crash: still alive (BUG -- kernel let us through)");
-	sys_exit();
-}
-
-static void cmd_crash(int argc, char *argv[])
-{
-	(void)argc; (void)argv;
-	long tid = sys_spawn(crash_main, 0);
-	cwrite("crash: spawned tid="); cprint_long(tid); cwrite("\r\n");
-}
-
-/*
- * sigtest -- prove sigaction / sendsig / sigreturn end-to-end.
- *
- * Install a SIGTERM handler that bumps a global marker, then send
- * SIGTERM to ourselves.  check_signals on the way out of sys_kill
- * rewrites our trap frame so the next instruction the CPU executes
- * is the handler -- not the line after the kill().  When the handler
- * returns, the kernel-emitted trampoline (sitting in the sigframe on
- * our stack) issues SYS_sigreturn, the kernel unwinds the saved tf,
- * and execution resumes here.  If we get past the kill() with the
- * marker bumped, the whole chain worked.
- */
-static volatile int sigtest_marker;
-
-__attribute__((used))
-static void sigtest_handler(int sig)
-{
-	cwrite("sigtest: handler running, sig=");
-	cprint_long(sig);
-	cwrite("\r\n");
-	sigtest_marker = 0xC0DE;
-}
-
-static void cmd_sigtest(int argc, char *argv[])
-{
-	(void)argc; (void)argv;
-
-	struct sigaction sa, old;
-	sa.sa_handler = sigtest_handler;
-	sa.sa_mask    = 0;
-	sa.sa_flags   = 0;
-
-	if (sys_sigaction(SIGTERM, &sa, &old) < 0) {
-		cwrite("sigtest: sigaction(SIGTERM) failed\r\n");
-		return;
-	}
-
-	cwrite("sigtest: handler installed; sending SIGTERM to self\r\n");
-	sigtest_marker = 0;
-	long pid = sys_getpid();
-	sys_kill((int)pid, SIGTERM);
-
-	/* Execution resumes here AFTER the handler ran (signal was
-	 * delivered on the way out of sys_kill itself). */
-	cwrite("sigtest: back in cmd_sigtest, marker=0x");
-	{
-		char buf[16];
-		int v = sigtest_marker;
-		int n = 0;
-		char tmp[16];
-		if (v == 0) tmp[n++] = '0';
-		while (v) { tmp[n++] = "0123456789abcdef"[v & 0xF]; v >>= 4; }
-		for (int i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
-		cwriten(buf, (size_t)n);
-	}
-	cwrite("\r\n");
-
-	/* Restore the default disposition.  Future SIGTERMs to this
-	 * shell will kill it the BSD way. */
-	struct sigaction restore;
-	restore.sa_handler = (void (*)(int))0;	/* SIG_DFL */
-	restore.sa_mask    = 0;
-	restore.sa_flags   = 0;
-	sys_sigaction(SIGTERM, &restore, 0);
-}
-
-/*
- * mask test -- exercises sigprocmask + sigsuspend.
- *
- * Block SIGUSR1 (we don't define USR1; reuse SIGTERM=15), send it to
- * self.  The signal sits pending because SIGTERM is masked, so the
- * handler doesn't run yet.  Then sigsuspend() with the empty mask
- * atomically unblocks SIGTERM, sleeps, and wakes when delivery
- * happens.  The handler runs, sigsuspend returns -1, the original
- * mask is restored.
- */
-static volatile int masktest_marker;
-
-__attribute__((used))
-static void masktest_handler(int sig)
-{
-	(void)sig;
-	cwrite("masktest: handler ran (delivered via sigsuspend)\r\n");
-	masktest_marker = 1;
-}
-
-static void cmd_masktest(int argc, char *argv[])
-{
-	(void)argc; (void)argv;
-
-	struct sigaction sa, old_sa;
-	sa.sa_handler = masktest_handler;
-	sa.sa_mask    = 0;
-	sa.sa_flags   = 0;
-	if (sys_sigaction(SIGTERM, &sa, &old_sa) < 0) {
-		cwrite("masktest: sigaction failed\r\n");
-		return;
-	}
-
-	unsigned int block = 1u << (SIGTERM - 1);
-	unsigned int old_mask = 0;
-	sys_sigprocmask(SIG_BLOCK, &block, &old_mask);
-
-	cwrite("masktest: SIGTERM blocked; sending to self\r\n");
-	masktest_marker = 0;
-	sys_kill((int)sys_getpid(), SIGTERM);
-
-	cwrite("masktest: still here (signal pended); calling sigsuspend\r\n");
-	sys_sigsuspend(old_mask);	/* unblock + wait + restore */
-	cwrite("masktest: sigsuspend returned, marker=");
-	cprint_long(masktest_marker);
-	cwrite("\r\n");
-
-	sys_sigaction(SIGTERM, &old_sa, 0);
-	sys_sigprocmask(SIG_SETMASK, &old_mask, 0);
-}
-
-/*
- * wait test -- spawn a short-lived worker, sys_wait for it.  Returns
- * immediately when the worker has already exited; otherwise sleeps
- * on thread_exit_wq inside the kernel and is woken when it dies.
- */
-static void waittest_main(long arg)
-{
-	(void)arg;
-	for (int i = 0; i < 20000; i++) sys_yield();
-	sys_exit();
-}
-
-static void cmd_waittest(int argc, char *argv[])
-{
-	(void)argc; (void)argv;
-	long tid = sys_spawn(waittest_main, 0);
-	if (tid < 0) { cwrite("waittest: spawn failed\r\n"); return; }
-	cwrite("waittest: spawned tid="); cprint_long(tid);
-	cwrite(", waiting for exit...\r\n");
-	long r = sys_wait((int)tid);
-	cwrite("waittest: sys_wait returned ");
-	cprint_long(r);
-	cwrite(" (0 = exited cleanly)\r\n");
-}
-
-/*
- * segvtest -- install a SIGSEGV handler, deliberately dereference NULL,
- * and prove the handler runs once before the default action takes the
- * thread down on the next fault.  Has to run in a spawned worker
- * because a real EL0 fault terminates the thread that took it.
- */
-__attribute__((used))
-static void segvtest_handler(int sig)
-{
-	(void)sig;
-	/* Spawned workers have an empty fd table -- they inherit the
-	 * user binary's globals (including fd_console) but no open
-	 * files.  sys_log goes straight to kprintf so it works without
-	 * any fd. */
-	sys_log("segvtest: handler caught SIGSEGV; one-shot, exiting");
-	sys_exit();
-}
-
-static void segvtest_main(long arg)
-{
-	(void)arg;
-	struct sigaction sa;
-	sa.sa_handler = segvtest_handler;
-	sa.sa_mask    = 0;
-	sa.sa_flags   = 0;
-	sys_sigaction(SIGSEGV, &sa, 0);
-
-	sys_log("segvtest: about to deref NULL");
-	volatile int *q = (volatile int *)0;
-	*q = 1;	/* SIGSEGV -- handler should run, then we exit */
-
-	sys_log("segvtest: BUG -- continued past fault");
-	sys_exit();
-}
-
-static void cmd_segvtest(int argc, char *argv[])
-{
-	(void)argc; (void)argv;
-	long tid = sys_spawn(segvtest_main, 0);
-	if (tid < 0) { cwrite("segvtest: spawn failed\r\n"); return; }
-	cwrite("segvtest: spawned tid="); cprint_long(tid); cwrite("\r\n");
-	sys_wait((int)tid);
-	cwrite("segvtest: worker exited\r\n");
-}
-
 /* halt -- ask QEMU to exit via ARM semihosting.  Only does anything
  * useful when QEMU was started with -semihosting-config enable=on;
  * make run-thrifty / run-gui pass that flag.  Otherwise the host
@@ -1651,6 +1440,23 @@ static void cmd_halt(int argc, char *argv[])
 	(void)argc; (void)argv;
 	cwrite("halt: requesting QEMU exit...\r\n");
 	sys_halt();
+}
+
+/* exec <path> [args] -- load and run an ELF from /bin (or any path).
+ * Spawns a new thread for the ELF, inherits fds, then blocks until
+ * the process exits.  Like a real shell's fork+exec+wait but without
+ * the fork (single address space for now). */
+static void cmd_exec(int argc, char *argv[])
+{
+	if (argc < 2) { cwrite("usage: exec <path>\r\n"); return; }
+	char path[128];
+	resolve_path(argv[1], path, sizeof(path));
+	long tid = sys_execve(path);
+	if (tid < 0) {
+		cwrite("exec: failed to load '"); cwrite(path); cwrite("'\r\n");
+		return;
+	}
+	sys_wait((int)tid);
 }
 
 /* ftrace <on|off|reset|dump>  -- control the per-CPU function tracer.
@@ -1689,110 +1495,6 @@ static void cmd_kill(int argc, char *argv[])
 	if (r < 0) { cwrite("kill: failed\r\n"); return; }
 	cwrite("kill: sig "); cprint_long(sig);
 	cwrite(" -> tid "); cprint_long(tid); cwrite("\r\n");
-}
-
-static void cmd_pipe(void)
-{
-	int fds[2];
-	long r = sys_pipe(fds);
-	if (r < 0) { cwrite("pipe: failed\r\n"); return; }
-	cwrite("pipe: rd_fd=");
-	cprint_long(fds[0]);
-	cwrite(" wr_fd=");
-	cprint_long(fds[1]);
-	cwrite("\r\n");
-
-	const char *msg = "hello through the streams pipe!";
-	long w = sys_write(fds[1], msg, ustrlen(msg));
-	cwrite("pipe: wrote "); cprint_long(w); cwrite(" bytes\r\n");
-
-	char buf[64];
-	long n = sys_read(fds[0], buf, sizeof(buf));
-	cwrite("pipe: read "); cprint_long(n); cwrite(" -> '");
-	for (long i = 0; i < n; i++) cputc(buf[i]);
-	cwrite("'\r\n");
-
-	sys_close(fds[0]);
-	sys_close(fds[1]);
-}
-
-/*
- * Pipework demo: spawn two worker threads connected by a pipe.
- * The writer puts a message and exits, dropping its end.  The
- * reader does blocking reads until it sees EOF -- which happens
- * once the file's refcount hits zero, i.e. once every other
- * holder of the write end has also closed.  That's why ksh
- * closes its own copies of both ends after spawning, the same
- * "parent closes after fork" pattern Unix uses.
- */
-/* Workers inherit BOTH pipe ends from the shell (spawn copies the
- * parent's fd table).  The POSIX pattern is for each side to close
- * the end it doesn't use; otherwise the file's refcount never hits
- * zero, stream_close never runs, and the reader never sees EOF.
- *
- * Encoding: the high 16 bits of `packed` carry the fd to keep,
- * low 16 bits carry the fd to close-and-discard.  Cheap convention
- * to avoid a heap allocation just to pass two ints. */
-
-__attribute__((used))
-static void pipe_writer_main(long packed)
-{
-	int keep    = (int)(packed >> 16);
-	int discard = (int)(packed & 0xffff);
-	sys_close(discard);
-	const char *msg = "pipe-writer: greetings from a second EL0 thread";
-	sys_write(keep, msg, ustrlen(msg));
-	sys_close(keep);
-	sys_exit();
-}
-
-__attribute__((used))
-static void pipe_reader_main(long packed)
-{
-	int keep    = (int)(packed >> 16);
-	int discard = (int)(packed & 0xffff);
-	sys_close(discard);
-	/* Blocking read: sleeps in the kernel until the writer puts
-	 * data or all writers close (EOF).  Loop until we see 0 so
-	 * a multi-chunk writer is fully drained. */
-	for (;;) {
-		char buf[80];
-		long n = sys_read(keep, buf, sizeof(buf) - 1);
-		if (n < 0) { sys_log("pipe-reader: read error"); break; }
-		if (n == 0) { sys_log("pipe-reader: EOF");        break; }
-		buf[n] = '\0';
-		char log[120];
-		const char *p = "pipe-reader: got '";
-		char *q = log;
-		while (*p) *q++ = *p++;
-		for (long i = 0; i < n && q < log + sizeof(log) - 3; i++)
-			*q++ = buf[i];
-		*q++ = '\'';
-		*q   = '\0';
-		sys_log(log);
-	}
-	sys_close(keep);
-	sys_exit();
-}
-
-static void cmd_pipework(void)
-{
-	int fds[2];
-	if (sys_pipe(fds) < 0) {
-		cwrite("pipework: sys_pipe failed\r\n"); return;
-	}
-	long wpacked = ((long)fds[1] << 16) | (long)(fds[0] & 0xffff);
-	long rpacked = ((long)fds[0] << 16) | (long)(fds[1] & 0xffff);
-	long wtid = sys_spawn(pipe_writer_main, wpacked);
-	long rtid = sys_spawn(pipe_reader_main, rpacked);
-	/* Drop the shell's copies so the workers are the only holders.
-	 * When the writer closes its end, the write-side file refcount
-	 * goes to zero, stream_close fires, and the reader sees EOF. */
-	sys_close(fds[0]);
-	sys_close(fds[1]);
-	cwrite("pipework: writer tid="); cprint_long(wtid);
-	cwrite(", reader tid="); cprint_long(rtid);
-	cwrite("\r\n");
 }
 
 /* -------- kc: Norton-Commander-style two-panel file manager --------
@@ -1835,19 +1537,26 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "rm"))     cmd_rm(argc, argv);
 	else if (!ustrcmp(argv[0], "rmdir"))  cmd_rmdir(argc, argv);
 	else if (!ustrcmp(argv[0], "append")) cmd_append(argc, argv);
-	else if (!ustrcmp(argv[0], "pipe"))   cmd_pipe();
 	else if (!ustrcmp(argv[0], "spawn"))  cmd_spawn(argc, argv);
 	else if (!ustrcmp(argv[0], "kill"))   cmd_kill(argc, argv);
-	else if (!ustrcmp(argv[0], "crash"))  cmd_crash(argc, argv);
-	else if (!ustrcmp(argv[0], "sigtest")) cmd_sigtest(argc, argv);
-	else if (!ustrcmp(argv[0], "masktest")) cmd_masktest(argc, argv);
-	else if (!ustrcmp(argv[0], "waittest")) cmd_waittest(argc, argv);
-	else if (!ustrcmp(argv[0], "segvtest")) cmd_segvtest(argc, argv);
+	else if (!ustrcmp(argv[0], "exec"))   cmd_exec(argc, argv);
 	else if (!ustrcmp(argv[0], "halt"))   cmd_halt(argc, argv);
 	else if (!ustrcmp(argv[0], "ftrace")) cmd_ftrace(argc, argv);
-	else if (!ustrcmp(argv[0], "pipework")) cmd_pipework();
 	else {
-		cwrite(argv[0]); cwrite(": command not found\r\n");
+		/* Try /usr/bin/<argv[0]> */
+		char path[128];
+		const char *prefix = "/usr/bin/";
+		size_t i = 0;
+		while (prefix[i] && i + 1 < sizeof(path)) { path[i] = prefix[i]; i++; }
+		const char *n = argv[0];
+		while (*n && i + 1 < sizeof(path)) path[i++] = *n++;
+		path[i] = '\0';
+		long tid = sys_execve(path);
+		if (tid < 0) {
+			cwrite(argv[0]); cwrite(": command not found\r\n");
+		} else {
+			sys_wait((int)tid);
+		}
 	}
 }
 
@@ -1884,11 +1593,13 @@ void _start(void)
 		sys_log(buf);
 	}
 
-	fd_console = (int)sys_open("/dev/console", 0);
+	fd_console = (int)sys_open("/dev/console", 0); /* fd 0 = stdin  */
 	if (fd_console < 0) {
 		sys_log("init: open /dev/console failed");
 		for (;;) sys_yield();
 	}
+	sys_open("/dev/console", 0); /* fd 1 = stdout (for exec'd programs) */
+	sys_open("/dev/console", 0); /* fd 2 = stderr */
 
 	/*
 	 * Catch Ctrl-C.  The console driver intercepts byte 0x03,
