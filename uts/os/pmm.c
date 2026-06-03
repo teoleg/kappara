@@ -70,9 +70,17 @@
 
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
+#include "kappara/spinlock.h"
 
 static uintptr_t freelist;
 static size_t    free_count;
+
+/* Guards freelist + free_count.  Without this, two CPUs racing in
+ * pmm_alloc can both pop the same head and end up handing the SAME
+ * physical page out as two different kernel stacks (or slab pages),
+ * which then trample each other's contents.  See commit history for
+ * the "/proc/ps text in saved callee-saved regs" panic. */
+static spinlock_t pmm_lock = SPINLOCK_INIT;
 
 static uintptr_t align_up(uintptr_t v, uintptr_t a) { return (v + a - 1) & ~(a - 1); }
 static uintptr_t align_dn(uintptr_t v, uintptr_t a) { return v & ~(a - 1); }
@@ -88,28 +96,35 @@ void pmm_free(void *p)
 {
 	if (!p) return;	/* defensive: never crash on free(NULL) */
 	uintptr_t pa = (uintptr_t)p;
+	unsigned long f = spin_lock_irq_save(&pmm_lock);
 	*(uintptr_t *)pa = freelist;
 	freelist = pa;
 	free_count++;
+	spin_unlock_irq_restore(&pmm_lock, f);
 }
 
 void *pmm_alloc(void)
 {
-	if (!freelist)
+	unsigned long f = spin_lock_irq_save(&pmm_lock);
+	if (!freelist) {
+		spin_unlock_irq_restore(&pmm_lock, f);
 		return NULL;
+	}
 	uintptr_t pa = freelist;
 	freelist = *(uintptr_t *)pa;
 	free_count--;
+	spin_unlock_irq_restore(&pmm_lock, f);
 	zero_page((void *)pa);
 	return (void *)pa;
 }
 
 size_t pmm_free_count(void) { return free_count; }
 
-void pmm_init(uintptr_t start, uintptr_t end)
+void pmm_add_range(uintptr_t start, uintptr_t end)
 {
 	start = align_up(start, PAGE_SIZE);
 	end   = align_dn(end,   PAGE_SIZE);
+	if (end <= start) return;
 
 	/* Free high-to-low so allocations come back in ascending order. */
 	for (uintptr_t pa = end; pa > start; ) {
@@ -117,8 +132,15 @@ void pmm_init(uintptr_t start, uintptr_t end)
 		pmm_free((void *)pa);
 	}
 
-	kprintf("pmm: %lu pages free (%lu MiB) over [0x%lx..0x%lx)\n",
+	kprintf("pmm: enrolled [0x%lx..0x%lx) (%lu MiB)\n",
+		(unsigned long)start, (unsigned long)end,
+		(unsigned long)((end - start) >> 20));
+}
+
+void pmm_init(uintptr_t start, uintptr_t end)
+{
+	pmm_add_range(start, end);
+	kprintf("pmm: %lu pages free (%lu MiB) total\n",
 		(unsigned long)free_count,
-		(unsigned long)((end - start) >> 20),
-		(unsigned long)start, (unsigned long)end);
+		(unsigned long)(free_count * PAGE_SIZE / (1024UL * 1024UL)));
 }

@@ -46,7 +46,12 @@ struct sigaction_k;
 struct kthread {
 	void          *sp;		/* saved kernel SP for context switch */
 	void          *stack_base;	/* page allocated for the kernel stack */
+	/* Display name for diagnostics (`/proc/ps`, kprintf).  Always
+	 * points into the embedded `comm` field below -- kthread_create
+	 * copies the caller's string in, so the source can be a stack
+	 * buffer (e.g. sys_execve's resolved basename) without worry. */
 	const char    *name;
+	char           comm[32];
 	unsigned       tid;
 	enum kt_state  state;
 	struct kthread *next;

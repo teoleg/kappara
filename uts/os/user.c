@@ -611,8 +611,19 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 	a->entry = eh->e_entry;
 	a->sp    = sp;   /* SP points at argc word on the exec stack */
 
-	struct kthread *t = kthread_create("exec", exec_thread_main, a);
+	/* Compute the basename FIRST and pass it into kthread_create so
+	 * t->name reflects the program name before the new thread is
+	 * dispatched.  Otherwise, on SMP a peer CPU can pick up the
+	 * thread and call /proc/ps's pb_str(t->name) while we're still
+	 * setting t->comm here -- the snapshot would show the placeholder
+	 * "exec" instead of e.g. "ps". */
+	const char *base = path;
+	for (const char *p = path; *p; p++)
+		if (*p == '/') base = p + 1;
+
+	struct kthread *t = kthread_create(base, exec_thread_main, a);
 	if (!t) { kfree(a); return -1; }
+
 	/* Inherit fd table so the exec'd program has /dev/console on fd 1. */
 	kthread_inherit_fds(t, curthread);
 	return (long)t->tid;

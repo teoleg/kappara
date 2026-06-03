@@ -81,7 +81,14 @@
 #include "kappara/kmem.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
+#include "kappara/spinlock.h"
 #include "kappara/string.h"
+
+/* One lock per cache would be more scalable, but for now a single
+ * coarse-grained lock around every cache mutation is enough to keep
+ * concurrent SMP allocators from corrupting each other's freelists.
+ * Held briefly around the list-walk + freelist pop / push. */
+static spinlock_t kmem_lock = SPINLOCK_INIT;
 
 #define SLAB_MAGIC	0x5BAB10C0u
 #define OBJ_ALIGN	8u
@@ -156,20 +163,27 @@ void kmem_cache_init(struct kmem_cache *c, const char *name, size_t obj_size)
 
 void *kmem_cache_alloc(struct kmem_cache *c)
 {
+	/* Held across the optional grow_cache.  grow_cache calls
+	 * pmm_alloc which takes pmm_lock -- a different lock, so the
+	 * nesting kmem -> pmm is consistent and deadlock-free. */
+	unsigned long f = spin_lock_irq_save(&kmem_lock);
 	struct slab *s;
 	for (s = c->slabs; s; s = s->next)
 		if (s->free_count > 0)
 			break;
 	if (!s) {
 		s = grow_cache(c);
-		if (!s)
+		if (!s) {
+			spin_unlock_irq_restore(&kmem_lock, f);
 			return NULL;
+		}
 	}
 
 	void *p = s->freelist;
 	s->freelist = *(void **)p;
 	s->free_count--;
 	c->free_objs--;
+	spin_unlock_irq_restore(&kmem_lock, f);
 	return p;
 }
 
@@ -191,7 +205,9 @@ void kmem_cache_free(struct kmem_cache *c, void *p)
 			c->name, p, s->magic, (void *)s->cache);
 		return;
 	}
+	unsigned long f = spin_lock_irq_save(&kmem_lock);
 	slab_free(s, p);
+	spin_unlock_irq_restore(&kmem_lock, f);
 }
 
 void kfree(void *p)
@@ -204,7 +220,9 @@ void kfree(void *p)
 			p, s->magic);
 		return;
 	}
+	unsigned long f = spin_lock_irq_save(&kmem_lock);
 	slab_free(s, p);
+	spin_unlock_irq_restore(&kmem_lock, f);
 }
 
 /* ---- kmalloc: power-of-two size caches ----------------------------------- */

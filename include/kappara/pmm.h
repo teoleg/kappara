@@ -23,6 +23,13 @@
  * [__kernel_end .. start_of_MMIO_window).
  */
 void   pmm_init(uintptr_t start, uintptr_t end);
+/* Enrol an additional [start, end) range onto the freelist after
+ * pmm_init has run.  Used by main.c to enrol non-contiguous chunks
+ * so the user/exec VA windows (whose L2 entries are later overwritten
+ * by mmu_map_user_2mb) stay out of the kernel-stack pool -- otherwise
+ * a kernel stack allocated at one of those PAs aliases user-mode
+ * storage and the saved-register frame gets clobbered by user writes. */
+void   pmm_add_range(uintptr_t start, uintptr_t end);
 void  *pmm_alloc(void);
 void   pmm_free(void *p);
 size_t pmm_free_count(void);

@@ -332,7 +332,40 @@ void kmain(void)
 	 * the GPU's reserved region from the freelist.  See the comment
 	 * on discover_gpu_reserve(). */
 	uintptr_t pmm_end = discover_gpu_reserve();
-	pmm_init((uintptr_t)__kernel_end, pmm_end);
+	/*
+	 * Carve the user-mapped VA windows out of the PMM.
+	 *
+	 * The kernel runs identity-mapped (VA == PA).  user_init() and
+	 * exec_space_init() later call mmu_map_user_2mb() to remap three
+	 * L2 entries so that the EL0-accessible 2 MB blocks at
+	 * 0x10000000, 0x20000000, and 0x20200000 point at dedicated BSS
+	 * storage (user_storage / exec_storage / exec_stack_storage).
+	 *
+	 * If we let PMM hand out a 4 KB page whose PA falls inside one of
+	 * those windows, the kernel's own access through the identity VA
+	 * goes through the OVERWRITTEN L2 entry and silently lands in the
+	 * BSS storage instead.  The classic symptom: a kthread whose
+	 * kernel stack landed in [0x20200000..0x20400000) saves its
+	 * callee-saved registers into exec_stack_storage; the exec'd
+	 * program then writes its user-mode stack to the SAME physical
+	 * bytes (via the legitimate user mapping), corrupting the saved
+	 * registers; on the next context_switch restore the LR (x30) is
+	 * loaded with whatever ASCII the program wrote, and the next
+	 * ret jumps EL1 to a garbage address -- instruction abort at
+	 * something like 0x200a78725f747261 ("art_rx\n").
+	 *
+	 * The fix: split pmm enrolment around the three holes.  Lost RAM
+	 * is 6 MB, which is fine on a 1 GB Pi.
+	 */
+	#define USER_HOLE_BASE	0x10000000UL
+	#define USER_HOLE_END	0x10200000UL
+	#define EXEC_HOLE_BASE	0x20000000UL
+	#define EXEC_HOLE_END	0x20400000UL
+	uintptr_t k_end = (uintptr_t)__kernel_end;
+	pmm_init(k_end, k_end < USER_HOLE_BASE ? USER_HOLE_BASE : k_end);
+	pmm_add_range(USER_HOLE_END < k_end ? k_end : USER_HOLE_END,
+		      EXEC_HOLE_BASE);
+	pmm_add_range(EXEC_HOLE_END, pmm_end);
 	kmem_init();
 
 	vfs_init();
