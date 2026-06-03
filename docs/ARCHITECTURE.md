@@ -86,6 +86,23 @@ no metadata table.
 - `start` = `__kernel_end` (linker symbol, page-aligned past BSS)
 - `end` = `min(PLAT_RAM_END, framebuffer_base)` — the GPU reserve trim
 
+`pmm_add_range(start, end)` enrolls an additional non-contiguous chunk
+onto the freelist after `pmm_init`.  This is what carves the
+user-mapped VA windows (`0x10000000..0x10200000` and
+`0x20000000..0x20400000`) out of the kernel-stack pool: those PAs would
+otherwise have their identity VAs silently aliased by the L2-entry
+overwrites that `mmu_map_user_2mb` performs in `user_init` /
+`exec_space_init`, and a kthread whose kernel stack landed in one of
+those windows would find its saved-register frame trampled by EL0
+writes to the same physical bytes.
+
+The freelist + counter are guarded by a single `pmm_lock`.  Without
+it, two CPUs racing in `pmm_alloc` could pop the same head and hand
+out the same 4 KB page as two different kernel stacks — exactly the
+class of corruption that produced the "saved callee-saved registers
+full of `/proc/ps` text" instruction-abort panic before the lock
+landed.
+
 ### Slab (kmem)
 
 Eight power-of-two `kmem_cache`s: 16, 32, 64, 128, 256, 512, 1024,
@@ -100,6 +117,11 @@ Memory recycling is **not zeroed** on alloc.  Callers that need clean
 memory (struct kthread, sometimes new_inode) explicitly `kmemset`.
 This is the bug from earlier in the project's history — see commit
 `983e1c2` for why we now zero struct kthread.
+
+A single coarse `kmem_lock` guards every cache's freelist and the
+`grow_cache` slab-page install path.  Lock order is **kmem → pmm**:
+`grow_cache` calls `pmm_alloc` while still holding `kmem_lock`; no
+path acquires them in the reverse order, so deadlock is impossible.
 
 ### MMU
 
@@ -222,6 +244,7 @@ STREAMS machinery is transparent at the syscall boundary.
 
 - `sp` — saved kernel SP (resumed by `context_switch`)
 - `stack_base` — the page allocated for the kernel stack
+- `name`, `comm[32]` — display name for `/proc/ps` and `kprintf`.  `name` always points into the embedded `comm` field; `kthread_create` copies the caller's string in so the source can be a short-lived buffer (e.g. `sys_execve_impl`'s resolved program basename).
 - `state` — READY / RUNNING / BLOCKED / DEAD
 - `next` — link in whatever queue we're on (ready, wait queue, to_reap)
 - `sig_pending`, `waiting_on` — signal bookkeeping

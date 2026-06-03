@@ -318,7 +318,19 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 		return NULL;
 	}
 
-	t->name       = name;
+	/* Copy `name` into t->comm so the caller can pass a string with
+	 * any lifetime (a stack-allocated basename from sys_execve, a
+	 * .rodata literal, ...) and t->name stays valid for as long as
+	 * the kthread does.  Bounded to comm[31] + NUL. */
+	if (name) {
+		size_t i = 0;
+		while (name[i] && i + 1 < sizeof(t->comm)) {
+			t->comm[i] = name[i];
+			i++;
+		}
+		t->comm[i] = '\0';
+	}
+	t->name       = t->comm;
 	{
 		unsigned long f = spin_lock_irq_save(&tid_lock);
 		t->tid = next_tid++;
