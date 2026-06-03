@@ -1448,10 +1448,11 @@ static void cmd_halt(int argc, char *argv[])
  * the fork (single address space for now). */
 static void cmd_exec(int argc, char *argv[])
 {
-	if (argc < 2) { cwrite("usage: exec <path>\r\n"); return; }
+	if (argc < 2) { cwrite("usage: exec <path> [args...]\r\n"); return; }
 	char path[128];
 	resolve_path(argv[1], path, sizeof(path));
-	long tid = sys_execve(path);
+	/* pass argv+1 so child's argv[0] = program name */
+	long tid = sys_execve(path, (const char *const *)(argv + 1));
 	if (tid < 0) {
 		cwrite("exec: failed to load '"); cwrite(path); cwrite("'\r\n");
 		return;
@@ -1551,7 +1552,8 @@ static void dispatch(char *line)
 		const char *n = argv[0];
 		while (*n && i + 1 < sizeof(path)) path[i++] = *n++;
 		path[i] = '\0';
-		long tid = sys_execve(path);
+		/* pass argv so child's argv[0] = command name */
+		long tid = sys_execve(path, (const char *const *)argv);
 		if (tid < 0) {
 			cwrite(argv[0]); cwrite(": command not found\r\n");
 		} else {

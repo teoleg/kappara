@@ -261,9 +261,13 @@ static inline long sys_wait(int tid)
 	return _syscall1(SYS_wait, (long)tid);
 }
 
-static inline long sys_execve(const char *path)
+static inline long sys_execve(const char *path, const char *const argv[])
 {
-	return _syscall1(SYS_execve, (long)(unsigned long)path);
+	register long x0 __asm__("x0") = (long)(unsigned long)path;
+	register long x1 __asm__("x1") = (long)(unsigned long)argv;
+	register long x8 __asm__("x8") = SYS_execve;
+	__asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory", "cc");
+	return x0;
 }
 
 /* ioctl commands -- mirror include/kappara/stream_head.h. */

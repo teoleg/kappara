@@ -21,8 +21,9 @@ static void worker(long arg)
     sys_exit();
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     long tid = sys_spawn(worker, 0);
     if (tid < 0) { puts("segvtest: spawn failed"); return 1; }
     printf("segvtest: spawned tid=%ld\n", tid);

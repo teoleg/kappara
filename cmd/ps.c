@@ -1,8 +1,9 @@
 #include <stdio.h>
 #include <unistd.h>
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     char buf[1024];
     int fd = open("/proc/ps", 0);
     if (fd < 0) { puts("ps: cannot open /proc/ps"); return 1; }

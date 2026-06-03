@@ -39,9 +39,10 @@ void exec_space_init(void);
 long sys_spawn_impl(uint64_t entry, uint64_t arg);
 
 /* sys_execve -- load an ELF from `path`, map it into the exec VA
- * window, spawn a new thread, inherit fds from the caller.
+ * window, set up the exec stack with argc/argv, spawn a new thread,
+ * inherit fds from the caller.
  * Returns the new thread's tid, or -1 on failure. */
-long sys_execve_impl(const char *path);
+long sys_execve_impl(const char *path, int argc, const char *const argv[]);
 
 /* sys_exit -- terminate the calling thread.  Does not return. */
 void sys_exit_impl(void) __attribute__((noreturn));

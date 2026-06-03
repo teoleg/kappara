@@ -1,7 +1,8 @@
 #include <stdio.h>
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     puts("crash: dereferencing NULL -- expecting SIGSEGV");
     volatile int *p = (volatile int *)0;
     *p = 1;

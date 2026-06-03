@@ -241,7 +241,9 @@ LIBC_SRCS   := $(LIBC_DIR)/src/string.c \
                $(LIBC_DIR)/src/printf.c  \
                $(LIBC_DIR)/src/stdlib.c  \
                $(LIBC_DIR)/src/io.c      \
-               $(LIBC_DIR)/src/signal.c
+               $(LIBC_DIR)/src/signal.c  \
+               $(LIBC_DIR)/src/malloc.c  \
+               $(LIBC_DIR)/src/file.c
 LIBC_OBJS   := $(patsubst $(LIBC_DIR)/src/%.c,$(CMD_BUILD)/libc/%.o,$(LIBC_SRCS))
 LIBC_CRT0   := $(CMD_BUILD)/libc/crt0.o
 LIBC_A      := $(CMD_BUILD)/libc/libc.a

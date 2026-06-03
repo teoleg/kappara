@@ -9,8 +9,9 @@ static void handler(int sig)
     marker = 0xC0DE;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     struct sigaction sa, old;
     sa.sa_handler = handler; sa.sa_mask = 0; sa.sa_flags = 0;
     if (sys_sigaction(SIGTERM, &sa, &old) < 0) {

@@ -34,10 +34,10 @@ The prompt shows the current working directory: `kappara:/etc#`.
 | `pid`                      | Print the current thread id.                                |
 | `spawn [arg]`              | Spawn a long-running worker thread in init space (returns its tid). |
 | `kill <tid> [sig]`         | Send a signal (POSIX numbers).  Default is `SIGTERM=15`.    |
-| `exec <path>`              | Load an ELF64 executable into the exec address space (VA 0x20000000), spawn an exec thread, and `sys_wait` for it.  The exec'd program inherits the shell's fd table so stdout (fd 1) goes to `/dev/console`. |
+| `exec <path> [args...]`    | Load an ELF64 executable into the exec address space (VA 0x20000000), spawn an exec thread, and `sys_wait` for it.  The exec'd program inherits the shell's fd table so stdout (fd 1) goes to `/dev/console`.  Trailing words are passed through as `argv` to the child's `main(argc, argv)`; `argv[0]` is the resolved path. |
 | `halt`                     | Ask QEMU to exit (semihosting SYS_EXIT). Run targets in the Makefile pass `-semihosting-config enable=on,target=native`. |
 | `ftrace [on\|off\|reset\|dump]` | Per-CPU function tracer.  No arg = `dump` (alias for `cat /proc/ftrace`).  Only meaningful when the kernel was built with `make TRACE=1`.  See `docs/FTRACE.md`. |
-| *(unknown)*                | If a command is not a builtin, the shell tries `exec /usr/bin/<name>` automatically.  Type any `/usr/bin/` binary name without the `exec` prefix. |
+| *(unknown)*                | If a command is not a builtin, the shell tries `exec /usr/bin/<name>` automatically with the original `argv` (so the program's `argv[0]` is the bare command name, not the full path).  Type any `/usr/bin/` binary name without the `exec` prefix. |
 
 ## /usr/bin — standalone ELF programs
 
@@ -62,6 +62,14 @@ kernel allocates their stacks from `exec_stack_storage` starting at
 `EXEC_STACK_TOP − slot × 64 KB` (same layout as the init-space spawn
 pool).  `exec_spawn_next` resets to 0 at the start of each `sys_execve`
 call so every exec'd program gets a fresh pool.
+
+`/usr/bin` programs are linked against the freestanding `lib/libc` (see
+`docs/ARCHITECTURE.md`).  `crt0.S` parses the exec stack and calls
+`int main(int argc, char **argv)`; `argv[0]` is the resolved path (or
+the command name for PATH-fallback dispatch).  The libc provides
+`printf`/`puts`, `FILE*` (`fopen`/`fread`/`fwrite`/`fprintf`,
+`stdin`/`stdout`/`stderr` on fds 0/1/2), and `malloc`/`free` against a
+512 KB BSS arena.
 
 ## Streams / device I/O
 

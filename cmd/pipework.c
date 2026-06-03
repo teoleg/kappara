@@ -31,8 +31,9 @@ static void pipe_reader(long packed)
     sys_exit();
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     int fds[2];
     if (sys_pipe(fds) < 0) { puts("pipework: sys_pipe failed"); return 1; }
     long wpacked = ((long)fds[1] << 16) | (long)(fds[0] & 0xffff);

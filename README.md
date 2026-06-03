@@ -79,6 +79,8 @@ To quit:
 | `uts/os/main.c`                | `kmain` orchestration                                             |
 | `user/init.c`                  | Userspace shell (ksh) — runs at EL0 as PID 2                      |
 | `user/syscall.h`               | User-side syscall numbers + inline asm wrappers                   |
+| `cmd/`                         | `/usr/bin` programs (ps, sigtest, waittest, …) — ELF64, linked against libc |
+| `lib/libc/`                    | Freestanding libc: crt0, printf, malloc, FILE*, string, io         |
 | `tools/gen_kallsyms.sh`        | nm + awk producing the symbol-table .S after pass-1 link          |
 | `docs/`                        | Reference documentation                                            |
 
