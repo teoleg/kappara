@@ -234,17 +234,56 @@ $(HELLO_ELF): $(USER_BUILD)/hello.o user/prog_linker.ld
 $(USER_BUILD):
 	mkdir -p $@
 
+# ---- libc + /usr/bin standalone ELF programs -----------------------
+CMD_BUILD  := build/cmd
+LIBC_DIR    := lib/libc
+LIBC_SRCS   := $(LIBC_DIR)/src/string.c \
+               $(LIBC_DIR)/src/printf.c  \
+               $(LIBC_DIR)/src/stdlib.c  \
+               $(LIBC_DIR)/src/io.c      \
+               $(LIBC_DIR)/src/signal.c
+LIBC_OBJS   := $(patsubst $(LIBC_DIR)/src/%.c,$(CMD_BUILD)/libc/%.o,$(LIBC_SRCS))
+LIBC_CRT0   := $(CMD_BUILD)/libc/crt0.o
+LIBC_A      := $(CMD_BUILD)/libc/libc.a
+
+LIBC_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
+               -ffreestanding -nostdlib -nostartfiles \
+               -fno-stack-protector -fno-pie -fno-pic \
+               -mcpu=cortex-a53 -mgeneral-regs-only \
+               -O2 -g \
+               -I$(LIBC_DIR)/include
+
+$(CMD_BUILD)/libc:
+	mkdir -p $@
+
+$(CMD_BUILD)/libc/%.o: $(LIBC_DIR)/src/%.c | $(CMD_BUILD)/libc
+	$(USER_CC) $(LIBC_CFLAGS) -c $< -o $@
+
+$(LIBC_CRT0): $(LIBC_DIR)/aarch64/crt0.S | $(CMD_BUILD)/libc
+	$(USER_CC) $(filter-out -finstrument-functions,$(LIBC_CFLAGS)) \
+	           -c $< -o $@
+
+$(LIBC_A): $(LIBC_OBJS)
+	$(CROSS)ar rcs $@ $^
+
 # ---- /usr/bin standalone ELF programs --------------------------------
 CMD_BUILD  := build/cmd
 CMD_NAMES  := ps sigtest masktest waittest segvtest crash pipe pipework
 CMD_ELFS   := $(addprefix $(CMD_BUILD)/, $(addsuffix .elf, $(CMD_NAMES)))
 
-$(CMD_BUILD)/%.o: cmd/%.c cmd/ulib.h user/syscall.h | $(CMD_BUILD)
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+CMD_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
+              -ffreestanding -nostdlib -nostartfiles \
+              -fno-stack-protector -fno-pie -fno-pic \
+              -mcpu=cortex-a53 -mgeneral-regs-only \
+              -O2 -g \
+              -I$(LIBC_DIR)/include
 
-$(CMD_BUILD)/%.elf: $(CMD_BUILD)/%.o user/prog_linker.ld
+$(CMD_BUILD)/%.o: cmd/%.c | $(CMD_BUILD)
+	$(USER_CC) $(CMD_CFLAGS) -c $< -o $@
+
+$(CMD_BUILD)/%.elf: $(CMD_BUILD)/%.o $(LIBC_CRT0) $(LIBC_A) user/prog_linker.ld
 	$(USER_LD) -nostdlib -static -s -z max-page-size=4096 \
-	           -T user/prog_linker.ld -o $@ $<
+	           -T user/prog_linker.ld -o $@ $(LIBC_CRT0) $< $(LIBC_A)
 
 $(CMD_BUILD):
 	mkdir -p $@
