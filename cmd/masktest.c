@@ -10,8 +10,9 @@ static void handler(int sig)
     marker = 1;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     struct sigaction sa, old_sa;
     sa.sa_handler = handler; sa.sa_mask = 0; sa.sa_flags = 0;
     if (sys_sigaction(SIGTERM, &sa, &old_sa) < 0) {

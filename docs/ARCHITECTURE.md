@@ -141,8 +141,28 @@ next command).
    at `p_vaddr - EXEC_VA`.  Segments outside `[0x20000000, 0x20200000)`
    are rejected.
 5. `dsb ish; ic iallu; dsb ish; isb` — D→I cache coherence.
-6. Spawns an `exec` kthread with `kthread_inherit_fds` (so fd 0/1/2 are
-   all `/dev/console`) and calls `aarch64_enter_userspace(e_entry, 0x20400000, 0)`.
+6. Builds the exec stack: argv strings are packed from `EXEC_STACK_TOP`
+   downward (each NUL-terminated, 8-byte aligned), then the pointer array
+   (`argv[0]..argv[argc-1]`, NULL terminator), then `argc` as a
+   `uint64_t`.  SP is set to the `argc` word.  Because the pointer table
+   is `(argc + 2)` words of 8 bytes each, an 8-byte padding word is
+   inserted when `(argc + 2)` is odd to keep SP 16-byte aligned — the
+   AArch64 ABI requirement at function-call boundaries.
+7. Spawns an `exec` kthread with `kthread_inherit_fds` (so fd 0/1/2 are
+   all `/dev/console`) and calls `aarch64_enter_userspace(e_entry, sp, 0)`.
+
+Exec stack frame at entry (grows down from `EXEC_STACK_TOP = 0x20400000`):
+```
+[argv string data, NUL-terminated, 8-byte aligned, packed from top]
+[optional 8-byte alignment pad if (argc+2) is odd]
+[NULL pointer   — argv[argc]]
+[argv[argc-1]   — user VA of last string]
+…
+[argv[0]        — user VA of program name]
+[argc (uint64_t)] ← SP, 16-byte aligned
+```
+`crt0.S` reads `ldr x0, [sp]` (argc) and `add x1, sp, #8` (argv) then
+calls `main(argc, argv)`.
 
 Programs in `/bin` are ELF blobs incbin'd into the kernel image
 (`uts/aarch64/helloblob.S`).  Programs in `/usr/bin` are similarly
@@ -169,6 +189,32 @@ so every exec'd program starts with a fresh pool.  Convention: exec'd
 programs must `sys_wait` for sub-threads before exiting to avoid a race
 where the next `sys_execve` zeroes the exec stack storage while a stale
 sub-thread is still running.
+
+### lib/libc — freestanding C library
+
+Source: `lib/libc/`.  Built as a static archive `build/cmd/libc.a` and
+linked into every `/usr/bin` binary.  Uses `-ffreestanding -nostdlib`
+so it has no host-OS dependencies.
+
+| Module                  | What it provides                                             |
+|-------------------------|--------------------------------------------------------------|
+| `aarch64/crt0.S`        | `_start`: loads argc/argv from exec stack, calls `main`, then `sys_exit`. |
+| `aarch64/internal.h`    | `__syscall1/__syscall3`, syscall numbers, `ssize_t`.          |
+| `src/string.c`          | `strlen`, `strcpy`, `strncpy`, `memcpy`, `memset`, `strcmp`. |
+| `src/printf.c`          | `printf`, `vprintf`, `sprintf`, `snprintf`, `vsnprintf`.      |
+| `src/malloc.c`          | `malloc`, `free`, `calloc`, `realloc` — 512 KB static BSS arena, first-fit with coalescing. No `sbrk` syscall needed. |
+| `src/file.c`            | `FILE*` layer: `fopen/fclose/fread/fwrite/fgets/fputs/fputc/fgetc`, `fprintf/vfprintf`, `puts/putchar`.  `stdin/stdout/stderr` backed by fd 0/1/2. |
+| `src/io.c`              | `read`, `write`, `open`, `close`, `pipe`, `_exit`.            |
+| `include/`              | `<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<unistd.h>`, `<stddef.h>`, `<stdarg.h>`, `<sys/types.h>`. |
+
+The malloc arena is a `static unsigned char _heap[512*1024]` in BSS.
+Because `sys_execve_impl` zeroes `exec_storage` before copying PT_LOAD
+segments, the BSS (which includes `_heap`) is always clean at program
+entry — no `sbrk` or zero-page mapping is needed.
+
+`FILE*` wraps an `int fd` and delegates to the raw `read`/`write`
+syscall wrappers in `io.c`.  It has no knowledge of STREAMS; the
+STREAMS machinery is transparent at the syscall boundary.
 
 ## Scheduling
 

@@ -8,8 +8,9 @@ static void worker(long arg)
     sys_exit();
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     long tid = sys_spawn(worker, 0);
     if (tid < 0) { puts("waittest: spawn failed"); return 1; }
     printf("waittest: spawned tid=%ld, waiting...\n", tid);

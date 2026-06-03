@@ -331,17 +331,46 @@ static long sys_wait(long a0, long a1, long a2, long a3, long a4, long a5)
 	return sys_wait_impl((int)a0);
 }
 
+#define EXEC_MAX_ARGS    32
+#define EXEC_MAX_ARGLEN  128
+
 static long sys_execve(long a0, long a1, long a2, long a3, long a4, long a5)
 {
-	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	(void)a2; (void)a3; (void)a4; (void)a5;
 	char kpath[128];
 	const char *path = (const char *)(uintptr_t)a0;
+	const char **uargv = (const char **)(uintptr_t)a1;
+
 	if (syscall_from_user) {
 		if (strncpy_from_user(kpath, path, sizeof(kpath)) < 0)
 			return -1;
 		path = kpath;
 	}
-	return sys_execve_impl(path);
+
+	/* Copy argv strings from user space into static kernel buffers.
+	 * Static storage avoids blowing the kernel stack with 4 KB of
+	 * argv data; only one exec runs at a time (shell waits). */
+	static char kargv_buf[EXEC_MAX_ARGS * EXEC_MAX_ARGLEN];
+	static const char *kargv[EXEC_MAX_ARGS + 1];
+	int kargc = 0;
+	char *kbuf = kargv_buf;
+
+	if (uargv) {
+		while (kargc < EXEC_MAX_ARGS) {
+			const char *uarg = NULL;
+			/* read one argv[kargc] pointer from user space */
+			if (copy_from_user(&uarg, uargv + kargc, sizeof(uarg)) < 0)
+				break;
+			if (!uarg) break;
+			long n = strncpy_from_user(kbuf, uarg, EXEC_MAX_ARGLEN);
+			if (n < 0) break;
+			kargv[kargc++] = kbuf;
+			kbuf += (size_t)n + 1;
+		}
+	}
+	kargv[kargc] = NULL;
+
+	return sys_execve_impl(path, kargc, kargv);
 }
 
 /*

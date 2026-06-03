@@ -3,8 +3,9 @@
 #include <unistd.h>
 #include "../user/syscall.h"
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     int fds[2];
     if (sys_pipe(fds) < 0) { puts("pipe: failed"); return 1; }
     printf("pipe: rd_fd=%d wr_fd=%d\n", fds[0], fds[1]);

@@ -205,18 +205,4 @@ int sprintf(char *buf, const char *fmt, ...)
     return r;
 }
 
-int puts(const char *s)
-{
-    size_t len = strlen(s);
-    __syscall3(__NR_write, 1, (long)(unsigned long)s, (long)len);
-    char nl = '\n';
-    __syscall3(__NR_write, 1, (long)(unsigned long)&nl, 1);
-    return (int)(len + 1);
-}
-
-int putchar(int c)
-{
-    char ch = (char)c;
-    __syscall3(__NR_write, 1, (long)(unsigned long)&ch, 1);
-    return c;
-}
+/* puts and putchar are defined in file.c (FILE* layer) */

@@ -491,7 +491,10 @@ static void exec_thread_main(void *p)
  */
 static unsigned char elf_read_buf[256 * 1024];
 
-long sys_execve_impl(const char *path)
+#define EXEC_MAX_ARGS    32
+#define EXEC_MAX_ARGLEN  128
+
+long sys_execve_impl(const char *path, int argc, const char *const argv[])
 {
 	long elf_sz = read_file_kernel(path, elf_read_buf, sizeof(elf_read_buf));
 	if (elf_sz < (long)sizeof(Elf64_Ehdr)) {
@@ -551,10 +554,62 @@ long sys_execve_impl(const char *path)
 		"isb\n"
 		::: "memory");
 
+	/* --- exec stack setup ---
+	 *
+	 * Layout (grows down from EXEC_STACK_TOP = 0x20400000):
+	 *   [string data -- argv strings packed from top down]
+	 *   [16-byte alignment pad]
+	 *   [argv[argc] = NULL,  8 bytes]
+	 *   [argv[argc-1],       8 bytes]
+	 *   ...
+	 *   [argv[0],            8 bytes]
+	 *   [argc as uint64_t,   8 bytes]  <-- SP points here
+	 */
+	int effective_argc = (argc > EXEC_MAX_ARGS) ? EXEC_MAX_ARGS : argc;
+	uint64_t sp = EXEC_STACK_TOP;
+	uint64_t uva_strings[EXEC_MAX_ARGS];
+
+	/* Pack strings from top down */
+	for (int i = effective_argc - 1; i >= 0; i--) {
+		size_t len = kstrlen(argv[i]) + 1;  /* include NUL */
+		sp -= (uint64_t)len;
+		sp &= ~(uint64_t)7;                 /* 8-byte align */
+		size_t off = (size_t)(sp - EXEC_STACK_VA);
+		kmemcpy(exec_stack_storage + off, argv[i], len);
+		uva_strings[i] = sp;
+	}
+
+	/* 16-byte align before pointer array */
+	sp &= ~(uint64_t)15;
+
+	/* The pointer table is (effective_argc + 1) words (pointers + NULL)
+	 * plus 1 word for argc = effective_argc + 2 words total.
+	 * If that count is odd the final SP lands on an 8-byte boundary,
+	 * violating the AArch64 ABI 16-byte alignment requirement.
+	 * Insert a padding word so the total is always even. */
+	if ((effective_argc + 2) & 1) {
+		sp -= 8;
+		*(uint64_t *)(exec_stack_storage + (sp - EXEC_STACK_VA)) = 0;
+	}
+
+	/* argv[argc] = NULL terminator */
+	sp -= 8;
+	*(uint64_t *)(exec_stack_storage + (sp - EXEC_STACK_VA)) = 0;
+
+	/* argv[argc-1] .. argv[0] */
+	for (int i = effective_argc - 1; i >= 0; i--) {
+		sp -= 8;
+		*(uint64_t *)(exec_stack_storage + (sp - EXEC_STACK_VA)) = uva_strings[i];
+	}
+
+	/* argc — SP is 16-byte aligned here */
+	sp -= 8;
+	*(uint64_t *)(exec_stack_storage + (sp - EXEC_STACK_VA)) = (uint64_t)effective_argc;
+
 	struct exec_args *a = kmalloc(sizeof(*a));
 	if (!a) return -1;
 	a->entry = eh->e_entry;
-	a->sp    = EXEC_STACK_TOP;
+	a->sp    = sp;   /* SP points at argc word on the exec stack */
 
 	struct kthread *t = kthread_create("exec", exec_thread_main, a);
 	if (!t) { kfree(a); return -1; }
