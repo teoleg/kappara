@@ -1,14 +1,19 @@
-#include "ulib.h"
-static void worker(long arg) {
+#include <stdio.h>
+#include "../user/syscall.h"
+
+static void worker(long arg)
+{
     (void)arg;
     for (int i = 0; i < 20000; i++) sys_yield();
     sys_exit();
 }
-void _start(void) {
+
+int main(void)
+{
     long tid = sys_spawn(worker, 0);
-    if (tid < 0) { err("waittest: spawn failed\r\n"); sys_exit(); }
-    out("waittest: spawned tid="); out_long(tid); out(", waiting...\r\n");
+    if (tid < 0) { puts("waittest: spawn failed"); return 1; }
+    printf("waittest: spawned tid=%ld, waiting...\n", tid);
     long r = sys_wait((int)tid);
-    out("waittest: sys_wait returned "); out_long(r); out(" (0 = clean)\r\n");
-    sys_exit();
+    printf("waittest: sys_wait returned %ld (0 = clean)\n", r);
+    return 0;
 }

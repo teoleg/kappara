@@ -1,8 +1,10 @@
-#include "ulib.h"
-void _start(void) {
-    out("crash: dereferencing NULL -- expecting SIGSEGV\r\n");
+#include <stdio.h>
+
+int main(void)
+{
+    puts("crash: dereferencing NULL -- expecting SIGSEGV");
     volatile int *p = (volatile int *)0;
     *p = 1;
-    out("crash: BUG -- survived null deref\r\n");
-    sys_exit();
+    puts("crash: BUG -- survived null deref");
+    return 1;
 }
