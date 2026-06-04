@@ -1,10 +1,12 @@
 # kappara
 
 A small SVR4-flavored Unix-like operating system for AArch64 (Raspberry Pi 3
-on QEMU today, eventually real Pi 4 hardware).  All four cores boot —
-core 0 runs the kernel + scheduler, cores 1-3 are released into a tiny
-"hello + idle" entry through the standard ARM spin-table at PA 0xE0/E8/F0.
-Real per-CPU scheduling is the next big step.
+on QEMU today, eventually real Pi 4 hardware).  Single-CPU by default;
+`make SMP=1` wakes cores 1-3 through the standard ARM spin-table at
+PA 0xE0/E8/F0 and runs them through the per-CPU dispatcher.  The SMP
+build has a known race in the `context_switch` handoff that panics
+`waittest` followed by another exec — see `docs/BUILDING.md` and the
+hot-bug list in `CLAUDE.md`.  Default UP build is rock-solid.
 
 The kernel uses SVR4 STREAMS for character I/O — pipes, console, /dev/loop,
 /dev/klog, /proc/* — with module push/pop, queues, and message blocks all

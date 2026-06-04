@@ -87,6 +87,21 @@ ifeq ($(TRACE),1)
     CFLAGS += -finstrument-functions
 endif
 
+# SMP gate.  Default OFF: secondary cores stay parked in their boot-
+# time WFI spin-table loop, the kernel scheduler runs only on core 0.
+# Stable -- nothing in the kernel today (interactive shell, /proc, all
+# the /usr/bin programs, signals, pipes, kfs, the editors) cares about
+# whether secondaries are up.  The dispatcher / per-CPU runqueue
+# machinery still BUILDS so the SMP code paths don't bit-rot.
+#
+# `make SMP=1` re-enables smp_wake_secondary in kmain.  Known issue:
+# `waittest` followed by another exec reliably panics under SMP --
+# see the long comment in uts/os/main.c and CLAUDE.md's hot-bug list.
+SMP ?= 0
+ifeq ($(SMP),1)
+    CFLAGS += -DKAPPARA_SMP=1
+endif
+
 # Files that must NEVER be instrumented (whether TRACE is on or off):
 NOINST_OBJS := \
     $(BUILD)/uts/os/ftrace.o \
