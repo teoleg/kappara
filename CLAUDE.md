@@ -84,6 +84,25 @@
   at `trap_tail+0xc`.  Don't remove the `msr daifset, #2` at the
   top of `KERNEL_EXIT` or `aarch64_enter_userspace`.  See commit
   for the canonical fix.
+- **Refcounts that are touched from multiple CPUs are lock-free
+  atomics, not plain `int`.**  Every counter where multiple threads
+  can race the increment/decrement — `struct file::f_refs`,
+  `struct inode::i_count` today — goes through
+  `atomic_inc(&p)` / `atomic_dec_and_test(&p)` in
+  `include/kappara/atomic.h`.  Never write raw `++` / `--`; one
+  lost decrement either leaks the object or double-frees it,
+  and the symptom (close hook running on already-freed memory)
+  is delayed enough that it presents as random later corruption.
+  The canonical wrappers are `file_get` / `file_put` for files
+  and `vfs_iget` / `vfs_iput` for inodes — those are the only
+  acceptable touchpoints.  If you add a new shared refcount,
+  follow the same shape and document it here.
+- **SMP-shared allocator/freelist state needs a spinlock.**  pmm
+  and kmem are guarded by `pmm_lock` and `kmem_lock`.  Lock
+  order is **kmem → pmm** (`grow_cache` holds `kmem_lock` across
+  `pmm_alloc`).  If you add any other multi-word state that all
+  CPUs touch (a global queue, a hash table, etc.), pick a lock
+  for it before the first SMP test, not after.
 
 ## Commit message style
 

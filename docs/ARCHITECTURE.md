@@ -355,6 +355,45 @@ and close removes only the name; the inode hangs around until the
 last close drops the count — matching Unix removed-but-open
 semantics.
 
+### Reference counting (`f_refs`, `i_count`)
+
+Both counters are reached from multiple CPUs the moment two threads
+share an fd: parent and exec'd / spawned child each touch `f_refs`,
+and either of them dropping the last reference races the inode
+`i_count` drop in `file_put`.  Concurrent `++` / `--` on a plain `int`
+on different CPUs loses updates — the canonical SMP refcount bug
+that surfaces as either a leak (count stays positive forever) or a
+double free (two CPUs both think they did the last drop).
+
+The fix is the universal Unix refcount idiom: a lock-free atomic
+counter, the same way Solaris's `atomic_inc_uint` / `atomic_dec_uint_nv`,
+Linux's `refcount_inc` / `refcount_dec_and_test`, and FreeBSD's
+`refcount_acquire` / `refcount_release` all do it.
+
+Our primitives live in `include/kappara/atomic.h`:
+
+- `atomic_inc(int *p)` — increment with ACQUIRE (LDAXR / STLXR loop).
+- `atomic_dec_and_test(int *p)` — decrement with RELEASE; returns 1 if
+  the caller drove the count to zero (and is therefore the unique
+  cleanup observer); emits a `dmb ishld` on that path so the
+  subsequent cleanup reads see every other CPU's prior RELEASE drop.
+
+Both are hand-rolled inline asm in the same style as
+`include/kappara/spinlock.h` rather than C11 `__atomic_*` builtins.
+Reason: AArch64 GCC ≥ 10 lowers `__atomic_*` to libgcc "outline
+atomics" helpers that internally call `__getauxval` to pick between
+LSE and LL/SC at runtime.  Freestanding kernels don't have glibc, and
+dragging libgcc into the trust boundary for a 32-bit counter add is
+the wrong trade.  The inline asm is one cache-line touch and three
+instructions in the uncontended case, with no symbol dependency
+outside the kernel.
+
+The discipline: refcounts are ONLY touched through chokepoint helpers
+(`file_get` / `file_put` / `vfs_iget` / `vfs_iput`).  Plain `++` /
+`--` is a bug; CLAUDE.md's hot-bug list calls this out.  Initial
+stores at struct-creation time are plain because no other CPU has
+the pointer yet.
+
 ## kfs
 
 Simple disk layout:
