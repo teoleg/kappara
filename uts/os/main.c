@@ -450,26 +450,9 @@ void kmain(void)
 	/* SMP foundation: wake cores 1..3 into a per-core "hello +
 	 * idle" entry.  They stay at EL2 with MMU off for now; the
 	 * actual EL drop + MMU setup + scheduler participation is the
-	 * follow-up.  This commit just proves we can light them up.
-	 *
-	 * Gated behind KAPPARA_SMP at build time (`make SMP=1`).
-	 * Default builds run single-CPU because of a race in the
-	 * dispatcher/context-switch handoff that reliably panics
-	 * `waittest` followed by another exec.  The race is
-	 * single-cycle-tight: every software probe we tried (lock
-	 * held across context_switch, per-thread DAIF mask on
-	 * first-run, dsb ish/ishst barriers, per-CPU strace ring
-	 * with non-atomic writes) either failed to close it or
-	 * perturbed timing enough to mask it.  Properly nailing it
-	 * needs either cycle-accurate emulation or rebuilding the
-	 * scheduler on top of an explicit thread-lock invariant
-	 * (Solaris's `tlock` shape).  Until then, default is UP. */
-#ifdef KAPPARA_SMP
+	 * follow-up.  This commit just proves we can light them up. */
 	for (unsigned cpu = 1; cpu < 4; cpu++)
 		smp_wake_secondary(cpu);
-#else
-	(void)smp_wake_secondary;
-#endif
 
 	__asm__ volatile ("msr daifclr, #2");
 

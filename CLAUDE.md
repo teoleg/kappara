@@ -103,20 +103,6 @@
   `pmm_alloc`).  If you add any other multi-word state that all
   CPUs touch (a global queue, a hash table, etc.), pick a lock
   for it before the first SMP test, not after.
-- **SMP is OFF by default.**  `make` builds a single-CPU kernel;
-  `make SMP=1` re-enables `smp_wake_secondary` in `kmain`.  There
-  is a known race in the dispatcher / `context_switch` handoff
-  that reliably panics `waittest` followed by another exec under
-  SMP: the next exec'd thread's saved register frame ends up
-  holding fragments of `/proc/ps` text (the recycled stack page's
-  previous occupant's data) and the first `ret` jumps EL1 to an
-  ASCII address.  Symptom: `!! trap: sync_spx ec=0x21` with
-  `elr=0x200a78725f747261` ("art_rx\n") in the trap dump.  The
-  race is single-cycle-tight -- every software probe perturbs
-  the timing enough to mask it; needs cycle-accurate emulation
-  or a Solaris-`tlock`-shape rewrite of the per-thread switch
-  state.  Until then, default is UP and SMP code paths still
-  BUILD so they don't bit-rot.
 
 ## Commit message style
 

@@ -15,39 +15,11 @@
 ## Build
 
 ```
-make                 # build/aarch64/kernel8.img  (single-CPU by default)
+make                 # build/aarch64/kernel8.img
 make ARCH=aarch64    # same, explicit
-make SMP=1           # wake secondary cores in kmain (known race -- see below)
 make TRACE=1         # build with gcc -finstrument-functions for ftrace
 make clean
 ```
-
-### `SMP=1` — multi-core boot
-
-By default `kmain` does NOT call `smp_wake_secondary` on cores 1-3;
-they stay parked in their boot-time WFI spin-table loop and the
-kernel runs entirely on core 0.  The per-CPU dispatcher, runqueue,
-and `try_steal` code all still compile and link so they don't
-bit-rot.
-
-`make SMP=1` defines `KAPPARA_SMP` and lights up cores 1-3 in
-`kmain`.  There is a **known panic** under SMP: running `waittest`
-followed by another exec (e.g. `ps`) reliably crashes with
-`!! trap: sync_spx ec=0x21` and `elr=0x200a78725f747261`
-("art_rx\n" — bytes from a stale `/proc/ps` text fragment
-appearing in the next thread's `context_switch` save frame).  The
-race is in the dispatcher / `context_switch` handoff and is
-extremely timing-sensitive — every software instrumentation
-attempt (lock held across `context_switch`, per-thread DAIF mask
-on first-run, `dsb ish`/`ishst` barriers, per-CPU `strace`
-ring) either failed to close it or perturbed timing enough that
-the race went into hiding.  Properly nailing it likely needs
-cycle-accurate emulation or a rewrite of the per-thread switch
-state on top of a Solaris-`tlock`-shape invariant.
-
-If you're working on SMP scheduler code, build with `SMP=1`,
-test single transitions in isolation, and don't `waittest` then
-exec in the same boot.
 
 ### `TRACE=1` — function tracing
 
