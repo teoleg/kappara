@@ -55,6 +55,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kappara/atomic.h"
 #include "kappara/cdevsw.h"
 #include "kappara/kmem.h"
 #include "kappara/printk.h"
@@ -351,13 +352,39 @@ struct file *fd_get(int fd)
 	return me->fdt[fd];
 }
 
-/* Drop one reference; on the last reference call the file's close op
- * and free the struct file.  Used by both sys_close and the implicit
- * close-all on thread exit. */
+/* ---- struct file reference counting -----------------------------------
+ *
+ * f_refs counts every fdt slot (across every thread) that still names
+ * this struct file.  Threads share files via fork-style fd inheritance
+ * (kthread_inherit_fds), so the same struct file is reachable from
+ * multiple CPUs at once and concurrent close() / dup() races on the
+ * counter.
+ *
+ * Discipline:
+ *   * Initialisation: plain store of 1 at struct creation time,
+ *     BEFORE the pointer is published to a fdt slot.  Safe because
+ *     no other CPU can see f yet.
+ *   * Incrementing an existing reference (dup, fd inherit): file_get(f).
+ *   * Decrementing a reference: file_put(f).  When file_put drives
+ *     the count to zero it is the unique cleanup observer and runs
+ *     close + vfs_iput + kfree.
+ *
+ * Both helpers route through atomic_inc / atomic_dec_and_test in
+ * include/kappara/atomic.h -- never write raw `f->f_refs++` or
+ * `--f->f_refs`, those lose updates under SMP and have driven at
+ * least one panic into this tree already. */
+static void file_get(struct file *f)
+{
+	if (!f) return;
+	atomic_inc(&f->f_refs);
+}
+
 static void file_put(struct file *f)
 {
 	if (!f) return;
-	if (--f->f_refs > 0) return;
+	if (!atomic_dec_and_test(&f->f_refs))
+		return;
+	/* We drove f_refs from 1 to 0; nobody else can reach *f. */
 	if (f->f_ops && f->f_ops->close)
 		f->f_ops->close(f);
 	/* Drop the inode reference acquired by sys_open_impl.  If this
@@ -370,10 +397,15 @@ static void file_put(struct file *f)
 void kthread_inherit_fds(struct kthread *child, const struct kthread *parent)
 {
 	if (!child || !parent) return;
+	/* Parent's fdt is only touched by the parent thread (== curthread,
+	 * the caller).  Child isn't dispatched yet so its fdt has no
+	 * other observers.  The only piece that needs atomicity is the
+	 * shared f_refs counter -- different exec'd / spawned children
+	 * across CPUs race here. */
 	for (int i = 0; i < KT_FD_MAX; i++) {
 		struct file *f = parent->fdt[i];
 		child->fdt[i] = f;
-		if (f) f->f_refs++;
+		file_get(f);		/* no-op on NULL */
 	}
 }
 
@@ -579,15 +611,27 @@ int vfs_remove_child(struct dentry *parent, const char *name)
 	return -1;
 }
 
+/* ---- struct inode reference counting ---------------------------------
+ *
+ * i_count is the SVR4 v_count: one reference per dentry that names
+ * the inode plus one per open struct file that has it.  Multi-CPU
+ * concurrency arises in the same way as f_refs -- two threads each
+ * closing the last file that holds the inode will race the
+ * decrement.  Without atomicity one of the drops is lost (leak) or
+ * both observers think they did the last drop and vop_inactive +
+ * kfree runs twice (double free).  Route through atomic_inc /
+ * atomic_dec_and_test; never write raw `++` / `--`. */
 void vfs_iget(struct inode *ino)
 {
-	if (ino) ino->i_count++;
+	if (!ino) return;
+	atomic_inc(&ino->i_count);
 }
 
 void vfs_iput(struct inode *ino)
 {
 	if (!ino) return;
-	if (--ino->i_count > 0) return;
+	if (!atomic_dec_and_test(&ino->i_count))
+		return;
 	/* Last reference -- ask the FS to release whatever lived behind
 	 * i_private (kfs_file, kfs_dir), then free the inode body. */
 	if (ino->i_fops && ino->i_fops->inactive)

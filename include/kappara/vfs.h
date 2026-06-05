@@ -113,7 +113,13 @@ struct inode {
 	 * i_fops->inactive (vop_inactive) to release the FS-private
 	 * data and then frees the inode itself.  This is the lifecycle
 	 * model SVR4 used; Linux's separate dcache/inode refcounting
-	 * is a different shape -- we don't need it here. */
+	 * is a different shape -- we don't need it here.
+	 *
+	 * Touched ONLY via vfs_iget / vfs_iput, which route through
+	 * atomic_inc / atomic_dec_and_test in include/kappara/atomic.h
+	 * so concurrent close() on multiple CPUs can't race the drop.
+	 * Plain `++` / `--` is a bug.  See the matching contract on
+	 * struct file::f_refs below. */
 	int               i_count;
 };
 
@@ -129,6 +135,14 @@ struct file {
 	struct file_ops *f_ops;
 	struct inode    *f_inode;
 	void            *f_private;
+	/* SVR4 f_count.  Number of fdt slots (across every thread)
+	 * that still name this file.  Touched ONLY via file_get /
+	 * file_put inside vfs.c -- those route through atomic_inc /
+	 * atomic_dec_and_test (include/kappara/atomic.h) so
+	 * concurrent dup() + close() on different CPUs can't lose an
+	 * increment or both think they did the last drop.  Initial
+	 * value is assigned plain at struct-creation time (no other
+	 * CPU has the pointer yet). */
 	int              f_refs;
 	int              f_flags;	/* O_TRUNC | ...  set by sys_open */
 };
