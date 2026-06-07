@@ -34,6 +34,29 @@ enum kt_state {
  * kept here to avoid pulling all of vfs.h into sched.h. */
 #define KT_FD_MAX	16
 
+/*
+ * SVR4 priority space.  Solaris uses 0..169 carved up by scheduling
+ * class: TS gets 0..59, IA 0..59, FSS 0..59, SYS 60..99, RT 100..159.
+ * We collapse that to 0..63 (one uint64_t for the active-priority
+ * bitmap) for now -- phase 4's class layer will partition this range:
+ *
+ *   pri 0..49  -- TS-class user threads (default 30)
+ *   pri 50..62 -- SYS-class kernel threads (default 60)
+ *   pri 63     -- reserved for future RT
+ *
+ * Higher pri = picked first.  Idle threads live below this range
+ * (KSCHED_PRI_IDLE = -1) and are never enqueued -- they're the
+ * fallback when every priority is empty.
+ */
+#define KSCHED_NPRI		64
+#define KSCHED_PRI_TS_MIN	0
+#define KSCHED_PRI_TS_MAX	49
+#define KSCHED_PRI_TS_DEFAULT	30
+#define KSCHED_PRI_SYS_MIN	50
+#define KSCHED_PRI_SYS_MAX	62
+#define KSCHED_PRI_SYS_DEFAULT	60
+#define KSCHED_PRI_IDLE		(-1)
+
 struct file;		/* fwd; defined in vfs.h */
 struct wait_queue;	/* fwd; defined later in this file */
 
@@ -80,6 +103,15 @@ struct kthread {
 	spinlock_t     t_lock;
 	unsigned       tid;
 	enum kt_state  state;
+	/*
+	 * Dispatch priority.  Higher value = picked first.  Set at
+	 * kthread_create from the parent's scheduling class default
+	 * (phase 4); for phase 3 every kthread starts at
+	 * KSCHED_PRI_SYS_DEFAULT.  Idle threads carry KSCHED_PRI_IDLE
+	 * (-1) -- they're never enqueued, so the value is just a
+	 * documentation marker.
+	 */
+	int            t_pri;
 	struct kthread *next;
 	/* Pending-signal bitmap.  sys_kill sets bits, check_signals
 	 * (from trap_dispatch's SVC return) consumes them.  See
@@ -175,15 +207,26 @@ struct cpu {
 	 * releases it.  NULL means "no extra lock" (the yield case).
 	 */
 	spinlock_t      *cpu_pending_release_lock;
-	struct kthread  *cpu_dispq_head;
-	struct kthread  *cpu_dispq_tail;
-	/* Maintained alongside head/tail by every push/pop on the
-	 * dispatch queue.  The push-side load balancer (`dispq_push`)
-	 * reads this WITHOUT taking the remote CPU's lock -- a stale
-	 * value just means we pick a slightly-suboptimal target, the
-	 * subsequent locked push/pop is correct either way.  Lockless
-	 * reads of a single word are atomic on AArch64. */
-	unsigned         cpu_dispq_len;
+	/*
+	 * SVR4 disp_t -- multi-priority dispatch.  One FIFO per
+	 * priority level (0..KSCHED_NPRI-1).  cpu_qactmap has bit `p`
+	 * set iff cpu_dispq_head[p] is non-empty; the dispatcher picks
+	 * by `__builtin_clzll(cpu_qactmap)` (or rather flsl-style:
+	 * 63 - clzll = highest bit set = highest priority with work).
+	 *
+	 * cpu_maxrunpri is maintained as a cache of the same value, so
+	 * the steal-side load balancer can read it without computing
+	 * clzll.  Set to KSCHED_PRI_IDLE (-1) when nothing is runnable.
+	 *
+	 * cpu_nrunnable is the total thread count across all priorities,
+	 * read unlocked by pick_push_target and /proc/cpuload.  A stale
+	 * value just costs a slightly-suboptimal pick.
+	 */
+	struct kthread  *cpu_dispq_head[KSCHED_NPRI];
+	struct kthread  *cpu_dispq_tail[KSCHED_NPRI];
+	uint64_t         cpu_qactmap;
+	int              cpu_maxrunpri;
+	unsigned         cpu_nrunnable;
 	/* STREAMS service-procedure runqueue, drained from this CPU's
 	 * sched_tick + sys_yield.  qenable on this CPU pushes here;
 	 * the per-CPU drain is what gives us "natural" SVR4 streams

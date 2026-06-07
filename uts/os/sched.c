@@ -172,7 +172,7 @@ void sched_get_cpu_info(unsigned i, struct sched_cpu_info *out)
 	 * scheduler hot path. */
 	struct cpu *c = &cpus[i];
 	out->cpu_id    = c->cpu_id;
-	out->dispq_len = c->cpu_dispq_len;
+	out->dispq_len = c->cpu_nrunnable;
 	out->idle      = (cpu_idle_mask >> i) & 1u;
 	out->cur_name  = (c->cpu_thread && c->cpu_thread->name)
 			 ? c->cpu_thread->name
@@ -189,29 +189,63 @@ void sched_get_cpu_info(unsigned i, struct sched_cpu_info *out)
 static struct kthread *tid_table[KSCHED_MAX_TID];
 static spinlock_t      tid_lock = SPINLOCK_INIT;
 
-/* Append t to CPU c's dispatch queue.  Caller MUST hold c->cpu_disp_lock. */
-static void dispq_push_locked(struct cpu *c, struct kthread *t)
+/*
+ * Multi-priority dispatch helpers -- SVR4 disp_t shape.
+ *
+ * cpu_dispq_head[p]/cpu_dispq_tail[p] is the FIFO at priority p.
+ * cpu_qactmap has bit p set iff that FIFO is non-empty.
+ * cpu_maxrunpri caches the highest set bit (or KSCHED_PRI_IDLE).
+ * cpu_nrunnable totals every priority -- read unlocked by the load
+ * balancer and /proc/cpuload.
+ *
+ * All four fields are touched by every push/pop and protected by
+ * c->cpu_disp_lock.
+ */
+static inline int dispq_clamp_pri(int pri)
 {
-	t->next = NULL;
-	if (c->cpu_dispq_tail)
-		c->cpu_dispq_tail->next = t;
-	else
-		c->cpu_dispq_head = t;
-	c->cpu_dispq_tail = t;
-	c->cpu_dispq_len++;
+	if (pri < 0)              return 0;
+	if (pri >= KSCHED_NPRI)   return KSCHED_NPRI - 1;
+	return pri;
 }
 
-/* Pop the head of CPU c's dispatch queue.  Caller MUST hold the lock. */
+static inline void dispq_recompute_max(struct cpu *c)
+{
+	c->cpu_maxrunpri = c->cpu_qactmap
+		? (int)(63 - (unsigned)__builtin_clzll(c->cpu_qactmap))
+		: KSCHED_PRI_IDLE;
+}
+
+/* Append t at its priority level.  Caller MUST hold c->cpu_disp_lock. */
+static void dispq_push_locked(struct cpu *c, struct kthread *t)
+{
+	int pri = dispq_clamp_pri(t->t_pri);
+	t->next = NULL;
+	if (c->cpu_dispq_tail[pri])
+		c->cpu_dispq_tail[pri]->next = t;
+	else
+		c->cpu_dispq_head[pri] = t;
+	c->cpu_dispq_tail[pri] = t;
+	c->cpu_qactmap |= (uint64_t)1 << pri;
+	if (pri > c->cpu_maxrunpri)
+		c->cpu_maxrunpri = pri;
+	c->cpu_nrunnable++;
+}
+
+/* Pop highest-priority head.  Caller MUST hold c->cpu_disp_lock. */
 static struct kthread *dispq_pop_locked(struct cpu *c)
 {
-	struct kthread *t = c->cpu_dispq_head;
-	if (t) {
-		c->cpu_dispq_head = t->next;
-		if (!c->cpu_dispq_head)
-			c->cpu_dispq_tail = NULL;
-		t->next = NULL;
-		c->cpu_dispq_len--;
+	if (!c->cpu_qactmap)
+		return NULL;
+	int pri = (int)(63 - (unsigned)__builtin_clzll(c->cpu_qactmap));
+	struct kthread *t = c->cpu_dispq_head[pri];
+	c->cpu_dispq_head[pri] = t->next;
+	if (!c->cpu_dispq_head[pri]) {
+		c->cpu_dispq_tail[pri] = NULL;
+		c->cpu_qactmap &= ~((uint64_t)1 << pri);
+		dispq_recompute_max(c);
 	}
+	t->next = NULL;
+	c->cpu_nrunnable--;
 	return t;
 }
 
@@ -230,7 +264,7 @@ static struct kthread *dispq_pop_locked(struct cpu *c)
  * mask is a single volatile word, cheap to read); otherwise pick
  * the CPU with the shortest dispatch queue.  Ties go to the caller
  * so steady-state behaviour matches the old policy when load is
- * balanced.  All reads of cpu_dispq_len are unlocked -- a stale
+ * balanced.  All reads of cpu_nrunnable are unlocked -- a stale
  * value just costs us a slightly worse pick, the subsequent locked
  * push lands on whatever CPU we settled on.
  *
@@ -253,15 +287,15 @@ static struct cpu *pick_push_target(struct cpu *caller)
 	/* Path 2: every CPU busy.  Hand the new thread to the
 	 * least-loaded CPU only if our own queue is non-trivial --
 	 * otherwise keep it local for cache locality. */
-	if (caller->cpu_dispq_len < 2)
+	if (caller->cpu_nrunnable < 2)
 		return caller;
 
 	struct cpu *best   = caller;
-	unsigned    best_n = caller->cpu_dispq_len;
+	unsigned    best_n = caller->cpu_nrunnable;
 	for (unsigned i = 0; i < KSCHED_NCPU; i++) {
 		struct cpu *v = &cpus[i];
 		if (v == caller) continue;
-		unsigned n = v->cpu_dispq_len;
+		unsigned n = v->cpu_nrunnable;
 		if (n + 1 < best_n) {	/* strict: avoid bouncing on ties */
 			best   = v;
 			best_n = n;
@@ -293,7 +327,14 @@ void sched_init(void)
 	main_thread.name  = "main";
 	main_thread.tid   = 0;
 	main_thread.state = KT_RUNNING;
+	main_thread.t_pri = KSCHED_PRI_IDLE;	/* doubles as cpu 0's idle */
 	main_thread.next  = NULL;
+
+	/* Initialise every CPU's disp_t to "no runnable threads".  BSS
+	 * zero already gives us qactmap=0 and nrunnable=0; we just need
+	 * maxrunpri = KSCHED_PRI_IDLE (which is -1, NOT zero). */
+	for (unsigned i = 0; i < KSCHED_NCPU; i++)
+		cpus[i].cpu_maxrunpri = KSCHED_PRI_IDLE;
 
 	/* Initialize core 0's per-CPU struct and publish via TPIDR_EL1
 	 * before anything touches curcpu/curthread.  Spinlocks live
@@ -356,6 +397,8 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 	}
 	t->stack_base = stack;
 	t->state      = KT_READY;
+	t->t_pri      = KSCHED_PRI_SYS_DEFAULT;	/* phase 4 will plumb a
+						 * class-specific value here */
 	t->next       = NULL;
 	/* Initial polymorphic state lock: the per-thread default.
 	 * dispq_push() will transition t_lockp to the target CPU's
@@ -381,21 +424,31 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
  * are already masked -- save captures the masked state, restore keeps
  * it.
  *
- * Quick lockless peek at cpu_dispq_head before acquiring the victim's
- * lock; a stale NULL just costs one missed steal, which is harmless.
+ * Quick lockless peek at cpu_qactmap before acquiring the victim's
+ * lock; a stale 0 just costs one missed steal, which is harmless.
+ * Highest cpu_maxrunpri across victims wins -- steal the most
+ * important pending work first.
  */
 static struct kthread *try_steal(struct cpu *my_cpu)
 {
+	struct cpu *best = NULL;
+	int         best_pri = KSCHED_PRI_IDLE;
 	for (unsigned i = 0; i < KSCHED_NCPU; i++) {
 		struct cpu *v = &cpus[i];
-		if (v == my_cpu)            continue;
-		if (!v->cpu_dispq_head)     continue;  /* racy but harmless */
-		unsigned long f = spin_lock_irq_save(&v->cpu_disp_lock);
-		struct kthread *t = dispq_pop_locked(v);
-		spin_unlock_irq_restore(&v->cpu_disp_lock, f);
-		if (t) return t;
+		if (v == my_cpu)        continue;
+		if (!v->cpu_qactmap)    continue;  /* racy but harmless */
+		int p = v->cpu_maxrunpri;          /* racy but harmless */
+		if (p > best_pri) {
+			best     = v;
+			best_pri = p;
+		}
 	}
-	return NULL;
+	if (!best)
+		return NULL;
+	unsigned long f = spin_lock_irq_save(&best->cpu_disp_lock);
+	struct kthread *t = dispq_pop_locked(best);
+	spin_unlock_irq_restore(&best->cpu_disp_lock, f);
+	return t;
 }
 
 /* Common scheduler step.  If requeue_current is set, the outgoing
@@ -863,6 +916,7 @@ void sched_secondary_init(unsigned cpu_id)
 	}
 	idle->name       = "idle";
 	idle->state      = KT_RUNNING;
+	idle->t_pri      = KSCHED_PRI_IDLE;	/* never enqueued; marker */
 	idle->stack_base = NULL;	/* never reaped; stack lives forever */
 
 	c->cpu_id     = cpu_id;

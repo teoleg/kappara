@@ -739,9 +739,24 @@ for (;;) { kthread_yield(); wfi; }   -- idle loop
 
 ### Dispatch queues, push-side balance, and idle steal
 
-Each `struct cpu` has a FIFO `cpu_dispq` (head + tail + length)
-guarded by `cpu_disp_lock`.  Both directions of load balancing are
-in play:
+Each `struct cpu` carries an SVR4 `disp_t` -- one FIFO per priority
+level guarded by `cpu_disp_lock`.  Priorities are `0..KSCHED_NPRI-1`
+(64 levels); the active-priority bitmap `cpu_qactmap` is a single
+`uint64_t` so picking the highest-priority runnable thread is one
+`__builtin_clzll`.  `cpu_maxrunpri` caches the same value for
+lock-free reads by the steal-side balancer, and `cpu_nrunnable` is
+the total thread count across all priorities.
+
+Phase 4 will plumb priorities through a scheduling class layer
+(SYS for kernel threads at `KSCHED_PRI_SYS_DEFAULT=60`, TS for
+user threads at `KSCHED_PRI_TS_DEFAULT=30`); for now every
+`kthread_create` lands at `KSCHED_PRI_SYS_DEFAULT`, so the
+multi-priority queue behaves as a single FIFO in practice.  Idle
+threads carry `KSCHED_PRI_IDLE=-1` as a documentation marker --
+they're never enqueued, they're the fallback that runs when every
+priority is empty AND the cross-CPU steal also turns up nothing.
+
+Both directions of load balancing are in play:
 
 **Push-side** (`dispq_push` / `pick_push_target`).  When a thread
 becomes runnable — `kthread_create` for a new thread,
@@ -754,14 +769,16 @@ waiting, we scan `cpus[]` for a strictly-shorter queue elsewhere
 and push there.  Single-shot wakes onto an empty local queue stay
 local for cache locality.
 
-The remote `cpu_dispq_len` reads are unlocked — a single word, so
-they're atomic on AArch64.  A stale value just means a slightly
-worse pick; the subsequent locked push lands on whatever target
-we chose, which is correct either way.
+The remote `cpu_nrunnable` and `cpu_maxrunpri` reads are unlocked
+— each is a single word, atomic on AArch64.  A stale value just
+means a slightly worse pick; the subsequent locked push/pop lands
+on whatever target we chose, which is correct either way.
 
 **Pull-side** (`try_steal`, in `switch_to_next`).  When a CPU has
-nothing in its own queue, it scans `cpus[]` and pops one thread
-from the first non-empty remote queue (under that CPU's lock).
+nothing in its own queue, it scans `cpus[]` for the peer with the
+highest `cpu_maxrunpri` (so we steal the most important pending
+work first, not just whatever's on the lowest-numbered CPU) and
+pops one thread from its dispatch queue under that CPU's lock.
 This is the catch-net for cases push-side missed (e.g. the waker
 guessed wrong, or a thread is now blocking too long on another
 CPU and a sibling went idle in the meantime).  If steal also
