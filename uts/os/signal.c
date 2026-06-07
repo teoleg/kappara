@@ -261,18 +261,32 @@ long sys_wait_impl(int tid)
 {
 	if (tid <= 0) return -1;
 	for (;;) {
-		/* kthread_find returns NULL for both "never existed" and
-		 * "exited (KT_DEAD or already reaped)" -- both are "tid
-		 * is gone, return 0".  We don't need to distinguish here
-		 * since we don't expose a status/exit-code yet. */
+		/* Take thread_exit_wq.sq_lock BEFORE reading kthread_find,
+		 * because kthread_exit sets state=KT_DEAD under the same
+		 * sq_lock.  Without holding sq_lock here, a waiter could
+		 * read state=KT_RUNNING (target still alive), then sleep
+		 * AFTER the target's wake (which observed an empty wq) --
+		 * the lost-wakeup hang seen in the phase-5 stress runs.
+		 * kthread_sleep_on_locked atomically transitions to
+		 * BLOCKED and releases sq_lock after ctx_switch save.
+		 * kthread_find returns NULL for both "never existed" and
+		 * "exited (KT_DEAD or already reaped)" -- both are "tid is
+		 * gone, return 0". */
+		unsigned long flags =
+			spin_lock_irq_save(&thread_exit_wq.sq_lock);
 		struct kthread *t = kthread_find((unsigned)tid);
-		if (!t) return 0;
+		if (!t) {
+			spin_unlock_irq_restore(&thread_exit_wq.sq_lock, flags);
+			return 0;
+		}
 
 		struct kthread *me = curthread;
-		if (me && (me->sig_pending & SIG_FATAL_MASK))
+		if (me && (me->sig_pending & SIG_FATAL_MASK)) {
+			spin_unlock_irq_restore(&thread_exit_wq.sq_lock, flags);
 			return -1;	/* EINTR shape */
+		}
 
-		kthread_sleep_on(&thread_exit_wq);
+		kthread_sleep_on_locked(&thread_exit_wq, flags);
 	}
 }
 

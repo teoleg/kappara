@@ -680,17 +680,21 @@ static inline void irq_restore(unsigned long daif)
 
 void kthread_sleep_on(struct wait_queue *wq)
 {
-	unsigned long flags = irq_save_and_disable();
-	struct kthread *t = curthread;
+	unsigned long flags = spin_lock_irq_save(&wq->sq_lock);
+	kthread_sleep_on_locked(wq, flags);
+}
+
+void kthread_sleep_on_locked(struct wait_queue *wq, unsigned long flags)
+{
 	/*
-	 * Acquire sq_lock BEFORE linking, and carry it across the
-	 * context switch via extra_release.  The lock is released by
-	 * the INCOMING thread inside switch_to_next AFTER context_switch
-	 * has committed our sp.  Until that point, any concurrent waker
-	 * spins on sq_lock and cannot observe us in a half-saved state.
-	 * See Phase 5 design notes on struct wait_queue::sq_lock.
+	 * Caller holds wq->sq_lock with IRQs masked.  We carry sq_lock
+	 * across context_switch via extra_release; the INCOMING thread
+	 * releases it AFTER context_switch commits our sp.  Until that
+	 * point any concurrent waker spins on sq_lock and cannot observe
+	 * us in a half-saved state.  See Phase 5 design notes on struct
+	 * wait_queue::sq_lock.
 	 */
-	spin_lock(&wq->sq_lock);
+	struct kthread *t = curthread;
 	t->state      = KT_BLOCKED;
 	t->waiting_on = wq;
 	t->next       = wq->head;
@@ -888,31 +892,51 @@ void kthread_exit(void)
 	kprintf("kthread: tid=%u (%s) exited\n", me->tid, me->name);
 
 	/*
-	 * Acquire to_reap_lock and link me onto to_reap, but DON'T
-	 * release the lock yet -- it's carried across context_switch
-	 * via the extra_release mechanism (same shape as Phase 5's
-	 * sleepq sq_lock).  Any concurrent to_reap drain on another
-	 * CPU spins on to_reap_lock and cannot pmm_free me's stack
-	 * page until save phase has committed me->sp -- otherwise the
-	 * page would be freed (and possibly reused) mid-save, leaving
-	 * stale register values in someone else's data.
-	 *
-	 * Set state FIRST, then wake.  A waiter racing kthread_find
-	 * after the wake must see state=KT_DEAD or it'll sleep again
-	 * and nothing will wake it a second time.
+	 * Lock acquisition order:
+	 *   to_reap_lock          -- carried across the switch so a
+	 *                            remote drain can't pmm_free our
+	 *                            stack mid-save (phase 5b).
+	 *   thread_exit_wq.sq_lock -- set state=KT_DEAD AND wake any
+	 *                            sys_wait() waiters under the same
+	 *                            lock the waiter takes for its
+	 *                            check-then-sleep window.  Without
+	 *                            this, a waiter could read
+	 *                            state=KT_RUNNING, decide to sleep,
+	 *                            then sleep AFTER our wake (which
+	 *                            saw an empty wq) -- a classic
+	 *                            lost-wakeup hang.  sys_wait_impl
+	 *                            and kthread_sleep_on_locked are
+	 *                            the matched pair.
 	 */
 	unsigned long flags = irq_save_and_disable();
 	spin_lock(&to_reap_lock);
+	spin_lock(&thread_exit_wq.sq_lock);
+
 	me->state = KT_DEAD;
 	me->next  = to_reap;
 	to_reap   = me;
 
-	/* Wake sys_wait()'ers.  kthread_find returns NULL on KT_DEAD,
-	 * so the waiter will observe "tid is gone" and return 0.  Called
-	 * while we still hold to_reap_lock (lock order: to_reap_lock ->
-	 * sq_lock -> disp_lock); nothing else takes sq_lock and then
-	 * to_reap_lock, so the order stays consistent. */
-	kthread_wake_all(&thread_exit_wq);
+	/* Inline wake_all so we can do it under the sq_lock we already
+	 * hold (re-acquiring would deadlock on this non-recursive lock).
+	 * Set state=KT_READY and unlink under sq_lock; dispq_push happens
+	 * AFTER we release sq_lock, since dispq_push acquires disp_lock
+	 * and we want the lock order to stay sq_lock -> disp_lock with
+	 * no inversion via the resumer drain path. */
+	struct kthread *t = thread_exit_wq.head;
+	thread_exit_wq.head = NULL;
+	for (struct kthread *p = t; p; p = p->next) {
+		p->waiting_on = NULL;
+		p->state      = KT_READY;
+	}
+	spin_unlock(&thread_exit_wq.sq_lock);
+
+	struct cpu *c = curcpu();
+	while (t) {
+		struct kthread *n = t->next;
+		t->next = NULL;
+		dispq_push(c, t);
+		t = n;
+	}
 
 	switch_to_next(0, &to_reap_lock);
 	/* unreachable: switch_to_next with requeue=0 never returns

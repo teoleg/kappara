@@ -553,9 +553,15 @@ then calls `kthread_wake_all(&thread_exit_wq)` -- in that order, so
 a waiter racing `kthread_find` after the wake observes
 `state == KT_DEAD` (which `kthread_find` filters to `NULL`) and
 returns 0 instead of sleeping again with nobody left to wake it.
-`sys_wait_impl` loops: `kthread_find` → if gone, return 0; if a
-fatal signal landed, return -1 (EINTR shape); otherwise
-`kthread_sleep_on(&thread_exit_wq)`.
+`sys_wait_impl` loops: take `thread_exit_wq.sq_lock`, then
+`kthread_find` → if gone, return 0; if a fatal signal landed,
+return -1 (EINTR shape); otherwise
+`kthread_sleep_on_locked(&thread_exit_wq, flags)` -- which atomically
+links onto the queue and releases `sq_lock` after `context_switch`
+commits sp.  `kthread_exit` sets `state=KT_DEAD` AND wakes any
+waiters under the same `sq_lock`, so the check-then-sleep window is
+closed: a waiter either sees the new state under its `sq_lock`
+acquire or it sleeps and is woken under the exiter's `sq_lock`.
 
 This isn't a real `waitpid` -- no parent-child tracking, no exit
 status, no `WNOHANG` flag.  It's a `pthread_join`-shaped building

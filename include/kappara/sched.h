@@ -281,6 +281,29 @@ struct wait_queue {
 #define WAIT_QUEUE_INIT		{ .head = NULL, .sq_lock = SPINLOCK_INIT }
 
 void            kthread_sleep_on (struct wait_queue *wq);
+
+/*
+ * Atomic check-and-sleep variant.  Caller MUST already hold wq->sq_lock
+ * (taken via spin_lock_irq_save, returning flags it captured) and pass
+ * the captured flags in.  This routine links the caller onto wq and
+ * yields without re-queuing -- the sq_lock release happens AFTER
+ * context_switch commits sp (via extra_release), same as the regular
+ * sleep path.  On return, sq_lock is NOT held and DAIF has been
+ * restored to `flags`.
+ *
+ * The point: callers with a "while (!condition) sleep" pattern (sys_wait,
+ * sys_sigsuspend, stream_read) can take sq_lock, evaluate `condition`
+ * under it, and -- if they need to sleep -- hand off to this routine.
+ * A waker on another CPU that sets the condition under sq_lock will
+ * either:
+ *   (a) get sq_lock first, set the condition, release.  The caller's
+ *       subsequent acquire sees the new condition, no sleep.
+ *   (b) spin on sq_lock until the caller has slept (release happens
+ *       after ctx_switch save).  Then sets condition and wakes.
+ * Either way, no lost wakeup.
+ */
+void            kthread_sleep_on_locked(struct wait_queue *wq,
+					unsigned long flags);
 void            kthread_wake_all (struct wait_queue *wq);
 void            kthread_wake_one (struct wait_queue *wq);
 
