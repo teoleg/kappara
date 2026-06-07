@@ -413,23 +413,65 @@ static struct kthread *try_steal(struct cpu *my_cpu)
 static void switch_to_next(int requeue_current)
 {
 	struct cpu *c = curcpu();
-	unsigned long flags = spin_lock_irq_save(&c->cpu_disp_lock);
+	/*
+	 * Phase 2 swtch() -- Solaris discipline.
+	 *
+	 * (1) Acquire cpu_thread_lock.  This is the OUTGOING thread's
+	 *     t_lockp by the invariant set up in phase 1.  Held across
+	 *     context_switch; released by the resumed thread (or
+	 *     thread_trampoline for first-run threads).
+	 * (2) Acquire cpu_disp_lock for the dispatch-queue scan.
+	 * (3) Pop next.  If absent, try_steal from a peer.  Re-acquire
+	 *     local cpu_disp_lock if we have to.
+	 * (4) If requeuing the outgoing thread, transition its t_lockp
+	 *     cpu_thread_lock -> cpu_disp_lock atomically under both
+	 *     locks held, then push onto the local dispq.  Other CPUs
+	 *     that see the outgoing thread on the dispq are seeing a
+	 *     thread whose sp will be committed AFTER context_switch
+	 *     completes.  However any try_steal that pops it will read
+	 *     prev->sp -- if the read happens before context_switch's
+	 *     save phase commits, the stealer sees STALE sp.  That's
+	 *     the steal-mid-save race.
+	 *
+	 *     The fix that actually closes the race: DEFER the dispq
+	 *     push to AFTER context_switch's save phase, on the
+	 *     resumed thread's side.  Until then, prev is stashed in
+	 *     cpu_pending_requeue and its t_lockp stays at
+	 *     cpu_thread_lock (which we still hold across the switch),
+	 *     so any concurrent thread_lock(prev) blocks on us.
+	 * (5) Transition next's t_lockp cpu_disp_lock ->
+	 *     cpu_thread_lock atomically under both locks held.
+	 * (6) Release cpu_disp_lock.  cpu_thread_lock stays held.
+	 * (7) context_switch.  The save phase commits prev->sp; the
+	 *     load phase brings in next.  On return we are next.
+	 * (8) Drain c->cpu_pending_requeue: push prev onto the dispq
+	 *     under cpu_disp_lock, transitioning its t_lockp from
+	 *     cpu_thread_lock (which we still hold) to cpu_disp_lock.
+	 * (9) Release cpu_thread_lock.  curthread is next; its
+	 *     t_lockp == cpu_thread_lock per the invariant.
+	 * (10) Drain to_reap as before.
+	 *
+	 * For first-run threads the path past (7) goes through
+	 * thread_trampoline, which calls sched_finish_switch() to do
+	 * steps (8)-(9) before unmasking IRQs.
+	 */
+	unsigned long flags = spin_lock_irq_save(&c->cpu_thread_lock);
+	spin_lock(&c->cpu_disp_lock);
 
 	struct kthread *next = dispq_pop_locked(c);
 	if (!next) {
-		/* Release queue lock; keep IRQs masked for try_steal. */
+		/* Drop disp_lock so try_steal can hit other CPUs' locks
+		 * without nesting.  cpu_thread_lock stays held. */
 		spin_unlock(&c->cpu_disp_lock);
 		next = try_steal(c);
 		if (!next) {
 			if (requeue_current) {
 				/* Yield with nothing to do: keep running. */
+				spin_unlock(&c->cpu_thread_lock);
 				__asm__ volatile ("msr daif, %0"
 						  :: "r"(flags) : "memory");
 				return;
 			}
-			/* Thread is blocking or exiting.  Run the CPU's
-			 * idle thread so the core can WFI rather than
-			 * burning cycles. */
 			next = c->cpu_idle;
 		}
 		if (!next) {
@@ -438,45 +480,83 @@ static void switch_to_next(int requeue_current)
 			for (;;)
 				__asm__ volatile ("wfe");
 		}
-		/* Re-acquire the lock for the thread swap below. */
 		spin_lock(&c->cpu_disp_lock);
 	}
 
 	struct kthread *prev = c->cpu_thread;
 	if (next == prev) {
-		/* Idle→idle or steal returned current thread: no-op. */
 		spin_unlock(&c->cpu_disp_lock);
+		spin_unlock(&c->cpu_thread_lock);
 		__asm__ volatile ("msr daif, %0" :: "r"(flags) : "memory");
 		return;
 	}
+
+	/* (4) Deferred requeue of prev: stash, set KT_READY.
+	 *
+	 * prev->t_lockp stays at cpu_thread_lock (which we still
+	 * hold).  The resumed thread will transition it to
+	 * cpu_disp_lock under both locks held, then push, in step (8).
+	 *
+	 * For !requeue_current (sleep / exit), prev is already linked
+	 * elsewhere by the caller (wait queue, to_reap) -- nothing for
+	 * swtch to do with prev. */
 	if (requeue_current && prev != c->cpu_idle) {
-		/* The per-CPU idle thread is a singleton fallback, not a
-		 * runqueue citizen.  When idle yields and we find real
-		 * work to switch to, we leave idle "off" the queue so the
-		 * empty-queue path can return to it whenever needed. */
-		dispq_push_locked(c, prev);
+		c->cpu_pending_requeue = prev;
 		prev->state = KT_READY;
+	} else {
+		c->cpu_pending_requeue = NULL;
 	}
-	next->state = KT_RUNNING;
+
+	/* (5) next's t_lockp transition cpu_disp_lock -> cpu_thread_lock.
+	 * We hold both, so concurrent thread_lock(next) sees the flip
+	 * atomically.  After this, next is owned by cpu_thread_lock. */
+	next->t_lockp = &c->cpu_thread_lock;
+	next->state   = KT_RUNNING;
 	c->cpu_thread = next;
-	/* Maintain the global idle mask used by IPI wake.  Setting/
-	 * clearing under cpu_disp_lock means a remote waker either sees
-	 * the bit set BEFORE this CPU committed to idle (so the IPI is
-	 * a no-op because the CPU was about to drain its own queue
-	 * anyway) or AFTER (so the IPI wakes the WFI in the idle loop). */
+
 	uint32_t mybit = 1u << c->cpu_id;
 	if (next == c->cpu_idle)
 		cpu_idle_mask |=  mybit;
 	else if (prev == c->cpu_idle)
 		cpu_idle_mask &= ~mybit;
-	/* Release the queue lock; keep IRQs masked across context_switch. */
+
+	/* (6) Release disp_lock; cpu_thread_lock stays held across (7). */
 	spin_unlock(&c->cpu_disp_lock);
 
+	/* (7) The actual swap.  Save commits prev->sp before load. */
 	context_switch(&prev->sp, next->sp);
 
-	/* We're now running as `next`.  Drain the to-reap list: any
-	 * thread that called kthread_exit added itself here and we're
-	 * guaranteed to be on a DIFFERENT stack now, so freeing is safe. */
+	/* (8) Drain pending_requeue: push prev with t_lockp transition.
+	 *
+	 * We arrive here as `next`, with cpu_thread_lock held (carried
+	 * across the switch).  If our predecessor stashed a thread for
+	 * us to requeue, do it now.
+	 *
+	 * Re-read curcpu() in case we somehow migrated -- on this
+	 * architecture context_switch never changes CPU, but the
+	 * re-read is free insurance against future changes. */
+	{
+		struct cpu *c2 = curcpu();
+		struct kthread *to_push = c2->cpu_pending_requeue;
+		c2->cpu_pending_requeue = NULL;
+		if (to_push) {
+			spin_lock(&c2->cpu_disp_lock);
+			to_push->t_lockp = &c2->cpu_disp_lock;
+			dispq_push_locked(c2, to_push);
+			spin_unlock(&c2->cpu_disp_lock);
+			if (cpu_idle_mask)
+				ipi_wake_idle();
+		}
+
+		/* (9) Release cpu_thread_lock.  curthread is `next`;
+		 * its t_lockp == cpu_thread_lock per the invariant, and
+		 * we are that thread, so releasing the lock is what hands
+		 * off "the running thread on this CPU is stable" to
+		 * code outside swtch. */
+		spin_unlock(&c2->cpu_thread_lock);
+	}
+
+	/* (10) Drain the to-reap list. */
 	unsigned long f2 = spin_lock_irq_save(&to_reap_lock);
 	struct kthread *grab = to_reap;
 	to_reap = NULL;
@@ -491,8 +571,6 @@ static void switch_to_next(int requeue_current)
 				spin_unlock_irq_restore(&tid_lock, f3);
 			}
 			pmm_free(t->stack_base);
-			/* Free the lazily-allocated per-signal disposition
-			 * table if this thread ever called sigaction. */
 			if (t->sig_actions) kfree(t->sig_actions);
 			kfree(t);
 		}
@@ -505,6 +583,40 @@ static void switch_to_next(int requeue_current)
 void kthread_yield(void)
 {
 	switch_to_next(1);
+}
+
+/*
+ * sched_finish_switch -- called by thread_trampoline (switch.S) as
+ * the very first act of a brand-new thread, before it executes any
+ * of its fn(arg) body.
+ *
+ * It does the same handoff work that swtch's resumed-thread side
+ * does (steps (8) and (9) of the comment in switch_to_next).  A
+ * first-run thread doesn't go through that code because its saved
+ * x30 points at thread_trampoline rather than back into swtch.
+ *
+ * IRQ discipline: arrives with DAIF.I set (initial saved DAIF in
+ * arch_thread_init_frame is 0x80).  Stays masked through the
+ * dispq_push and the cpu_thread_lock release; the trampoline issues
+ * `daifclr, #2` AFTER this function returns.  Without I masked, a
+ * timer IRQ between trampoline entry and the unlock would re-enter
+ * swtch on this CPU and deadlock on the cpu_thread_lock we still
+ * hold.
+ */
+void sched_finish_switch(void)
+{
+	struct cpu *c = curcpu();
+	struct kthread *to_push = c->cpu_pending_requeue;
+	c->cpu_pending_requeue = NULL;
+	if (to_push) {
+		spin_lock(&c->cpu_disp_lock);
+		to_push->t_lockp = &c->cpu_disp_lock;
+		dispq_push_locked(c, to_push);
+		spin_unlock(&c->cpu_disp_lock);
+		if (cpu_idle_mask)
+			ipi_wake_idle();
+	}
+	spin_unlock(&c->cpu_thread_lock);
 }
 
 /* Bracket the wait-queue mutation + context switch so the timer

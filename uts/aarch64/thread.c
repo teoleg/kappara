@@ -28,10 +28,17 @@ void *arch_thread_init_frame(void *stack_top, void (*fn)(void *), void *arg)
 	sp[8]  = 0; sp[9]  = 0;				/* x27, x28 */
 	sp[10] = 0;					/* x29 (fp) */
 	sp[11] = (uint64_t)(uintptr_t)thread_trampoline;/* x30 (lr) */
-	sp[12] = 0;	/* saved DAIF: fully unmasked.  The trampoline
-			 * does daifclr #2 anyway, but having a sane
-			 * initial value makes the first context_switch
-			 * msr daif behave predictably. */
+	sp[12] = 0x80;	/* saved DAIF: bit 7 = PSTATE.I = IRQ masked.
+			 *
+			 * Required by phase-2 swtch: thread_trampoline
+			 * calls sched_finish_switch() to release the
+			 * cpu_thread_lock that swtch held across
+			 * context_switch.  If a timer IRQ fired between
+			 * trampoline entry and the unlock, the handler's
+			 * own swtch invocation would deadlock on the
+			 * still-held cpu_thread_lock.  The trampoline
+			 * issues `daifclr, #2` only AFTER
+			 * sched_finish_switch returns. */
 	sp[13] = 0;	/* pad, keeps frame size 112 = 16-byte aligned */
 	return sp;
 }

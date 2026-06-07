@@ -153,6 +153,18 @@ struct cpu {
 	 * initialised but nothing uses it yet.
 	 */
 	spinlock_t       cpu_thread_lock;
+	/*
+	 * Pending requeue stash for swtch's deferred dispq push.
+	 * The OUTGOING thread sets this BEFORE context_switch; the
+	 * INCOMING thread (or thread_trampoline) reads it AFTER
+	 * context_switch and pushes the stashed thread onto the
+	 * dispq with its t_lockp transitioned to cpu_disp_lock.
+	 * Deferring the push to the after-switch side is what closes
+	 * the steal-mid-save race -- a stealer that gets the stashed
+	 * thread reads a sp that has been committed by
+	 * context_switch's save phase.
+	 */
+	struct kthread  *cpu_pending_requeue;
 	struct kthread  *cpu_dispq_head;
 	struct kthread  *cpu_dispq_tail;
 	/* Maintained alongside head/tail by every push/pop on the
