@@ -122,6 +122,14 @@ static unsigned next_tid = 1;
 static struct kthread *to_reap;
 static spinlock_t      to_reap_lock = SPINLOCK_INIT;
 
+/*
+ * Sentinel for `kthread.t_lockp` mid-transition (phase 1: declared,
+ * not yet used).  See include/kappara/thread_lock.h for the role.
+ * No code spin_locks this; it's just a uniquely-identifiable
+ * non-NULL pointer.
+ */
+spinlock_t t_transition_lock = SPINLOCK_INIT;
+
 /* Global wait queue for sys_wait().  Every kthread_exit wakes
  * everyone on it; each waiter re-checks whether ITS target tid is
  * now gone.  A single broadcast is fine -- the cost is one yield
@@ -295,6 +303,14 @@ void sched_init(void)
 	cpus[0].cpu_idle      = &main_thread;	/* main IS our idle */
 	set_curcpu(&cpus[0]);
 
+	/*
+	 * Polymorphic state lock: main_thread is KT_RUNNING on cpu 0,
+	 * so its t_lockp is cpu 0's cpu_thread_lock per the discipline
+	 * documented on struct kthread::t_lockp.  Phase 1 sets the
+	 * pointer for future readers; nothing reads it yet.
+	 */
+	main_thread.t_lockp   = &cpus[0].cpu_thread_lock;
+
 	/* Core 0 starts on its idle (== main) thread.  Mark it so. */
 	cpu_idle_mask |= (1u << 0);
 
@@ -341,6 +357,11 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 	t->stack_base = stack;
 	t->state      = KT_READY;
 	t->next       = NULL;
+	/* Initial polymorphic state lock: the per-thread default.
+	 * dispq_push() will transition t_lockp to the target CPU's
+	 * cpu_disp_lock in a later phase; for now this is just a
+	 * stable initial value so nothing reads NULL. */
+	t->t_lockp    = &t->t_lock;
 	t->sp         = arch_thread_init_frame((char *)stack + PAGE_SIZE,
 					       fn, arg);
 
@@ -669,6 +690,9 @@ void sched_secondary_init(unsigned cpu_id)
 	c->cpu_id     = cpu_id;
 	c->cpu_thread = idle;
 	c->cpu_idle   = idle;
+	/* idle is KT_RUNNING on this CPU: t_lockp = cpu_thread_lock
+	 * per the discipline on struct kthread::t_lockp. */
+	idle->t_lockp = &c->cpu_thread_lock;
 
 	/* Mark this CPU as starting in its idle thread so a waker on
 	 * another core knows to send a wake-up IPI when it parks work. */

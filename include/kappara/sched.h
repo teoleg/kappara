@@ -52,6 +52,32 @@ struct kthread {
 	 * buffer (e.g. sys_execve's resolved basename) without worry. */
 	const char    *name;
 	char           comm[32];
+	/*
+	 * Solaris-style polymorphic thread-state lock.
+	 *
+	 * t_lockp points at whichever spinlock currently owns this
+	 * thread's mutable state (sp, state, waiting_on, next, queue
+	 * linkage).  It is updated as the thread transitions between
+	 * dispatch / sleep / per-CPU ownership:
+	 *
+	 *   newly created          -> &kthread.t_lock (per-thread default)
+	 *   KT_RUNNING on a CPU    -> &cpu.cpu_thread_lock
+	 *   KT_READY on a dispq    -> &cpu.cpu_disp_lock
+	 *   KT_BLOCKED on a wait q -> &wait_queue.wq_lock  (phase 5)
+	 *   KT_DEAD on to_reap     -> &to_reap_lock
+	 *
+	 * Future code mutates t state ONLY after acquiring *t_lockp,
+	 * with retries when t_lockp changes mid-acquire (see
+	 * thread_lock() in include/kappara/thread_lock.h, added in
+	 * phase 1).  This is what closes the steal-mid-save race that
+	 * the "/proc/ps text in a recycled stack page's saved-register
+	 * slots" panic exposed.
+	 *
+	 * Phase 1 (this commit): the fields exist and are initialised
+	 * but nothing reads t_lockp yet.  Phase 2 will wire swtch().
+	 */
+	spinlock_t    *t_lockp;
+	spinlock_t     t_lock;
 	unsigned       tid;
 	enum kt_state  state;
 	struct kthread *next;
@@ -115,6 +141,18 @@ struct cpu {
 	struct kthread  *cpu_thread;	/* currently running on this CPU   */
 	struct kthread  *cpu_idle;	/* this CPU's idle thread          */
 	spinlock_t       cpu_disp_lock;
+	/*
+	 * cpu_thread_lock owns the t_lockp of whichever kthread is
+	 * currently KT_RUNNING on this CPU.  In phase 2 swtch() will
+	 * hold it across context_switch -- the OUTGOING thread's
+	 * dispatcher acquires it (it equals outgoing->t_lockp at
+	 * entry); the INCOMING thread's continuation releases it
+	 * (it equals incoming->t_lockp after the transfer inside
+	 * swtch).  That's the structural close for the
+	 * steal-mid-save race.  In phase 1 the lock exists and is
+	 * initialised but nothing uses it yet.
+	 */
+	spinlock_t       cpu_thread_lock;
 	struct kthread  *cpu_dispq_head;
 	struct kthread  *cpu_dispq_tail;
 	/* Maintained alongside head/tail by every push/pop on the
