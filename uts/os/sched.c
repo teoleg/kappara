@@ -403,6 +403,17 @@ static struct kthread *try_steal(struct cpu *my_cpu)
  * if not, it has already been parked somewhere else (a wait queue,
  * exit limbo, ...) and we MUST NOT put it back.
  *
+ * extra_release (Phase 5): an optional second spinlock that the caller
+ * is currently holding and wants released ONLY after context_switch's
+ * save phase has committed prev->sp.  Used by kthread_sleep_on to
+ * carry wq->sq_lock across the switch -- a waker that grabs sq_lock
+ * before prev->sp is committed could see a thread on the queue whose
+ * sp is stale, exactly the steal-mid-save race that Phase 2 closed
+ * for the yield path.  The OUTGOING thread stashes the pointer in
+ * c->cpu_pending_release_lock; the INCOMING thread (or
+ * sched_finish_switch on first-run) releases it after the requeue
+ * drain, before releasing cpu_thread_lock.  NULL means "no extra lock".
+ *
  * Lock discipline: spin_lock_irq_save at entry masks IRQs for the
  * entire switch; spin_unlock releases the queue lock but KEEPS IRQs
  * masked until the end.  When the local queue is empty we release the
@@ -410,7 +421,7 @@ static struct kthread *try_steal(struct cpu *my_cpu)
  * If that also turns up nothing we fall through to the per-CPU idle
  * thread so the CPU can WFI rather than spin.
  */
-static void switch_to_next(int requeue_current)
+static void switch_to_next(int requeue_current, spinlock_t *extra_release)
 {
 	struct cpu *c = curcpu();
 	/*
@@ -466,7 +477,13 @@ static void switch_to_next(int requeue_current)
 		next = try_steal(c);
 		if (!next) {
 			if (requeue_current) {
-				/* Yield with nothing to do: keep running. */
+				/* Yield with nothing to do: keep running.
+				 * Defensive: release any extra_release the
+				 * caller passed -- in practice yield never
+				 * passes one, but if a future caller does
+				 * it would deadlock without this. */
+				if (extra_release)
+					spin_unlock(extra_release);
 				spin_unlock(&c->cpu_thread_lock);
 				__asm__ volatile ("msr daif, %0"
 						  :: "r"(flags) : "memory");
@@ -486,6 +503,8 @@ static void switch_to_next(int requeue_current)
 	struct kthread *prev = c->cpu_thread;
 	if (next == prev) {
 		spin_unlock(&c->cpu_disp_lock);
+		if (extra_release)
+			spin_unlock(extra_release);
 		spin_unlock(&c->cpu_thread_lock);
 		__asm__ volatile ("msr daif, %0" :: "r"(flags) : "memory");
 		return;
@@ -506,6 +525,13 @@ static void switch_to_next(int requeue_current)
 	} else {
 		c->cpu_pending_requeue = NULL;
 	}
+
+	/* (4b) Stash extra_release.  For sleep this is &wq->sq_lock,
+	 * which the caller is currently holding.  The resumer releases
+	 * it AFTER context_switch's save phase commits prev->sp, which
+	 * is what closes the wake-side variant of the steal-mid-save
+	 * race -- wakers spinning on sq_lock can't proceed until then. */
+	c->cpu_pending_release_lock = extra_release;
 
 	/* (5) next's t_lockp transition cpu_disp_lock -> cpu_thread_lock.
 	 * We hold both, so concurrent thread_lock(next) sees the flip
@@ -548,6 +574,16 @@ static void switch_to_next(int requeue_current)
 				ipi_wake_idle();
 		}
 
+		/* (8b) Release the optional extra_release lock that the
+		 * sleeper stashed.  Order matters: release this BEFORE
+		 * cpu_thread_lock so a waker spinning on sq_lock can
+		 * make progress while we still own "the running thread on
+		 * this CPU is stable" via cpu_thread_lock. */
+		spinlock_t *extra = c2->cpu_pending_release_lock;
+		c2->cpu_pending_release_lock = NULL;
+		if (extra)
+			spin_unlock(extra);
+
 		/* (9) Release cpu_thread_lock.  curthread is `next`;
 		 * its t_lockp == cpu_thread_lock per the invariant, and
 		 * we are that thread, so releasing the lock is what hands
@@ -582,7 +618,7 @@ static void switch_to_next(int requeue_current)
 
 void kthread_yield(void)
 {
-	switch_to_next(1);
+	switch_to_next(1, NULL);
 }
 
 /*
@@ -616,6 +652,10 @@ void sched_finish_switch(void)
 		if (cpu_idle_mask)
 			ipi_wake_idle();
 	}
+	spinlock_t *extra = c->cpu_pending_release_lock;
+	c->cpu_pending_release_lock = NULL;
+	if (extra)
+		spin_unlock(extra);
 	spin_unlock(&c->cpu_thread_lock);
 }
 
@@ -642,11 +682,20 @@ void kthread_sleep_on(struct wait_queue *wq)
 {
 	unsigned long flags = irq_save_and_disable();
 	struct kthread *t = curthread;
+	/*
+	 * Acquire sq_lock BEFORE linking, and carry it across the
+	 * context switch via extra_release.  The lock is released by
+	 * the INCOMING thread inside switch_to_next AFTER context_switch
+	 * has committed our sp.  Until that point, any concurrent waker
+	 * spins on sq_lock and cannot observe us in a half-saved state.
+	 * See Phase 5 design notes on struct wait_queue::sq_lock.
+	 */
+	spin_lock(&wq->sq_lock);
 	t->state      = KT_BLOCKED;
 	t->waiting_on = wq;
 	t->next       = wq->head;
 	wq->head      = t;
-	switch_to_next(0);
+	switch_to_next(0, &wq->sq_lock);
 	/* Reached here after someone called kthread_wake_*; the new
 	 * DAIF that context_switch restored is whatever this thread
 	 * had at the moment it slept (masked) -- so restore the
@@ -658,18 +707,23 @@ void kthread_sleep_on(struct wait_queue *wq)
 
 void kthread_wake_all(struct wait_queue *wq)
 {
-	unsigned long flags = irq_save_and_disable();
+	unsigned long flags = spin_lock_irq_save(&wq->sq_lock);
 	struct kthread *t = wq->head;
 	wq->head = NULL;
-	irq_restore(flags);
-	/* Wake each onto the WAKER's CPU.  Cross-CPU scheduling will
-	 * pick it up via idle steal later; for now, locality. */
+	/* Mark them READY under sq_lock so a racing thread_lock(t) that
+	 * sees t->t_lockp transitioned to dispq_lock by dispq_push sees
+	 * KT_READY rather than stale KT_BLOCKED. */
+	for (struct kthread *p = t; p; p = p->next) {
+		p->waiting_on = NULL;
+		p->state      = KT_READY;
+	}
+	spin_unlock_irq_restore(&wq->sq_lock, flags);
+	/* Wake each onto the WAKER's CPU.  dispq_push picks an idle peer
+	 * via push-side load balancing and IPIs idle cores. */
 	struct cpu *c = curcpu();
 	while (t) {
 		struct kthread *n = t->next;
-		t->next       = NULL;
-		t->waiting_on = NULL;
-		t->state      = KT_READY;
+		t->next = NULL;
 		dispq_push(c, t);
 		t = n;
 	}
@@ -677,7 +731,7 @@ void kthread_wake_all(struct wait_queue *wq)
 
 void kthread_wake_one(struct wait_queue *wq)
 {
-	unsigned long flags = irq_save_and_disable();
+	unsigned long flags = spin_lock_irq_save(&wq->sq_lock);
 	struct kthread *t = wq->head;
 	if (t) {
 		wq->head      = t->next;
@@ -685,7 +739,7 @@ void kthread_wake_one(struct wait_queue *wq)
 		t->waiting_on = NULL;
 		t->state      = KT_READY;
 	}
-	irq_restore(flags);
+	spin_unlock_irq_restore(&wq->sq_lock, flags);
 	if (t)
 		dispq_push(curcpu(), t);
 }
@@ -729,25 +783,33 @@ int kthread_signal(struct kthread *t, unsigned sig)
 	unsigned long flags = irq_save_and_disable();
 	t->sig_pending |= SIGBIT(sig);
 	/* If t is sleeping on a wait queue, surgically unlink it and
-	 * mark it READY so it wakes and observes the signal.  The
-	 * blocking primitive is expected to re-check sig_pending
-	 * after sleep_on returns. */
-	if (t->state == KT_BLOCKED && t->waiting_on) {
-		struct wait_queue *wq = t->waiting_on;
-		if (wq->head == t) {
-			wq->head = t->next;
-		} else {
-			for (struct kthread *p = wq->head; p; p = p->next) {
-				if (p->next == t) {
-					p->next = t->next;
-					break;
+	 * mark it READY so it wakes and observes the signal.  Take the
+	 * sq_lock of whatever queue we observe t parked on (racy read
+	 * of waiting_on -- recheck under sq_lock).  The blocking
+	 * primitive is expected to re-check sig_pending after sleep_on
+	 * returns. */
+	struct wait_queue *wq = NULL;
+	if (t->state == KT_BLOCKED && t->waiting_on)
+		wq = t->waiting_on;
+	if (wq) {
+		spin_lock(&wq->sq_lock);
+		if (t->state == KT_BLOCKED && t->waiting_on == wq) {
+			if (wq->head == t) {
+				wq->head = t->next;
+			} else {
+				for (struct kthread *p = wq->head; p; p = p->next) {
+					if (p->next == t) {
+						p->next = t->next;
+						break;
+					}
 				}
 			}
+			t->next       = NULL;
+			t->waiting_on = NULL;
+			t->state      = KT_READY;
+			needs_dispq_push = 1;
 		}
-		t->next       = NULL;
-		t->waiting_on = NULL;
-		t->state      = KT_READY;
-		needs_dispq_push = 1;
+		spin_unlock(&wq->sq_lock);
 	}
 	irq_restore(flags);
 	if (needs_dispq_push)
@@ -825,20 +887,34 @@ void kthread_exit(void)
 	vfs_drain_fds(me);
 	kprintf("kthread: tid=%u (%s) exited\n", me->tid, me->name);
 
-	/* Set state FIRST, then wake.  A waiter racing kthread_find
+	/*
+	 * Acquire to_reap_lock and link me onto to_reap, but DON'T
+	 * release the lock yet -- it's carried across context_switch
+	 * via the extra_release mechanism (same shape as Phase 5's
+	 * sleepq sq_lock).  Any concurrent to_reap drain on another
+	 * CPU spins on to_reap_lock and cannot pmm_free me's stack
+	 * page until save phase has committed me->sp -- otherwise the
+	 * page would be freed (and possibly reused) mid-save, leaving
+	 * stale register values in someone else's data.
+	 *
+	 * Set state FIRST, then wake.  A waiter racing kthread_find
 	 * after the wake must see state=KT_DEAD or it'll sleep again
-	 * and nothing will wake it a second time. */
-	unsigned long flags = spin_lock_irq_save(&to_reap_lock);
+	 * and nothing will wake it a second time.
+	 */
+	unsigned long flags = irq_save_and_disable();
+	spin_lock(&to_reap_lock);
 	me->state = KT_DEAD;
 	me->next  = to_reap;
 	to_reap   = me;
-	spin_unlock_irq_restore(&to_reap_lock, flags);
 
-	/* Now wake sys_wait()'ers.  kthread_find returns NULL on KT_DEAD,
-	 * so the waiter will observe "tid is gone" and return 0. */
+	/* Wake sys_wait()'ers.  kthread_find returns NULL on KT_DEAD,
+	 * so the waiter will observe "tid is gone" and return 0.  Called
+	 * while we still hold to_reap_lock (lock order: to_reap_lock ->
+	 * sq_lock -> disp_lock); nothing else takes sq_lock and then
+	 * to_reap_lock, so the order stays consistent. */
 	kthread_wake_all(&thread_exit_wq);
 
-	switch_to_next(0);
+	switch_to_next(0, &to_reap_lock);
 	/* unreachable: switch_to_next with requeue=0 never returns
 	 * once cur is no longer in the ready queue and never woken. */
 	(void)flags;

@@ -165,6 +165,16 @@ struct cpu {
 	 * context_switch's save phase.
 	 */
 	struct kthread  *cpu_pending_requeue;
+	/*
+	 * Optional second lock the resumer releases after
+	 * context_switch.  When the OUTGOING thread held a lock across
+	 * the switch in addition to cpu_thread_lock (specifically:
+	 * sleepers hold wq->sq_lock to keep wakers from observing the
+	 * outgoing thread's stale sp during the save phase), it
+	 * stashes the pointer here so the INCOMING continuation
+	 * releases it.  NULL means "no extra lock" (the yield case).
+	 */
+	spinlock_t      *cpu_pending_release_lock;
 	struct kthread  *cpu_dispq_head;
 	struct kthread  *cpu_dispq_tail;
 	/* Maintained alongside head/tail by every push/pop on the
@@ -252,15 +262,23 @@ void            kthread_inherit_fds(struct kthread *child,
  * "while empty, sleep" rather than "if empty, sleep") so spurious or
  * coalesced wakeups don't matter.
  *
- * Single-CPU concurrency: the primitives disable IRQs around the
- * state mutation so the timer can't preempt between marking us
- * BLOCKED and the context switch.  Spin-locking lands when SMP does.
+ * SMP discipline (Solaris sleepq).  sq_lock guards the queue body
+ * (wq->head + the linkage of every thread currently on it) AND, more
+ * importantly, is held by the sleeper across context_switch's save
+ * phase.  The mechanism: kthread_sleep_on acquires sq_lock, links
+ * self onto wq->head, then passes &sq_lock to switch_to_next as
+ * extra_release.  switch_to_next stashes it in cpu_pending_release_lock;
+ * the INCOMING thread releases sq_lock AFTER context_switch returns.
+ * A waker therefore cannot acquire sq_lock until the sleeper's sp has
+ * been committed -- which closes the wake-side variant of the
+ * steal-mid-save race that Phase 2 closed for the yield path.
  */
 struct wait_queue {
 	struct kthread *head;
+	spinlock_t      sq_lock;
 };
 
-#define WAIT_QUEUE_INIT		{ .head = NULL }
+#define WAIT_QUEUE_INIT		{ .head = NULL, .sq_lock = SPINLOCK_INIT }
 
 void            kthread_sleep_on (struct wait_queue *wq);
 void            kthread_wake_all (struct wait_queue *wq);

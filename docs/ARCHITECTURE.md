@@ -266,7 +266,7 @@ thread.  Per-thread DAIF is critical (commit `0929814`): without it, a
 thread that slept with IRQs masked would resume into whoever's DAIF
 state the waker happened to have.
 
-### Wait queues
+### Wait queues (sleepq)
 
 `kthread_sleep_on(wq)` marks BLOCKED, threads onto `wq->head`,
 yields without re-queuing.  `kthread_wake_all(wq)` walks the queue,
@@ -276,12 +276,41 @@ Used by `stream_read` for blocking I/O, by signal delivery to
 surgically unlink a sleeper from its queue, and by pipe close to wake
 the peer's reader with EOF.
 
+**SMP discipline (Solaris sleepq, Phase 5).**  `struct wait_queue`
+carries a `sq_lock` that the sleeper holds **across `context_switch`'s
+save phase**.  Mechanism: `kthread_sleep_on` acquires `sq_lock`,
+links itself, then passes `&sq_lock` to `switch_to_next` as
+`extra_release`.  `switch_to_next` stashes the pointer in
+`cpu_pending_release_lock`; the **incoming** thread releases
+`sq_lock` after `context_switch` returns, before releasing
+`cpu_thread_lock`.
+
+A waker therefore cannot acquire `sq_lock` until the sleeper's `sp`
+has been committed by the save phase.  Without this, a waker that
+ran between `wq->head = t` and `context_switch`'s `str x2,[x0]`
+could move `t` to the dispq and let another CPU `try_steal` `t` with
+its `sp` field still holding the previous value — the same
+steal-mid-save race that Phase 2 closed for the yield path, just
+reached via the wake side instead of `dispq_push`.
+
 ### Reaping
 
 `kthread_exit` parks the dying thread on `to_reap`.  The next
 `switch_to_next` runs the reap loop **after** the context_switch — so
 we're on a different stack, safe to `pmm_free` the dying thread's
 stack and `kfree` its struct.
+
+**SMP discipline (Phase 5b).**  `kthread_exit` acquires
+`to_reap_lock` and **does not release it** before calling
+`switch_to_next(0, &to_reap_lock)` — the lock is carried across the
+switch the same way sleepers carry `sq_lock`, via
+`cpu_pending_release_lock` released by the incoming thread.  This
+prevents a `to_reap` drain on another CPU (every `switch_to_next`
+resumer drains the global list) from `pmm_free`'ing the dying
+thread's stack page **while save phase is still writing to it**.
+The freed page would otherwise be reallocated immediately by slab
+or another stack alloc, corrupting either the freelist or the
+register save area.
 
 ## STREAMS
 

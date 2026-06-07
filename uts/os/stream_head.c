@@ -536,7 +536,7 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name)
 	sd->sd_name   = name;
 	sd->sd_flags  = 0;
 	sd->sd_peer   = NULL;
-	sd->sd_readwait.head = NULL;
+	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
 
 	/* Backref so sh_rq_putp can wake readers without a global
 	 * queue->stdata lookup.  The driver-side queues are not seen
@@ -929,7 +929,7 @@ static struct stdata *pipe_end(const char *name)
 	sd->sd_name   = name;
 	sd->sd_flags  = 0;
 	sd->sd_peer   = NULL;
-	sd->sd_readwait.head = NULL;
+	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
 	rq->q_ptr = sd;	/* so sh_rq_putp can wake readers */
 	wq->q_ptr = sd;
 	sd->sd_all_next = all_open_streams;
