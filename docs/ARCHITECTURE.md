@@ -747,13 +747,30 @@ level guarded by `cpu_disp_lock`.  Priorities are `0..KSCHED_NPRI-1`
 lock-free reads by the steal-side balancer, and `cpu_nrunnable` is
 the total thread count across all priorities.
 
-Phase 4 will plumb priorities through a scheduling class layer
-(SYS for kernel threads at `KSCHED_PRI_SYS_DEFAULT=60`, TS for
-user threads at `KSCHED_PRI_TS_DEFAULT=30`); for now every
-`kthread_create` lands at `KSCHED_PRI_SYS_DEFAULT`, so the
-multi-priority queue behaves as a single FIFO in practice.  Idle
-threads carry `KSCHED_PRI_IDLE=-1` as a documentation marker --
-they're never enqueued, they're the fallback that runs when every
+Priorities are driven by a scheduling-class layer (phase 4).  Two
+classes ship today:
+
+* **`SCLASS_SYS`** -- every kernel-only kthread (`uart_rx`, idle,
+  `/proc/ps` readers, ...).  Fixed at `KSCHED_PRI_SYS_DEFAULT = 60`,
+  no quantum tracking; `cl_tick` returns "no class-driven preempt"
+  so SYS threads run until they voluntarily yield or block.
+
+* **`SCLASS_TS`** -- every user-space (EL0) thread.  Driven by an
+  inlined `ts_dptbl` row: each thread carries a `t_quantum_left`
+  countdown reloaded to `TS_QUANTUM_TICKS = 5` (~50ms at HZ=100).
+  `cl_tick` decrements it; on hit-zero the thread's priority is
+  demoted by `TS_DEMOTE_STEP = 5` (floor 0).  `cl_wakeup` snaps
+  priority back to `KSCHED_PRI_TS_DEFAULT = 30` and reloads the
+  quantum -- I/O-bound threads stay at high priority, CPU-bound
+  threads drift downward.
+
+`sys_execve` / `sys_spawn` flip the new thread to `SCLASS_TS`
+right after `kthread_create` and before the wake path picks it up,
+so user processes pick up the aging behaviour automatically.
+`kthread_setclass(t, cid)` is the public entry point.
+
+Idle threads carry `KSCHED_PRI_IDLE = -1` as a documentation marker
+-- they're never enqueued, they're the fallback that runs when every
 priority is empty AND the cross-CPU steal also turns up nothing.
 
 Both directions of load balancing are in play:

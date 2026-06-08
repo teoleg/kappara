@@ -57,6 +57,61 @@ enum kt_state {
 #define KSCHED_PRI_SYS_DEFAULT	60
 #define KSCHED_PRI_IDLE		(-1)
 
+/*
+ * SVR4 scheduling classes.  Each class has an sclass_ops vector
+ * (cl_tick, cl_wakeup) hooked by sched_tick + the wake path.  Phase
+ * 4 ships two classes:
+ *
+ *   SCLASS_SYS -- kernel threads (uart_rx, klogd, idle, /proc/ps
+ *                 readers spawned from kshell).  Fixed priority
+ *                 KSCHED_PRI_SYS_DEFAULT, no quantum tracking;
+ *                 sched_tick returns "no preempt" so they keep
+ *                 running until they voluntarily yield/block.
+ *
+ *   SCLASS_TS  -- user-space threads.  TS-flavoured aging: each
+ *                 thread carries `t_quantum_left` ticks; cl_tick
+ *                 decrements it and, when it hits zero, demotes
+ *                 the priority via the inlined `ts_dptbl` and
+ *                 returns "preempt" so swtch picks a peer.  On
+ *                 wakeup the priority is reset to the entry the
+ *                 dptbl says (`ts_slpret`) -- I/O bound threads
+ *                 ride at high priority, CPU-bound drift downward.
+ *
+ * sys_execve sets the new thread to SCLASS_TS so user programs
+ * pick up the aging behaviour automatically; everything else
+ * stays SCLASS_SYS.
+ */
+enum sclass_id {
+	SCLASS_SYS = 0,
+	SCLASS_TS  = 1,
+};
+
+struct kthread;
+struct sclass_ops {
+	const char *name;
+	/* Called the moment a thread transitions to runnable from
+	 * blocked (kthread_wake_*, kthread_signal surgical-removal).
+	 * The implementation typically resets t_pri to a higher value
+	 * (TS: ts_slpret) so a recently-blocked thread is responsive
+	 * when its I/O completes. */
+	void (*cl_wakeup)(struct kthread *t);
+	/* Called from sched_tick on curthread.  Returns 1 if the
+	 * thread should be preempted (its quantum expired); the
+	 * caller (sched_tick) then yields. */
+	int  (*cl_tick)(struct kthread *t);
+	/* Called from kthread_create to set initial t_pri,
+	 * t_quantum_left etc. for this class. */
+	void (*cl_fork)(struct kthread *t);
+};
+
+extern const struct sclass_ops *sclass[2];
+
+/* Switch a thread (typically curthread) into a new class.  Used by
+ * sys_execve to transition kernel-created threads to TS just before
+ * they enter EL0.  No lock; the thread either owns itself (caller is
+ * curthread) or is brand-new (caller is the creator). */
+void kthread_setclass(struct kthread *t, enum sclass_id cid);
+
 struct file;		/* fwd; defined in vfs.h */
 struct wait_queue;	/* fwd; defined later in this file */
 
@@ -105,13 +160,26 @@ struct kthread {
 	enum kt_state  state;
 	/*
 	 * Dispatch priority.  Higher value = picked first.  Set at
-	 * kthread_create from the parent's scheduling class default
-	 * (phase 4); for phase 3 every kthread starts at
-	 * KSCHED_PRI_SYS_DEFAULT.  Idle threads carry KSCHED_PRI_IDLE
-	 * (-1) -- they're never enqueued, so the value is just a
-	 * documentation marker.
+	 * kthread_create from the thread's scheduling class default
+	 * (cl_fork).  Idle threads carry KSCHED_PRI_IDLE (-1) --
+	 * they're never enqueued, so the value is just a marker.
+	 *
+	 * SCLASS_TS adjusts t_pri at runtime (cl_tick demotes on
+	 * quantum expiry, cl_wakeup re-promotes after a sleep).
+	 * SCLASS_SYS leaves it alone.
 	 */
 	int            t_pri;
+	/*
+	 * Scheduling class.  Defaults to SCLASS_SYS at kthread_create;
+	 * sys_execve flips user-thread creates to SCLASS_TS so their
+	 * priority ages with CPU consumption.
+	 */
+	enum sclass_id t_cid;
+	/* TS-class quantum bookkeeping.  cl_tick decrements
+	 * t_quantum_left each tick; when it reaches 0 the priority is
+	 * demoted and the quantum is reloaded from the dptbl.  Unused
+	 * by SCLASS_SYS. */
+	short          t_quantum_left;
 	struct kthread *next;
 	/* Pending-signal bitmap.  sys_kill sets bits, check_signals
 	 * (from trap_dispatch's SVC return) consumes them.  See

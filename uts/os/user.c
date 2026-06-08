@@ -147,7 +147,9 @@ static void user_thread_main(void *arg)
 
 void user_spawn(void)
 {
-	kthread_create("user-init", user_thread_main, NULL);
+	struct kthread *t = kthread_create("user-init", user_thread_main, NULL);
+	if (t)
+		kthread_setclass(t, SCLASS_TS);
 }
 
 /*
@@ -241,6 +243,10 @@ long sys_spawn_impl(uint64_t entry, uint64_t arg)
 	 * the fork()-ish piece of spawn that makes pipework actually
 	 * compose. */
 	kthread_inherit_fds(t, curthread);
+	/* sys_spawn lands an EL0 thread: TS class so its priority
+	 * ages under CPU consumption.  cl_fork stamps t_pri and
+	 * t_quantum_left to the TS defaults. */
+	kthread_setclass(t, SCLASS_TS);
 	return (long)t->tid;
 }
 
@@ -626,5 +632,7 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 
 	/* Inherit fd table so the exec'd program has /dev/console on fd 1. */
 	kthread_inherit_fds(t, curthread);
+	/* exec lands in EL0: TS class for priority aging. */
+	kthread_setclass(t, SCLASS_TS);
 	return (long)t->tid;
 }

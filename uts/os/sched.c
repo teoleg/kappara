@@ -130,6 +130,114 @@ static spinlock_t      to_reap_lock = SPINLOCK_INIT;
  */
 spinlock_t t_transition_lock = SPINLOCK_INIT;
 
+/* ---- Scheduling classes (phase 4) ---------------------------------------
+ *
+ * Two classes, matching the SVR4 `sclass_ops` shape but trimmed to
+ * the hooks our scheduler currently calls:
+ *
+ *   sys_class -- fixed priority, no quantum, never preempted by
+ *                cl_tick.  Used by every kthread that isn't a user
+ *                EL0 thread (uart_rx, klogd-style readers, /proc
+ *                qopens, idle).
+ *
+ *   ts_class  -- inlined ts_dptbl-style aging.  cl_fork stamps the
+ *                default priority and a fresh quantum.  cl_tick
+ *                ticks the quantum down; on hit zero, demote one
+ *                ts_dptbl row (priority dec by 5, floor 0) and
+ *                reload the quantum.  cl_wakeup snaps priority back
+ *                to `ts_slpret` (= KSCHED_PRI_TS_DEFAULT) so an
+ *                I/O-bound thread always returns at default
+ *                priority no matter how far it had drifted.
+ *
+ * The TS table is collapsed into the constants below.  The full
+ * Solaris ts_dptbl has 60 rows of (quantum, tqexp, slpret, maxwait,
+ * lwait); we don't yet do maxwait/lwait/load-balancing-by-age, so
+ * the row is just (TS_DEMOTE_STEP, slpret).
+ */
+#define TS_QUANTUM_TICKS	5	/* ~50ms at HZ=100 */
+#define TS_DEMOTE_STEP		5	/* tqexp -- drop 5 priorities per
+					 *          quantum exhaustion */
+
+static void sys_cl_wakeup(struct kthread *t)
+{
+	/* Plain SYS thread: a wakeup doesn't change priority.  The
+	 * thread already has KSCHED_PRI_SYS_DEFAULT; leave it. */
+	(void)t;
+}
+
+static int sys_cl_tick(struct kthread *t)
+{
+	/* SYS class never voluntarily yields from sched_tick.  Phase
+	 * 4 keeps round-robin among SYS peers at the same priority by
+	 * still letting the timer-driven kthread_yield run -- this
+	 * hook only signals "preempt right now" for class reasons,
+	 * which SYS never wants. */
+	(void)t;
+	return 0;
+}
+
+static void sys_cl_fork(struct kthread *t)
+{
+	t->t_pri          = KSCHED_PRI_SYS_DEFAULT;
+	t->t_quantum_left = 0;
+}
+
+static void ts_cl_wakeup(struct kthread *t)
+{
+	/* ts_slpret: a thread blocking on I/O gets its priority
+	 * snapped back to KSCHED_PRI_TS_DEFAULT regardless of how
+	 * far cl_tick had demoted it.  The quantum resets too. */
+	t->t_pri          = KSCHED_PRI_TS_DEFAULT;
+	t->t_quantum_left = TS_QUANTUM_TICKS;
+}
+
+static int ts_cl_tick(struct kthread *t)
+{
+	if (t->t_quantum_left > 0)
+		t->t_quantum_left--;
+	if (t->t_quantum_left == 0) {
+		/* ts_tqexp: demote one row, floor at KSCHED_PRI_TS_MIN. */
+		int newp = t->t_pri - TS_DEMOTE_STEP;
+		if (newp < KSCHED_PRI_TS_MIN) newp = KSCHED_PRI_TS_MIN;
+		t->t_pri          = newp;
+		t->t_quantum_left = TS_QUANTUM_TICKS;
+		return 1;	/* preempt: someone may now have higher pri */
+	}
+	return 0;
+}
+
+static void ts_cl_fork(struct kthread *t)
+{
+	t->t_pri          = KSCHED_PRI_TS_DEFAULT;
+	t->t_quantum_left = TS_QUANTUM_TICKS;
+}
+
+static const struct sclass_ops sys_class = {
+	.name      = "SYS",
+	.cl_wakeup = sys_cl_wakeup,
+	.cl_tick   = sys_cl_tick,
+	.cl_fork   = sys_cl_fork,
+};
+
+static const struct sclass_ops ts_class = {
+	.name      = "TS",
+	.cl_wakeup = ts_cl_wakeup,
+	.cl_tick   = ts_cl_tick,
+	.cl_fork   = ts_cl_fork,
+};
+
+const struct sclass_ops *sclass[2] = {
+	[SCLASS_SYS] = &sys_class,
+	[SCLASS_TS]  = &ts_class,
+};
+
+void kthread_setclass(struct kthread *t, enum sclass_id cid)
+{
+	if (cid != SCLASS_SYS && cid != SCLASS_TS) return;
+	t->t_cid = cid;
+	sclass[cid]->cl_fork(t);
+}
+
 /* Global wait queue for sys_wait().  Every kthread_exit wakes
  * everyone on it; each waiter re-checks whether ITS target tid is
  * now gone.  A single broadcast is fine -- the cost is one yield
@@ -328,6 +436,7 @@ void sched_init(void)
 	main_thread.tid   = 0;
 	main_thread.state = KT_RUNNING;
 	main_thread.t_pri = KSCHED_PRI_IDLE;	/* doubles as cpu 0's idle */
+	main_thread.t_cid = SCLASS_SYS;
 	main_thread.next  = NULL;
 
 	/* Initialise every CPU's disp_t to "no runnable threads".  BSS
@@ -397,8 +506,11 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 	}
 	t->stack_base = stack;
 	t->state      = KT_READY;
-	t->t_pri      = KSCHED_PRI_SYS_DEFAULT;	/* phase 4 will plumb a
-						 * class-specific value here */
+	/* Default class is SYS; sys_execve flips child threads to TS
+	 * (via kthread_setclass) right after this returns.  cl_fork
+	 * sets t_pri + t_quantum_left for the class. */
+	t->t_cid      = SCLASS_SYS;
+	sclass[SCLASS_SYS]->cl_fork(t);
 	t->next       = NULL;
 	/* Initial polymorphic state lock: the per-thread default.
 	 * dispq_push() will transition t_lockp to the target CPU's
@@ -769,10 +881,14 @@ void kthread_wake_all(struct wait_queue *wq)
 	wq->head = NULL;
 	/* Mark them READY under sq_lock so a racing thread_lock(t) that
 	 * sees t->t_lockp transitioned to dispq_lock by dispq_push sees
-	 * KT_READY rather than stale KT_BLOCKED. */
+	 * KT_READY rather than stale KT_BLOCKED.  Also call cl_wakeup
+	 * to let the class promote priority back to its slpret entry
+	 * (TS: snap to KSCHED_PRI_TS_DEFAULT) BEFORE dispq_push reads
+	 * t->t_pri to pick the queue. */
 	for (struct kthread *p = t; p; p = p->next) {
 		p->waiting_on = NULL;
 		p->state      = KT_READY;
+		sclass[p->t_cid]->cl_wakeup(p);
 	}
 	spin_unlock_irq_restore(&wq->sq_lock, flags);
 	/* Wake each onto the WAKER's CPU.  dispq_push picks an idle peer
@@ -795,6 +911,7 @@ void kthread_wake_one(struct wait_queue *wq)
 		t->next       = NULL;
 		t->waiting_on = NULL;
 		t->state      = KT_READY;
+		sclass[t->t_cid]->cl_wakeup(t);
 	}
 	spin_unlock_irq_restore(&wq->sq_lock, flags);
 	if (t)
@@ -864,6 +981,7 @@ int kthread_signal(struct kthread *t, unsigned sig)
 			t->next       = NULL;
 			t->waiting_on = NULL;
 			t->state      = KT_READY;
+			sclass[t->t_cid]->cl_wakeup(t);
 			needs_dispq_push = 1;
 		}
 		spin_unlock(&wq->sq_lock);
@@ -876,8 +994,15 @@ int kthread_signal(struct kthread *t, unsigned sig)
 
 void sched_tick(void)
 {
-	/* Each tick: drain any deferred STREAMS work, then rotate. */
+	/* Each tick: drain any deferred STREAMS work, then consult the
+	 * class.  SYS threads run until they block (cl_tick returns 0,
+	 * but we still kthread_yield for round-robin among same-pri
+	 * peers); TS threads drop priority on quantum expiry and the
+	 * yield after may pick a higher-priority peer. */
 	streams_run();
+	struct kthread *cur = curthread;
+	if (cur)
+		(void)sclass[cur->t_cid]->cl_tick(cur);
 	kthread_yield();
 }
 
@@ -917,6 +1042,7 @@ void sched_secondary_init(unsigned cpu_id)
 	idle->name       = "idle";
 	idle->state      = KT_RUNNING;
 	idle->t_pri      = KSCHED_PRI_IDLE;	/* never enqueued; marker */
+	idle->t_cid      = SCLASS_SYS;
 	idle->stack_base = NULL;	/* never reaped; stack lives forever */
 
 	c->cpu_id     = cpu_id;
