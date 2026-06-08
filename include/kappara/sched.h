@@ -113,7 +113,20 @@ extern const struct sclass_ops *sclass[2];
 void kthread_setclass(struct kthread *t, enum sclass_id cid);
 
 struct file;		/* fwd; defined in vfs.h */
-struct wait_queue;	/* fwd; defined later in this file */
+struct kthread;		/* fwd; defined just below struct wait_queue */
+
+/*
+ * Wait queue.  Defined HERE -- before struct kthread -- because
+ * kthread embeds a per-thread sigwait_wq inline (phase 6 sigsuspend
+ * interlock).  The longer comment on the role of sq_lock lives at
+ * the public declarations near kthread_sleep_on() further down.
+ */
+struct wait_queue {
+	struct kthread *head;
+	spinlock_t      sq_lock;
+};
+
+#define WAIT_QUEUE_INIT		{ .head = NULL, .sq_lock = SPINLOCK_INIT }
 
 /* Forward decl: per-signal disposition, defined in signal.h.
  * We don't pull signal.h in here -- it'd be a circular include
@@ -208,6 +221,15 @@ struct kthread {
 	 * sys_kill surgically extract a sleeping thread from its
 	 * queue so it wakes and observes the signal. */
 	struct wait_queue *waiting_on;
+	/* Per-thread interlock wait queue used by sigsuspend.  Its
+	 * sq_lock is taken by kthread_signal when it ORs `sig` into
+	 * sig_pending, so a sigsuspend that's evaluating
+	 * `pending & ~mask` under the same sq_lock either sees the
+	 * just-set bit (no sleep) or sleeps and is then surgically
+	 * removed by the same signaler (no lost wakeup).  Idle until
+	 * the first sigsuspend on this thread; BSS zero (sq_lock=0,
+	 * head=NULL) is a valid initial state for both fields. */
+	struct wait_queue  sigwait_wq;
 	/* Per-thread open files.  Each entry is either NULL or a
 	 * struct file * whose f_refs counts how many fd slots (across
 	 * all threads) still point at it.  See kernel/vfs.c. */
@@ -384,12 +406,9 @@ void            kthread_inherit_fds(struct kthread *child,
  * been committed -- which closes the wake-side variant of the
  * steal-mid-save race that Phase 2 closed for the yield path.
  */
-struct wait_queue {
-	struct kthread *head;
-	spinlock_t      sq_lock;
-};
-
-#define WAIT_QUEUE_INIT		{ .head = NULL, .sq_lock = SPINLOCK_INIT }
+/* struct wait_queue + WAIT_QUEUE_INIT are defined up near struct
+ * kthread (kthread embeds a sigwait_wq inline -- phase 6 -- so the
+ * type has to be complete before kthread's declaration). */
 
 void            kthread_sleep_on (struct wait_queue *wq);
 

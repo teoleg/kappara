@@ -955,37 +955,84 @@ int kthread_signal(struct kthread *t, unsigned sig)
 	if (!t || sig == 0 || sig >= NSIG) return -1;
 	int needs_dispq_push = 0;
 	unsigned long flags = irq_save_and_disable();
+
+	/*
+	 * Set sig_pending under the target's PER-THREAD sigwait_wq.sq_lock.
+	 * This interlocks with sys_sigsuspend_impl, which holds the same
+	 * sq_lock around its (pending & ~mask) check.  Phase 6: closes
+	 * the sigsuspend lost-wakeup window where a signal arriving
+	 * between check and sleep would otherwise be ignored.
+	 *
+	 * For non-sigsuspend targets (the common case), this is a
+	 * single uncontended acquire -- sigwait_wq is per-thread, so
+	 * different signalers targeting different threads don't
+	 * collide, and a thread not in sigsuspend has nobody else
+	 * touching its sigwait_wq.sq_lock.
+	 */
+	spin_lock(&t->sigwait_wq.sq_lock);
 	t->sig_pending |= SIGBIT(sig);
-	/* If t is sleeping on a wait queue, surgically unlink it and
-	 * mark it READY so it wakes and observes the signal.  Take the
-	 * sq_lock of whatever queue we observe t parked on (racy read
-	 * of waiting_on -- recheck under sq_lock).  The blocking
-	 * primitive is expected to re-check sig_pending after sleep_on
-	 * returns. */
-	struct wait_queue *wq = NULL;
-	if (t->state == KT_BLOCKED && t->waiting_on)
-		wq = t->waiting_on;
-	if (wq) {
-		spin_lock(&wq->sq_lock);
-		if (t->state == KT_BLOCKED && t->waiting_on == wq) {
-			if (wq->head == t) {
-				wq->head = t->next;
-			} else {
-				for (struct kthread *p = wq->head; p; p = p->next) {
-					if (p->next == t) {
-						p->next = t->next;
-						break;
-					}
+
+	/* If t is asleep on its OWN sigwait_wq (i.e. it's in
+	 * sys_sigsuspend), surgically remove it here while we still
+	 * hold sigwait_wq.sq_lock -- avoids dropping and re-acquiring.
+	 * The signaler that wakes a sigsuspended thread does the
+	 * normal wake + push afterwards. */
+	int woke_from_sigwait = 0;
+	if (t->state == KT_BLOCKED && t->waiting_on == &t->sigwait_wq) {
+		struct wait_queue *wq = &t->sigwait_wq;
+		if (wq->head == t) {
+			wq->head = t->next;
+		} else {
+			for (struct kthread *p = wq->head; p; p = p->next) {
+				if (p->next == t) {
+					p->next = t->next;
+					break;
 				}
 			}
-			t->next       = NULL;
-			t->waiting_on = NULL;
-			t->state      = KT_READY;
-			sclass[t->t_cid]->cl_wakeup(t);
-			needs_dispq_push = 1;
 		}
-		spin_unlock(&wq->sq_lock);
+		t->next       = NULL;
+		t->waiting_on = NULL;
+		t->state      = KT_READY;
+		sclass[t->t_cid]->cl_wakeup(t);
+		woke_from_sigwait = 1;
+		needs_dispq_push  = 1;
 	}
+	spin_unlock(&t->sigwait_wq.sq_lock);
+
+	/*
+	 * If t was BLOCKED on some OTHER wait queue (stream_read,
+	 * sys_wait, ...), surgically unlink it from THAT queue using
+	 * the existing path.  We re-read waiting_on because we don't
+	 * hold that wq's sq_lock yet (lock order: sigwait_wq.sq_lock
+	 * first, then any other wq's sq_lock is acquired later).
+	 */
+	if (!woke_from_sigwait) {
+		struct wait_queue *wq = NULL;
+		if (t->state == KT_BLOCKED && t->waiting_on)
+			wq = t->waiting_on;
+		if (wq) {
+			spin_lock(&wq->sq_lock);
+			if (t->state == KT_BLOCKED && t->waiting_on == wq) {
+				if (wq->head == t) {
+					wq->head = t->next;
+				} else {
+					for (struct kthread *p = wq->head; p; p = p->next) {
+						if (p->next == t) {
+							p->next = t->next;
+							break;
+						}
+					}
+				}
+				t->next       = NULL;
+				t->waiting_on = NULL;
+				t->state      = KT_READY;
+				sclass[t->t_cid]->cl_wakeup(t);
+				needs_dispq_push = 1;
+			}
+			spin_unlock(&wq->sq_lock);
+		}
+	}
+
 	irq_restore(flags);
 	if (needs_dispq_push)
 		dispq_push(curcpu(), t);

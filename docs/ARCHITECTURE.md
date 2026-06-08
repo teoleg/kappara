@@ -312,6 +312,31 @@ The freed page would otherwise be reallocated immediately by slab
 or another stack alloc, corrupting either the freelist or the
 register save area.
 
+### Signal interlock (phase 6)
+
+Every `struct kthread` carries a per-thread `sigwait_wq`.
+`sys_sigsuspend_impl` takes `sigwait_wq.sq_lock` around BOTH the
+mask install AND the `(sig_pending & ~sig_mask)` check, then sleeps
+via `kthread_sleep_on_locked(&t->sigwait_wq, flags)` -- same
+extra-release pattern phase 5 introduced for sq_lock and phase 5b
+for to_reap_lock.
+
+`kthread_signal` takes the target's `sigwait_wq.sq_lock` around the
+`sig_pending |= SIGBIT(sig)` OR, so the check-then-sleep window
+inside sigsuspend is closed: either the signaler sets the bit
+before sigsuspend's check (which then sees it and returns without
+sleeping), or sigsuspend gets sq_lock first and the signaler spins
+until sigsuspend has slept -- at which point the signaler surgically
+removes the thread from sigwait_wq under the same lock it already
+holds.  A target NOT in sigsuspend pays a single uncontended
+acquire (the wq is per-thread, nobody else touches its sq_lock).
+
+If the target is parked on some OTHER wait queue (stream_read,
+sys_wait, ...), the signaler then takes THAT queue's sq_lock and
+does the existing surgical-remove + dispq_push.  Lock order is
+`sigwait_wq.sq_lock` outer, peer wq sq_lock inner -- consistent
+because nothing else acquires those two together.
+
 ## STREAMS
 
 SVR4 vocabulary, intentionally.

@@ -237,22 +237,29 @@ long sys_sigsuspend_impl(uint32_t mask)
 	 * re-block the very signal we're about to dispatch -- the bug
 	 * that took the first masktest down.
 	 *
-	 * We sleep on thread_exit_wq even though we're not waiting
-	 * for a thread exit -- it's a convenient broadcast queue,
-	 * and kthread_signal pulls us off it surgically the moment
-	 * a signal arrives.  An incidental wake from someone else's
-	 * exit just retries the loop, which is harmless.
+	 * Sleep on the thread's PER-THREAD sigwait_wq, taking sq_lock
+	 * around both the mask install AND the (pending & ~mask) check.
+	 * kthread_signal takes the SAME sigwait_wq.sq_lock around the
+	 * sig_pending |=, so the check-then-sleep window is closed --
+	 * either we see the just-set bit and skip sleep, or we sleep
+	 * holding sq_lock and the signaler spins waiting for us to
+	 * release in switch_to_next's resumer (phase 5's extra_release
+	 * mechanism).  Mirrors phase 5c's sys_wait fix.
 	 */
 	struct kthread *t = curthread;
 	if (!t) return -1;
+
+	unsigned long flags = spin_lock_irq_save(&t->sigwait_wq.sq_lock);
 
 	t->sig_saved_mask         = t->sig_mask;
 	t->sig_mask_save_pending  = 1;
 	t->sig_mask               = mask & ~SIGBIT(SIGKILL);
 
 	while (!(t->sig_pending & ~t->sig_mask)) {
-		kthread_sleep_on(&thread_exit_wq);
+		kthread_sleep_on_locked(&t->sigwait_wq, flags);
+		flags = spin_lock_irq_save(&t->sigwait_wq.sq_lock);
 	}
+	spin_unlock_irq_restore(&t->sigwait_wq.sq_lock, flags);
 
 	return -1;	/* check_signals handles delivery + mask unwind */
 }
