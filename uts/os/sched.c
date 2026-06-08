@@ -1042,15 +1042,24 @@ int kthread_signal(struct kthread *t, unsigned sig)
 void sched_tick(void)
 {
 	/* Each tick: drain any deferred STREAMS work, then consult the
-	 * class.  SYS threads run until they block (cl_tick returns 0,
-	 * but we still kthread_yield for round-robin among same-pri
-	 * peers); TS threads drop priority on quantum expiry and the
-	 * yield after may pick a higher-priority peer. */
+	 * scheduling class.  Phase 8: honour the cl_tick preempt
+	 * signal.  cl_tick returns 1 for TS threads whose quantum just
+	 * expired (priority was demoted); we also yield if the dispq
+	 * has a peer at >= curthread's priority so same-priority
+	 * round-robin still works (a TS thread sharing pri with a peer,
+	 * or a SYS thread whose pri-60 peer just became runnable, gets
+	 * rotated even though cl_tick returns 0).
+	 *
+	 * A CPU-bound SYS thread with no peers at its priority
+	 * therefore runs uninterrupted until it voluntarily blocks --
+	 * which is what SYS class is for. */
 	streams_run();
 	struct kthread *cur = curthread;
-	if (cur)
-		(void)sclass[cur->t_cid]->cl_tick(cur);
-	kthread_yield();
+	if (!cur)
+		return;
+	int preempt = sclass[cur->t_cid]->cl_tick(cur);
+	if (preempt || curcpu()->cpu_maxrunpri >= cur->t_pri)
+		kthread_yield();
 }
 
 /*
