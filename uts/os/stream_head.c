@@ -124,20 +124,40 @@ static int sh_rq_putp(queue_t *q, mblk_t *mp)
 	 * Set SD_EOF so the next sys_read returns 0 and any
 	 * blocked reader wakes to see EOF.  This is the SVR4 stream
 	 * head's job: M_HANGUP doesn't get queued for the reader, it
-	 * mutates head state. */
+	 * mutates head state.
+	 *
+	 * Phase 7: SD_EOF mutation and the data putq below both happen
+	 * under sd_readwait.sq_lock, the same lock stream_read holds
+	 * across its (getq + EOF check + sleep_on) window.  Closes the
+	 * lost-wakeup race where a reader could getq() == NULL, observe
+	 * SD_EOF unset, then sleep AFTER a writer's putq + wake-all
+	 * completed (with no waiters present yet). */
 	if (mp->b_datap->db_type == M_HANGUP) {
 		freemsg(mp);
 		if (sd) {
+			unsigned long f =
+				spin_lock_irq_save(&sd->sd_readwait.sq_lock);
 			sd->sd_flags |= SD_EOF;
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, f);
 			kthread_wake_all(&sd->sd_readwait);
 		}
 		return 0;
 	}
-	putq(q, mp);
+	if (sd) {
+		unsigned long f =
+			spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		putq(q, mp);
+		spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, f);
+	} else {
+		putq(q, mp);
+	}
 	/* Wake any reader parked on this stream head's read queue.
 	 * q_ptr was wired to the owning stdata in stream_build so we
 	 * can hop back from the queue to its waitq without a global
-	 * lookup. */
+	 * lookup.  The wake-all takes sd_readwait.sq_lock internally;
+	 * because we already released it above, the reader either
+	 * sees our putq via its own subsequent sq_lock+getq, or it
+	 * was already asleep and gets surgically removed by wake_all. */
 	if (sd)
 		kthread_wake_all(&sd->sd_readwait);
 	return 0;
@@ -601,7 +621,14 @@ static int stream_close(struct file *f)
 	 * so the peer's later close doesn't chase a freed pointer. */
 	if (sd->sd_peer) {
 		struct stdata *peer = sd->sd_peer;
+		/* Same Phase-7 sq_lock interlock as sh_rq_putp's M_HANGUP
+		 * branch: peer's reader checks sd_flags & SD_EOF under
+		 * sd_readwait.sq_lock, so set the bit under the same lock
+		 * so the reader can't miss the EOF + sleep forever. */
+		unsigned long f =
+			spin_lock_irq_save(&peer->sd_readwait.sq_lock);
 		peer->sd_flags |= SD_EOF;
+		spin_unlock_irq_restore(&peer->sd_readwait.sq_lock, f);
 		peer->sd_peer   = NULL;
 		sd->sd_peer     = NULL;
 		kthread_wake_all(&peer->sd_readwait);
@@ -700,23 +727,51 @@ static long stream_read(struct file *f, void *buf, size_t len)
 	/* Block until something arrives on the head's read queue, or
 	 * the peer closes (SD_EOF) and the backlog is drained.  The
 	 * SD_EOF check after getq is what gives us proper Unix EOF
-	 * semantics: drained data is still returned before the 0. */
+	 * semantics: drained data is still returned before the 0.
+	 *
+	 * Phase 7: take sd_readwait.sq_lock around the whole (getq +
+	 * EOF check + sleep_on) window.  sh_rq_putp / pipe close take
+	 * the same lock around their putq + SD_EOF mutations, so the
+	 * check-then-sleep race that drops a writer's wake when it
+	 * fires "too early" (before the reader is on the wq) is
+	 * closed.  kthread_sleep_on_locked releases sq_lock via the
+	 * phase-5 extra_release pathway -- the reader is on the wq
+	 * before any new writer can acquire sq_lock and putq more
+	 * data. */
 	mblk_t *mp;
+	unsigned long flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
 	for (;;) {
 		mp = getq(sd->sd_rq);
 		if (mp) break;
-		if (sd->sd_flags & SD_EOF)
+		if (sd->sd_flags & SD_EOF) {
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, flags);
 			return 0;	/* EOF -- no more writers */
+		}
 		/* A pending fatal signal short-circuits the read so the
 		 * thread can exit cleanly in check_signals on the way
 		 * back out of the syscall.  Mirrors EINTR on real Unix
 		 * (we don't surface errno yet). */
 		{ struct kthread *me = curthread;
-		  if (me && (me->sig_pending & SIG_FATAL_MASK)) return -1; }
-		kthread_sleep_on(&sd->sd_readwait);
+		  if (me && (me->sig_pending & SIG_FATAL_MASK)) {
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
+					        flags);
+			return -1;
+		  }
+		}
+		kthread_sleep_on_locked(&sd->sd_readwait, flags);
+		/* sleep_on_locked releases sq_lock as part of ctx_switch
+		 * save and restores our caller's IRQ state at the tail.
+		 * Re-acquire for the next loop iteration's getq. */
+		flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
 		{ struct kthread *me = curthread;
-		  if (me && (me->sig_pending & SIG_FATAL_MASK)) return -1; }
+		  if (me && (me->sig_pending & SIG_FATAL_MASK)) {
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
+					        flags);
+			return -1;
+		  }
+		}
 	}
+	spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, flags);
 
 	/*
 	 * Walk the b_cont chain copying out bytes, advancing each mblk's
@@ -746,6 +801,12 @@ static long stream_read(struct file *f, void *buf, size_t len)
 		}
 	}
 
+	/* putbq mutates sd_rq -- same queue sh_rq_putp's putq writes
+	 * to.  Take sd_readwait.sq_lock for the leftover put-back so a
+	 * concurrent putq/getq doesn't trip over a half-updated
+	 * q_first/q_last pair.  Lock is released immediately; the
+	 * caller already copied data to user above without holding it,
+	 * which is what we want (no spinlock across uaccess). */
 	if (cur && cur != mp) {
 		/* Drained mp..(predecessor of cur); leftover starts at cur. */
 		mblk_t *prev = mp;
@@ -753,10 +814,16 @@ static long stream_read(struct file *f, void *buf, size_t len)
 			prev = prev->b_cont;
 		prev->b_cont = NULL;
 		freemsg(mp);
+		unsigned long f2 =
+			spin_lock_irq_save(&sd->sd_readwait.sq_lock);
 		putbq(sd->sd_rq, cur);
+		spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, f2);
 	} else if (cur) {
 		/* mp itself has leftover; put it back unchanged. */
+		unsigned long f2 =
+			spin_lock_irq_save(&sd->sd_readwait.sq_lock);
 		putbq(sd->sd_rq, mp);
+		spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, f2);
 	} else {
 		/* Chain fully drained. */
 		freemsg(mp);

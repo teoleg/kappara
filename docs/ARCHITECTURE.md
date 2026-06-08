@@ -391,6 +391,25 @@ the inode.
 `sd_peer` pointing at the other.  Closing one end signals
 `SD_EOF` on the peer and wakes its readers.
 
+### Stream-read interlock (phase 7)
+
+`stream_read` takes `sd_readwait.sq_lock` across the whole
+`(getq + SD_EOF check + sleep_on)` window and hands the lock to
+`kthread_sleep_on_locked`.  `sh_rq_putp` and the pipe-close path
+take the same lock around `putq(sd_rq, mp)` and the
+`sd_flags |= SD_EOF` mutation.  Same-shape fix as phases 5c
+(`sys_wait`) and 6 (`sigsuspend`): a writer that arrives "just
+before" the reader sleeps either grabs sq_lock first (in which
+case the reader's later `getq` sees the data and never sleeps),
+or spins until the reader is fully on the wq (in which case
+`kthread_wake_all` after the writer's release surgically wakes it).
+
+`sq_lock` also doubles as the queue mutation lock for `sd_rq` --
+nothing else serialised concurrent `putq` / `getq` / `putbq`
+calls.  `stream_read` releases sq_lock before copying to user
+(no spinlock across uaccess) and re-acquires it briefly around
+the leftover `putbq` on partial reads.
+
 ## VFS
 
 In-memory dentry/inode tree.  Each `dentry` has name + parent +
