@@ -112,13 +112,25 @@ static struct procbuf ps_pb;
 static int proc_ps_qopen(queue_t *q)
 {
 	pb_reset(&ps_pb);
-	pb_str(&ps_pb, "  TID  STATE   NAME\n");
+	pb_str(&ps_pb, "  TID  STATE  PRI  CL   NAME\n");
 	for (unsigned tid = 0; tid < kthread_max_tid(); tid++) {
 		struct kthread *t = kthread_at(tid);
 		if (!t) continue;
 		pb_pad_dec(&ps_pb, t->tid, 5);
 		pb_str(&ps_pb, "  ");
-		pb_pad_str(&ps_pb, kthread_state_name(t->state), 8);
+		pb_pad_str(&ps_pb, kthread_state_name(t->state), 6);
+		/* Priority: idle threads carry KSCHED_PRI_IDLE = -1; show
+		 * those as " - " so the column stays 3 wide without leaking
+		 * a minus that looks like an unsigned underflow. */
+		pb_putc(&ps_pb, ' ');
+		if (t->t_pri == KSCHED_PRI_IDLE) {
+			pb_str(&ps_pb, "  -");
+		} else {
+			pb_pad_dec(&ps_pb, (unsigned long)t->t_pri, 3);
+		}
+		pb_str(&ps_pb, "  ");
+		pb_pad_str(&ps_pb, sclass[t->t_cid]->name, 4);
+		pb_str(&ps_pb, " ");
 		pb_str(&ps_pb, t->name ? t->name : "?");
 		pb_putc(&ps_pb, '\n');
 	}

@@ -40,16 +40,27 @@ All read-only.  Each `cat /proc/X` produces a fresh snapshot.
 
 ```
 kappara:/# cat /proc/ps
-  TID  STATE   NAME
-    0  READY   main
-    1  READY   uart_rx
-    2  RUN     user-init
-    3  BLOCK   spawn
+  TID  STATE  PRI  CL   NAME
+    0  RUN      -  SYS  main
+    1  RUN     60  SYS  uart_rx
+    2  RUN     30  TS   user-init
+    3  RUN      -  SYS  idle
+    4  RUN      -  SYS  idle
+    5  RUN      -  SYS  idle
+    9  RUN     30  TS   ps
 ```
 
 Columns:
 - **TID** — thread id, monotonic
 - **STATE** — `READY`/`RUN`/`BLOCK`/`DEAD` (= KT_* enum)
+- **PRI** — dispatch priority.  Higher = picked first.  Idle threads
+  show ` - ` (they carry `KSCHED_PRI_IDLE = -1` as a marker; they're
+  never enqueued, so the number wouldn't mean anything).  SYS threads
+  sit at `KSCHED_PRI_SYS_DEFAULT = 60`; TS threads start at
+  `KSCHED_PRI_TS_DEFAULT = 30` and drift downward as `cl_tick`
+  demotes them on quantum expiry (see ARCHITECTURE.md scheduling).
+- **CL** — scheduling class: `SYS` (kernel threads, fixed priority)
+  or `TS` (EL0 user threads, priority ages with CPU consumption).
 - **NAME** — thread name passed to `kthread_create`
 
 DEAD threads stay visible until the next `switch_to_next` runs the
