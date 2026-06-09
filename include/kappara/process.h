@@ -44,6 +44,9 @@ struct kthread;	/* fwd; defined in kappara/sched.h */
  */
 struct vm_map {
 	uint64_t  l0_phys;	/* TTBR0_EL1 value for this process */
+	uint64_t  l1_phys;	/* for teardown; arch-allocated by
+				 * mmu_vmap_create on aarch64 */
+	uint64_t  l2_phys;	/* L2 we mutate when mapping user pages */
 	int       refs;		/* threads sharing this map */
 	spinlock_t lock;
 };
@@ -90,5 +93,18 @@ void process_put(struct process *p);
  */
 struct vm_map *vm_map_get(struct vm_map *vm);
 void           vm_map_put(struct vm_map *vm);
+
+/*
+ * Allocate a fresh vm_map with empty user VA + a duplicated kernel
+ * mapping.  Refs = 1 on return.  NULL on allocation failure.  The
+ * arch backend (mmu_vmap_create) pulls 3 pages from pmm for L0/L1/L2;
+ * the matching vm_map_put will release them via mmu_vmap_destroy.
+ */
+struct vm_map *vm_map_create(void);
+
+/* Boot-time self-test: create a vm_map, verify it carries the kernel
+ * mappings + TTBR0 swap-and-back works without crashing.  Runs after
+ * the existing vt/ldterm/tty/ldterm-ioc battery. */
+void process_selftest(void);
 
 #endif

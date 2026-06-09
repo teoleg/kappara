@@ -83,6 +83,7 @@
 
 #include "kappara/ipi.h"
 #include "kappara/kmem.h"
+#include "kappara/mmu.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
 #include "kappara/process.h"
@@ -744,6 +745,18 @@ static void switch_to_next(int requeue_current, spinlock_t *extra_release)
 
 	/* (6) Release disp_lock; cpu_thread_lock stays held across (7). */
 	spin_unlock(&c->cpu_disp_lock);
+
+	/* (6b) Phase R1c2: swap TTBR0_EL1 when crossing a process
+	 * boundary.  Done BEFORE context_switch so the new process's
+	 * page tables are live by the time we load its sp -- which
+	 * sits on its kernel stack (mapped identically across all
+	 * processes for now) but its ret target may reach into user
+	 * pages.  TLBI is per-CPU; no broadcast needed.  Skipped when
+	 * both threads share a process (the common pthread-style
+	 * case) so we don't pay a TLB flush per context switch. */
+	if (next->t_proc && prev->t_proc
+	    && next->t_proc->vm != prev->t_proc->vm)
+		mmu_vmap_switch(next->t_proc->vm);
 
 	/* (7) The actual swap.  Save commits prev->sp before load. */
 	context_switch(&prev->sp, next->sp);

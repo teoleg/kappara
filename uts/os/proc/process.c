@@ -80,11 +80,77 @@ void vm_map_put(struct vm_map *vm)
 		init_vm_map.refs = 1;
 		return;
 	}
-	/* R1c2: free the L0 / L1 / L2 / L3 page-table pages this map
-	 * owns.  For now, free the kmalloc'd struct only -- exec
-	 * hasn't started allocating page tables yet, so a leak here
-	 * is impossible in v1. */
+	/* Free the L0 / L1 / L2 page-table pages this map owns (R1c2
+	 * allocated them via mmu_vmap_create).  Then the struct. */
+#ifdef __aarch64__
+	mmu_vmap_destroy(vm);
+#endif
 	kfree(vm);
+}
+
+struct vm_map *vm_map_create(void)
+{
+	struct vm_map *vm = kmalloc(sizeof(*vm));
+	if (!vm) return 0;
+	kmemset(vm, 0, sizeof(*vm));
+	vm->refs = 1;
+#ifdef __aarch64__
+	if (mmu_vmap_create(vm) < 0) {
+		kfree(vm);
+		return 0;
+	}
+#endif
+	return vm;
+}
+
+/* ---- selftest --------------------------------------------------------- */
+
+void process_selftest(void)
+{
+	/* R1c2 mechanism check.  Allocate a fresh vm_map, prove its
+	 * tables are populated with the kernel mappings, install a
+	 * fake user mapping, swap TTBR0 to it briefly, swap back to
+	 * init.  No actual EL0 access -- that comes with R2 once
+	 * sys_execve loads ELFs into per-process address spaces. */
+	int ok = 1;
+
+	struct vm_map *vm = vm_map_create();
+	if (!vm) {
+		kprintf("process: SELFTEST FAIL vm_map_create\n");
+		return;
+	}
+	if (!vm->l0_phys || !vm->l1_phys || !vm->l2_phys) {
+		kprintf("process: SELFTEST FAIL l0=%lx l1=%lx l2=%lx\n",
+		        (unsigned long)vm->l0_phys,
+		        (unsigned long)vm->l1_phys,
+		        (unsigned long)vm->l2_phys);
+		ok = 0; goto done;
+	}
+
+	/* The fresh L2 should carry the boot kernel mappings -- the
+	 * 2 MB block covering kmain (whose address we have via
+	 * &process_selftest) had better be valid. */
+#ifdef __aarch64__
+	uint64_t self = (uint64_t)(uintptr_t)&process_selftest;
+	uint64_t *l2  = (uint64_t *)(uintptr_t)vm->l2_phys;
+	unsigned idx  = (unsigned)(self >> 21) & 0x1ff;
+	if (!(l2[idx] & 1)) {
+		kprintf("process: SELFTEST FAIL kernel L2[%u] not valid\n",
+		        idx);
+		ok = 0; goto done;
+	}
+
+	/* Switch TTBR0 to the new vm, then back.  If the kernel L2
+	 * copy was correct we'll execute the swap-back path through
+	 * the new mapping without crashing. */
+	mmu_vmap_switch(vm);
+	mmu_vmap_switch(&init_vm_map);
+#endif
+
+done:
+	vm_map_put(vm);
+	if (ok)
+		kprintf("process: selftest PASS\n");
 }
 
 struct process *process_alloc(struct vm_map *vm)
