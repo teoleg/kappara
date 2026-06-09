@@ -37,6 +37,7 @@
 #include "kappara/printk.h"
 #include "kappara/proc.h"
 #include "kappara/sched.h"
+#include "kappara/vt.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
 #include "kappara/string.h"
@@ -428,6 +429,7 @@ void kmain(void)
 
 	sched_init();
 	timer_init(100);
+	vt_selftest();
 	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ on core 0 */
 
 	/* Smoke-test the kallsyms table by walking our own frame chain
