@@ -62,8 +62,9 @@
 #define SYS_setsid	30	/* () -> new session id                     */
 #define SYS_tcsetpgrp	31	/* (fd, pgid) -> 0 -- set tty fg pgrp       */
 #define SYS_tcgetpgrp	32	/* (fd) -> pgid                             */
+#define SYS_brk		33	/* (uintptr_t addr) -> new break / -1      */
 
-#define SYS_MAX		33
+#define SYS_MAX		34
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

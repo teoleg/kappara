@@ -47,5 +47,12 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[]);
 /* sys_exit -- terminate the calling thread.  Does not return. */
 void sys_exit_impl(void) __attribute__((noreturn));
 
+/* sys_brk -- set the heap break for the current exec session.
+ * addr == 0: return current break.
+ * addr in [EXEC_HEAP_VA, EXEC_HEAP_VA+EXEC_HEAP_SIZE]: set break,
+ *   return new break.
+ * Out-of-range: return -1. */
+long sys_brk_impl(uint64_t addr);
+
 #endif
 

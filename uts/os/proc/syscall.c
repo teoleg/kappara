@@ -406,6 +406,12 @@ static long sys_tcgetpgrp(long a0, long a1, long a2, long a3, long a4, long a5)
 	return sys_tcgetpgrp_impl((int)a0);
 }
 
+static long sys_brk(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_brk_impl((uint64_t)(unsigned long)a0);
+}
+
 static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_log]    = sys_log,
 	[SYS_getpid] = sys_getpid,
@@ -439,6 +445,7 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_setsid]      = sys_setsid,
 	[SYS_tcsetpgrp]   = sys_tcsetpgrp,
 	[SYS_tcgetpgrp]   = sys_tcgetpgrp,
+	[SYS_brk]         = sys_brk,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

@@ -44,6 +44,7 @@
 #define SYS_setsid	30
 #define SYS_tcsetpgrp	31
 #define SYS_tcgetpgrp	32
+#define SYS_brk		33
 
 #define SIG_BLOCK	0
 #define SIG_UNBLOCK	1
@@ -317,6 +318,11 @@ static inline long sys_tcsetpgrp(int fd, int pgid)
 static inline long sys_tcgetpgrp(int fd)
 {
 	return _syscall1(SYS_tcgetpgrp, (long)fd);
+}
+
+static inline long sys_brk(unsigned long addr)
+{
+	return _syscall1(SYS_brk, (long)addr);
 }
 
 /* ioctl commands -- mirror include/kappara/stream_head.h. */

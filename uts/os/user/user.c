@@ -181,6 +181,8 @@ void user_spawn(void)
 #define EXEC_SIZE      0x00200000UL	/* 2 MB code region */
 #define EXEC_STACK_VA  0x20200000UL
 #define EXEC_STACK_TOP 0x20400000UL	/* SP starts here, grows down */
+#define EXEC_HEAP_VA   0x20400000UL	/* heap: grows up from here */
+#define EXEC_HEAP_SIZE 0x00200000UL	/* 2 MB ceiling */
 
 #define SPAWN_STACK_SIZE	0x10000UL
 #define SPAWN_MAX		((USER_SIZE / SPAWN_STACK_SIZE) - 1)
@@ -255,8 +257,6 @@ void sys_exit_impl(void) __attribute__((noreturn));
 void sys_exit_impl(void)
 {
 	kthread_exit();
-	/* kthread_exit doesn't return, but the attribute helps the
-	 * caller's control-flow analysis. */
 	for (;;)
 		;
 }
@@ -291,6 +291,23 @@ static unsigned char exec_storage[EXEC_SIZE];
 
 __attribute__((aligned(0x200000)))
 static unsigned char exec_stack_storage[EXEC_SIZE];
+
+__attribute__((aligned(0x200000)))
+static unsigned char exec_heap_storage[EXEC_HEAP_SIZE];
+
+/* Current heap break for the running exec session.  Reset to
+ * EXEC_HEAP_VA on each new execve; sys_brk_impl moves it up. */
+static uint64_t exec_heap_brk;
+
+long sys_brk_impl(uint64_t addr)
+{
+	if (addr == 0)
+		return (long)exec_heap_brk;
+	if (addr < EXEC_HEAP_VA || addr > EXEC_HEAP_VA + EXEC_HEAP_SIZE)
+		return -1;
+	exec_heap_brk = addr;
+	return (long)exec_heap_brk;
+}
 
 /* ---- blob file_ops ---- */
 
@@ -378,14 +395,18 @@ extern char pipe_blob_start[];
 extern char pipe_blob_end[];
 extern char pipework_blob_start[];
 extern char pipework_blob_end[];
+extern char malloctest_blob_start[];
+extern char malloctest_blob_end[];
 
 static struct blob_priv hello_priv;
 
 void exec_space_init(void)
 {
-	/* Map exec code and stack windows to EL0. */
+	/* Map exec code, stack, and heap windows to EL0. */
 	mmu_map_user_2mb(EXEC_VA,       (uintptr_t)exec_storage);
 	mmu_map_user_2mb(EXEC_STACK_VA, (uintptr_t)exec_stack_storage);
+	mmu_map_user_2mb(EXEC_HEAP_VA,  (uintptr_t)exec_heap_storage);
+	exec_heap_brk = EXEC_HEAP_VA;
 
 	/* Create /bin and register embedded ELF blobs. */
 	struct dentry *bin = vfs_mkdir(vfs_root(), "bin");
@@ -404,7 +425,7 @@ void exec_space_init(void)
 
 	static struct blob_priv ps_priv, sigtest_priv, masktest_priv,
 	                        waittest_priv, segvtest_priv, crash_priv,
-	                        pipe_priv, pipework_priv;
+	                        pipe_priv, pipework_priv, malloctest_priv;
 
 #define REG(dir, name, priv, s, e) do { \
 	(priv).data = (const unsigned char *)(s); \
@@ -419,12 +440,14 @@ void exec_space_init(void)
 	REG(usrbin, "segvtest", segvtest_priv, segvtest_blob_start, segvtest_blob_end);
 	REG(usrbin, "crash",    crash_priv,    crash_blob_start,    crash_blob_end);
 	REG(usrbin, "pipe",     pipe_priv,     pipe_blob_start,     pipe_blob_end);
-	REG(usrbin, "pipework", pipework_priv, pipework_blob_start, pipework_blob_end);
+	REG(usrbin, "pipework",  pipework_priv,  pipework_blob_start,  pipework_blob_end);
+	REG(usrbin, "malloctest", malloctest_priv, malloctest_blob_start, malloctest_blob_end);
 
 #undef REG
 
 	kprintf("exec: /usr/bin registered: ps(%lu) sigtest(%lu) masktest(%lu) "
-		"waittest(%lu) segvtest(%lu) crash(%lu) pipe(%lu) pipework(%lu)\n",
+		"waittest(%lu) segvtest(%lu) crash(%lu) pipe(%lu) pipework(%lu) "
+		"malloctest(%lu)\n",
 		(unsigned long)ps_priv.size,
 		(unsigned long)sigtest_priv.size,
 		(unsigned long)masktest_priv.size,
@@ -432,7 +455,8 @@ void exec_space_init(void)
 		(unsigned long)segvtest_priv.size,
 		(unsigned long)crash_priv.size,
 		(unsigned long)pipe_priv.size,
-		(unsigned long)pipework_priv.size);
+		(unsigned long)pipework_priv.size,
+		(unsigned long)malloctest_priv.size);
 }
 
 /* ---- ELF loader ---- */
@@ -532,6 +556,8 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 	/* Zero exec storage so BSS segments start clean. */
 	kmemset(exec_storage,       0, EXEC_SIZE);
 	kmemset(exec_stack_storage, 0, EXEC_SIZE);
+	kmemset(exec_heap_storage,  0, EXEC_HEAP_SIZE);
+	exec_heap_brk = EXEC_HEAP_VA;
 
 	/* Copy PT_LOAD segments into exec_storage. */
 	for (unsigned i = 0; i < eh->e_phnum; i++) {
