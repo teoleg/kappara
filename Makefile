@@ -46,6 +46,9 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/uts/os/fs/procfs.o \
         $(BUILD)/uts/os/io/streams.o \
         $(BUILD)/uts/os/io/cdevsw.o \
+        $(BUILD)/uts/os/io/bdevsw.o \
+        $(BUILD)/uts/os/io/buf.o \
+        $(BUILD)/uts/os/io/bram.o \
         $(BUILD)/uts/os/io/stream_head.o \
         $(BUILD)/uts/os/io/vt.o \
         $(BUILD)/uts/os/io/ldterm.o \
