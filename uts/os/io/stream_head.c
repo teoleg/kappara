@@ -306,15 +306,17 @@ void uart_rx_main(void *arg)
 	int vc_prefix_pending = 0;
 
 	for (;;) {
-		/* Wait until at least one possible sink exists -- either a
-		 * tty open we can route to via tty_drv_rq(active) or the
-		 * legacy console_active.  Draining FIFO with nowhere to
-		 * put bytes would lose them. */
-		if (!tty_drv_rq(tty_active()) && !console_active) {
-			kthread_yield();
-			continue;
-		}
-
+		/*
+		 * Always poll the UART FIFO.  Earlier versions waited
+		 * until a sink (tty_drv_rq(active) or console_active)
+		 * existed before reading, but that wedges the loop the
+		 * moment you Ctrl-X to a tty nobody has opened: the
+		 * follow-up Ctrl-X 0 (to come back) sits unread in the
+		 * FIFO forever.  Cheap fix: read every iteration; drop
+		 * non-switch bytes when there's nowhere to send them.
+		 * Switch bytes (the Ctrl-X N escape) are always handled
+		 * regardless of sink state.
+		 */
 		int c = uart_getc_nonblock();
 		if (c < 0) {
 			kthread_yield();
