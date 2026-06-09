@@ -138,25 +138,39 @@ user binary.
 
 ### Layout
 
-Hardcoded 80x24:
+Hardcoded 80x24, double-line borders (UTF-8 box drawing) with the
+title embedded in the top border, Norton-style:
 
 ```
-+--------- Row 1: header bar -------------+-----------------------+
-|/path/of/left          /path/of/right                            |
-+ Rows 2..21: 20 entries per panel ------+-----------------------+
-| ..                            DIR     | etc                DIR  |
-| motd                           31     | proc               DIR  |
-| readme                         93     | dev                DIR  |
-+----- Row 22: separator -----------------------------------------+
-| Row 23: status -- /selected/path  31 bytes                      |
-| Row 24: 1Help 2Menu 3View 4Edit 5Copy 6RenMv 7Mkdir 8Delet ...   |
-+-----------------------------------------------------------------+
+╔═════════════ /home/user ═════════════╦═══════════ Info ═══════════════╗
+║ ..                            UP-DIR ║   Kappara Commander -- Info    ║
+║ etc                              DIR ║                                ║
+║ motd                              31 ║   Name: motd                   ║
+║ readme                            93 ║   Path: /home/user/motd        ║
+║                                      ║                                ║
+║                                      ║   Type: regular file           ║
+║                                      ║   Size: 31 bytes               ║
+║                                      ║                                ║
+║                                      ║   -- content ----              ║
+║                                      ║   welcome to kappara! ...      ║
+║                                      ║                                ║
+║ ... (rows 2..21)                     ║   ... (info content)           ║
+╚══════════════════════════════════════╩════════════════════════════════╝
+ /home/user/motd  31 bytes
+ 1Help 2Menu 3View 4Edit 5Copy 6RenMv 7Mkdir 8Delet 9PullDn qQuit
 ```
 
-Classic Norton Commander palette: panel background is **blue** (ANSI
+Left panel is the file listing (navigable with arrow keys); right
+panel is the **Info pane** showing the properties of the highlighted
+entry: name, full path, and either a directory summary or, for
+regular files, a head-of-file preview (up to ~512 bytes, with
+non-printables ?'d out so the panel never decorates with stray
+escape sequences).
+
+Classic Norton Commander palette: panel background **blue** (ANSI
 `\033[44m`), regular files in light grey, directories in bold
-bright-white, selected entry inverted to black-on-cyan, active-panel
-header bold black-on-white, function-key footer black-on-cyan.
+bright-white, selected entry inverted to black-on-cyan,
+function-key footer black-on-cyan.
 
 ### Keys
 

@@ -51,17 +51,56 @@
 #define KC_W           80
 #define KC_H           24
 
-#define KC_HDR_ROW     1
+/*
+ * Layout, top-to-bottom:
+ *   Row 1            Top border ╔═══<lpath>═══╦═══ Info ═══╗
+ *   Rows 2..21       Panel rows (20 entries each); left = listing,
+ *                    right = info pane (folder props or file preview).
+ *                    Each row is bordered: ║ ... ║ ... ║.
+ *   Row 22           Bottom border ╚═══╩═══╝
+ *   Row 23           Status: selected entry's full path + size.
+ *   Row 24           Function-key footer (F1..F10).
+ *
+ * Columns:
+ *   Col 1            Left border ║
+ *   Cols 2..39       Left panel content (38 cells)
+ *   Col 40           Middle separator ║
+ *   Cols 41..79      Right panel (info) content (39 cells)
+ *   Col 80           Right border ║
+ */
+#define KC_TOP_ROW     1
 #define KC_LIST_TOP    2
 #define KC_LIST_BOT    21
 #define KC_LIST_ROWS   (KC_LIST_BOT - KC_LIST_TOP + 1)   /* 20 */
-#define KC_SEP_ROW     22
+#define KC_BOT_ROW     22
 #define KC_INFO_ROW    23
 #define KC_FN_ROW      24
 
-#define KC_LEFT_COL    1
-#define KC_MID_COL     41	/* right panel starts here */
-#define KC_PANEL_W     40
+#define KC_BORDER_L_COL    1
+#define KC_LEFT_COL        2
+#define KC_BORDER_M_COL    40
+#define KC_RIGHT_COL       41
+#define KC_BORDER_R_COL    80
+#define KC_LEFT_W          38
+#define KC_RIGHT_W         39
+
+/* Compatibility aliases for the old left-side-only render-cell path.
+ * kc_render_cell still draws a 38-cell row starting at base_col. */
+#define KC_MID_COL         KC_RIGHT_COL
+#define KC_PANEL_W         KC_LEFT_W
+
+/* Double-line box drawing -- CP437 lineage, UTF-8 encoded.  Each
+ * glyph is 3 bytes in the output stream but occupies 1 terminal
+ * cell, so cursor-column math counts each cwrite() of one of these
+ * as one column advance. */
+#define KC_BOX_TL  "\xe2\x95\x94"  /* ╔ */
+#define KC_BOX_TR  "\xe2\x95\x97"  /* ╗ */
+#define KC_BOX_BL  "\xe2\x95\x9a"  /* ╚ */
+#define KC_BOX_BR  "\xe2\x95\x9d"  /* ╝ */
+#define KC_BOX_TD  "\xe2\x95\xa6"  /* ╦ */
+#define KC_BOX_BU  "\xe2\x95\xa9"  /* ╩ */
+#define KC_BOX_H   "\xe2\x95\x90"  /* ═ */
+#define KC_BOX_V   "\xe2\x95\x91"  /* ║ */
 
 #define KC_MAX_ENT     128
 #define KC_NAME_MAX    32
@@ -171,7 +210,12 @@ static void kc_attr_normal(void)   { cwrite("\033[0;37;44m"); }   /* light grey 
 static void kc_attr_select(void)   { cwrite("\033[0;30;46m"); }   /* black on cyan -- selected entry */
 static void kc_attr_dir(void)      { cwrite("\033[1;97;44m"); }   /* bold bright-white on blue -- dirs */
 static void kc_attr_dir_sel(void)  { cwrite("\033[1;30;46m"); }   /* bold black on cyan -- selected dir */
+/* header/header_act are dormant now that the top border embeds the
+ * title in the normal blue palette.  Keep them around for the eventual
+ * Tab-toggles-active-panel work without dragging unused-fn errors. */
+__attribute__((unused))
 static void kc_attr_header(void)   { cwrite("\033[0;30;46m"); }   /* black on cyan */
+__attribute__((unused))
 static void kc_attr_header_act(void){ cwrite("\033[1;30;47m"); }  /* bold black on white -- active panel */
 static void kc_attr_footer(void)   { cwrite("\033[0;30;46m"); }
 static void kc_attr_fkey_num(void) { cwrite("\033[1;37;40m"); }   /* white-on-black: the F-key number */
@@ -318,19 +362,22 @@ static void kc_panel_load(struct kc_panel *p)
 /* ---- rendering --------------------------------------------------------- */
 
 /*
- * Render one panel cell.  Layout within KC_PANEL_W = 40 columns:
+ * Render one left-panel cell.  Layout within KC_LEFT_W = 38 columns:
  *
  *   col 0       leading space
- *   col 1..28   name (truncated, padded)
- *   col 29..38  size (right-aligned 10 chars) -- "DIR" right-aligned
- *               or decimal byte count
- *   col 39      trailing space
+ *   col 1..26   name (truncated, padded -- 26 cells)
+ *   col 27..37  size (right-aligned 11 chars: 1 leading sep space +
+ *               10-char value) -- "DIR" / "CHAR" / decimal bytes
+ *
+ * Right panel is the info pane; nothing else calls this with
+ * panel_idx==1 since kc_render_panel(1) was replaced by
+ * kc_render_info.
  */
 static void kc_render_cell(int panel_idx, int row, int row_in_panel)
 {
 	struct kc_panel *p = &kc_panels[panel_idx];
 	int idx = p->top + row_in_panel;
-	int base_col = (panel_idx == 0) ? KC_LEFT_COL : KC_MID_COL;
+	int base_col = (panel_idx == 0) ? KC_LEFT_COL : KC_RIGHT_COL;
 
 	int selected = (idx == p->cur) && (panel_idx == kc_active);
 	struct kc_ent *e = (idx < p->n) ? &p->ents[idx] : ((struct kc_ent *)0);
@@ -347,12 +394,12 @@ static void kc_render_cell(int panel_idx, int row, int row_in_panel)
 	cputc(' ');
 
 	if (!e) {
-		kc_pad_spaces(KC_PANEL_W - 1);
+		kc_pad_spaces(KC_LEFT_W - 1);
 		return;
 	}
 
-	/* name: truncate to 28 chars max */
-	int name_cells = 28;
+	/* name: 26 cells */
+	int name_cells = 26;
 	int written = 0;
 	for (int i = 0; e->name[i] && written < name_cells; i++) {
 		cputc(e->name[i]);
@@ -360,19 +407,18 @@ static void kc_render_cell(int panel_idx, int row, int row_in_panel)
 	}
 	kc_pad_spaces(name_cells - written);
 
-	/* size column: 10 chars, right-aligned */
+	/* size column: 11 cells right-aligned (1 sep space + 10 value) */
 	if (e->type == 'd') {
-		/* show "DIR" right-aligned in 10 cells */
-		kc_pad_spaces(7);
+		/* "DIR" right-aligned in 11 cells */
+		kc_pad_spaces(8);
 		cwrite("DIR");
 	} else if (e->type == 'c') {
-		kc_pad_spaces(6);
+		kc_pad_spaces(7);
 		cwrite("CHAR");
 	} else {
+		cputc(' ');
 		kc_print_size(e->size, 10);
 	}
-
-	cputc(' ');
 }
 
 static void kc_render_panel(int idx)
@@ -382,38 +428,261 @@ static void kc_render_panel(int idx)
 	}
 }
 
-static void kc_render_header(void)
+/*
+ * Right-panel "Info" view -- replaces the second listing.  Shows the
+ * properties of the entry currently highlighted in the LEFT panel
+ * (Norton Commander's Quickview / Info layout):
+ *
+ *   - For a directory: name, full path, total entries, cumulative
+ *     byte count, and a Kappara-flavoured volume blurb (mem stats
+ *     from /proc/meminfo if openable).
+ *
+ *   - For a regular file: name, full path, size, then up to ~14 head
+ *     lines of the file's content, character-clipped at the right
+ *     edge.  Binary data gets ?'s for non-printable bytes so the
+ *     panel never decorates with stray escape sequences.
+ *
+ *   - For a character device or unknown type: just name + type tag,
+ *     no read attempted.
+ */
+static char kc_info_buf[2048];
+
+static void kc_info_print_line(int row, const char *s)
 {
-	/* Two header cells, one per panel, separated by a thin divider. */
-	for (int i = 0; i < 2; i++) {
-		int active = (i == kc_active);
-		int col = (i == 0) ? KC_LEFT_COL : KC_MID_COL;
+	kc_attr_normal();
+	kc_move(row, KC_RIGHT_COL);
+	cputc(' ');
+	int written = 1;
+	for (int i = 0; s[i] && written < KC_RIGHT_W - 1; i++) {
+		char c = s[i];
+		/* Treat <0x20 (except space wouldn't be here anyway) and
+		 * 0x7F as ?.  >=0x80 is allowed so UTF-8 paths come
+		 * through; the host terminal renders them. */
+		if ((unsigned char)c < 0x20 || c == 0x7f) c = '?';
+		cputc(c);
+		written++;
+	}
+	kc_pad_spaces(KC_RIGHT_W - written);
+}
 
-		if (active) kc_attr_header_act();
-		else        kc_attr_header();
+static void kc_info_blank(int row)
+{
+	kc_attr_normal();
+	kc_move(row, KC_RIGHT_COL);
+	kc_pad_spaces(KC_RIGHT_W);
+}
 
-		kc_move(KC_HDR_ROW, col);
-		cputc(' ');
-		const char *path = kc_panels[i].path;
-		int len = (int)ustrlen(path);
-		int max = KC_PANEL_W - 2;
-		if (len > max) {
-			/* Show "..." + tail of path so the last components stay visible. */
-			cwrite("...");
-			cwrite(path + (len - (max - 3)));
+/* Compose a "Name: <name>" / "Path: <path>" / "Size: <n> bytes" line
+ * triple into kc_info_buf at offset *off.  Returns the (offset, count)
+ * structure indirectly via the buffer; caller picks lines off with
+ * kc_info_split_lines. */
+static int kc_info_emit_str(int off, const char *s)
+{
+	int i = 0;
+	while (s[i] && off < (int)sizeof(kc_info_buf) - 1)
+		kc_info_buf[off++] = s[i++];
+	return off;
+}
+
+static int kc_info_emit_dec(int off, long v)
+{
+	char tmp[24];
+	udec(tmp, v);
+	return kc_info_emit_str(off, tmp);
+}
+
+static int kc_info_emit_nl(int off)
+{
+	if (off < (int)sizeof(kc_info_buf) - 1)
+		kc_info_buf[off++] = '\n';
+	return off;
+}
+
+/* Read up to `cap` bytes of `path` into kc_info_buf starting at `off`.
+ * Returns new offset.  Bytes that are non-printable get replaced with
+ * '?'.  We open + read + close inline -- the panel keeps no fd
+ * across redraws. */
+static int kc_info_emit_file_head(int off, const char *path, int cap)
+{
+	long fd = sys_open(path, 0);
+	if (fd < 0) return off;
+	long n = sys_read(fd, kc_info_buf + off,
+	                  (cap > (int)sizeof(kc_info_buf) - off - 1)
+	                  ? (size_t)(sizeof(kc_info_buf) - off - 1)
+	                  : (size_t)cap);
+	sys_close(fd);
+	if (n <= 0) return off;
+	return off + (int)n;
+}
+
+static void kc_render_info(void)
+{
+	/* Compose the info text in kc_info_buf, line-separated by '\n'.
+	 * Then walk lines through kc_info_print_line so each one gets
+	 * clipped at the right edge and the row gets padded to the
+	 * panel width. */
+	struct kc_panel *p = &kc_panels[0];
+	struct kc_ent  *e  = (p->cur < p->n) ? &p->ents[p->cur] : 0;
+
+	int off = 0;
+	off = kc_info_emit_str(off, "  Kappara Commander -- Info\n");
+	off = kc_info_emit_nl(off);
+
+	if (!e) {
+		off = kc_info_emit_str(off, "  (empty selection)\n");
+	} else {
+		off = kc_info_emit_str(off, "  Name: ");
+		off = kc_info_emit_str(off, e->name);
+		off = kc_info_emit_nl(off);
+
+		off = kc_info_emit_str(off, "  Path: ");
+		off = kc_info_emit_str(off, p->path);
+		if (!(p->path[0] == '/' && p->path[1] == '\0'))
+			off = kc_info_emit_str(off, "/");
+		off = kc_info_emit_str(off, e->name);
+		off = kc_info_emit_nl(off);
+
+		off = kc_info_emit_nl(off);
+
+		if (e->type == 'd') {
+			off = kc_info_emit_str(off, "  Type: directory\n");
+			/* Per-directory totals are loaded into the OTHER
+			 * panel only when the user descends.  Without a
+			 * cheap "stat dir" syscall we just show the
+			 * current listing's high-level counts. */
+			off = kc_info_emit_str(off, "  ");
+			off = kc_info_emit_dec(off, (long)p->n);
+			off = kc_info_emit_str(off, " entries in parent\n");
+		} else if (e->type == 'c') {
+			off = kc_info_emit_str(off, "  Type: character device\n");
+		} else if (e->type == 'r') {
+			off = kc_info_emit_str(off, "  Type: regular file\n");
+			off = kc_info_emit_str(off, "  Size: ");
+			off = kc_info_emit_dec(off, e->size);
+			off = kc_info_emit_str(off, " bytes\n");
+
+			off = kc_info_emit_nl(off);
+			off = kc_info_emit_str(off, "  -- content ----\n");
+			/* Build the absolute path into kc_scratch (we own
+			 * the buffer; the directory loader only uses it
+			 * during kc_panel_load).  Then read up to 512
+			 * bytes of head. */
+			int spi = 0;
+			for (int i = 0; p->path[i] && spi < (int)sizeof(kc_scratch) - 2; i++)
+				kc_scratch[spi++] = p->path[i];
+			if (!(p->path[0] == '/' && p->path[1] == '\0'))
+				kc_scratch[spi++] = '/';
+			for (int i = 0; e->name[i] && spi < (int)sizeof(kc_scratch) - 1; i++)
+				kc_scratch[spi++] = e->name[i];
+			kc_scratch[spi] = '\0';
+			off = kc_info_emit_file_head(off, kc_scratch, 512);
 		} else {
-			cwrite(path);
-			kc_pad_spaces(max - len);
+			off = kc_info_emit_str(off, "  Type: ?\n");
 		}
-		cputc(' ');
+	}
+
+	/* Walk lines.  Output starts at row KC_LIST_TOP and runs for
+	 * KC_LIST_ROWS rows. */
+	int row = KC_LIST_TOP;
+	int i = 0;
+	while (row < KC_LIST_TOP + KC_LIST_ROWS && i < off) {
+		/* Extract one line into a small temporary buffer. */
+		char tmp[KC_RIGHT_W + 1];
+		int  tlen = 0;
+		while (i < off && kc_info_buf[i] != '\n'
+		       && tlen < (int)sizeof(tmp) - 1) {
+			tmp[tlen++] = kc_info_buf[i++];
+		}
+		tmp[tlen] = '\0';
+		/* Skip the \n separator if present. */
+		if (i < off && kc_info_buf[i] == '\n') i++;
+		kc_info_print_line(row++, tmp);
+	}
+	/* Blank remaining rows. */
+	while (row < KC_LIST_TOP + KC_LIST_ROWS) {
+		kc_info_blank(row++);
 	}
 }
 
-static void kc_render_separator(void)
+/* Paint one solid row of horizontal box character between two columns
+ * (inclusive of both ends, but the caller positions the cursor). */
+static void kc_render_h_run(int cells)
 {
-	kc_attr_header();
-	kc_move(KC_SEP_ROW, 1);
-	for (int i = 0; i < KC_W; i++) cputc(' ');
+	for (int i = 0; i < cells; i++) cwrite(KC_BOX_H);
+}
+
+/* Top border: ╔══<lpath truncated>══╦══ Info ══╗
+ *
+ * The path slot gets " <path> " with horizontal fills on either side;
+ * if the path is too long for the slot, we cut from the LEFT (keeping
+ * the tail components visible) with a leading "...". */
+static void kc_render_frame_top(void)
+{
+	kc_attr_normal();
+	kc_move(KC_TOP_ROW, KC_BORDER_L_COL);
+	cwrite(KC_BOX_TL);
+
+	/* --- left section: KC_LEFT_W cells (= 38) --- */
+	const char *lpath = kc_panels[0].path;
+	int llen = (int)ustrlen(lpath);
+	int lslot = KC_LEFT_W - 2;	/* horizontal pad on each side >=1 */
+	int ldisp;
+	const char *lshow = lpath;
+	int truncated = 0;
+	if (llen + 2 > lslot) {
+		/* Need to drop the leading components.  Show "..." + tail. */
+		lshow = lpath + (llen - (lslot - 5));
+		truncated = 1;
+		ldisp = lslot - 2;	/* the " <text> " consumes lslot-2 box chars */
+	} else {
+		ldisp = llen + 2;
+	}
+	int lfill_left  = (KC_LEFT_W - ldisp) / 2;
+	int lfill_right = KC_LEFT_W - ldisp - lfill_left;
+	kc_render_h_run(lfill_left);
+	cputc(' ');
+	if (truncated) cwrite("...");
+	cwrite(lshow);
+	cputc(' ');
+	kc_render_h_run(lfill_right);
+
+	/* --- middle T --- */
+	cwrite(KC_BOX_TD);
+
+	/* --- right section: KC_RIGHT_W cells (= 39), title "Info" --- */
+	const char *rtitle = " Info ";
+	int rlen = 6;
+	int rfill_left  = (KC_RIGHT_W - rlen) / 2;
+	int rfill_right = KC_RIGHT_W - rlen - rfill_left;
+	kc_render_h_run(rfill_left);
+	cwrite(rtitle);
+	kc_render_h_run(rfill_right);
+
+	cwrite(KC_BOX_TR);
+}
+
+static void kc_render_frame_bottom(void)
+{
+	kc_attr_normal();
+	kc_move(KC_BOT_ROW, KC_BORDER_L_COL);
+	cwrite(KC_BOX_BL);
+	kc_render_h_run(KC_LEFT_W);
+	cwrite(KC_BOX_BU);
+	kc_render_h_run(KC_RIGHT_W);
+	cwrite(KC_BOX_BR);
+}
+
+/* Draw the three vertical bars (left, middle, right) on each list row.
+ * Called once during a full repaint; the cell renderer writes into
+ * the space between them. */
+static void kc_render_frame_sides(void)
+{
+	kc_attr_normal();
+	for (int r = KC_LIST_TOP; r <= KC_LIST_BOT; r++) {
+		kc_move(r, KC_BORDER_L_COL); cwrite(KC_BOX_V);
+		kc_move(r, KC_BORDER_M_COL); cwrite(KC_BOX_V);
+		kc_move(r, KC_BORDER_R_COL); cwrite(KC_BOX_V);
+	}
 }
 
 static void kc_render_status(void)
@@ -490,10 +759,11 @@ static void kc_render_all(void)
 		for (int c = 0; c < KC_W; c++) cputc(' ');
 	}
 
-	kc_render_header();
+	kc_render_frame_top();
+	kc_render_frame_sides();
 	kc_render_panel(0);
-	kc_render_panel(1);
-	kc_render_separator();
+	kc_render_info();
+	kc_render_frame_bottom();
 	kc_render_status();
 	kc_render_footer();
 
@@ -501,13 +771,13 @@ static void kc_render_all(void)
 	kc_flush();
 }
 
-/* Light repaint: just the two panels + status, no full clear.
- * Used after arrow-key moves to avoid flicker. */
+/* Light repaint after arrow-key moves: panels + info + status.  The
+ * frame stays put. */
 static void kc_repaint_dynamic(void)
 {
-	kc_render_header();
+	kc_render_frame_top();		/* path may have changed */
 	kc_render_panel(0);
-	kc_render_panel(1);
+	kc_render_info();
 	kc_render_status();
 	kc_attr_reset();
 	kc_flush();
