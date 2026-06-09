@@ -163,7 +163,7 @@ void vt_feed_bytes(struct vt *v, const uint8_t *buf, size_t len);
 int  vt_take_bell(struct vt *v);
 
 /* Fetch + clear the dirty-row range.  Returns 1 if anything was
- * dirty and stores the inclusive [top..bot] in *top, *bot; returns
+ * dirty and stores the inclusive [top..bot] in *topbot; returns
  * 0 if nothing changed since the last call (and leaves the
  * outputs untouched).  Renderers loop r=top..bot. */
 int  vt_take_dirty(struct vt *v, int *top, int *bot);
