@@ -510,6 +510,15 @@ static int do_ipush(struct stdata *sd, const char *modname)
 	sd->sd_wq->q_next  = m_wq;
 	old_top_rq->q_next = m_rq;
 	m_rq->q_next       = sd->sd_rq;
+
+	/* SVR4: call the module's read-side qi_qopen at push time so
+	 * per-instance state (ldterm's struct ldterm + termios, etc.)
+	 * gets allocated.  Phase 4: previously skipped, which meant
+	 * a user-space I_PUSH of any stateful module left q_ptr NULL
+	 * and the first putp dereferenced through it.  Same shape
+	 * stream_build uses on the driver. */
+	if (st->st_rdinit && st->st_rdinit->qi_qopen)
+		st->st_rdinit->qi_qopen(m_rq);
 	return 0;
 }
 
@@ -610,6 +619,17 @@ static int stream_open(struct file *f)
 					 MINOR(f->f_inode->i_rdev));
 	if (!sd)
 		return -1;
+
+	/* Auto-push the SVR4 line discipline onto every tty open.  In
+	 * Solaris this is what the autopush database (sad(7D)) drives
+	 * per-device; phase 4 hardcodes "ldterm on tty" because tty
+	 * is the only multi-cooking driver we have.  The push happens
+	 * AFTER stream_build so the driver's qi_qopen has already
+	 * wired its per-minor state via q_ptr -- ldterm pushes above
+	 * it without disturbing that. */
+	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_TTY)
+		(void)do_ipush(sd, "ldterm");
+
 	f->f_private = sd;
 	return 0;
 }
