@@ -338,9 +338,12 @@ void tty_switch(int i)
 	if (i == tty_active_minor) return;
 	tty_active_minor = i;
 	tty_repaint(&tty_minors[i].vt);
-	/* Phase 7: also repaint the framebuffer (real-HW HDMI display).
-	 * No-op when no framebuffer is initialised, so QEMU -display
-	 * none keeps working transparently. */
+	/* Force a full fb repaint -- the dirty bitmap only tracks
+	 * changes SINCE THE LAST PAINT, but the framebuffer is showing
+	 * whatever the previous tty left there, so we need to paint
+	 * the entire grid.  No-op when no framebuffer is initialised
+	 * (QEMU -display none keeps working transparently). */
+	vt_mark_all_dirty(&tty_minors[i].vt);
 	fbcon_render_vt(&tty_minors[i].vt);
 }
 

@@ -312,18 +312,26 @@ static void fbcon_render_cell(const struct vt_cell *cell, int row, int col)
 void fbcon_render_vt(const struct vt *v)
 {
 	if (!framebuffer_get() || !v) return;
-	/* Clear the grid background to BG first so cells that have
-	 * never been written (or just got blanked) come out as the
-	 * default colour instead of stale splash pixels. */
-	framebuffer_rect(0, 0,
-	                 (uint32_t)VT_COLS * FBCON_CW,
-	                 (uint32_t)VT_ROWS * FBCON_CH,
-	                 0xff000000u);
-	for (int r = 0; r < VT_ROWS; r++) {
+
+	/* Only repaint rows that the emulator marked dirty since the
+	 * last fetch.  Drops the per-mblk cost from "1920 cells *
+	 * 64 px = 122,000 pixel writes" to "rows-touched * 80 * 64",
+	 * which for the typical shell echo (1 byte → 1 row) is more
+	 * like 5,000 writes -- 25x cheaper, and proportional to what
+	 * actually changed.  Callers that need a full repaint (e.g.
+	 * tty_switch) call vt_mark_all_dirty first. */
+	int top, bot;
+	if (!vt_take_dirty((struct vt *)v, &top, &bot))
+		return;	/* nothing changed since last paint */
+
+	/* Repaint each dirty row.  We don't pre-clear with a rect
+	 * because each cell write paints its own bg colour. */
+	for (int r = top; r <= bot; r++) {
 		for (int c = 0; c < VT_COLS; c++) {
 			fbcon_render_cell(&v->cells[r][c], r, c);
 		}
 	}
-	fbcon_mark_dirty(0, (uint32_t)VT_ROWS * FBCON_CH);
+	fbcon_mark_dirty((uint32_t)top * FBCON_CH,
+	                 (uint32_t)(bot - top + 1) * FBCON_CH);
 	fbcon_tee_flush();
 }
