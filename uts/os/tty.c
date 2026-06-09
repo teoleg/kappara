@@ -28,6 +28,7 @@
 #include <stdint.h>
 
 #include "kappara/cdevsw.h"
+#include "kappara/fbcon.h"
 #include "kappara/kmem.h"
 #include "kappara/printk.h"
 #include "kappara/stream_head.h"
@@ -147,6 +148,12 @@ static int tty_drv_wq_putp(queue_t *q, mblk_t *mp)
 			uart_putc_unlocked((char)*p);
 		}
 		uart_release(flags);
+		/* Phase 7: incremental fb repaint after the mblk.  Once
+		 * per mblk rather than once per byte -- the shell tends
+		 * to write a whole prompt/echo line as a single mblk, so
+		 * this is much cheaper than per-byte yet still feels
+		 * live to the user.  No-op when no framebuffer is up. */
+		fbcon_render_vt(&m->vt);
 	} else {
 		/* Inactive: only update the cell buffer.  Bytes will
 		 * surface on the next tty_switch to this minor. */
@@ -310,6 +317,10 @@ void tty_switch(int i)
 	if (i == tty_active_minor) return;
 	tty_active_minor = i;
 	tty_repaint(&tty_minors[i].vt);
+	/* Phase 7: also repaint the framebuffer (real-HW HDMI display).
+	 * No-op when no framebuffer is initialised, so QEMU -display
+	 * none keeps working transparently. */
+	fbcon_render_vt(&tty_minors[i].vt);
 }
 
 /* ---- init ------------------------------------------------------------- */
