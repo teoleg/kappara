@@ -423,6 +423,19 @@ void kmain(void)
 		 * in the lower half of the screen, scrolling under the
 		 * "kappara" title rather than over it. */
 		fbcon_init_cursor(320);
+
+		/* Phase 8 dual-console: enable the kprintf-to-fb mirror so
+		 * the boot log is visible on a real HDMI monitor without
+		 * needing serial.  UART output is unchanged -- always-on
+		 * debug channel.  Phase-7 cell-grid render writes occupy
+		 * the top 192 px (rows 0..23 x 8 px); the tee cursor sits
+		 * below them, so the two paths share the screen without
+		 * conflict.  In QEMU TCG this is the path the original
+		 * "shell appears to freeze" comment in fbcon.c was about
+		 * -- the dc cvac cost competes with the host display
+		 * refresh.  Live with it on the test rig; the win on
+		 * real HW makes up for it. */
+		fbcon_tee_enable(1);
 	}
 
 	kprintf("\n");
