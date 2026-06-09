@@ -364,7 +364,7 @@ static void cmd_help(void)
 		"  pwd                    print current directory\r\n"
 		"  cd [path]              change current directory\r\n"
 		"  ls [path]              list a directory\r\n"
-		"  lsl [path]             list with type + size (ls -l)\r\n"
+		"  ll [path]              list with type + size (ls -l)\r\n"
 		"  open <path>            open and remember as $fd\r\n"
 		"  close                  close $fd\r\n"
 		"  read [n]               read up to n bytes from $fd\r\n"
@@ -419,7 +419,7 @@ static void cmd_ls(int argc, char *argv[])
 	}
 }
 
-static void cmd_lsl(int argc, char *argv[])
+static void cmd_ll(int argc, char *argv[])
 {
 	char path[128];
 	if (argc > 1)
@@ -430,7 +430,7 @@ static void cmd_lsl(int argc, char *argv[])
 		path[i] = '\0';
 	}
 	char out[512];
-	long n = sys_lsl(path, out, sizeof(out));
+	long n = sys_ll(path, out, sizeof(out));
 	if (n < 0) {
 		cwrite("lsl: cannot access '"); cwrite(path); cwrite("'\r\n");
 		return;
@@ -1457,7 +1457,7 @@ static void worker_main(long arg)
 		}
 		sys_yield();
 	}
-	sys_exit();
+	sys_exit(0);
 }
 
 static void cmd_spawn(int argc, char *argv[])
@@ -1561,7 +1561,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "pwd"))    cmd_pwd();
 	else if (!ustrcmp(argv[0], "cd"))     cmd_cd(argc, argv);
 	else if (!ustrcmp(argv[0], "ls"))     cmd_ls(argc, argv);
-	else if (!ustrcmp(argv[0], "lsl"))    cmd_lsl(argc, argv);
+	else if (!ustrcmp(argv[0], "ll"))     cmd_ll(argc, argv);
 	else if (!ustrcmp(argv[0], "open"))   cmd_open(argc, argv);
 	else if (!ustrcmp(argv[0], "close"))  cmd_close();
 	else if (!ustrcmp(argv[0], "read"))   cmd_read(argc, argv);

@@ -253,10 +253,10 @@ long sys_spawn_impl(uint64_t entry, uint64_t arg)
 	return (long)t->tid;
 }
 
-void sys_exit_impl(void) __attribute__((noreturn));
-void sys_exit_impl(void)
+void sys_exit_impl(int status) __attribute__((noreturn));
+void sys_exit_impl(int status)
 {
-	kthread_exit();
+	kthread_exit(status);
 	for (;;)
 		;
 }

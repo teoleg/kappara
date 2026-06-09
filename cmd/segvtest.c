@@ -5,7 +5,7 @@ static void segv_handler(int sig)
 {
     (void)sig;
     sys_log("segvtest: handler caught SIGSEGV; exiting");
-    sys_exit();
+    sys_exit(0);
 }
 
 static void worker(long arg)
@@ -18,7 +18,7 @@ static void worker(long arg)
     volatile int *q = (volatile int *)0;
     *q = 1;
     sys_log("segvtest: BUG -- continued past fault");
-    sys_exit();
+    sys_exit(0);
 }
 
 int main(int argc, char **argv)

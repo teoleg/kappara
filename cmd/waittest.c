@@ -3,18 +3,32 @@
 
 static void worker(long arg)
 {
-    (void)arg;
-    for (int i = 0; i < 20000; i++) sys_yield();
-    sys_exit();
+    sys_exit((int)arg);
 }
 
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    long tid = sys_spawn(worker, 0);
-    if (tid < 0) { puts("waittest: spawn failed"); return 1; }
+
+    /* Spawn worker with exit status 42; verify wait returns 42. */
+    long tid = sys_spawn(worker, 42);
+    if (tid < 0) { puts("waittest: spawn failed\n"); return 1; }
     printf("waittest: spawned tid=%ld, waiting...\n", tid);
     long r = sys_wait((int)tid);
-    printf("waittest: sys_wait returned %ld (0 = clean)\n", r);
+    if (r != 42) {
+        printf("waittest: FAIL expected 42 got %ld\n", r);
+        return 1;
+    }
+
+    /* Zero exit status. */
+    tid = sys_spawn(worker, 0);
+    if (tid < 0) { puts("waittest: spawn failed (2)\n"); return 1; }
+    r = sys_wait((int)tid);
+    if (r != 0) {
+        printf("waittest: FAIL expected 0 got %ld\n", r);
+        return 1;
+    }
+
+    puts("waittest: PASS\n");
     return 0;
 }

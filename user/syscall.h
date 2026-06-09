@@ -31,7 +31,7 @@
 #define SYS_unlink	17
 #define SYS_rmdir	18
 #define SYS_kill	19
-#define SYS_lsl		20
+#define SYS_ll		20
 #define SYS_halt	21
 #define SYS_sigaction	22
 #define SYS_sigreturn	23
@@ -155,11 +155,12 @@ static inline long sys_spawn(void (*entry)(long), long arg)
 	return x0;
 }
 
-static inline void sys_exit(void) __attribute__((noreturn));
-static inline void sys_exit(void)
+static inline void sys_exit(int status) __attribute__((noreturn));
+static inline void sys_exit(int status)
 {
+	register long x0 __asm__("x0") = (long)status;
 	register long x8 __asm__("x8") = SYS_exit;
-	__asm__ volatile ("svc #0" :: "r"(x8) : "memory");
+	__asm__ volatile ("svc #0" :: "r"(x0), "r"(x8) : "memory");
 	__builtin_unreachable();
 }
 
@@ -207,9 +208,9 @@ static inline long sys_ls(const char *path, char *out, size_t cap)
 			 (long)cap);
 }
 
-static inline long sys_lsl(const char *path, char *out, size_t cap)
+static inline long sys_ll(const char *path, char *out, size_t cap)
 {
-	return _syscall3(SYS_lsl,
+	return _syscall3(SYS_ll,
 			 (long)(unsigned long)path,
 			 (long)(unsigned long)out,
 			 (long)cap);

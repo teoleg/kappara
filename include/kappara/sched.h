@@ -247,6 +247,8 @@ struct kthread {
 	 * the first sigsuspend on this thread; BSS zero (sq_lock=0,
 	 * head=NULL) is a valid initial state for both fields. */
 	struct wait_queue  sigwait_wq;
+	/* Exit status set by kthread_exit(status); read by sys_wait. */
+	int            t_exit_status;
 	/* Per-thread open files.  Each entry is either NULL or a
 	 * struct file * whose f_refs counts how many fd slots (across
 	 * all threads) still point at it.  See kernel/vfs.c. */
@@ -396,7 +398,14 @@ struct kthread *kthread_create_no_dispatch(const char *name,
                                            void (*fn)(void *), void *arg);
 void            kthread_dispatch         (struct kthread *t);
 void            kthread_yield(void);
-void            kthread_exit(void) __attribute__((noreturn));
+void            kthread_exit(int status) __attribute__((noreturn));
+
+/* Return the exit status of a thread that has already exited.
+ * Returns 0 if the tid was never recorded (never existed or the
+ * table slot was recycled -- only matters if more than EXIT_TAB_N
+ * distinct tids exit between spawn and wait, which doesn't happen
+ * in practice). */
+int             kthread_exit_status(unsigned tid);
 void            sched_tick(void);
 
 /* Make `child` inherit `parent`'s open files: each non-NULL slot is

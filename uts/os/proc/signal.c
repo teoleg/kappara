@@ -284,7 +284,7 @@ long sys_wait_impl(int tid)
 		struct kthread *t = kthread_find((unsigned)tid);
 		if (!t) {
 			spin_unlock_irq_restore(&thread_exit_wq.sq_lock, flags);
-			return 0;
+			return (long)kthread_exit_status((unsigned)tid);
 		}
 
 		struct kthread *me = curthread;
@@ -416,7 +416,7 @@ void check_signals(struct trap_frame *tf)
 			if (SIG_FATAL_MASK & SIGBIT(sig)) {
 				kprintf("kthread: tid=%u killed by signal %u\n",
 					t->tid, sig);
-				sys_exit_impl();
+				sys_exit_impl(-1);
 				/* unreachable */
 			}
 			/* non-fatal default = ignore */
@@ -442,7 +442,7 @@ void check_signals(struct trap_frame *tf)
 		if (sendsig(tf, (int)sig, handler) < 0) {
 			kprintf("kthread: tid=%u sendsig(%u) failed\n",
 				t->tid, sig);
-			sys_exit_impl();
+			sys_exit_impl(-1);
 			/* unreachable */
 		}
 		if (sa_flags & SA_RESETHAND) {

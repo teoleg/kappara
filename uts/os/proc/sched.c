@@ -1201,9 +1201,41 @@ void sched_secondary_init(unsigned cpu_id)
 	kprintf("sched: cpu %u up  idle tid=%u\n", cpu_id, idle->tid);
 }
 
-void kthread_exit(void)
+/* ---- exit-status table ------------------------------------------------- */
+/* Small static table so sys_wait can retrieve a thread's exit status
+ * even after the kthread has been reaped (stack freed).  Sized for the
+ * typical max number of threads that can exit between a spawn and a
+ * wait; collisions only occur if more than EXIT_TAB_N distinct tids
+ * exit before being waited on -- not a real concern on this kernel. */
+#define EXIT_TAB_N	64
+static struct { unsigned tid; int status; } exit_tab[EXIT_TAB_N];
+static spinlock_t exit_tab_lock = SPINLOCK_INIT;
+
+static void exit_tab_store(unsigned tid, int status)
+{
+	unsigned long fl = spin_lock_irq_save(&exit_tab_lock);
+	unsigned idx = tid % EXIT_TAB_N;
+	exit_tab[idx].tid    = tid;
+	exit_tab[idx].status = status;
+	spin_unlock_irq_restore(&exit_tab_lock, fl);
+}
+
+int kthread_exit_status(unsigned tid)
+{
+	unsigned long fl = spin_lock_irq_save(&exit_tab_lock);
+	unsigned idx = tid % EXIT_TAB_N;
+	int st = (exit_tab[idx].tid == tid) ? exit_tab[idx].status : 0;
+	spin_unlock_irq_restore(&exit_tab_lock, fl);
+	return st;
+}
+
+void kthread_exit(int status)
 {
 	struct kthread *me = curthread;
+	/* Store exit status before going KT_DEAD so sys_wait can read
+	 * it even after the kthread is reaped. */
+	me->t_exit_status = status;
+	exit_tab_store(me->tid, status);
 	/* Release every file the dying thread still holds.  pipe ends
 	 * inherited from the parent get their refcount dropped here so
 	 * the pipe goes away naturally when both ends are closed. */
