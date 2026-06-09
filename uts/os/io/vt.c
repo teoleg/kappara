@@ -34,17 +34,35 @@
 
 /* ---- cell-buffer primitives ------------------------------------------- */
 
+static void vt_dirty_row(struct vt *v, int row)
+{
+	if (row < 0 || row >= VT_ROWS) return;
+	if (row < v->dirty_top) v->dirty_top = row;
+	if (row > v->dirty_bot) v->dirty_bot = row;
+}
+
+static void vt_dirty_range(struct vt *v, int top, int bot)
+{
+	if (top < 0)          top = 0;
+	if (bot >= VT_ROWS)   bot = VT_ROWS - 1;
+	if (top > bot)        return;
+	if (top < v->dirty_top) v->dirty_top = top;
+	if (bot > v->dirty_bot) v->dirty_bot = bot;
+}
+
 static void vt_clear_row(struct vt *v, int row, int col_start, int col_end)
 {
 	if (row < 0 || row >= VT_ROWS) return;
 	if (col_start < 0)        col_start = 0;
 	if (col_end > VT_COLS)    col_end = VT_COLS;
+	if (col_end <= col_start) return;
 	for (int c = col_start; c < col_end; c++) {
 		v->cells[row][c].ch    = ' ';
 		v->cells[row][c].fg    = v->cur_fg;
 		v->cells[row][c].bg    = v->cur_bg;
 		v->cells[row][c].flags = 0;
 	}
+	vt_dirty_row(v, row);
 }
 
 static void vt_clear_region(struct vt *v, int r_start, int r_end)
@@ -71,6 +89,7 @@ static void vt_scroll_up(struct vt *v, int n)
 	}
 	for (int r = bot - n + 1; r <= bot; r++)
 		vt_clear_row(v, r, 0, VT_COLS);
+	vt_dirty_range(v, top, bot);
 }
 
 static void vt_scroll_down(struct vt *v, int n)
@@ -87,6 +106,7 @@ static void vt_scroll_down(struct vt *v, int n)
 	}
 	for (int r = top; r < top + n; r++)
 		vt_clear_row(v, r, 0, VT_COLS);
+	vt_dirty_range(v, top, bot);
 }
 
 /* ---- cursor + plain-char placement ------------------------------------- */
@@ -129,6 +149,7 @@ static void vt_put_printable(struct vt *v, uint8_t ch)
 	v->cells[v->row][v->col].fg    = v->cur_fg;
 	v->cells[v->row][v->col].bg    = v->cur_bg;
 	v->cells[v->row][v->col].flags = v->cur_flags;
+	vt_dirty_row(v, v->row);
 	if (v->col == VT_COLS - 1) {
 		if (v->autowrap)
 			v->wrap_pending = 1;
@@ -403,6 +424,7 @@ static void vt_dispatch_csi(struct vt *v, uint8_t final)
 			v->cells[v->row][c].bg    = v->cur_bg;
 			v->cells[v->row][c].flags = 0;
 		}
+		vt_dirty_row(v, v->row);
 		break;
 	}
 	case 'P': {	/* DCH -- delete N chars at cursor */
@@ -416,6 +438,7 @@ static void vt_dispatch_csi(struct vt *v, uint8_t final)
 			v->cells[v->row][c].bg    = v->cur_bg;
 			v->cells[v->row][c].flags = 0;
 		}
+		vt_dirty_row(v, v->row);
 		break;
 	}
 	case 'S':	vt_scroll_up(v, vt_p(v, 0, 1)); break;
@@ -492,6 +515,8 @@ void vt_init(struct vt *v)
 	v->n_params = 0;
 	v->csi_private = 0;
 	v->bell_pending = 0;
+	v->dirty_top = VT_ROWS;	/* > dirty_bot means "nothing dirty" */
+	v->dirty_bot = -1;
 	for (int i = 0; i < VT_PARAMS_MAX; i++) v->params[i] = 0;
 }
 
@@ -559,6 +584,22 @@ int vt_take_bell(struct vt *v)
 	int b = v->bell_pending;
 	v->bell_pending = 0;
 	return b;
+}
+
+int vt_take_dirty(struct vt *v, int *top, int *bot)
+{
+	if (v->dirty_top > v->dirty_bot) return 0;
+	*top = v->dirty_top;
+	*bot = v->dirty_bot;
+	v->dirty_top = VT_ROWS;
+	v->dirty_bot = -1;
+	return 1;
+}
+
+void vt_mark_all_dirty(struct vt *v)
+{
+	v->dirty_top = 0;
+	v->dirty_bot = VT_ROWS - 1;
 }
 
 const struct vt_cell *vt_cell_at(const struct vt *v, int row, int col)

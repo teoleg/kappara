@@ -135,6 +135,14 @@ struct vt {
 	 * vt_take_bell so the driver can drive an audible/visible
 	 * beep without the emulator needing a callback. */
 	int bell_pending;
+
+	/* Dirty-row range since last vt_take_dirty().  Renderers
+	 * (fbcon, the UART switch repaint) ask "what rows changed?"
+	 * and only repaint those.  Range is inclusive [top..bot];
+	 * top > bot means "nothing dirty".  vt_init starts in the
+	 * empty state. */
+	int dirty_top;
+	int dirty_bot;
 };
 
 /* Initialise vt to a blank 80x24 grid, cursor at (0,0), default
@@ -153,6 +161,17 @@ void vt_feed_bytes(struct vt *v, const uint8_t *buf, size_t len);
 /* Consume a pending bell (returns 1 once per BEL byte fed, 0
  * otherwise). */
 int  vt_take_bell(struct vt *v);
+
+/* Fetch + clear the dirty-row range.  Returns 1 if anything was
+ * dirty and stores the inclusive [top..bot] in *top/*bot; returns
+ * 0 if nothing changed since the last call (and leaves the
+ * outputs untouched).  Renderers loop r=top..bot. */
+int  vt_take_dirty(struct vt *v, int *top, int *bot);
+
+/* Force the next vt_take_dirty to report the full screen.  Used
+ * by tty_switch when the renderer needs to repaint everything
+ * even if nothing's been written since the last fetch. */
+void vt_mark_all_dirty(struct vt *v);
 
 /* Read accessor for renderers.  Returns NULL if (row, col) is OOB. */
 const struct vt_cell *vt_cell_at(const struct vt *v, int row, int col);
