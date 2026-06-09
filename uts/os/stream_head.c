@@ -274,6 +274,28 @@ static queue_t *bottom_driver_rq(struct stdata *sd)
 void uart_rx_main(void *arg)
 {
 	(void)arg;
+
+	/*
+	 * Phase 9 virtual-console switch keystroke: Ctrl-X N.
+	 *
+	 * On Ctrl-X (0x18) we set vc_prefix_pending.  If the next byte
+	 * is '0'..'9' we treat it as a tty number and call
+	 * tty_switch().  Anything else cancels the prefix.
+	 *
+	 * Ctrl-X chosen over the more conventional Ctrl-A because
+	 * QEMU's -serial mon:stdio mode eats Ctrl-A as its monitor
+	 * escape prefix -- the byte never reaches the guest, so it's
+	 * useless as our switch key on the test rig.  On real
+	 * hardware (or QEMU with plain -serial stdio) Ctrl-X works
+	 * the same way Ctrl-A would.
+	 *
+	 * The held Ctrl-X byte is NOT echoed to the reader -- losing
+	 * it is the price of a single-byte prefix.  Real screen /
+	 * tmux deal with the same trade-off by requiring the prefix
+	 * to be typed twice to send a literal; we don't bother yet.
+	 */
+	int vc_prefix_pending = 0;
+
 	for (;;) {
 		if (!console_active) {
 			/* Nothing listening yet -- don't drain the FIFO
@@ -284,23 +306,39 @@ void uart_rx_main(void *arg)
 		}
 
 		int c = uart_getc_nonblock();
+		if (c < 0) {
+			kthread_yield();
+			continue;
+		}
+
+		if (vc_prefix_pending) {
+			vc_prefix_pending = 0;
+			if (c >= '0' && c < '0' + NTTY) {
+				tty_switch(c - '0');
+				kthread_yield();
+				continue;
+			}
+			/* Not a digit -- silently drop both the held
+			 * Ctrl-A and the trailing byte.  The user typed
+			 * a stale prefix; losing one byte beats injecting
+			 * a Ctrl-A into the data stream. */
+			kthread_yield();
+			continue;
+		}
+
+		if (c == 0x18) {	/* Ctrl-X */
+			vc_prefix_pending = 1;
+			kthread_yield();
+			continue;
+		}
+
 		if (c == 0x03) {
 			/*
-			 * Ctrl-C: send SIGINT to the foreground reader of
-			 * the console.  Preferred target is whatever's on
-			 * the read wait queue right now; if it's empty
-			 * (typical: the reader is mid-loop processing the
-			 * previous byte), fall back to the most recent
-			 * reader (sd_last_reader, set by stream_read).
-			 *
-			 * kthread_signal pulls the thread off the wait
-			 * queue if blocked (so the read returns -1 with
-			 * the EINTR shape) AND sets the pending bit (so
-			 * check_signals on the way out of the syscall
-			 * dispatches to the user handler, if installed).
-			 *
-			 * No byte goes upstream -- the line-discipline
-			 * convention is that Ctrl-C is consumed.
+			 * Ctrl-C still consumed at the rx-loop level for
+			 * console_active (pre-phase-5 tty path).  Phase 5
+			 * routes via tty_signal_fg_pgrp once ldterm sits
+			 * over the tty; today /dev/console isn't a tty so
+			 * we keep this fallback in place.
 			 */
 			struct stdata *sd = console_active;
 			struct kthread *t = sd->sd_readwait.head;
@@ -308,7 +346,7 @@ void uart_rx_main(void *arg)
 				t = kthread_find(sd->sd_last_reader);
 			}
 			if (t) kthread_signal(t, SIGINT);
-		} else if (c >= 0) {
+		} else {
 			mblk_t *mp = allocb(1, 0);
 			if (mp) {
 				*mp->b_wptr++ = (unsigned char)c;

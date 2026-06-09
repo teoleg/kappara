@@ -18,6 +18,7 @@ The prompt shows the current working directory: `kappara:/etc#`.
 | `pwd`                      | Print working directory.                                    |
 | `cat <path>`               | Dump a file's bytes to the console.                         |
 | `echo <path> <text>`       | Overwrite a file with `<text>` (creates if missing).        |
+| `vc <n> <text>`            | Write `<text>` to `/dev/tty<n>` (one-digit minor) without doing the cwd-relative open the `echo` command does.  Lets you put bytes into an inactive virtual console's cell buffer; switch to that tty via `Ctrl-X <n>` to see them.  See ARCHITECTURE.md "Virtual consoles" for the bigger picture. |
 | `append <path> <text>`     | Append `<text>` + newline to a file.                        |
 | `touch <path>`             | Create an empty file under a kfs mount.                     |
 | `mkdir <path>`             | Create a directory under a kfs mount.                       |
