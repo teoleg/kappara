@@ -380,6 +380,32 @@ static long sys_execve(long a0, long a1, long a2, long a3, long a4, long a5)
  * stub here would silently shadow the real handler.
  */
 
+static long sys_setpgid(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_setpgid_impl((int)a0, (int)a1);
+}
+static long sys_getpgrp(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_getpgrp_impl();
+}
+static long sys_setsid(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_setsid_impl();
+}
+static long sys_tcsetpgrp(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_tcsetpgrp_impl((int)a0, (int)a1);
+}
+static long sys_tcgetpgrp(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_tcgetpgrp_impl((int)a0);
+}
+
 static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_log]    = sys_log,
 	[SYS_getpid] = sys_getpid,
@@ -408,6 +434,11 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_sigsuspend]  = sys_sigsuspend,
 	[SYS_wait]        = sys_wait,
 	[SYS_execve]      = sys_execve,
+	[SYS_setpgid]     = sys_setpgid,
+	[SYS_getpgrp]     = sys_getpgrp,
+	[SYS_setsid]      = sys_setsid,
+	[SYS_tcsetpgrp]   = sys_tcsetpgrp,
+	[SYS_tcgetpgrp]   = sys_tcgetpgrp,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

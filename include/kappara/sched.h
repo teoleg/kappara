@@ -170,6 +170,16 @@ struct kthread {
 	spinlock_t    *t_lockp;
 	spinlock_t     t_lock;
 	unsigned       tid;
+	/* SVR4 session and process group.  Both are tid values: a
+	 * thread that calls setsid() makes its tid the session and
+	 * pgrp id; setpgid(pid=0, pgid=0) makes its tid the pgrp id
+	 * (joining itself as the new pgrp leader); other threads
+	 * inherit at kthread_create time from the caller.  0 means
+	 * "no session / no pgrp" -- the initial state of the boot
+	 * main_thread before user-init has been spawned; signals to
+	 * pgrp 0 are no-ops. */
+	unsigned       t_session;
+	unsigned       t_pgrp;
 	enum kt_state  state;
 	/*
 	 * Dispatch priority.  Higher value = picked first.  Set at
@@ -458,6 +468,10 @@ const char     *kthread_state_name(enum kt_state s);
  * and observes the signal.  Returns 0 on success or -1 if sig is
  * out of range. */
 int             kthread_signal(struct kthread *t, unsigned sig);
+
+/* Fan-out signal to every thread whose t_pgrp matches `pgrp`.
+ * No-op when pgrp == 0.  Returns the number of threads signaled. */
+int             kthread_signal_pgrp(unsigned pgrp, unsigned sig);
 
 /*
  * Arch-specific hook implemented in arch/<arch>/thread.c.  Lays

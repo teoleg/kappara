@@ -51,6 +51,16 @@ void tty_switch(int i);
 /* Currently-active tty's minor.  0 at boot. */
 int  tty_active(void);
 
+/* SVR4 controlling-tty foreground process group for /dev/tty<i>.
+ * tty_signal_fg_pgrp delivers `sig` to every kthread whose t_pgrp
+ * matches that tty's fg_pgrp; if fg_pgrp is 0 it falls back to the
+ * stream head's sd_last_reader (the pre-session-model behaviour
+ * uart_rx_main has used since the start).  Returns the number of
+ * recipients (0 = no one received it). */
+void tty_set_fg_pgrp(int minor, unsigned pgrp);
+unsigned tty_fg_pgrp(int minor);
+int  tty_signal_fg_pgrp(int minor, unsigned sig);
+
 /* Boot-time self-test -- writes bytes to tty 1 (inactive), checks
  * the cell buffer, switches, switches back. */
 void tty_selftest(void);

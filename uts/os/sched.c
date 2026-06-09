@@ -437,6 +437,13 @@ void sched_init(void)
 	main_thread.state = KT_RUNNING;
 	main_thread.t_pri = KSCHED_PRI_IDLE;	/* doubles as cpu 0's idle */
 	main_thread.t_cid = SCLASS_SYS;
+	/* Initial main_thread is the boot session leader: tid 0 / pgrp 0
+	 * / session 0.  user-init (and any subsequent shell) gets the
+	 * inherited 0; calling setsid() in the shell promotes it to its
+	 * own session + pgrp.  Pgrp 0 signals are a no-op so transient
+	 * "before anyone called setsid" state is harmless. */
+	main_thread.t_pgrp    = 0;
+	main_thread.t_session = 0;
 	main_thread.next  = NULL;
 
 	/* Initialise every CPU's disp_t to "no runnable threads".  BSS
@@ -511,6 +518,16 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 	 * sets t_pri + t_quantum_left for the class. */
 	t->t_cid      = SCLASS_SYS;
 	sclass[SCLASS_SYS]->cl_fork(t);
+	/* Inherit session + pgrp from the creator -- classic Unix
+	 * fork() semantics applied to our spawn-shaped model.  setsid
+	 * / setpgid still get to override at the receiver's end. */
+	{
+		struct kthread *parent = curthread;
+		if (parent) {
+			t->t_session = parent->t_session;
+			t->t_pgrp    = parent->t_pgrp;
+		}
+	}
 	t->next       = NULL;
 	/* Initial polymorphic state lock: the per-thread default.
 	 * dispq_push() will transition t_lockp to the target CPU's
@@ -1037,6 +1054,20 @@ int kthread_signal(struct kthread *t, unsigned sig)
 	if (needs_dispq_push)
 		dispq_push(curcpu(), t);
 	return 0;
+}
+
+int kthread_signal_pgrp(unsigned pgrp, unsigned sig)
+{
+	if (pgrp == 0) return 0;	/* "no group" -- nothing to signal */
+	int n = 0;
+	for (unsigned i = 0; i < KSCHED_MAX_TID; i++) {
+		struct kthread *t = kthread_at(i);
+		if (!t) continue;
+		if (t->state == KT_DEAD) continue;
+		if (t->t_pgrp != pgrp) continue;
+		if (kthread_signal(t, sig) == 0) n++;
+	}
+	return n;
 }
 
 void sched_tick(void)

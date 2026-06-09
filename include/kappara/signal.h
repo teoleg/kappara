@@ -131,6 +131,14 @@ long sys_sigsuspend_impl(uint32_t mask);
  * in kernel/signal.c next to the other thread-state syscalls. */
 long sys_wait_impl(int tid);
 
+/* SVR4 session / pgrp + controlling-tty foreground group.  See
+ * sys_setpgid_impl and friends in kernel/signal.c for the bodies. */
+long sys_setpgid_impl(int pid, int pgid);
+long sys_getpgrp_impl(void);
+long sys_setsid_impl(void);
+long sys_tcsetpgrp_impl(int fd, int pgid);
+long sys_tcgetpgrp_impl(int fd);
+
 /* Trap-return signal delivery point.  Called from the SVC handler
  * after the syscall's impl returns and before ERET.  Walks the
  * deliverable bits in pending&~mask, picks the lowest, and either:

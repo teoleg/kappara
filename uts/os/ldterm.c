@@ -43,6 +43,7 @@
 #include "kappara/stream_head.h"
 #include "kappara/string.h"
 #include "kappara/termios.h"
+#include "kappara/tty.h"
 
 /* ---- per-instance state -------------------------------------------------- */
 
@@ -147,18 +148,23 @@ static void ldterm_deliver_line(queue_t *rq, struct ldterm *ld,
 
 static void ldterm_signal_reader(queue_t *rq, unsigned sig)
 {
-	/* SVR4 sends the signal to the controlling tty's foreground
-	 * process group.  We don't have sessions/pgrps yet (phase 5
-	 * of the VC roadmap); fall back to the current reader of the
-	 * stream head above us, same shape as uart_rx_main's existing
-	 * Ctrl-C path. */
+	/* SVR4: signal goes to the controlling tty's foreground
+	 * process group.  Phase 5 wires it via tty_signal_fg_pgrp,
+	 * which itself falls back to sd_last_reader when no fg_pgrp
+	 * has been set (the pre-session-model behaviour kept around
+	 * so the existing shell still receives Ctrl-C before user
+	 * code calls tcsetpgrp).
+	 *
+	 * ldterm assumes its stream's sd_minor is a tty minor since
+	 * the only auto-push path puts it on /dev/tty<N>.  If
+	 * someone hand-pushes ldterm onto /dev/loop or similar,
+	 * tty_signal_fg_pgrp() with the unrelated minor would
+	 * misroute -- not worth a guard for since that pattern
+	 * never occurs in practice. */
 	queue_t *up = rq->q_next;
 	if (!up || !up->q_ptr) return;
 	struct stdata *sd = (struct stdata *)up->q_ptr;
-	struct kthread *t = sd->sd_readwait.head;
-	if (!t && sd->sd_last_reader)
-		t = kthread_find(sd->sd_last_reader);
-	if (t) kthread_signal(t, sig);
+	tty_signal_fg_pgrp((int)sd->sd_minor, sig);
 }
 
 /* ---- read side: bytes from driver coming UP ------------------------------ */

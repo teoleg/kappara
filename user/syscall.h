@@ -39,6 +39,11 @@
 #define SYS_sigsuspend	25
 #define SYS_wait	26
 #define SYS_execve	27
+#define SYS_setpgid	28
+#define SYS_getpgrp	29
+#define SYS_setsid	30
+#define SYS_tcsetpgrp	31
+#define SYS_tcgetpgrp	32
 
 #define SIG_BLOCK	0
 #define SIG_UNBLOCK	1
@@ -62,12 +67,31 @@
 typedef long ssize_t;
 typedef unsigned long size_t;
 
+static inline long _syscall0(long num)
+{
+	register long x0 __asm__("x0");
+	register long x8 __asm__("x8") = num;
+	__asm__ volatile ("svc #0"
+			  : "=r"(x0) : "r"(x8) : "memory", "cc");
+	return x0;
+}
+
 static inline long _syscall1(long num, long a0)
 {
 	register long x0 __asm__("x0") = a0;
 	register long x8 __asm__("x8") = num;
 	__asm__ volatile ("svc #0"
 			  : "+r"(x0) : "r"(x8) : "memory", "cc");
+	return x0;
+}
+
+static inline long _syscall2(long num, long a0, long a1)
+{
+	register long x0 __asm__("x0") = a0;
+	register long x1 __asm__("x1") = a1;
+	register long x8 __asm__("x8") = num;
+	__asm__ volatile ("svc #0"
+			  : "+r"(x0) : "r"(x1), "r"(x8) : "memory", "cc");
 	return x0;
 }
 
@@ -268,6 +292,31 @@ static inline long sys_execve(const char *path, const char *const argv[])
 	register long x8 __asm__("x8") = SYS_execve;
 	__asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory", "cc");
 	return x0;
+}
+
+static inline long sys_setpgid(int pid, int pgid)
+{
+	return _syscall2(SYS_setpgid, (long)pid, (long)pgid);
+}
+
+static inline long sys_getpgrp(void)
+{
+	return _syscall0(SYS_getpgrp);
+}
+
+static inline long sys_setsid(void)
+{
+	return _syscall0(SYS_setsid);
+}
+
+static inline long sys_tcsetpgrp(int fd, int pgid)
+{
+	return _syscall2(SYS_tcsetpgrp, (long)fd, (long)pgid);
+}
+
+static inline long sys_tcgetpgrp(int fd)
+{
+	return _syscall1(SYS_tcgetpgrp, (long)fd);
 }
 
 /* ioctl commands -- mirror include/kappara/stream_head.h. */

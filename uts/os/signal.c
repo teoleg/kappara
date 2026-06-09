@@ -297,6 +297,77 @@ long sys_wait_impl(int tid)
 	}
 }
 
+/* ---- session / pgrp -- phase 5 ----------------------------------------
+ *
+ * Bare-minimum POSIX: setpgid(0,0) puts curthread into its own pgrp
+ * (with itself as leader, pgid == tid).  setsid() makes curthread
+ * both session leader AND pgrp leader, also clearing the controlling
+ * tty (which we don't track per-thread yet -- gap noted in the
+ * phase-5 design doc).
+ */
+
+long sys_setpgid_impl(int pid, int pgid)
+{
+	struct kthread *t = (pid == 0) ? curthread : kthread_find((unsigned)pid);
+	if (!t) return -1;
+	if (pgid < 0) return -1;
+	if (pgid == 0) pgid = (int)t->tid;
+	t->t_pgrp = (unsigned)pgid;
+	return 0;
+}
+
+long sys_getpgrp_impl(void)
+{
+	struct kthread *t = curthread;
+	return t ? (long)t->t_pgrp : -1;
+}
+
+long sys_setsid_impl(void)
+{
+	struct kthread *t = curthread;
+	if (!t) return -1;
+	/* POSIX says setsid fails if caller is already a pgrp leader;
+	 * we skip that check since we have no concept of pgrp-leader
+	 * uniqueness yet.  The effect of being a leader (pgid == tid)
+	 * is already what we install. */
+	t->t_session = t->tid;
+	t->t_pgrp    = t->tid;
+	return (long)t->tid;
+}
+
+/* Tcsetpgrp / tcgetpgrp wrap tty.c's per-minor fg_pgrp array.  fd
+ * must refer to a /dev/ttyN; checked via the underlying inode's
+ * cdev major.  We don't yet enforce "the calling session must own
+ * the controlling tty" -- another bookkeeping piece deferred for
+ * later. */
+#include "kappara/cdevsw.h"
+#include "kappara/vfs.h"
+#include "kappara/tty.h"
+
+static int fd_tty_minor(int fd)
+{
+	struct file *f = fd_get(fd);
+	if (!f || !f->f_inode) return -1;
+	if (MAJOR(f->f_inode->i_rdev) != CDEV_MAJ_TTY) return -1;
+	return (int)MINOR(f->f_inode->i_rdev);
+}
+
+long sys_tcsetpgrp_impl(int fd, int pgid)
+{
+	int minor = fd_tty_minor(fd);
+	if (minor < 0) return -1;
+	if (pgid < 0) return -1;
+	tty_set_fg_pgrp(minor, (unsigned)pgid);
+	return 0;
+}
+
+long sys_tcgetpgrp_impl(int fd)
+{
+	int minor = fd_tty_minor(fd);
+	if (minor < 0) return -1;
+	return (long)tty_fg_pgrp(minor);
+}
+
 void check_signals(struct trap_frame *tf)
 {
 	struct kthread *t = curthread;

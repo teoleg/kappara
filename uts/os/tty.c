@@ -39,10 +39,41 @@
 
 static struct tty_minor tty_minors[NTTY];
 static int              tty_active_minor;
+static unsigned         tty_fg_pgrp_arr[NTTY];
 
 int tty_active(void)
 {
 	return tty_active_minor;
+}
+
+void tty_set_fg_pgrp(int minor, unsigned pgrp)
+{
+	if (minor < 0 || minor >= NTTY) return;
+	tty_fg_pgrp_arr[minor] = pgrp;
+}
+
+unsigned tty_fg_pgrp(int minor)
+{
+	if (minor < 0 || minor >= NTTY) return 0;
+	return tty_fg_pgrp_arr[minor];
+}
+
+int tty_signal_fg_pgrp(int minor, unsigned sig)
+{
+	if (minor < 0 || minor >= NTTY) return 0;
+	unsigned pg = tty_fg_pgrp_arr[minor];
+	if (pg != 0)
+		return kthread_signal_pgrp(pg, sig);
+	/* Fallback to sd_last_reader: same shape uart_rx_main has used
+	 * since before sessions existed.  Lets the existing pre-Phase-5
+	 * shell flow keep working until tcsetpgrp is wired in user
+	 * space. */
+	struct tty_minor *m = &tty_minors[minor];
+	if (!m->sd) return 0;
+	if (!m->sd->sd_last_reader) return 0;
+	struct kthread *t = kthread_find(m->sd->sd_last_reader);
+	if (!t) return 0;
+	return kthread_signal(t, sig) == 0 ? 1 : 0;
 }
 
 /* ---- driver qinit ----------------------------------------------------- */
