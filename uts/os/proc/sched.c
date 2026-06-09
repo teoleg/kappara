@@ -482,7 +482,8 @@ void sched_init(void)
 	kprintf("sched: cpu 0 main thread is tid=0\n");
 }
 
-struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
+static struct kthread *kthread_create_internal(const char *name,
+                                               void (*fn)(void *), void *arg)
 {
 	struct kthread *t = kmalloc(sizeof(*t));
 	if (!t)
@@ -552,11 +553,34 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 	t->sp         = arch_thread_init_frame((char *)stack + PAGE_SIZE,
 					       fn, arg);
 
-	/* For now, every new thread lands on the creator's CPU.
-	 * Cross-CPU load balancing (idle steal) is a separate step. */
+	/* Defer dispatch -- the matching kthread_dispatch lives below
+	 * and is what plain kthread_create calls.  Callers that need
+	 * to twiddle thread state after creation but before the
+	 * scheduler can pick it up (R1c2: sys_execve overrides t_proc
+	 * to a fresh process before letting the thread start) can call
+	 * kthread_create_no_dispatch + kthread_dispatch directly. */
+	return t;
+}
+
+void kthread_dispatch(struct kthread *t)
+{
+	if (!t) return;
 	dispq_push(curcpu(), t);
-	kprintf("sched: created tid=%u name=%s stack=%p fn=%p\n",
-		t->tid, name, stack, (void *)(uintptr_t)fn);
+	kprintf("sched: created tid=%u name=%s stack=%p\n",
+		t->tid, t->name, t->stack_base);
+}
+
+struct kthread *kthread_create_no_dispatch(const char *name,
+                                           void (*fn)(void *), void *arg)
+{
+	return kthread_create_internal(name, fn, arg);
+}
+
+struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
+{
+	struct kthread *t = kthread_create_internal(name, fn, arg);
+	if (!t) return NULL;
+	kthread_dispatch(t);
 	return t;
 }
 

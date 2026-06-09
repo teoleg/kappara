@@ -70,6 +70,7 @@
 #include "kappara/mmu.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
+#include "kappara/process.h"
 #include "kappara/sched.h"
 #include "kappara/string.h"
 #include "kappara/syscall.h"
@@ -627,12 +628,52 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 	for (const char *p = path; *p; p++)
 		if (*p == '/') base = p + 1;
 
-	struct kthread *t = kthread_create(base, exec_thread_main, a);
+	struct kthread *t = kthread_create_no_dispatch(base,
+	                                               exec_thread_main, a);
 	if (!t) { kfree(a); return -1; }
+
+	/* Phase R2c1: each exec gets its own process + vm_map.  The
+	 * vm_map's user L2 entries point at the shared exec_storage /
+	 * exec_stack_storage for now (R2c2 will allocate per-exec
+	 * physical 2 MB regions for true isolation; only one exec
+	 * runs at a time today thanks to the shell's spawn-then-wait
+	 * model, so sharing the backing data is correct in v1).
+	 *
+	 * Order matters here: we MUST install the new t_proc on the
+	 * thread BEFORE kthread_dispatch hands it to the scheduler.
+	 * Otherwise the new thread could run with t_proc still
+	 * pointing at init_process and end up using the wrong TTBR0
+	 * the first time the dispatcher schedules it. */
+	struct vm_map *vm = vm_map_create();
+	if (!vm) {
+		kprintf("execve: vm_map_create failed\n");
+		kfree(a);
+		/* Leak the partial kthread to keep this commit small;
+		 * R2c2 will tighten the failure path. */
+		return -1;
+	}
+	mmu_vmap_map_user_2mb(vm, EXEC_VA,       (uintptr_t)exec_storage);
+	mmu_vmap_map_user_2mb(vm, EXEC_STACK_VA, (uintptr_t)exec_stack_storage);
+
+	struct process *p = process_alloc(vm);
+	vm_map_put(vm);	/* process_alloc bumped vm refs */
+	if (!p) {
+		kprintf("execve: process_alloc failed\n");
+		kfree(a);
+		return -1;
+	}
+
+	/* Swap the inherited init_process backref for the fresh one.
+	 * process_put on the inherited proc drops the ref kthread_create
+	 * bumped; the new proc came in with refs=1 from process_alloc. */
+	process_put(t->t_proc);
+	t->t_proc = p;
 
 	/* Inherit fd table so the exec'd program has /dev/console on fd 1. */
 	kthread_inherit_fds(t, curthread);
 	/* exec lands in EL0: TS class for priority aging. */
 	kthread_setclass(t, SCLASS_TS);
+
+	kthread_dispatch(t);
 	return (long)t->tid;
 }

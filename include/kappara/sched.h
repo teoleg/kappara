@@ -386,6 +386,15 @@ unsigned        sched_ncpu(void);
 void            sched_get_cpu_info(unsigned i, struct sched_cpu_info *out);
 
 struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg);
+
+/* Two-step variants: create a thread WITHOUT pushing it on the dispatch
+ * queue (so the caller can mutate t_proc / t_pri / etc. atomically
+ * before the scheduler ever sees it), then dispatch separately.  R1c2
+ * sys_execve_impl uses this to install a fresh process on the new
+ * thread before it can run with the wrong TTBR0. */
+struct kthread *kthread_create_no_dispatch(const char *name,
+                                           void (*fn)(void *), void *arg);
+void            kthread_dispatch         (struct kthread *t);
 void            kthread_yield(void);
 void            kthread_exit(void) __attribute__((noreturn));
 void            sched_tick(void);
