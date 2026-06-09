@@ -1145,6 +1145,10 @@ void streams_head_init(void)
 	streams_register("fbcon",   &fbcon_streamtab);
 #endif
 
+	/* SVR4 line discipline -- registers "ldterm" so a tty stream
+	 * can do I_PUSH "ldterm" and get cooked-mode + termios. */
+	ldterm_init();
+
 	/* SVR4 cdevsw: each openable STREAMS driver claims a major
 	 * number.  Modules (upper, delay) are pushed onto an already-
 	 * open stream and don't need a major; we register them here

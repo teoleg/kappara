@@ -186,6 +186,13 @@ struct streamtab {
 
 void    streams_init(void);
 
+/* Line-discipline module (SVR4 ldterm).  ldterm_init registers it
+ * with the module registry so I_PUSH "ldterm" can find it.
+ * ldterm_selftest exercises canonical input, erase, VINTR, and
+ * OPOST on a self-contained synthetic queue stack. */
+void    ldterm_init(void);
+void    ldterm_selftest(void);
+
 mblk_t *allocb(size_t size, unsigned pri);
 void    freeb(mblk_t *mp);
 void    freemsg(mblk_t *mp);
