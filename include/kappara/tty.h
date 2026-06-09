@@ -51,6 +51,12 @@ void tty_switch(int i);
 /* Currently-active tty's minor.  0 at boot. */
 int  tty_active(void);
 
+/* Per-minor driver-side read queue, or NULL if /dev/tty<minor> is
+ * not open yet.  uart_rx_main uses this to push received UART bytes
+ * into the active tty's stream stack -- they flow up through ldterm
+ * and land in the head's read queue for sys_read. */
+struct queue *tty_drv_rq(int minor);
+
 /* SVR4 controlling-tty foreground process group for /dev/tty<i>.
  * tty_signal_fg_pgrp delivers `sig` to every kthread whose t_pgrp
  * matches that tty's fg_pgrp; if fg_pgrp is 0 it falls back to the

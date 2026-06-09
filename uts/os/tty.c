@@ -46,6 +46,14 @@ int tty_active(void)
 	return tty_active_minor;
 }
 
+struct queue *tty_drv_rq(int minor)
+{
+	if (minor < 0 || minor >= NTTY) return 0;
+	struct tty_minor *m = &tty_minors[minor];
+	if (!m->sd) return 0;
+	return m->sd->sd_drv_rq;
+}
+
 void tty_set_fg_pgrp(int minor, unsigned pgrp)
 {
 	if (minor < 0 || minor >= NTTY) return;

@@ -61,7 +61,13 @@ static void ldterm_set_default_termios(struct termios *t)
 	t->c_iflag = BRKINT | ICRNL;
 	t->c_oflag = OPOST  | ONLCR;
 	t->c_cflag = CS8    | CREAD | CLOCAL;
-	t->c_lflag = ICANON | ECHO  | ECHOE | ECHOK | ISIG;
+	/* Default to RAW + ISIG: signals on Ctrl-C / Ctrl-\, but no
+	 * line buffering, no echo.  The existing kappara shell does
+	 * its own per-byte read + arrow-key handling + echo, so
+	 * canonical mode would double-cook.  Programs that want
+	 * line-buffered input can flip ICANON+ECHO via TCSETA once
+	 * M_IOCTL flow lands. */
+	t->c_lflag = ISIG;
 	t->c_cc[VINTR]  = CTRL('C');	/* 0x03 -- ^C SIGINT  */
 	t->c_cc[VQUIT]  = CTRL('\\');	/* 0x1c -- ^\ SIGQUIT */
 	t->c_cc[VERASE] = 0x7f;		/* DEL (a.k.a. ^?)    */
@@ -469,6 +475,13 @@ void ldterm_selftest(void)
 	if (ldterm_qopen(&ld_rq) != 0) {
 		kprintf("ldterm: SELFTEST FAIL qopen\n");
 		return;
+	}
+
+	/* The selftest exercises canonical-mode behaviour; override the
+	 * (now raw-by-default) termios that qopen installed. */
+	{
+		struct ldterm *ld = ld_rq.q_ptr;
+		ld->termios.c_lflag |= ICANON | ECHO | ECHOE | ECHOK;
 	}
 
 	int ok = 1;

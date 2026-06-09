@@ -276,31 +276,18 @@ void uart_rx_main(void *arg)
 	(void)arg;
 
 	/*
-	 * Phase 9 virtual-console switch keystroke: Ctrl-X N.
-	 *
-	 * On Ctrl-X (0x18) we set vc_prefix_pending.  If the next byte
-	 * is '0'..'9' we treat it as a tty number and call
-	 * tty_switch().  Anything else cancels the prefix.
-	 *
-	 * Ctrl-X chosen over the more conventional Ctrl-A because
-	 * QEMU's -serial mon:stdio mode eats Ctrl-A as its monitor
-	 * escape prefix -- the byte never reaches the guest, so it's
-	 * useless as our switch key on the test rig.  On real
-	 * hardware (or QEMU with plain -serial stdio) Ctrl-X works
-	 * the same way Ctrl-A would.
-	 *
-	 * The held Ctrl-X byte is NOT echoed to the reader -- losing
-	 * it is the price of a single-byte prefix.  Real screen /
-	 * tmux deal with the same trade-off by requiring the prefix
-	 * to be typed twice to send a literal; we don't bother yet.
+	 * Phase 9 virtual-console switch keystroke: Ctrl-X N.  See
+	 * the earlier note for why Ctrl-X rather than Ctrl-A (QEMU
+	 * mon:stdio eats Ctrl-A).
 	 */
 	int vc_prefix_pending = 0;
 
 	for (;;) {
-		if (!console_active) {
-			/* Nothing listening yet -- don't drain the FIFO
-			 * or those bytes are lost.  Wait for the first
-			 * open of /dev/console. */
+		/* Wait until at least one possible sink exists -- either a
+		 * tty open we can route to via tty_drv_rq(active) or the
+		 * legacy console_active.  Draining FIFO with nowhere to
+		 * put bytes would lose them. */
+		if (!tty_drv_rq(tty_active()) && !console_active) {
 			kthread_yield();
 			continue;
 		}
@@ -332,26 +319,32 @@ void uart_rx_main(void *arg)
 			continue;
 		}
 
+		/* Phase 6: prefer the currently-active tty's drv_rq;
+		 * fall back to console_active if no /dev/tty<N> is
+		 * open yet (early boot or pre-multi-tty user space). */
+		queue_t *drq = tty_drv_rq(tty_active());
+		if (!drq && console_active)
+			drq = bottom_driver_rq(console_active);
+
 		if (c == 0x03) {
-			/*
-			 * Ctrl-C still consumed at the rx-loop level for
-			 * console_active (pre-phase-5 tty path).  Phase 5
-			 * routes via tty_signal_fg_pgrp once ldterm sits
-			 * over the tty; today /dev/console isn't a tty so
-			 * we keep this fallback in place.
-			 */
-			struct stdata *sd = console_active;
-			struct kthread *t = sd->sd_readwait.head;
-			if (!t && sd->sd_last_reader) {
-				t = kthread_find(sd->sd_last_reader);
+			/* Ctrl-C delivery: route via the tty's fg_pgrp
+			 * (phase 5) when we're on a /dev/tty<N>; fall
+			 * back to console_active's sd_last_reader for
+			 * the legacy path. */
+			if (tty_drv_rq(tty_active())) {
+				tty_signal_fg_pgrp(tty_active(), SIGINT);
+			} else if (console_active) {
+				struct stdata *sd = console_active;
+				struct kthread *t = sd->sd_readwait.head;
+				if (!t && sd->sd_last_reader)
+					t = kthread_find(sd->sd_last_reader);
+				if (t) kthread_signal(t, SIGINT);
 			}
-			if (t) kthread_signal(t, SIGINT);
-		} else {
+		} else if (drq) {
 			mblk_t *mp = allocb(1, 0);
 			if (mp) {
 				*mp->b_wptr++ = (unsigned char)c;
-				queue_t *drq = bottom_driver_rq(console_active);
-				if (drq && drq->q_next)
+				if (drq->q_next)
 					putnext(drq, mp);
 				else
 					freemsg(mp);
@@ -653,6 +646,34 @@ static int stream_open(struct file *f)
 			MAJOR(f->f_inode->i_rdev));
 		return -1;
 	}
+
+	/* Multi-minor tty driver: multiple opens of the same /dev/ttyN
+	 * share ONE stdata so all readers of the tty see the same
+	 * stream-head queue and uart_rx_main only has to know about
+	 * one sink per minor.  Bump sd_refs on every subsequent open;
+	 * stream_close decrements and tears down on the last close. */
+	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_TTY) {
+		struct queue *drq = tty_drv_rq((int)MINOR(f->f_inode->i_rdev));
+		if (drq) {
+			struct stdata *existing = drq->q_ptr;
+			/* drv_rq's q_ptr is &tty_minor[minor] after the
+			 * driver's qopen; the tty_minor->sd backref is
+			 * the actual stdata we want to share. */
+			if (existing) {
+				/* tty_drv_rq already returns NULL when sd
+				 * is NULL, so existing is the tty_minor;
+				 * fetch sd through it. */
+				struct stdata *sd =
+				    ((struct tty_minor *)existing)->sd;
+				if (sd) {
+					sd->sd_refs++;
+					f->f_private = sd;
+					return 0;
+				}
+			}
+		}
+	}
+
 	struct stdata *sd = stream_build(cdev->streamtab, cdev->name,
 					 MINOR(f->f_inode->i_rdev));
 	if (!sd)
