@@ -163,9 +163,20 @@ title embedded in the top border, Norton-style:
 Left panel is the file listing (navigable with arrow keys); right
 panel is the **Info pane** showing the properties of the highlighted
 entry: name, full path, and either a directory summary or, for
-regular files, a head-of-file preview (up to ~512 bytes, with
-non-printables ?'d out so the panel never decorates with stray
-escape sequences).
+regular files, a content preview.  The preview is sniffed first:
+
+- **Text** files (no NUL, no 0x7F, no control bytes outside
+  HT/LF/CR in the first 256 bytes) get rendered as plain text with
+  non-printables stripped, up to ~512 bytes.
+- **Binary** files get a compact hex dump:
+  ```
+    -- hex ----
+    000  7f 45 4c 46 02 01 01 00 .ELF....
+    008  03 00 b7 00 01 00 00 00 ........
+    ...
+  ```
+  8 bytes per row + ASCII column on the right, ~14 rows shown
+  (112 bytes total).  Non-printable ASCII bytes are rendered as `.`.
 
 Classic Norton Commander palette: panel background **blue** (ANSI
 `\033[44m`), regular files in light grey, directories in bold

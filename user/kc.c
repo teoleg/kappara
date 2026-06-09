@@ -498,21 +498,80 @@ static int kc_info_emit_nl(int off)
 	return off;
 }
 
-/* Read up to `cap` bytes of `path` into kc_info_buf starting at `off`.
- * Returns new offset.  Bytes that are non-printable get replaced with
- * '?'.  We open + read + close inline -- the panel keeps no fd
- * across redraws. */
-static int kc_info_emit_file_head(int off, const char *path, int cap)
+/* Sniff for "binary or text" on the first N bytes.  Any NUL, any
+ * 0x7F, or any control byte other than HT/LF/CR makes it binary.
+ * Same rule POSIX `file(1)` uses internally before deciding whether
+ * to print the file or run a magic match. */
+static int kc_is_binary(const unsigned char *data, int len)
 {
-	long fd = sys_open(path, 0);
-	if (fd < 0) return off;
-	long n = sys_read(fd, kc_info_buf + off,
-	                  (cap > (int)sizeof(kc_info_buf) - off - 1)
-	                  ? (size_t)(sizeof(kc_info_buf) - off - 1)
-	                  : (size_t)cap);
-	sys_close(fd);
-	if (n <= 0) return off;
-	return off + (int)n;
+	int n = len > 256 ? 256 : len;
+	for (int i = 0; i < n; i++) {
+		unsigned char c = data[i];
+		if (c == 0)                        return 1;
+		if (c == 0x7f)                     return 1;
+		if (c < 0x20 && c != '\t'
+		             && c != '\n'
+		             && c != '\r')         return 1;
+	}
+	return 0;
+}
+
+static const char kc_hex_digits[] = "0123456789abcdef";
+
+static int kc_info_emit_hex_byte(int off, unsigned char b)
+{
+	if (off < (int)sizeof(kc_info_buf) - 1)
+		kc_info_buf[off++] = kc_hex_digits[b >> 4];
+	if (off < (int)sizeof(kc_info_buf) - 1)
+		kc_info_buf[off++] = kc_hex_digits[b & 0xf];
+	return off;
+}
+
+static int kc_info_emit_ch(int off, char c)
+{
+	if (off < (int)sizeof(kc_info_buf) - 1)
+		kc_info_buf[off++] = c;
+	return off;
+}
+
+/* Hex dump rows, classic xxd shape but compacted to fit the 38-cell
+ * panel width (kc_info_print_line takes 1 leading space, so we have
+ * 37 char-cells of content).
+ *
+ *     000  7f 45 4c 46 02 01 01 00 .ELF....
+ *     ^^^  ^^^^^^^^^^^^^^^^^^^^^^^ ^^^^^^^^
+ *      3            23 (8b + 7sp)     8
+ *      + 2 spaces + 1 space = 37
+ *
+ * Limit shown rows to fit the ~14-line content slot under the file's
+ * Name / Path / Size / "-- hex ----" header. */
+static int kc_info_emit_hex_dump(int off, const unsigned char *data, int len)
+{
+	int max = len > 112 ? 112 : len;
+	for (int i = 0; i < max; i += 8) {
+		off = kc_info_emit_ch(off, kc_hex_digits[(i >> 8) & 0xf]);
+		off = kc_info_emit_ch(off, kc_hex_digits[(i >> 4) & 0xf]);
+		off = kc_info_emit_ch(off, kc_hex_digits[(i     ) & 0xf]);
+		off = kc_info_emit_ch(off, ' ');
+		off = kc_info_emit_ch(off, ' ');
+		for (int j = 0; j < 8; j++) {
+			if (i + j < len) {
+				off = kc_info_emit_hex_byte(off, data[i + j]);
+			} else {
+				off = kc_info_emit_ch(off, ' ');
+				off = kc_info_emit_ch(off, ' ');
+			}
+			if (j < 7) off = kc_info_emit_ch(off, ' ');
+		}
+		off = kc_info_emit_ch(off, ' ');
+		for (int j = 0; j < 8 && i + j < len; j++) {
+			unsigned char c = data[i + j];
+			if (c < 0x20 || c >= 0x7f) c = '.';
+			off = kc_info_emit_ch(off, (char)c);
+		}
+		off = kc_info_emit_nl(off);
+	}
+	return off;
 }
 
 static void kc_render_info(void)
@@ -561,21 +620,49 @@ static void kc_render_info(void)
 			off = kc_info_emit_dec(off, e->size);
 			off = kc_info_emit_str(off, " bytes\n");
 
-			off = kc_info_emit_nl(off);
-			off = kc_info_emit_str(off, "  -- content ----\n");
-			/* Build the absolute path into kc_scratch (we own
-			 * the buffer; the directory loader only uses it
-			 * during kc_panel_load).  Then read up to 512
-			 * bytes of head. */
-			int spi = 0;
-			for (int i = 0; p->path[i] && spi < (int)sizeof(kc_scratch) - 2; i++)
-				kc_scratch[spi++] = p->path[i];
+			/* Build the absolute path on the stack -- kc_scratch
+			 * is the read buffer below. */
+			char fpath[256];
+			int pi = 0;
+			for (int i = 0; p->path[i] && pi < (int)sizeof(fpath) - 2; i++)
+				fpath[pi++] = p->path[i];
 			if (!(p->path[0] == '/' && p->path[1] == '\0'))
-				kc_scratch[spi++] = '/';
-			for (int i = 0; e->name[i] && spi < (int)sizeof(kc_scratch) - 1; i++)
-				kc_scratch[spi++] = e->name[i];
-			kc_scratch[spi] = '\0';
-			off = kc_info_emit_file_head(off, kc_scratch, 512);
+				fpath[pi++] = '/';
+			for (int i = 0; e->name[i] && pi < (int)sizeof(fpath) - 1; i++)
+				fpath[pi++] = e->name[i];
+			fpath[pi] = '\0';
+
+			/* Read up to kc_scratch's capacity, then sniff and
+			 * dispatch.  Binary -> hex dump; text -> head
+			 * preview (line-walked through kc_info_print_line
+			 * exactly as the existing branch did). */
+			long fd = sys_open(fpath, 0);
+			long n  = -1;
+			if (fd >= 0) {
+				n = sys_read(fd, kc_scratch,
+				             (size_t)sizeof(kc_scratch));
+				sys_close(fd);
+			}
+			if (n > 0) {
+				off = kc_info_emit_nl(off);
+				if (kc_is_binary((const unsigned char *)kc_scratch,
+				                 (int)n)) {
+					off = kc_info_emit_str(off, "  -- hex ----\n");
+					off = kc_info_emit_hex_dump(off,
+					        (const unsigned char *)kc_scratch,
+					        (int)n);
+				} else {
+					off = kc_info_emit_str(off, "  -- content ----\n");
+					/* Copy text bytes verbatim;
+					 * kc_info_print_line strips
+					 * non-printables and splits on \n. */
+					int cap = n > 512 ? 512 : (int)n;
+					for (int k = 0; k < cap
+					        && off < (int)sizeof(kc_info_buf) - 1;
+					        k++)
+						kc_info_buf[off++] = kc_scratch[k];
+				}
+			}
 		} else {
 			off = kc_info_emit_str(off, "  Type: ?\n");
 		}
