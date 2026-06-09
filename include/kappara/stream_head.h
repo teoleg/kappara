@@ -77,6 +77,12 @@ struct stdata {
 	struct stdata	*sd_all_next;	/* global list link -- every live
 					 * stdata is on it so /proc/streams
 					 * can walk all open instances    */
+	/* Minor number of the underlying cdev, captured at open from
+	 * MINOR(f->f_inode->i_rdev).  Zero for pipe ends and other
+	 * non-cdev streams.  Multi-minor drivers (the tty driver from
+	 * phase 3) read this from drv_rq->q_ptr in their qi_qopen to
+	 * route to the right per-minor state. */
+	unsigned	 sd_minor;
 };
 
 void streams_head_init(void);

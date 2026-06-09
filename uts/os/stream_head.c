@@ -56,6 +56,7 @@
 #include "kappara/signal.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
+#include "kappara/tty.h"
 #include "kappara/string.h"
 #include "kappara/uart.h"
 #include "kappara/vfs.h"
@@ -532,7 +533,8 @@ static int do_ipop(struct stdata *sd)
 
 /* ---- stream_fops -- the file_ops the VFS dispatches through ----------- */
 
-static struct stdata *stream_build(struct streamtab *drv_st, const char *name)
+static struct stdata *stream_build(struct streamtab *drv_st, const char *name,
+				   unsigned minor)
 {
 	struct stdata *sd = kmalloc(sizeof(*sd));
 	queue_t *head_rq = kmalloc(sizeof(*head_rq));
@@ -556,6 +558,7 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name)
 	sd->sd_name   = name;
 	sd->sd_flags  = 0;
 	sd->sd_peer   = NULL;
+	sd->sd_minor  = minor;
 	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
 
 	/* Backref so sh_rq_putp can wake readers without a global
@@ -575,6 +578,16 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name)
 	sd->sd_all_next = all_open_streams;
 	all_open_streams = sd;
 
+	/* Hand the stdata backref to the driver's qi_qopen via the
+	 * read-queue's q_ptr.  Phase 3 multi-minor drivers (tty) use
+	 * this to look up sd_minor; the qopen typically overwrites
+	 * q_ptr with its own per-instance state pointer right after,
+	 * so single-minor drivers that don't read q_ptr (klog, proc-*)
+	 * are unaffected.  Both read AND write driver queues get the
+	 * backref so any qopen-time wiring is unambiguous. */
+	drv_rq->q_ptr = sd;
+	drv_wq->q_ptr = sd;
+
 	/* SVR4 streams call the driver's qi_qopen on the read side at
 	 * open time.  klog uses this to prime the queue with the ring
 	 * buffer contents; most drivers leave it NULL. */
@@ -593,7 +606,8 @@ static int stream_open(struct file *f)
 			MAJOR(f->f_inode->i_rdev));
 		return -1;
 	}
-	struct stdata *sd = stream_build(cdev->streamtab, cdev->name);
+	struct stdata *sd = stream_build(cdev->streamtab, cdev->name,
+					 MINOR(f->f_inode->i_rdev));
 	if (!sd)
 		return -1;
 	f->f_private = sd;
@@ -996,6 +1010,7 @@ static struct stdata *pipe_end(const char *name)
 	sd->sd_name   = name;
 	sd->sd_flags  = 0;
 	sd->sd_peer   = NULL;
+	sd->sd_minor  = 0;	/* pipes have no minor */
 	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
 	rq->q_ptr = sd;	/* so sh_rq_putp can wake readers */
 	wq->q_ptr = sd;
@@ -1175,6 +1190,15 @@ void streams_head_init(void)
 #ifdef __aarch64__
 	vfs_mknod_chrdev(dev, "fbcon",   MKDEV(CDEV_MAJ_FBCON,   0));
 #endif
+
+	/* Phase 3 virtual-console TTYs.  tty_init registers the cdev
+	 * + streamtab; the /dev nodes go here so /dev lookup stays in
+	 * one place. */
+	tty_init();
+	vfs_mknod_chrdev(dev, "tty0", MKDEV(CDEV_MAJ_TTY, 0));
+	vfs_mknod_chrdev(dev, "tty1", MKDEV(CDEV_MAJ_TTY, 1));
+	vfs_mknod_chrdev(dev, "tty2", MKDEV(CDEV_MAJ_TTY, 2));
+	vfs_mknod_chrdev(dev, "tty3", MKDEV(CDEV_MAJ_TTY, 3));
 
 	kprintf("stream_head: registered modules:");
 	for (struct stmod_entry *e = registry; e; e = e->next)

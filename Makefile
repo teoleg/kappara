@@ -40,6 +40,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/uts/os/stream_head.o \
         $(BUILD)/uts/os/vt.o \
         $(BUILD)/uts/os/ldterm.o \
+        $(BUILD)/uts/os/tty.o \
         $(BUILD)/uts/os/syscall.o \
         $(BUILD)/uts/os/signal.o \
         $(BUILD)/uts/os/proc.o \
