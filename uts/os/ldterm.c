@@ -283,11 +283,91 @@ static int ldterm_rq_putp(queue_t *q, mblk_t *mp)
 	return 0;
 }
 
+/* ---- M_IOCTL: TCGETA / TCSETA / TCFLSH ---------------------------------- */
+
+/* Return an ACK to the head with optional payload data in b_cont.
+ * Walks the splice in reverse: we own the original M_IOCTL mblk, so
+ * we replace its b_cont with our response payload (freeing whatever
+ * the caller put there), flip db_type, and putnext upstream via the
+ * read-side queue. */
+static void ldterm_ioc_ack(queue_t *wq, mblk_t *mp, int err,
+                           const void *data, int len)
+{
+	mp->b_datap->db_type = err ? M_IOCNAK : M_IOCACK;
+	struct iocblk *ic = (struct iocblk *)mp->b_rptr;
+	ic->ic_error = err;
+	ic->ic_count = len;
+
+	if (mp->b_cont) {
+		freemsg(mp->b_cont);
+		mp->b_cont = NULL;
+	}
+	if (len > 0 && data) {
+		mblk_t *rd = allocb((size_t)len, 0);
+		if (rd) {
+			kmemcpy(rd->b_wptr, data, (size_t)len);
+			rd->b_wptr += len;
+			mp->b_cont = rd;
+		}
+	}
+
+	/* Send back UP via the read-side queue paired with this wq. */
+	queue_t *rq = wq->q_link;
+	if (rq)
+		putnext(rq, mp);
+	else
+		freemsg(mp);
+}
+
+static int ldterm_handle_ioctl(queue_t *q, struct ldterm *ld, mblk_t *mp)
+{
+	if ((size_t)(mp->b_wptr - mp->b_rptr) < sizeof(struct iocblk)) {
+		ldterm_ioc_ack(q, mp, -1, NULL, 0);
+		return 1;
+	}
+	struct iocblk *ic = (struct iocblk *)mp->b_rptr;
+	switch (ic->ic_cmd) {
+	case TCGETA:
+		/* Copy our current termios into the response payload. */
+		ldterm_ioc_ack(q, mp, 0, &ld->termios, sizeof(ld->termios));
+		return 1;
+	case TCSETA:
+	case TCSETAW:
+	case TCSETAF:
+		if (mp->b_cont
+		    && (size_t)(mp->b_cont->b_wptr - mp->b_cont->b_rptr)
+		           >= sizeof(struct termios)) {
+			kmemcpy(&ld->termios, mp->b_cont->b_rptr,
+			        sizeof(ld->termios));
+			ldterm_ioc_ack(q, mp, 0, NULL, 0);
+		} else {
+			ldterm_ioc_ack(q, mp, -1, NULL, 0);
+		}
+		return 1;
+	case TCFLSH:
+		/* No queue depth to flush at the ldterm level today --
+		 * the canon line buffer gets a courtesy reset though. */
+		ld->canon_len = 0;
+		ldterm_ioc_ack(q, mp, 0, NULL, 0);
+		return 1;
+	default:
+		/* Unknown command -- pass through downstream so the
+		 * driver gets a shot.  If nothing handles it, the
+		 * driver should NAK; for now we NAK at the bottom. */
+		return 0;
+	}
+}
+
 /* ---- write side: bytes from head going DOWN ----------------------------- */
 
 static int ldterm_wq_putp(queue_t *q, mblk_t *mp)
 {
 	struct ldterm *ld = q->q_ptr;
+	if (ld && mp->b_datap->db_type == M_IOCTL) {
+		if (ldterm_handle_ioctl(q, ld, mp))
+			return 0;
+		/* Fall through: not ours, push it down. */
+	}
 	if (!ld || mp->b_datap->db_type != M_DATA) {
 		putnext(q, mp);
 		return 0;
@@ -558,4 +638,67 @@ void ldterm_selftest(void)
 
 	if (ok)
 		kprintf("ldterm: selftest PASS\n");
+}
+
+/* ---- M_IOCTL round-trip selftest -- exercises strioctl on a real
+ * open of /dev/tty0.  Runs at kmain time on main_thread (so the per-
+ * thread fdt is curthread->fdt and we can issue sys_*_impl calls
+ * straight through).  Verifies TCGETA returns the default termios,
+ * TCSETA installs a flipped value, and a second TCGETA reads it back.
+ */
+#include "kappara/sched.h"
+#include "kappara/vfs.h"
+
+void ldterm_mioctl_selftest(void)
+{
+	int ok = 1;
+	int fd = sys_open_impl("/dev/tty0", 0);
+	if (fd < 0) {
+		kprintf("ldterm-ioc: SELFTEST FAIL open(/dev/tty0)\n");
+		return;
+	}
+
+	struct termios t0, t1, t2;
+	long r = sys_ioctl_impl(fd, TCGETA, (long)(uintptr_t)&t0);
+	if (r != 0) {
+		kprintf("ldterm-ioc: SELFTEST FAIL TCGETA1 r=%ld\n", r);
+		ok = 0; goto done;
+	}
+	/* Default termios from phase 6: c_lflag = ISIG only. */
+	if ((t0.c_lflag & (ICANON | ECHO)) != 0
+	    || (t0.c_lflag & ISIG) == 0) {
+		kprintf("ldterm-ioc: SELFTEST FAIL TCGETA1 lflag=0x%x\n",
+		        t0.c_lflag);
+		ok = 0; goto done;
+	}
+
+	t1 = t0;
+	t1.c_lflag |= ICANON | ECHO;
+	r = sys_ioctl_impl(fd, TCSETA, (long)(uintptr_t)&t1);
+	if (r != 0) {
+		kprintf("ldterm-ioc: SELFTEST FAIL TCSETA r=%ld\n", r);
+		ok = 0; goto done;
+	}
+
+	r = sys_ioctl_impl(fd, TCGETA, (long)(uintptr_t)&t2);
+	if (r != 0) {
+		kprintf("ldterm-ioc: SELFTEST FAIL TCGETA2 r=%ld\n", r);
+		ok = 0; goto done;
+	}
+	if ((t2.c_lflag & ICANON) == 0 || (t2.c_lflag & ECHO) == 0) {
+		kprintf("ldterm-ioc: SELFTEST FAIL TCGETA2 lflag=0x%x\n",
+		        t2.c_lflag);
+		ok = 0; goto done;
+	}
+
+	/* Restore defaults so the actual shell isn't double-cooked. */
+	r = sys_ioctl_impl(fd, TCSETA, (long)(uintptr_t)&t0);
+	if (r != 0) {
+		kprintf("ldterm-ioc: SELFTEST FAIL TCSETA-restore r=%ld\n", r);
+		ok = 0;
+	}
+
+done:
+	sys_close_impl(fd);
+	if (ok) kprintf("ldterm-ioc: selftest PASS\n");
 }

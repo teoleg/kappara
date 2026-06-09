@@ -56,7 +56,9 @@
 #include "kappara/signal.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
+#include "kappara/termios.h"
 #include "kappara/tty.h"
+#include "kappara/uaccess.h"
 #include "kappara/string.h"
 #include "kappara/uart.h"
 #include "kappara/vfs.h"
@@ -133,6 +135,27 @@ static int sh_rq_putp(queue_t *q, mblk_t *mp)
 	 * lost-wakeup race where a reader could getq() == NULL, observe
 	 * SD_EOF unset, then sleep AFTER a writer's putq + wake-all
 	 * completed (with no waiters present yet). */
+	/* M_IOCACK / M_IOCNAK -- response to an ioctl we started
+	 * earlier via strioctl.  Stash the mblk on the stdata and wake
+	 * the waiter; strioctl owns it from there.  Don't touch the
+	 * data queue or sd_readwait. */
+	if (sd && (mp->b_datap->db_type == M_IOCACK
+	        || mp->b_datap->db_type == M_IOCNAK)) {
+		unsigned long f = spin_lock_irq_save(&sd->sd_ioc_wq.sq_lock);
+		if (sd->sd_ioc_response) {
+			/* Spurious or duplicated ack -- drop the
+			 * newer one rather than overwriting an
+			 * unhandled response. */
+			spin_unlock_irq_restore(&sd->sd_ioc_wq.sq_lock, f);
+			freemsg(mp);
+			return 0;
+		}
+		sd->sd_ioc_response = mp;
+		spin_unlock_irq_restore(&sd->sd_ioc_wq.sq_lock, f);
+		kthread_wake_all(&sd->sd_ioc_wq);
+		return 0;
+	}
+
 	if (mp->b_datap->db_type == M_HANGUP) {
 		freemsg(mp);
 		if (sd) {
@@ -600,6 +623,8 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name,
 	sd->sd_peer   = NULL;
 	sd->sd_minor  = minor;
 	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
+	sd->sd_ioc_wq   = (struct wait_queue)WAIT_QUEUE_INIT;
+	sd->sd_ioc_response = NULL;
 
 	/* Backref so sh_rq_putp can wake readers without a global
 	 * queue->stdata lookup.  The driver-side queues are not seen
@@ -753,19 +778,29 @@ static int stream_close(struct file *f)
 	drain_q(sd->sd_wq);
 
 	if (sd->sd_drv_wq) {
-		/* Free any pushed-module pairs sitting between head and
-		 * driver. */
+		/* Walk the pushed-module pairs.  For each pair: invoke its
+		 * qi_qclose (so the module can free per-instance state +
+		 * clear any backrefs from upper modules to its q_ptr),
+		 * then drain + free both queues. */
 		queue_t *q = sd->sd_wq->q_next;
 		while (q && q != sd->sd_drv_wq) {
 			queue_t *next = q->q_next;
 			queue_t *peer_q = q->q_link;
+			if (q->q_qinfo && q->q_qinfo->qi_qclose)
+				q->q_qinfo->qi_qclose(peer_q);
 			drain_q(q);
 			drain_q(peer_q);
 			kfree(q);
 			kfree(peer_q);
 			q = next;
 		}
-		/* Now the driver pair. */
+		/* Now the driver pair.  qi_qclose on the read side gives
+		 * multi-minor drivers (tty) a chance to null out the
+		 * per-minor sd backref so the next open of the same minor
+		 * doesn't latch onto a freed stdata. */
+		if (sd->sd_drv_rq->q_qinfo
+		    && sd->sd_drv_rq->q_qinfo->qi_qclose)
+			sd->sd_drv_rq->q_qinfo->qi_qclose(sd->sd_drv_rq);
 		drain_q(sd->sd_drv_rq);
 		drain_q(sd->sd_drv_wq);
 		kfree(sd->sd_drv_rq);
@@ -947,6 +982,121 @@ static long stream_write(struct file *f, const void *buf, size_t len)
 	return r < 0 ? r : (long)len;
 }
 
+/* ---- M_IOCTL strioctl glue --------------------------------------------- */
+
+/* Per-cmd payload size table -- maps the ioctl command to the
+ * number of bytes the user buffer holds.  Used by both the
+ * "build M_IOCTL going down" and the "copy response back to user"
+ * paths so the two stay symmetric.  Unknown commands get 0 and
+ * stream_ioctl bails out before allocating a payload mblk. */
+static int strioctl_payload_size(int cmd)
+{
+	switch (cmd) {
+	case TCGETA:
+	case TCSETA:
+	case TCSETAW:
+	case TCSETAF:
+		return (int)sizeof(struct termios);
+	case TCFLSH:
+		return 0;
+	default:
+		return -1;
+	}
+}
+
+static long strioctl(struct stdata *sd, int cmd, long arg)
+{
+	int payload = strioctl_payload_size(cmd);
+	if (payload < 0)
+		return -1;
+	if (!sd->sd_wq->q_next)
+		return -1;
+
+	/* Build the M_IOCTL mblk: iocblk header in the first mblk, the
+	 * payload (a struct termios for TCSETA, etc.) chained via
+	 * b_cont.  TCSETA / TCFLSH copy data IN from user; TCGETA gets
+	 * its payload filled by the module on the way back up. */
+	mblk_t *iocmp = allocb(sizeof(struct iocblk), 0);
+	if (!iocmp) return -1;
+	iocmp->b_datap->db_type = M_IOCTL;
+	struct iocblk *ic = (struct iocblk *)iocmp->b_wptr;
+	ic->ic_cmd   = cmd;
+	ic->ic_count = payload;
+	ic->ic_error = 0;
+	ic->ic_tid   = curthread ? (int)curthread->tid : -1;
+	iocmp->b_wptr += sizeof(*ic);
+
+	if (payload > 0) {
+		mblk_t *data = allocb((size_t)payload, 0);
+		if (!data) {
+			freemsg(iocmp);
+			return -1;
+		}
+		/* TCSETA / TCSETAW / TCSETAF carry data IN -- copy from
+		 * user space (or kernel, for in-kernel callers).
+		 * TCGETA carries data OUT only -- the module fills it
+		 * on the way back. */
+		if (cmd == TCSETA || cmd == TCSETAW || cmd == TCSETAF) {
+			if (syscall_from_user) {
+				if (copy_from_user(data->b_wptr,
+				                   (const void *)(uintptr_t)arg,
+				                   (size_t)payload) < 0) {
+					freemsg(iocmp);
+					freemsg(data);
+					return -1;
+				}
+			} else {
+				kmemcpy(data->b_wptr,
+				        (const void *)(uintptr_t)arg,
+				        (size_t)payload);
+			}
+		}
+		data->b_wptr += payload;
+		iocmp->b_cont = data;
+	}
+
+	/* Send the M_IOCTL down the write side.  Modules + driver get
+	 * their crack at it via their qi_putp; whoever recognises
+	 * ic_cmd flips db_type and putnexts back up. */
+	putnext(sd->sd_wq, iocmp);
+
+	/* Wait for sh_rq_putp to stash the response.  sd_ioc_wq is
+	 * the rendezvous queue.  We hold sq_lock around the check +
+	 * sleep to close the lost-wakeup window that phases 5c/6/7
+	 * handled for the data path. */
+	unsigned long flags = spin_lock_irq_save(&sd->sd_ioc_wq.sq_lock);
+	while (sd->sd_ioc_response == NULL) {
+		kthread_sleep_on_locked(&sd->sd_ioc_wq, flags);
+		flags = spin_lock_irq_save(&sd->sd_ioc_wq.sq_lock);
+	}
+	mblk_t *resp = sd->sd_ioc_response;
+	sd->sd_ioc_response = NULL;
+	spin_unlock_irq_restore(&sd->sd_ioc_wq.sq_lock, flags);
+
+	/* Decode the response.  iocblk in the head mblk, payload (if
+	 * any) in b_cont.  ic_error == 0 + db_type == M_IOCACK means
+	 * success; M_IOCNAK or non-zero ic_error means failure. */
+	long ret = -1;
+	struct iocblk *ric = (struct iocblk *)resp->b_rptr;
+	if (resp->b_datap->db_type == M_IOCACK && ric->ic_error == 0) {
+		ret = 0;
+		if (cmd == TCGETA && resp->b_cont) {
+			mblk_t *rdata = resp->b_cont;
+			size_t n = (size_t)(rdata->b_wptr - rdata->b_rptr);
+			if (n > (size_t)payload) n = (size_t)payload;
+			if (syscall_from_user) {
+				if (copy_to_user((void *)(uintptr_t)arg,
+				                 rdata->b_rptr, n) < 0)
+					ret = -1;
+			} else {
+				kmemcpy((void *)(uintptr_t)arg, rdata->b_rptr, n);
+			}
+		}
+	}
+	freemsg(resp);
+	return ret;
+}
+
 static long stream_ioctl(struct file *f, int cmd, long arg)
 {
 	struct stdata *sd = f->f_private;
@@ -958,7 +1108,12 @@ static long stream_ioctl(struct file *f, int cmd, long arg)
 	case I_POP:
 		return do_ipop(sd);
 	default:
-		return -1;
+		/* Everything else flows down the stream as M_IOCTL.  The
+		 * module or driver that owns the command (TCGETA on
+		 * ldterm, future driver-private commands on a tty
+		 * driver, ...) processes it and responds via M_IOCACK /
+		 * M_IOCNAK. */
+		return strioctl(sd, cmd, arg);
 	}
 }
 
@@ -1091,6 +1246,8 @@ static struct stdata *pipe_end(const char *name)
 	sd->sd_peer   = NULL;
 	sd->sd_minor  = 0;	/* pipes have no minor */
 	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
+	sd->sd_ioc_wq   = (struct wait_queue)WAIT_QUEUE_INIT;
+	sd->sd_ioc_response = NULL;
 	rq->q_ptr = sd;	/* so sh_rq_putp can wake readers */
 	wq->q_ptr = sd;
 	sd->sd_all_next = all_open_streams;

@@ -88,4 +88,16 @@ struct termios {
 /* Conventional control-char value for "^X" where X is uppercase. */
 #define CTRL(x)		((x) & 0x1f)
 
+/* SVR4 termio ioctl numbers.  TCGETA reads the current termios into
+ * the user's struct; TCSETA writes it back immediately.  TCSETAW and
+ * TCSETAF add output drain + input flush in real Unix; we model both
+ * as plain TCSETA for now since the underlying tty is byte-stream
+ * fast enough that "drain" is meaningless and "flush" is a no-op
+ * without queue depth pressure. */
+#define TCGETA		0x5401
+#define TCSETA		0x5402
+#define TCSETAW		0x5403
+#define TCSETAF		0x5404
+#define TCFLSH		0x5405
+
 #endif

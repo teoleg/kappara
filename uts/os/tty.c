@@ -132,7 +132,28 @@ static int tty_drv_qclose(queue_t *q)
 static int tty_drv_wq_putp(queue_t *q, mblk_t *mp)
 {
 	struct tty_minor *m = q->q_ptr;
-	if (!m || mp->b_datap->db_type != M_DATA) {
+	if (!m) {
+		freemsg(mp);
+		return 0;
+	}
+	/* M_IOCTL that fell through the stack with nobody recognising
+	 * it -- we're the bottom, NAK it back upstream so the head's
+	 * strioctl returns -1 instead of waiting forever. */
+	if (mp->b_datap->db_type == M_IOCTL) {
+		mp->b_datap->db_type = M_IOCNAK;
+		struct iocblk *ic = (struct iocblk *)mp->b_rptr;
+		ic->ic_error = -1;
+		ic->ic_count = 0;
+		if (mp->b_cont) {
+			freemsg(mp->b_cont);
+			mp->b_cont = NULL;
+		}
+		queue_t *rq = q->q_link;
+		if (rq) putnext(rq, mp);
+		else    freemsg(mp);
+		return 0;
+	}
+	if (mp->b_datap->db_type != M_DATA) {
 		freemsg(mp);
 		return 0;
 	}

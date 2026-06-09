@@ -446,6 +446,7 @@ void kmain(void)
 	vt_selftest();
 	ldterm_selftest();
 	tty_selftest();
+	ldterm_mioctl_selftest();
 	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ on core 0 */
 
 	/* Smoke-test the kallsyms table by walking our own frame chain
