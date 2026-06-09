@@ -32,6 +32,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/uts/os/pmm.o \
         $(BUILD)/uts/os/string.o \
         $(BUILD)/uts/os/kmem.o \
+        $(BUILD)/uts/os/process.o \
         $(BUILD)/uts/os/sched.o \
         $(BUILD)/uts/os/streams.o \
         $(BUILD)/uts/os/klog.o \

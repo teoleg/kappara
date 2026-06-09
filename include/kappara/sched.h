@@ -20,6 +20,8 @@
 
 #include "kappara/spinlock.h"
 
+struct process;	/* fwd; defined in kappara/process.h */
+
 enum kt_state {
 	KT_READY = 0,
 	KT_RUNNING,
@@ -170,6 +172,11 @@ struct kthread {
 	spinlock_t    *t_lockp;
 	spinlock_t     t_lock;
 	unsigned       tid;
+	/* Phase R1: the process this thread belongs to.  Every kthread
+	 * starts out pointing at init_process; sys_execve (R1c2) will
+	 * allocate fresh processes with their own vm_map.  Used by
+	 * switch_to_next to decide whether to swap TTBR0_EL1. */
+	struct process *t_proc;
 	/* SVR4 session and process group.  Both are tid values: a
 	 * thread that calls setsid() makes its tid the session and
 	 * pgrp id; setpgid(pid=0, pgid=0) makes its tid the pgrp id

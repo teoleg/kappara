@@ -163,6 +163,11 @@
 #define SCTLR_I			(1UL << 12)
 
 __attribute__((aligned(PAGE_SIZE))) static uint64_t l0_table[ENTRIES_PER_TABLE];
+
+unsigned long mmu_boot_l0_phys(void)
+{
+	return (unsigned long)(uintptr_t)l0_table;
+}
 __attribute__((aligned(PAGE_SIZE))) static uint64_t l1_table[ENTRIES_PER_TABLE];
 __attribute__((aligned(PAGE_SIZE))) static uint64_t l2_table[ENTRIES_PER_TABLE];
 

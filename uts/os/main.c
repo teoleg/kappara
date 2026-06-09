@@ -36,6 +36,7 @@
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
 #include "kappara/proc.h"
+#include "kappara/process.h"
 #include "kappara/sched.h"
 #include "kappara/vt.h"
 #include "kappara/tty.h"
@@ -441,6 +442,11 @@ void kmain(void)
 	kprintf("\n");
 	vfs_dump_tree(vfs_root());
 
+	/* R1: stamp init_vm_map.l0_phys from the live MMU table before
+	 * any thread is created.  process_init must run after mmu_init
+	 * but before sched_init (main_thread's t_proc dereferences
+	 * init_process). */
+	process_init();
 	sched_init();
 	timer_init(100);
 	vt_selftest();

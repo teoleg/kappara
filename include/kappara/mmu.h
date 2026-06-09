@@ -23,6 +23,12 @@ void mmu_enable_this_cpu(void);
  * low 1 GB on AArch64) as a Normal-cacheable user-RW block.
  * Used to publish a user code/data page so EL0 can read+execute it. */
 void mmu_map_user_2mb(unsigned long va, unsigned long pa);
+
+/* Phase R1: physical address of the boot-time L0 page table.  init
+ * process's vm_map wraps this -- TTBR0_EL1 is loaded from it on every
+ * CPU's MMU enable.  Future per-process L0s are independent
+ * allocations. */
+unsigned long mmu_boot_l0_phys(void);
 #endif
 
 #endif

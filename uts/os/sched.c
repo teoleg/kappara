@@ -85,6 +85,7 @@
 #include "kappara/kmem.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
+#include "kappara/process.h"
 #include "kappara/signal.h"
 #include "kappara/streams.h"
 #include "kappara/sched.h"
@@ -444,6 +445,11 @@ void sched_init(void)
 	 * "before anyone called setsid" state is harmless. */
 	main_thread.t_pgrp    = 0;
 	main_thread.t_session = 0;
+	/* Phase R1: main thread is the first thread of init_process,
+	 * which wraps the boot-time L0 page table.  All subsequent
+	 * kthread_create calls inherit t_proc until R1c2 sys_execve
+	 * starts handing out fresh processes. */
+	main_thread.t_proc    = &init_process;
 	main_thread.next  = NULL;
 
 	/* Initialise every CPU's disp_t to "no runnable threads".  BSS
@@ -518,15 +524,23 @@ struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg)
 	 * sets t_pri + t_quantum_left for the class. */
 	t->t_cid      = SCLASS_SYS;
 	sclass[SCLASS_SYS]->cl_fork(t);
-	/* Inherit session + pgrp from the creator -- classic Unix
-	 * fork() semantics applied to our spawn-shaped model.  setsid
-	 * / setpgid still get to override at the receiver's end. */
+	/* Inherit session + pgrp + process from the creator -- classic
+	 * Unix fork() semantics applied to our spawn-shaped model.
+	 * setsid / setpgid still get to override at the receiver's
+	 * end.  Phase R1: t_proc inheritance means a newly created
+	 * thread shares the parent's vm_map, which is the natural
+	 * pthread_create shape -- if a future caller wants a fresh
+	 * address space it'll be sys_execve's job to install one. */
 	{
 		struct kthread *parent = curthread;
 		if (parent) {
 			t->t_session = parent->t_session;
 			t->t_pgrp    = parent->t_pgrp;
+			t->t_proc    = parent->t_proc;
+		} else {
+			t->t_proc    = &init_process;
 		}
+		if (t->t_proc) t->t_proc->refs++;
 	}
 	t->next       = NULL;
 	/* Initial polymorphic state lock: the per-thread default.
@@ -1130,6 +1144,7 @@ void sched_secondary_init(unsigned cpu_id)
 	idle->state      = KT_RUNNING;
 	idle->t_pri      = KSCHED_PRI_IDLE;	/* never enqueued; marker */
 	idle->t_cid      = SCLASS_SYS;
+	idle->t_proc     = &init_process;
 	idle->stack_base = NULL;	/* never reaped; stack lives forever */
 
 	c->cpu_id     = cpu_id;
