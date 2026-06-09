@@ -266,7 +266,7 @@ thread.  Per-thread DAIF is critical (commit `0929814`): without it, a
 thread that slept with IRQs masked would resume into whoever's DAIF
 state the waker happened to have.
 
-### Wait queues
+### Wait queues (sleepq)
 
 `kthread_sleep_on(wq)` marks BLOCKED, threads onto `wq->head`,
 yields without re-queuing.  `kthread_wake_all(wq)` walks the queue,
@@ -276,12 +276,66 @@ Used by `stream_read` for blocking I/O, by signal delivery to
 surgically unlink a sleeper from its queue, and by pipe close to wake
 the peer's reader with EOF.
 
+**SMP discipline (Solaris sleepq, Phase 5).**  `struct wait_queue`
+carries a `sq_lock` that the sleeper holds **across `context_switch`'s
+save phase**.  Mechanism: `kthread_sleep_on` acquires `sq_lock`,
+links itself, then passes `&sq_lock` to `switch_to_next` as
+`extra_release`.  `switch_to_next` stashes the pointer in
+`cpu_pending_release_lock`; the **incoming** thread releases
+`sq_lock` after `context_switch` returns, before releasing
+`cpu_thread_lock`.
+
+A waker therefore cannot acquire `sq_lock` until the sleeper's `sp`
+has been committed by the save phase.  Without this, a waker that
+ran between `wq->head = t` and `context_switch`'s `str x2,[x0]`
+could move `t` to the dispq and let another CPU `try_steal` `t` with
+its `sp` field still holding the previous value — the same
+steal-mid-save race that Phase 2 closed for the yield path, just
+reached via the wake side instead of `dispq_push`.
+
 ### Reaping
 
 `kthread_exit` parks the dying thread on `to_reap`.  The next
 `switch_to_next` runs the reap loop **after** the context_switch — so
 we're on a different stack, safe to `pmm_free` the dying thread's
 stack and `kfree` its struct.
+
+**SMP discipline (Phase 5b).**  `kthread_exit` acquires
+`to_reap_lock` and **does not release it** before calling
+`switch_to_next(0, &to_reap_lock)` — the lock is carried across the
+switch the same way sleepers carry `sq_lock`, via
+`cpu_pending_release_lock` released by the incoming thread.  This
+prevents a `to_reap` drain on another CPU (every `switch_to_next`
+resumer drains the global list) from `pmm_free`'ing the dying
+thread's stack page **while save phase is still writing to it**.
+The freed page would otherwise be reallocated immediately by slab
+or another stack alloc, corrupting either the freelist or the
+register save area.
+
+### Signal interlock (phase 6)
+
+Every `struct kthread` carries a per-thread `sigwait_wq`.
+`sys_sigsuspend_impl` takes `sigwait_wq.sq_lock` around BOTH the
+mask install AND the `(sig_pending & ~sig_mask)` check, then sleeps
+via `kthread_sleep_on_locked(&t->sigwait_wq, flags)` -- same
+extra-release pattern phase 5 introduced for sq_lock and phase 5b
+for to_reap_lock.
+
+`kthread_signal` takes the target's `sigwait_wq.sq_lock` around the
+`sig_pending |= SIGBIT(sig)` OR, so the check-then-sleep window
+inside sigsuspend is closed: either the signaler sets the bit
+before sigsuspend's check (which then sees it and returns without
+sleeping), or sigsuspend gets sq_lock first and the signaler spins
+until sigsuspend has slept -- at which point the signaler surgically
+removes the thread from sigwait_wq under the same lock it already
+holds.  A target NOT in sigsuspend pays a single uncontended
+acquire (the wq is per-thread, nobody else touches its sq_lock).
+
+If the target is parked on some OTHER wait queue (stream_read,
+sys_wait, ...), the signaler then takes THAT queue's sq_lock and
+does the existing surgical-remove + dispq_push.  Lock order is
+`sigwait_wq.sq_lock` outer, peer wq sq_lock inner -- consistent
+because nothing else acquires those two together.
 
 ## STREAMS
 
@@ -336,6 +390,25 @@ the inode.
 `a->sd_wq->q_next = b->sd_rq` (and vice versa).  Each end has
 `sd_peer` pointing at the other.  Closing one end signals
 `SD_EOF` on the peer and wakes its readers.
+
+### Stream-read interlock (phase 7)
+
+`stream_read` takes `sd_readwait.sq_lock` across the whole
+`(getq + SD_EOF check + sleep_on)` window and hands the lock to
+`kthread_sleep_on_locked`.  `sh_rq_putp` and the pipe-close path
+take the same lock around `putq(sd_rq, mp)` and the
+`sd_flags |= SD_EOF` mutation.  Same-shape fix as phases 5c
+(`sys_wait`) and 6 (`sigsuspend`): a writer that arrives "just
+before" the reader sleeps either grabs sq_lock first (in which
+case the reader's later `getq` sees the data and never sleeps),
+or spins until the reader is fully on the wq (in which case
+`kthread_wake_all` after the writer's release surgically wakes it).
+
+`sq_lock` also doubles as the queue mutation lock for `sd_rq` --
+nothing else serialised concurrent `putq` / `getq` / `putbq`
+calls.  `stream_read` releases sq_lock before copying to user
+(no spinlock across uaccess) and re-acquires it briefly around
+the leftover `putbq` on partial reads.
 
 ## VFS
 
@@ -524,9 +597,15 @@ then calls `kthread_wake_all(&thread_exit_wq)` -- in that order, so
 a waiter racing `kthread_find` after the wake observes
 `state == KT_DEAD` (which `kthread_find` filters to `NULL`) and
 returns 0 instead of sleeping again with nobody left to wake it.
-`sys_wait_impl` loops: `kthread_find` → if gone, return 0; if a
-fatal signal landed, return -1 (EINTR shape); otherwise
-`kthread_sleep_on(&thread_exit_wq)`.
+`sys_wait_impl` loops: take `thread_exit_wq.sq_lock`, then
+`kthread_find` → if gone, return 0; if a fatal signal landed,
+return -1 (EINTR shape); otherwise
+`kthread_sleep_on_locked(&thread_exit_wq, flags)` -- which atomically
+links onto the queue and releases `sq_lock` after `context_switch`
+commits sp.  `kthread_exit` sets `state=KT_DEAD` AND wakes any
+waiters under the same `sq_lock`, so the check-then-sleep window is
+closed: a waiter either sees the new state under its `sq_lock`
+acquire or it sleeps and is woken under the exiter's `sq_lock`.
 
 This isn't a real `waitpid` -- no parent-child tracking, no exit
 status, no `WNOHANG` flag.  It's a `pthread_join`-shaped building
@@ -704,9 +783,41 @@ for (;;) { kthread_yield(); wfi; }   -- idle loop
 
 ### Dispatch queues, push-side balance, and idle steal
 
-Each `struct cpu` has a FIFO `cpu_dispq` (head + tail + length)
-guarded by `cpu_disp_lock`.  Both directions of load balancing are
-in play:
+Each `struct cpu` carries an SVR4 `disp_t` -- one FIFO per priority
+level guarded by `cpu_disp_lock`.  Priorities are `0..KSCHED_NPRI-1`
+(64 levels); the active-priority bitmap `cpu_qactmap` is a single
+`uint64_t` so picking the highest-priority runnable thread is one
+`__builtin_clzll`.  `cpu_maxrunpri` caches the same value for
+lock-free reads by the steal-side balancer, and `cpu_nrunnable` is
+the total thread count across all priorities.
+
+Priorities are driven by a scheduling-class layer (phase 4).  Two
+classes ship today:
+
+* **`SCLASS_SYS`** -- every kernel-only kthread (`uart_rx`, idle,
+  `/proc/ps` readers, ...).  Fixed at `KSCHED_PRI_SYS_DEFAULT = 60`,
+  no quantum tracking; `cl_tick` returns "no class-driven preempt"
+  so SYS threads run until they voluntarily yield or block.
+
+* **`SCLASS_TS`** -- every user-space (EL0) thread.  Driven by an
+  inlined `ts_dptbl` row: each thread carries a `t_quantum_left`
+  countdown reloaded to `TS_QUANTUM_TICKS = 5` (~50ms at HZ=100).
+  `cl_tick` decrements it; on hit-zero the thread's priority is
+  demoted by `TS_DEMOTE_STEP = 5` (floor 0).  `cl_wakeup` snaps
+  priority back to `KSCHED_PRI_TS_DEFAULT = 30` and reloads the
+  quantum -- I/O-bound threads stay at high priority, CPU-bound
+  threads drift downward.
+
+`sys_execve` / `sys_spawn` flip the new thread to `SCLASS_TS`
+right after `kthread_create` and before the wake path picks it up,
+so user processes pick up the aging behaviour automatically.
+`kthread_setclass(t, cid)` is the public entry point.
+
+Idle threads carry `KSCHED_PRI_IDLE = -1` as a documentation marker
+-- they're never enqueued, they're the fallback that runs when every
+priority is empty AND the cross-CPU steal also turns up nothing.
+
+Both directions of load balancing are in play:
 
 **Push-side** (`dispq_push` / `pick_push_target`).  When a thread
 becomes runnable — `kthread_create` for a new thread,
@@ -719,14 +830,16 @@ waiting, we scan `cpus[]` for a strictly-shorter queue elsewhere
 and push there.  Single-shot wakes onto an empty local queue stay
 local for cache locality.
 
-The remote `cpu_dispq_len` reads are unlocked — a single word, so
-they're atomic on AArch64.  A stale value just means a slightly
-worse pick; the subsequent locked push lands on whatever target
-we chose, which is correct either way.
+The remote `cpu_nrunnable` and `cpu_maxrunpri` reads are unlocked
+— each is a single word, atomic on AArch64.  A stale value just
+means a slightly worse pick; the subsequent locked push/pop lands
+on whatever target we chose, which is correct either way.
 
 **Pull-side** (`try_steal`, in `switch_to_next`).  When a CPU has
-nothing in its own queue, it scans `cpus[]` and pops one thread
-from the first non-empty remote queue (under that CPU's lock).
+nothing in its own queue, it scans `cpus[]` for the peer with the
+highest `cpu_maxrunpri` (so we steal the most important pending
+work first, not just whatever's on the lowest-numbered CPU) and
+pops one thread from its dispatch queue under that CPU's lock.
 This is the catch-net for cases push-side missed (e.g. the waker
 guessed wrong, or a thread is now blocking too long on another
 CPU and a sibling went idle in the meantime).  If steal also

@@ -26,6 +26,8 @@
 
 #include <stdint.h>
 
+struct vt;	/* fwd; defined in kappara/vt.h */
+
 #ifdef __aarch64__
 void fbcon_putc_tee   (char c);
 void fbcon_tee_flush  (void);
@@ -36,11 +38,20 @@ void fbcon_init_cursor(uint32_t y);
  * refresh thread doesn't fight per-character fbcon writes for the
  * same 3 MB region. */
 void fbcon_tee_enable (int on);
+/* Phase 7: paint a struct vt's full cell grid onto the framebuffer.
+ * 80x24 cells at FBCON_CW x FBCON_CH pixels each, top-left aligned.
+ * Mapped via the standard 16-color VGA palette; VT_COLOR_DEFAULT
+ * resolves to xterm's light-grey-on-black.  Caller decides when to
+ * paint -- typically tty_switch (full repaint on switch) and the
+ * tty driver's wq_putp (incremental redraw on active tty's writes).
+ * No-op when no framebuffer is up. */
+void fbcon_render_vt  (const struct vt *v);
 #else
 static inline void fbcon_putc_tee   (char c)        { (void)c; }
 static inline void fbcon_tee_flush  (void)          { }
 static inline void fbcon_init_cursor(uint32_t y)    { (void)y; }
 static inline void fbcon_tee_enable (int on)        { (void)on; }
+static inline void fbcon_render_vt  (const struct vt *v) { (void)v; }
 #endif
 
 #endif

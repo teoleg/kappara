@@ -77,6 +77,20 @@ struct stdata {
 	struct stdata	*sd_all_next;	/* global list link -- every live
 					 * stdata is on it so /proc/streams
 					 * can walk all open instances    */
+	/* Minor number of the underlying cdev, captured at open from
+	 * MINOR(f->f_inode->i_rdev).  Zero for pipe ends and other
+	 * non-cdev streams.  Multi-minor drivers (the tty driver from
+	 * phase 3) read this from drv_rq->q_ptr in their qi_qopen to
+	 * route to the right per-minor state. */
+	unsigned	 sd_minor;
+	/* SVR4 strioctl synchronisation.  stream_ioctl wraps a non-
+	 * head ioctl as an M_IOCTL mblk, putnexts it down, sleeps on
+	 * sd_ioc_wq, and waits for sh_rq_putp to catch an M_IOCACK or
+	 * M_IOCNAK with a matching ic_tid.  sd_ioc_response is stashed
+	 * by the head before the wake so the caller can read it off
+	 * the wq side without re-walking the head's read queue. */
+	struct wait_queue sd_ioc_wq;
+	struct msgb      *sd_ioc_response;	/* mblk_t alias */
 };
 
 void streams_head_init(void);

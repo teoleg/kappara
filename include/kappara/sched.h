@@ -20,6 +20,8 @@
 
 #include "kappara/spinlock.h"
 
+struct process;	/* fwd; defined in kappara/process.h */
+
 enum kt_state {
 	KT_READY = 0,
 	KT_RUNNING,
@@ -34,8 +36,99 @@ enum kt_state {
  * kept here to avoid pulling all of vfs.h into sched.h. */
 #define KT_FD_MAX	16
 
+/*
+ * SVR4 priority space.  Solaris uses 0..169 carved up by scheduling
+ * class: TS gets 0..59, IA 0..59, FSS 0..59, SYS 60..99, RT 100..159.
+ * We collapse that to 0..63 (one uint64_t for the active-priority
+ * bitmap) for now -- phase 4's class layer will partition this range:
+ *
+ *   pri 0..49  -- TS-class user threads (default 30)
+ *   pri 50..62 -- SYS-class kernel threads (default 60)
+ *   pri 63     -- reserved for future RT
+ *
+ * Higher pri = picked first.  Idle threads live below this range
+ * (KSCHED_PRI_IDLE = -1) and are never enqueued -- they're the
+ * fallback when every priority is empty.
+ */
+#define KSCHED_NPRI		64
+#define KSCHED_PRI_TS_MIN	0
+#define KSCHED_PRI_TS_MAX	49
+#define KSCHED_PRI_TS_DEFAULT	30
+#define KSCHED_PRI_SYS_MIN	50
+#define KSCHED_PRI_SYS_MAX	62
+#define KSCHED_PRI_SYS_DEFAULT	60
+#define KSCHED_PRI_IDLE		(-1)
+
+/*
+ * SVR4 scheduling classes.  Each class has an sclass_ops vector
+ * (cl_tick, cl_wakeup) hooked by sched_tick + the wake path.  Phase
+ * 4 ships two classes:
+ *
+ *   SCLASS_SYS -- kernel threads (uart_rx, klogd, idle, /proc/ps
+ *                 readers spawned from kshell).  Fixed priority
+ *                 KSCHED_PRI_SYS_DEFAULT, no quantum tracking;
+ *                 sched_tick returns "no preempt" so they keep
+ *                 running until they voluntarily yield/block.
+ *
+ *   SCLASS_TS  -- user-space threads.  TS-flavoured aging: each
+ *                 thread carries `t_quantum_left` ticks; cl_tick
+ *                 decrements it and, when it hits zero, demotes
+ *                 the priority via the inlined `ts_dptbl` and
+ *                 returns "preempt" so swtch picks a peer.  On
+ *                 wakeup the priority is reset to the entry the
+ *                 dptbl says (`ts_slpret`) -- I/O bound threads
+ *                 ride at high priority, CPU-bound drift downward.
+ *
+ * sys_execve sets the new thread to SCLASS_TS so user programs
+ * pick up the aging behaviour automatically; everything else
+ * stays SCLASS_SYS.
+ */
+enum sclass_id {
+	SCLASS_SYS = 0,
+	SCLASS_TS  = 1,
+};
+
+struct kthread;
+struct sclass_ops {
+	const char *name;
+	/* Called the moment a thread transitions to runnable from
+	 * blocked (kthread_wake_*, kthread_signal surgical-removal).
+	 * The implementation typically resets t_pri to a higher value
+	 * (TS: ts_slpret) so a recently-blocked thread is responsive
+	 * when its I/O completes. */
+	void (*cl_wakeup)(struct kthread *t);
+	/* Called from sched_tick on curthread.  Returns 1 if the
+	 * thread should be preempted (its quantum expired); the
+	 * caller (sched_tick) then yields. */
+	int  (*cl_tick)(struct kthread *t);
+	/* Called from kthread_create to set initial t_pri,
+	 * t_quantum_left etc. for this class. */
+	void (*cl_fork)(struct kthread *t);
+};
+
+extern const struct sclass_ops *sclass[2];
+
+/* Switch a thread (typically curthread) into a new class.  Used by
+ * sys_execve to transition kernel-created threads to TS just before
+ * they enter EL0.  No lock; the thread either owns itself (caller is
+ * curthread) or is brand-new (caller is the creator). */
+void kthread_setclass(struct kthread *t, enum sclass_id cid);
+
 struct file;		/* fwd; defined in vfs.h */
-struct wait_queue;	/* fwd; defined later in this file */
+struct kthread;		/* fwd; defined just below struct wait_queue */
+
+/*
+ * Wait queue.  Defined HERE -- before struct kthread -- because
+ * kthread embeds a per-thread sigwait_wq inline (phase 6 sigsuspend
+ * interlock).  The longer comment on the role of sq_lock lives at
+ * the public declarations near kthread_sleep_on() further down.
+ */
+struct wait_queue {
+	struct kthread *head;
+	spinlock_t      sq_lock;
+};
+
+#define WAIT_QUEUE_INIT		{ .head = NULL, .sq_lock = SPINLOCK_INIT }
 
 /* Forward decl: per-signal disposition, defined in signal.h.
  * We don't pull signal.h in here -- it'd be a circular include
@@ -52,8 +145,71 @@ struct kthread {
 	 * buffer (e.g. sys_execve's resolved basename) without worry. */
 	const char    *name;
 	char           comm[32];
+	/*
+	 * Solaris-style polymorphic thread-state lock.
+	 *
+	 * t_lockp points at whichever spinlock currently owns this
+	 * thread's mutable state (sp, state, waiting_on, next, queue
+	 * linkage).  It is updated as the thread transitions between
+	 * dispatch / sleep / per-CPU ownership:
+	 *
+	 *   newly created          -> &kthread.t_lock (per-thread default)
+	 *   KT_RUNNING on a CPU    -> &cpu.cpu_thread_lock
+	 *   KT_READY on a dispq    -> &cpu.cpu_disp_lock
+	 *   KT_BLOCKED on a wait q -> &wait_queue.wq_lock  (phase 5)
+	 *   KT_DEAD on to_reap     -> &to_reap_lock
+	 *
+	 * Future code mutates t state ONLY after acquiring *t_lockp,
+	 * with retries when t_lockp changes mid-acquire (see
+	 * thread_lock() in include/kappara/thread_lock.h, added in
+	 * phase 1).  This is what closes the steal-mid-save race that
+	 * the "/proc/ps text in a recycled stack page's saved-register
+	 * slots" panic exposed.
+	 *
+	 * Phase 1 (this commit): the fields exist and are initialised
+	 * but nothing reads t_lockp yet.  Phase 2 will wire swtch().
+	 */
+	spinlock_t    *t_lockp;
+	spinlock_t     t_lock;
 	unsigned       tid;
+	/* Phase R1: the process this thread belongs to.  Every kthread
+	 * starts out pointing at init_process; sys_execve (R1c2) will
+	 * allocate fresh processes with their own vm_map.  Used by
+	 * switch_to_next to decide whether to swap TTBR0_EL1. */
+	struct process *t_proc;
+	/* SVR4 session and process group.  Both are tid values: a
+	 * thread that calls setsid() makes its tid the session and
+	 * pgrp id; setpgid(pid=0, pgid=0) makes its tid the pgrp id
+	 * (joining itself as the new pgrp leader); other threads
+	 * inherit at kthread_create time from the caller.  0 means
+	 * "no session / no pgrp" -- the initial state of the boot
+	 * main_thread before user-init has been spawned; signals to
+	 * pgrp 0 are no-ops. */
+	unsigned       t_session;
+	unsigned       t_pgrp;
 	enum kt_state  state;
+	/*
+	 * Dispatch priority.  Higher value = picked first.  Set at
+	 * kthread_create from the thread's scheduling class default
+	 * (cl_fork).  Idle threads carry KSCHED_PRI_IDLE (-1) --
+	 * they're never enqueued, so the value is just a marker.
+	 *
+	 * SCLASS_TS adjusts t_pri at runtime (cl_tick demotes on
+	 * quantum expiry, cl_wakeup re-promotes after a sleep).
+	 * SCLASS_SYS leaves it alone.
+	 */
+	int            t_pri;
+	/*
+	 * Scheduling class.  Defaults to SCLASS_SYS at kthread_create;
+	 * sys_execve flips user-thread creates to SCLASS_TS so their
+	 * priority ages with CPU consumption.
+	 */
+	enum sclass_id t_cid;
+	/* TS-class quantum bookkeeping.  cl_tick decrements
+	 * t_quantum_left each tick; when it reaches 0 the priority is
+	 * demoted and the quantum is reloaded from the dptbl.  Unused
+	 * by SCLASS_SYS. */
+	short          t_quantum_left;
 	struct kthread *next;
 	/* Pending-signal bitmap.  sys_kill sets bits, check_signals
 	 * (from trap_dispatch's SVC return) consumes them.  See
@@ -82,6 +238,15 @@ struct kthread {
 	 * sys_kill surgically extract a sleeping thread from its
 	 * queue so it wakes and observes the signal. */
 	struct wait_queue *waiting_on;
+	/* Per-thread interlock wait queue used by sigsuspend.  Its
+	 * sq_lock is taken by kthread_signal when it ORs `sig` into
+	 * sig_pending, so a sigsuspend that's evaluating
+	 * `pending & ~mask` under the same sq_lock either sees the
+	 * just-set bit (no sleep) or sleeps and is then surgically
+	 * removed by the same signaler (no lost wakeup).  Idle until
+	 * the first sigsuspend on this thread; BSS zero (sq_lock=0,
+	 * head=NULL) is a valid initial state for both fields. */
+	struct wait_queue  sigwait_wq;
 	/* Per-thread open files.  Each entry is either NULL or a
 	 * struct file * whose f_refs counts how many fd slots (across
 	 * all threads) still point at it.  See kernel/vfs.c. */
@@ -115,15 +280,60 @@ struct cpu {
 	struct kthread  *cpu_thread;	/* currently running on this CPU   */
 	struct kthread  *cpu_idle;	/* this CPU's idle thread          */
 	spinlock_t       cpu_disp_lock;
-	struct kthread  *cpu_dispq_head;
-	struct kthread  *cpu_dispq_tail;
-	/* Maintained alongside head/tail by every push/pop on the
-	 * dispatch queue.  The push-side load balancer (`dispq_push`)
-	 * reads this WITHOUT taking the remote CPU's lock -- a stale
-	 * value just means we pick a slightly-suboptimal target, the
-	 * subsequent locked push/pop is correct either way.  Lockless
-	 * reads of a single word are atomic on AArch64. */
-	unsigned         cpu_dispq_len;
+	/*
+	 * cpu_thread_lock owns the t_lockp of whichever kthread is
+	 * currently KT_RUNNING on this CPU.  In phase 2 swtch() will
+	 * hold it across context_switch -- the OUTGOING thread's
+	 * dispatcher acquires it (it equals outgoing->t_lockp at
+	 * entry); the INCOMING thread's continuation releases it
+	 * (it equals incoming->t_lockp after the transfer inside
+	 * swtch).  That's the structural close for the
+	 * steal-mid-save race.  In phase 1 the lock exists and is
+	 * initialised but nothing uses it yet.
+	 */
+	spinlock_t       cpu_thread_lock;
+	/*
+	 * Pending requeue stash for swtch's deferred dispq push.
+	 * The OUTGOING thread sets this BEFORE context_switch; the
+	 * INCOMING thread (or thread_trampoline) reads it AFTER
+	 * context_switch and pushes the stashed thread onto the
+	 * dispq with its t_lockp transitioned to cpu_disp_lock.
+	 * Deferring the push to the after-switch side is what closes
+	 * the steal-mid-save race -- a stealer that gets the stashed
+	 * thread reads a sp that has been committed by
+	 * context_switch's save phase.
+	 */
+	struct kthread  *cpu_pending_requeue;
+	/*
+	 * Optional second lock the resumer releases after
+	 * context_switch.  When the OUTGOING thread held a lock across
+	 * the switch in addition to cpu_thread_lock (specifically:
+	 * sleepers hold wq->sq_lock to keep wakers from observing the
+	 * outgoing thread's stale sp during the save phase), it
+	 * stashes the pointer here so the INCOMING continuation
+	 * releases it.  NULL means "no extra lock" (the yield case).
+	 */
+	spinlock_t      *cpu_pending_release_lock;
+	/*
+	 * SVR4 disp_t -- multi-priority dispatch.  One FIFO per
+	 * priority level (0..KSCHED_NPRI-1).  cpu_qactmap has bit `p`
+	 * set iff cpu_dispq_head[p] is non-empty; the dispatcher picks
+	 * by `__builtin_clzll(cpu_qactmap)` (or rather flsl-style:
+	 * 63 - clzll = highest bit set = highest priority with work).
+	 *
+	 * cpu_maxrunpri is maintained as a cache of the same value, so
+	 * the steal-side load balancer can read it without computing
+	 * clzll.  Set to KSCHED_PRI_IDLE (-1) when nothing is runnable.
+	 *
+	 * cpu_nrunnable is the total thread count across all priorities,
+	 * read unlocked by pick_push_target and /proc/cpuload.  A stale
+	 * value just costs a slightly-suboptimal pick.
+	 */
+	struct kthread  *cpu_dispq_head[KSCHED_NPRI];
+	struct kthread  *cpu_dispq_tail[KSCHED_NPRI];
+	uint64_t         cpu_qactmap;
+	int              cpu_maxrunpri;
+	unsigned         cpu_nrunnable;
 	/* STREAMS service-procedure runqueue, drained from this CPU's
 	 * sched_tick + sys_yield.  qenable on this CPU pushes here;
 	 * the per-CPU drain is what gives us "natural" SVR4 streams
@@ -176,6 +386,15 @@ unsigned        sched_ncpu(void);
 void            sched_get_cpu_info(unsigned i, struct sched_cpu_info *out);
 
 struct kthread *kthread_create(const char *name, void (*fn)(void *), void *arg);
+
+/* Two-step variants: create a thread WITHOUT pushing it on the dispatch
+ * queue (so the caller can mutate t_proc / t_pri / etc. atomically
+ * before the scheduler ever sees it), then dispatch separately.  R1c2
+ * sys_execve_impl uses this to install a fresh process on the new
+ * thread before it can run with the wrong TTBR0. */
+struct kthread *kthread_create_no_dispatch(const char *name,
+                                           void (*fn)(void *), void *arg);
+void            kthread_dispatch         (struct kthread *t);
 void            kthread_yield(void);
 void            kthread_exit(void) __attribute__((noreturn));
 void            sched_tick(void);
@@ -202,17 +421,45 @@ void            kthread_inherit_fds(struct kthread *child,
  * "while empty, sleep" rather than "if empty, sleep") so spurious or
  * coalesced wakeups don't matter.
  *
- * Single-CPU concurrency: the primitives disable IRQs around the
- * state mutation so the timer can't preempt between marking us
- * BLOCKED and the context switch.  Spin-locking lands when SMP does.
+ * SMP discipline (Solaris sleepq).  sq_lock guards the queue body
+ * (wq->head + the linkage of every thread currently on it) AND, more
+ * importantly, is held by the sleeper across context_switch's save
+ * phase.  The mechanism: kthread_sleep_on acquires sq_lock, links
+ * self onto wq->head, then passes &sq_lock to switch_to_next as
+ * extra_release.  switch_to_next stashes it in cpu_pending_release_lock;
+ * the INCOMING thread releases sq_lock AFTER context_switch returns.
+ * A waker therefore cannot acquire sq_lock until the sleeper's sp has
+ * been committed -- which closes the wake-side variant of the
+ * steal-mid-save race that Phase 2 closed for the yield path.
  */
-struct wait_queue {
-	struct kthread *head;
-};
-
-#define WAIT_QUEUE_INIT		{ .head = NULL }
+/* struct wait_queue + WAIT_QUEUE_INIT are defined up near struct
+ * kthread (kthread embeds a sigwait_wq inline -- phase 6 -- so the
+ * type has to be complete before kthread's declaration). */
 
 void            kthread_sleep_on (struct wait_queue *wq);
+
+/*
+ * Atomic check-and-sleep variant.  Caller MUST already hold wq->sq_lock
+ * (taken via spin_lock_irq_save, returning flags it captured) and pass
+ * the captured flags in.  This routine links the caller onto wq and
+ * yields without re-queuing -- the sq_lock release happens AFTER
+ * context_switch commits sp (via extra_release), same as the regular
+ * sleep path.  On return, sq_lock is NOT held and DAIF has been
+ * restored to `flags`.
+ *
+ * The point: callers with a "while (!condition) sleep" pattern (sys_wait,
+ * sys_sigsuspend, stream_read) can take sq_lock, evaluate `condition`
+ * under it, and -- if they need to sleep -- hand off to this routine.
+ * A waker on another CPU that sets the condition under sq_lock will
+ * either:
+ *   (a) get sq_lock first, set the condition, release.  The caller's
+ *       subsequent acquire sees the new condition, no sleep.
+ *   (b) spin on sq_lock until the caller has slept (release happens
+ *       after ctx_switch save).  Then sets condition and wakes.
+ * Either way, no lost wakeup.
+ */
+void            kthread_sleep_on_locked(struct wait_queue *wq,
+					unsigned long flags);
 void            kthread_wake_all (struct wait_queue *wq);
 void            kthread_wake_one (struct wait_queue *wq);
 
@@ -237,6 +484,10 @@ const char     *kthread_state_name(enum kt_state s);
  * and observes the signal.  Returns 0 on success or -1 if sig is
  * out of range. */
 int             kthread_signal(struct kthread *t, unsigned sig);
+
+/* Fan-out signal to every thread whose t_pgrp matches `pgrp`.
+ * No-op when pgrp == 0.  Returns the number of threads signaled. */
+int             kthread_signal_pgrp(unsigned pgrp, unsigned sig);
 
 /*
  * Arch-specific hook implemented in arch/<arch>/thread.c.  Lays

@@ -36,7 +36,11 @@
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
 #include "kappara/proc.h"
+#include "kappara/buf.h"
+#include "kappara/process.h"
 #include "kappara/sched.h"
+#include "kappara/vt.h"
+#include "kappara/tty.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
 #include "kappara/string.h"
@@ -421,13 +425,42 @@ void kmain(void)
 		 * in the lower half of the screen, scrolling under the
 		 * "kappara" title rather than over it. */
 		fbcon_init_cursor(320);
+
+		/* Phase 8 dual-console: enable the kprintf-to-fb mirror so
+		 * the boot log is visible on a real HDMI monitor without
+		 * needing serial.  UART output is unchanged -- always-on
+		 * debug channel.  Phase-7 cell-grid render writes occupy
+		 * the top 192 px (rows 0..23 x 8 px); the tee cursor sits
+		 * below them, so the two paths share the screen without
+		 * conflict.  In QEMU TCG this is the path the original
+		 * "shell appears to freeze" comment in fbcon.c was about
+		 * -- the dc cvac cost competes with the host display
+		 * refresh.  Live with it on the test rig; the win on
+		 * real HW makes up for it. */
+		fbcon_tee_enable(1);
 	}
 
 	kprintf("\n");
 	vfs_dump_tree(vfs_root());
 
+	/* R1: stamp init_vm_map.l0_phys from the live MMU table before
+	 * any thread is created.  process_init must run after mmu_init
+	 * but before sched_init (main_thread's t_proc dereferences
+	 * init_process). */
+	process_init();
 	sched_init();
 	timer_init(100);
+	vt_selftest();
+	ldterm_selftest();
+	tty_selftest();
+	ldterm_mioctl_selftest();
+	process_selftest();
+
+	/* S1: bring up the buffer cache + an in-memory test block
+	 * device, then exercise the round-trip. */
+	buf_init();
+	bram_init();
+	buf_selftest();
 	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ on core 0 */
 
 	/* Smoke-test the kallsyms table by walking our own frame chain

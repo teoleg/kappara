@@ -56,6 +56,9 @@
 #include "kappara/signal.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
+#include "kappara/termios.h"
+#include "kappara/tty.h"
+#include "kappara/uaccess.h"
 #include "kappara/string.h"
 #include "kappara/uart.h"
 #include "kappara/vfs.h"
@@ -124,20 +127,61 @@ static int sh_rq_putp(queue_t *q, mblk_t *mp)
 	 * Set SD_EOF so the next sys_read returns 0 and any
 	 * blocked reader wakes to see EOF.  This is the SVR4 stream
 	 * head's job: M_HANGUP doesn't get queued for the reader, it
-	 * mutates head state. */
+	 * mutates head state.
+	 *
+	 * Phase 7: SD_EOF mutation and the data putq below both happen
+	 * under sd_readwait.sq_lock, the same lock stream_read holds
+	 * across its (getq + EOF check + sleep_on) window.  Closes the
+	 * lost-wakeup race where a reader could getq() == NULL, observe
+	 * SD_EOF unset, then sleep AFTER a writer's putq + wake-all
+	 * completed (with no waiters present yet). */
+	/* M_IOCACK / M_IOCNAK -- response to an ioctl we started
+	 * earlier via strioctl.  Stash the mblk on the stdata and wake
+	 * the waiter; strioctl owns it from there.  Don't touch the
+	 * data queue or sd_readwait. */
+	if (sd && (mp->b_datap->db_type == M_IOCACK
+	        || mp->b_datap->db_type == M_IOCNAK)) {
+		unsigned long f = spin_lock_irq_save(&sd->sd_ioc_wq.sq_lock);
+		if (sd->sd_ioc_response) {
+			/* Spurious or duplicated ack -- drop the
+			 * newer one rather than overwriting an
+			 * unhandled response. */
+			spin_unlock_irq_restore(&sd->sd_ioc_wq.sq_lock, f);
+			freemsg(mp);
+			return 0;
+		}
+		sd->sd_ioc_response = mp;
+		spin_unlock_irq_restore(&sd->sd_ioc_wq.sq_lock, f);
+		kthread_wake_all(&sd->sd_ioc_wq);
+		return 0;
+	}
+
 	if (mp->b_datap->db_type == M_HANGUP) {
 		freemsg(mp);
 		if (sd) {
+			unsigned long f =
+				spin_lock_irq_save(&sd->sd_readwait.sq_lock);
 			sd->sd_flags |= SD_EOF;
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, f);
 			kthread_wake_all(&sd->sd_readwait);
 		}
 		return 0;
 	}
-	putq(q, mp);
+	if (sd) {
+		unsigned long f =
+			spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		putq(q, mp);
+		spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, f);
+	} else {
+		putq(q, mp);
+	}
 	/* Wake any reader parked on this stream head's read queue.
 	 * q_ptr was wired to the owning stdata in stream_build so we
 	 * can hop back from the queue to its waitq without a global
-	 * lookup. */
+	 * lookup.  The wake-all takes sd_readwait.sq_lock internally;
+	 * because we already released it above, the reader either
+	 * sees our putq via its own subsequent sq_lock+getq, or it
+	 * was already asleep and gets surgically removed by wake_all. */
 	if (sd)
 		kthread_wake_all(&sd->sd_readwait);
 	return 0;
@@ -253,46 +297,77 @@ static queue_t *bottom_driver_rq(struct stdata *sd)
 void uart_rx_main(void *arg)
 {
 	(void)arg;
+
+	/*
+	 * Phase 9 virtual-console switch keystroke: Ctrl-X N.  See
+	 * the earlier note for why Ctrl-X rather than Ctrl-A (QEMU
+	 * mon:stdio eats Ctrl-A).
+	 */
+	int vc_prefix_pending = 0;
+
 	for (;;) {
-		if (!console_active) {
-			/* Nothing listening yet -- don't drain the FIFO
-			 * or those bytes are lost.  Wait for the first
-			 * open of /dev/console. */
+		/* Wait until at least one possible sink exists -- either a
+		 * tty open we can route to via tty_drv_rq(active) or the
+		 * legacy console_active.  Draining FIFO with nowhere to
+		 * put bytes would lose them. */
+		if (!tty_drv_rq(tty_active()) && !console_active) {
 			kthread_yield();
 			continue;
 		}
 
 		int c = uart_getc_nonblock();
-		if (c == 0x03) {
-			/*
-			 * Ctrl-C: send SIGINT to the foreground reader of
-			 * the console.  Preferred target is whatever's on
-			 * the read wait queue right now; if it's empty
-			 * (typical: the reader is mid-loop processing the
-			 * previous byte), fall back to the most recent
-			 * reader (sd_last_reader, set by stream_read).
-			 *
-			 * kthread_signal pulls the thread off the wait
-			 * queue if blocked (so the read returns -1 with
-			 * the EINTR shape) AND sets the pending bit (so
-			 * check_signals on the way out of the syscall
-			 * dispatches to the user handler, if installed).
-			 *
-			 * No byte goes upstream -- the line-discipline
-			 * convention is that Ctrl-C is consumed.
-			 */
-			struct stdata *sd = console_active;
-			struct kthread *t = sd->sd_readwait.head;
-			if (!t && sd->sd_last_reader) {
-				t = kthread_find(sd->sd_last_reader);
+		if (c < 0) {
+			kthread_yield();
+			continue;
+		}
+
+		if (vc_prefix_pending) {
+			vc_prefix_pending = 0;
+			if (c >= '0' && c < '0' + NTTY) {
+				tty_switch(c - '0');
+				kthread_yield();
+				continue;
 			}
-			if (t) kthread_signal(t, SIGINT);
-		} else if (c >= 0) {
+			/* Not a digit -- silently drop both the held
+			 * Ctrl-A and the trailing byte.  The user typed
+			 * a stale prefix; losing one byte beats injecting
+			 * a Ctrl-A into the data stream. */
+			kthread_yield();
+			continue;
+		}
+
+		if (c == 0x18) {	/* Ctrl-X */
+			vc_prefix_pending = 1;
+			kthread_yield();
+			continue;
+		}
+
+		/* Phase 6: prefer the currently-active tty's drv_rq;
+		 * fall back to console_active if no /dev/tty<N> is
+		 * open yet (early boot or pre-multi-tty user space). */
+		queue_t *drq = tty_drv_rq(tty_active());
+		if (!drq && console_active)
+			drq = bottom_driver_rq(console_active);
+
+		if (c == 0x03) {
+			/* Ctrl-C delivery: route via the tty's fg_pgrp
+			 * (phase 5) when we're on a /dev/tty<N>; fall
+			 * back to console_active's sd_last_reader for
+			 * the legacy path. */
+			if (tty_drv_rq(tty_active())) {
+				tty_signal_fg_pgrp(tty_active(), SIGINT);
+			} else if (console_active) {
+				struct stdata *sd = console_active;
+				struct kthread *t = sd->sd_readwait.head;
+				if (!t && sd->sd_last_reader)
+					t = kthread_find(sd->sd_last_reader);
+				if (t) kthread_signal(t, SIGINT);
+			}
+		} else if (drq) {
 			mblk_t *mp = allocb(1, 0);
 			if (mp) {
 				*mp->b_wptr++ = (unsigned char)c;
-				queue_t *drq = bottom_driver_rq(console_active);
-				if (drq && drq->q_next)
+				if (drq->q_next)
 					putnext(drq, mp);
 				else
 					freemsg(mp);
@@ -489,6 +564,15 @@ static int do_ipush(struct stdata *sd, const char *modname)
 	sd->sd_wq->q_next  = m_wq;
 	old_top_rq->q_next = m_rq;
 	m_rq->q_next       = sd->sd_rq;
+
+	/* SVR4: call the module's read-side qi_qopen at push time so
+	 * per-instance state (ldterm's struct ldterm + termios, etc.)
+	 * gets allocated.  Phase 4: previously skipped, which meant
+	 * a user-space I_PUSH of any stateful module left q_ptr NULL
+	 * and the first putp dereferenced through it.  Same shape
+	 * stream_build uses on the driver. */
+	if (st->st_rdinit && st->st_rdinit->qi_qopen)
+		st->st_rdinit->qi_qopen(m_rq);
 	return 0;
 }
 
@@ -512,7 +596,8 @@ static int do_ipop(struct stdata *sd)
 
 /* ---- stream_fops -- the file_ops the VFS dispatches through ----------- */
 
-static struct stdata *stream_build(struct streamtab *drv_st, const char *name)
+static struct stdata *stream_build(struct streamtab *drv_st, const char *name,
+				   unsigned minor)
 {
 	struct stdata *sd = kmalloc(sizeof(*sd));
 	queue_t *head_rq = kmalloc(sizeof(*head_rq));
@@ -536,7 +621,10 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name)
 	sd->sd_name   = name;
 	sd->sd_flags  = 0;
 	sd->sd_peer   = NULL;
-	sd->sd_readwait.head = NULL;
+	sd->sd_minor  = minor;
+	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
+	sd->sd_ioc_wq   = (struct wait_queue)WAIT_QUEUE_INIT;
+	sd->sd_ioc_response = NULL;
 
 	/* Backref so sh_rq_putp can wake readers without a global
 	 * queue->stdata lookup.  The driver-side queues are not seen
@@ -554,6 +642,16 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name)
 	 * O(N) but the list is short (handful at most). */
 	sd->sd_all_next = all_open_streams;
 	all_open_streams = sd;
+
+	/* Hand the stdata backref to the driver's qi_qopen via the
+	 * read-queue's q_ptr.  Phase 3 multi-minor drivers (tty) use
+	 * this to look up sd_minor; the qopen typically overwrites
+	 * q_ptr with its own per-instance state pointer right after,
+	 * so single-minor drivers that don't read q_ptr (klog, proc-*)
+	 * are unaffected.  Both read AND write driver queues get the
+	 * backref so any qopen-time wiring is unambiguous. */
+	drv_rq->q_ptr = sd;
+	drv_wq->q_ptr = sd;
 
 	/* SVR4 streams call the driver's qi_qopen on the read side at
 	 * open time.  klog uses this to prime the queue with the ring
@@ -573,9 +671,49 @@ static int stream_open(struct file *f)
 			MAJOR(f->f_inode->i_rdev));
 		return -1;
 	}
-	struct stdata *sd = stream_build(cdev->streamtab, cdev->name);
+
+	/* Multi-minor tty driver: multiple opens of the same /dev/ttyN
+	 * share ONE stdata so all readers of the tty see the same
+	 * stream-head queue and uart_rx_main only has to know about
+	 * one sink per minor.  Bump sd_refs on every subsequent open;
+	 * stream_close decrements and tears down on the last close. */
+	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_TTY) {
+		struct queue *drq = tty_drv_rq((int)MINOR(f->f_inode->i_rdev));
+		if (drq) {
+			struct stdata *existing = drq->q_ptr;
+			/* drv_rq's q_ptr is &tty_minor[minor] after the
+			 * driver's qopen; the tty_minor->sd backref is
+			 * the actual stdata we want to share. */
+			if (existing) {
+				/* tty_drv_rq already returns NULL when sd
+				 * is NULL, so existing is the tty_minor;
+				 * fetch sd through it. */
+				struct stdata *sd =
+				    ((struct tty_minor *)existing)->sd;
+				if (sd) {
+					sd->sd_refs++;
+					f->f_private = sd;
+					return 0;
+				}
+			}
+		}
+	}
+
+	struct stdata *sd = stream_build(cdev->streamtab, cdev->name,
+					 MINOR(f->f_inode->i_rdev));
 	if (!sd)
 		return -1;
+
+	/* Auto-push the SVR4 line discipline onto every tty open.  In
+	 * Solaris this is what the autopush database (sad(7D)) drives
+	 * per-device; phase 4 hardcodes "ldterm on tty" because tty
+	 * is the only multi-cooking driver we have.  The push happens
+	 * AFTER stream_build so the driver's qi_qopen has already
+	 * wired its per-minor state via q_ptr -- ldterm pushes above
+	 * it without disturbing that. */
+	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_TTY)
+		(void)do_ipush(sd, "ldterm");
+
 	f->f_private = sd;
 	return 0;
 }
@@ -601,7 +739,14 @@ static int stream_close(struct file *f)
 	 * so the peer's later close doesn't chase a freed pointer. */
 	if (sd->sd_peer) {
 		struct stdata *peer = sd->sd_peer;
+		/* Same Phase-7 sq_lock interlock as sh_rq_putp's M_HANGUP
+		 * branch: peer's reader checks sd_flags & SD_EOF under
+		 * sd_readwait.sq_lock, so set the bit under the same lock
+		 * so the reader can't miss the EOF + sleep forever. */
+		unsigned long f =
+			spin_lock_irq_save(&peer->sd_readwait.sq_lock);
 		peer->sd_flags |= SD_EOF;
+		spin_unlock_irq_restore(&peer->sd_readwait.sq_lock, f);
 		peer->sd_peer   = NULL;
 		sd->sd_peer     = NULL;
 		kthread_wake_all(&peer->sd_readwait);
@@ -633,19 +778,29 @@ static int stream_close(struct file *f)
 	drain_q(sd->sd_wq);
 
 	if (sd->sd_drv_wq) {
-		/* Free any pushed-module pairs sitting between head and
-		 * driver. */
+		/* Walk the pushed-module pairs.  For each pair: invoke its
+		 * qi_qclose (so the module can free per-instance state +
+		 * clear any backrefs from upper modules to its q_ptr),
+		 * then drain + free both queues. */
 		queue_t *q = sd->sd_wq->q_next;
 		while (q && q != sd->sd_drv_wq) {
 			queue_t *next = q->q_next;
 			queue_t *peer_q = q->q_link;
+			if (q->q_qinfo && q->q_qinfo->qi_qclose)
+				q->q_qinfo->qi_qclose(peer_q);
 			drain_q(q);
 			drain_q(peer_q);
 			kfree(q);
 			kfree(peer_q);
 			q = next;
 		}
-		/* Now the driver pair. */
+		/* Now the driver pair.  qi_qclose on the read side gives
+		 * multi-minor drivers (tty) a chance to null out the
+		 * per-minor sd backref so the next open of the same minor
+		 * doesn't latch onto a freed stdata. */
+		if (sd->sd_drv_rq->q_qinfo
+		    && sd->sd_drv_rq->q_qinfo->qi_qclose)
+			sd->sd_drv_rq->q_qinfo->qi_qclose(sd->sd_drv_rq);
 		drain_q(sd->sd_drv_rq);
 		drain_q(sd->sd_drv_wq);
 		kfree(sd->sd_drv_rq);
@@ -700,23 +855,51 @@ static long stream_read(struct file *f, void *buf, size_t len)
 	/* Block until something arrives on the head's read queue, or
 	 * the peer closes (SD_EOF) and the backlog is drained.  The
 	 * SD_EOF check after getq is what gives us proper Unix EOF
-	 * semantics: drained data is still returned before the 0. */
+	 * semantics: drained data is still returned before the 0.
+	 *
+	 * Phase 7: take sd_readwait.sq_lock around the whole (getq +
+	 * EOF check + sleep_on) window.  sh_rq_putp / pipe close take
+	 * the same lock around their putq + SD_EOF mutations, so the
+	 * check-then-sleep race that drops a writer's wake when it
+	 * fires "too early" (before the reader is on the wq) is
+	 * closed.  kthread_sleep_on_locked releases sq_lock via the
+	 * phase-5 extra_release pathway -- the reader is on the wq
+	 * before any new writer can acquire sq_lock and putq more
+	 * data. */
 	mblk_t *mp;
+	unsigned long flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
 	for (;;) {
 		mp = getq(sd->sd_rq);
 		if (mp) break;
-		if (sd->sd_flags & SD_EOF)
+		if (sd->sd_flags & SD_EOF) {
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, flags);
 			return 0;	/* EOF -- no more writers */
+		}
 		/* A pending fatal signal short-circuits the read so the
 		 * thread can exit cleanly in check_signals on the way
 		 * back out of the syscall.  Mirrors EINTR on real Unix
 		 * (we don't surface errno yet). */
 		{ struct kthread *me = curthread;
-		  if (me && (me->sig_pending & SIG_FATAL_MASK)) return -1; }
-		kthread_sleep_on(&sd->sd_readwait);
+		  if (me && (me->sig_pending & SIG_FATAL_MASK)) {
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
+					        flags);
+			return -1;
+		  }
+		}
+		kthread_sleep_on_locked(&sd->sd_readwait, flags);
+		/* sleep_on_locked releases sq_lock as part of ctx_switch
+		 * save and restores our caller's IRQ state at the tail.
+		 * Re-acquire for the next loop iteration's getq. */
+		flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
 		{ struct kthread *me = curthread;
-		  if (me && (me->sig_pending & SIG_FATAL_MASK)) return -1; }
+		  if (me && (me->sig_pending & SIG_FATAL_MASK)) {
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
+					        flags);
+			return -1;
+		  }
+		}
 	}
+	spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, flags);
 
 	/*
 	 * Walk the b_cont chain copying out bytes, advancing each mblk's
@@ -746,6 +929,12 @@ static long stream_read(struct file *f, void *buf, size_t len)
 		}
 	}
 
+	/* putbq mutates sd_rq -- same queue sh_rq_putp's putq writes
+	 * to.  Take sd_readwait.sq_lock for the leftover put-back so a
+	 * concurrent putq/getq doesn't trip over a half-updated
+	 * q_first/q_last pair.  Lock is released immediately; the
+	 * caller already copied data to user above without holding it,
+	 * which is what we want (no spinlock across uaccess). */
 	if (cur && cur != mp) {
 		/* Drained mp..(predecessor of cur); leftover starts at cur. */
 		mblk_t *prev = mp;
@@ -753,10 +942,16 @@ static long stream_read(struct file *f, void *buf, size_t len)
 			prev = prev->b_cont;
 		prev->b_cont = NULL;
 		freemsg(mp);
+		unsigned long f2 =
+			spin_lock_irq_save(&sd->sd_readwait.sq_lock);
 		putbq(sd->sd_rq, cur);
+		spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, f2);
 	} else if (cur) {
 		/* mp itself has leftover; put it back unchanged. */
+		unsigned long f2 =
+			spin_lock_irq_save(&sd->sd_readwait.sq_lock);
 		putbq(sd->sd_rq, mp);
+		spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, f2);
 	} else {
 		/* Chain fully drained. */
 		freemsg(mp);
@@ -787,6 +982,121 @@ static long stream_write(struct file *f, const void *buf, size_t len)
 	return r < 0 ? r : (long)len;
 }
 
+/* ---- M_IOCTL strioctl glue --------------------------------------------- */
+
+/* Per-cmd payload size table -- maps the ioctl command to the
+ * number of bytes the user buffer holds.  Used by both the
+ * "build M_IOCTL going down" and the "copy response back to user"
+ * paths so the two stay symmetric.  Unknown commands get 0 and
+ * stream_ioctl bails out before allocating a payload mblk. */
+static int strioctl_payload_size(int cmd)
+{
+	switch (cmd) {
+	case TCGETA:
+	case TCSETA:
+	case TCSETAW:
+	case TCSETAF:
+		return (int)sizeof(struct termios);
+	case TCFLSH:
+		return 0;
+	default:
+		return -1;
+	}
+}
+
+static long strioctl(struct stdata *sd, int cmd, long arg)
+{
+	int payload = strioctl_payload_size(cmd);
+	if (payload < 0)
+		return -1;
+	if (!sd->sd_wq->q_next)
+		return -1;
+
+	/* Build the M_IOCTL mblk: iocblk header in the first mblk, the
+	 * payload (a struct termios for TCSETA, etc.) chained via
+	 * b_cont.  TCSETA / TCFLSH copy data IN from user; TCGETA gets
+	 * its payload filled by the module on the way back up. */
+	mblk_t *iocmp = allocb(sizeof(struct iocblk), 0);
+	if (!iocmp) return -1;
+	iocmp->b_datap->db_type = M_IOCTL;
+	struct iocblk *ic = (struct iocblk *)iocmp->b_wptr;
+	ic->ic_cmd   = cmd;
+	ic->ic_count = payload;
+	ic->ic_error = 0;
+	ic->ic_tid   = curthread ? (int)curthread->tid : -1;
+	iocmp->b_wptr += sizeof(*ic);
+
+	if (payload > 0) {
+		mblk_t *data = allocb((size_t)payload, 0);
+		if (!data) {
+			freemsg(iocmp);
+			return -1;
+		}
+		/* TCSETA / TCSETAW / TCSETAF carry data IN -- copy from
+		 * user space (or kernel, for in-kernel callers).
+		 * TCGETA carries data OUT only -- the module fills it
+		 * on the way back. */
+		if (cmd == TCSETA || cmd == TCSETAW || cmd == TCSETAF) {
+			if (syscall_from_user) {
+				if (copy_from_user(data->b_wptr,
+				                   (const void *)(uintptr_t)arg,
+				                   (size_t)payload) < 0) {
+					freemsg(iocmp);
+					freemsg(data);
+					return -1;
+				}
+			} else {
+				kmemcpy(data->b_wptr,
+				        (const void *)(uintptr_t)arg,
+				        (size_t)payload);
+			}
+		}
+		data->b_wptr += payload;
+		iocmp->b_cont = data;
+	}
+
+	/* Send the M_IOCTL down the write side.  Modules + driver get
+	 * their crack at it via their qi_putp; whoever recognises
+	 * ic_cmd flips db_type and putnexts back up. */
+	putnext(sd->sd_wq, iocmp);
+
+	/* Wait for sh_rq_putp to stash the response.  sd_ioc_wq is
+	 * the rendezvous queue.  We hold sq_lock around the check +
+	 * sleep to close the lost-wakeup window that phases 5c/6/7
+	 * handled for the data path. */
+	unsigned long flags = spin_lock_irq_save(&sd->sd_ioc_wq.sq_lock);
+	while (sd->sd_ioc_response == NULL) {
+		kthread_sleep_on_locked(&sd->sd_ioc_wq, flags);
+		flags = spin_lock_irq_save(&sd->sd_ioc_wq.sq_lock);
+	}
+	mblk_t *resp = sd->sd_ioc_response;
+	sd->sd_ioc_response = NULL;
+	spin_unlock_irq_restore(&sd->sd_ioc_wq.sq_lock, flags);
+
+	/* Decode the response.  iocblk in the head mblk, payload (if
+	 * any) in b_cont.  ic_error == 0 + db_type == M_IOCACK means
+	 * success; M_IOCNAK or non-zero ic_error means failure. */
+	long ret = -1;
+	struct iocblk *ric = (struct iocblk *)resp->b_rptr;
+	if (resp->b_datap->db_type == M_IOCACK && ric->ic_error == 0) {
+		ret = 0;
+		if (cmd == TCGETA && resp->b_cont) {
+			mblk_t *rdata = resp->b_cont;
+			size_t n = (size_t)(rdata->b_wptr - rdata->b_rptr);
+			if (n > (size_t)payload) n = (size_t)payload;
+			if (syscall_from_user) {
+				if (copy_to_user((void *)(uintptr_t)arg,
+				                 rdata->b_rptr, n) < 0)
+					ret = -1;
+			} else {
+				kmemcpy((void *)(uintptr_t)arg, rdata->b_rptr, n);
+			}
+		}
+	}
+	freemsg(resp);
+	return ret;
+}
+
 static long stream_ioctl(struct file *f, int cmd, long arg)
 {
 	struct stdata *sd = f->f_private;
@@ -798,7 +1108,12 @@ static long stream_ioctl(struct file *f, int cmd, long arg)
 	case I_POP:
 		return do_ipop(sd);
 	default:
-		return -1;
+		/* Everything else flows down the stream as M_IOCTL.  The
+		 * module or driver that owns the command (TCGETA on
+		 * ldterm, future driver-private commands on a tty
+		 * driver, ...) processes it and responds via M_IOCACK /
+		 * M_IOCNAK. */
+		return strioctl(sd, cmd, arg);
 	}
 }
 
@@ -929,7 +1244,10 @@ static struct stdata *pipe_end(const char *name)
 	sd->sd_name   = name;
 	sd->sd_flags  = 0;
 	sd->sd_peer   = NULL;
-	sd->sd_readwait.head = NULL;
+	sd->sd_minor  = 0;	/* pipes have no minor */
+	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
+	sd->sd_ioc_wq   = (struct wait_queue)WAIT_QUEUE_INIT;
+	sd->sd_ioc_response = NULL;
 	rq->q_ptr = sd;	/* so sh_rq_putp can wake readers */
 	wq->q_ptr = sd;
 	sd->sd_all_next = all_open_streams;
@@ -1078,6 +1396,10 @@ void streams_head_init(void)
 	streams_register("fbcon",   &fbcon_streamtab);
 #endif
 
+	/* SVR4 line discipline -- registers "ldterm" so a tty stream
+	 * can do I_PUSH "ldterm" and get cooked-mode + termios. */
+	ldterm_init();
+
 	/* SVR4 cdevsw: each openable STREAMS driver claims a major
 	 * number.  Modules (upper, delay) are pushed onto an already-
 	 * open stream and don't need a major; we register them here
@@ -1104,6 +1426,15 @@ void streams_head_init(void)
 #ifdef __aarch64__
 	vfs_mknod_chrdev(dev, "fbcon",   MKDEV(CDEV_MAJ_FBCON,   0));
 #endif
+
+	/* Phase 3 virtual-console TTYs.  tty_init registers the cdev
+	 * + streamtab; the /dev nodes go here so /dev lookup stays in
+	 * one place. */
+	tty_init();
+	vfs_mknod_chrdev(dev, "tty0", MKDEV(CDEV_MAJ_TTY, 0));
+	vfs_mknod_chrdev(dev, "tty1", MKDEV(CDEV_MAJ_TTY, 1));
+	vfs_mknod_chrdev(dev, "tty2", MKDEV(CDEV_MAJ_TTY, 2));
+	vfs_mknod_chrdev(dev, "tty3", MKDEV(CDEV_MAJ_TTY, 3));
 
 	kprintf("stream_head: registered modules:");
 	for (struct stmod_entry *e = registry; e; e = e->next)

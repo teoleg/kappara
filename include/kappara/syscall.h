@@ -57,8 +57,13 @@
 #define SYS_wait	26	/* (int tid) -> 0 once tid has exited,     *
 				 * -1 on bad tid or interruption          */
 #define SYS_execve	27	/* (const char *path) -> tid / -1          */
+#define SYS_setpgid	28	/* (pid, pgid) -- POSIX setpgid             */
+#define SYS_getpgrp	29	/* () -> curthread->t_pgrp                  */
+#define SYS_setsid	30	/* () -> new session id                     */
+#define SYS_tcsetpgrp	31	/* (fd, pgid) -> 0 -- set tty fg pgrp       */
+#define SYS_tcgetpgrp	32	/* (fd) -> pgid                             */
 
-#define SYS_MAX		28
+#define SYS_MAX		33
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

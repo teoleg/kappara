@@ -18,6 +18,7 @@ The prompt shows the current working directory: `kappara:/etc#`.
 | `pwd`                      | Print working directory.                                    |
 | `cat <path>`               | Dump a file's bytes to the console.                         |
 | `echo <path> <text>`       | Overwrite a file with `<text>` (creates if missing).        |
+| `vc <n> <text>`            | Write `<text>` to `/dev/tty<n>` (one-digit minor) without doing the cwd-relative open the `echo` command does.  Lets you put bytes into an inactive virtual console's cell buffer; switch to that tty via `Ctrl-X <n>` to see them.  See ARCHITECTURE.md "Virtual consoles" for the bigger picture. |
 | `append <path> <text>`     | Append `<text>` + newline to a file.                        |
 | `touch <path>`             | Create an empty file under a kfs mount.                     |
 | `mkdir <path>`             | Create a directory under a kfs mount.                       |
@@ -138,25 +139,50 @@ user binary.
 
 ### Layout
 
-Hardcoded 80x24:
+Hardcoded 80x24, double-line borders (UTF-8 box drawing) with the
+title embedded in the top border, Norton-style:
 
 ```
-+--------- Row 1: header bar -------------+-----------------------+
-|/path/of/left          /path/of/right                            |
-+ Rows 2..21: 20 entries per panel ------+-----------------------+
-| ..                            DIR     | etc                DIR  |
-| motd                           31     | proc               DIR  |
-| readme                         93     | dev                DIR  |
-+----- Row 22: separator -----------------------------------------+
-| Row 23: status -- /selected/path  31 bytes                      |
-| Row 24: 1Help 2Menu 3View 4Edit 5Copy 6RenMv 7Mkdir 8Delet ...   |
-+-----------------------------------------------------------------+
+╔═════════════ /home/user ═════════════╦═══════════ Info ═══════════════╗
+║ ..                            UP-DIR ║   Kappara Commander -- Info    ║
+║ etc                              DIR ║                                ║
+║ motd                              31 ║   Name: motd                   ║
+║ readme                            93 ║   Path: /home/user/motd        ║
+║                                      ║                                ║
+║                                      ║   Type: regular file           ║
+║                                      ║   Size: 31 bytes               ║
+║                                      ║                                ║
+║                                      ║   -- content ----              ║
+║                                      ║   welcome to kappara! ...      ║
+║                                      ║                                ║
+║ ... (rows 2..21)                     ║   ... (info content)           ║
+╚══════════════════════════════════════╩════════════════════════════════╝
+ /home/user/motd  31 bytes
+ 1Help 2Menu 3View 4Edit 5Copy 6RenMv 7Mkdir 8Delet 9PullDn qQuit
 ```
 
-Classic Norton Commander palette: panel background is **blue** (ANSI
+Left panel is the file listing (navigable with arrow keys); right
+panel is the **Info pane** showing the properties of the highlighted
+entry: name, full path, and either a directory summary or, for
+regular files, a content preview.  The preview is sniffed first:
+
+- **Text** files (no NUL, no 0x7F, no control bytes outside
+  HT/LF/CR in the first 256 bytes) get rendered as plain text with
+  non-printables stripped, up to ~512 bytes.
+- **Binary** files get a compact hex dump:
+  ```
+    -- hex ----
+    000  7f 45 4c 46 02 01 01 00 .ELF....
+    008  03 00 b7 00 01 00 00 00 ........
+    ...
+  ```
+  8 bytes per row + ASCII column on the right, ~14 rows shown
+  (112 bytes total).  Non-printable ASCII bytes are rendered as `.`.
+
+Classic Norton Commander palette: panel background **blue** (ANSI
 `\033[44m`), regular files in light grey, directories in bold
-bright-white, selected entry inverted to black-on-cyan, active-panel
-header bold black-on-white, function-key footer black-on-cyan.
+bright-white, selected entry inverted to black-on-cyan,
+function-key footer black-on-cyan.
 
 ### Keys
 

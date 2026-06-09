@@ -259,3 +259,71 @@ void fbcon_init_cursor(uint32_t y)
 	fbcon.cx = 0;
 	fbcon.cy = y;
 }
+
+/* ---- Phase 7: cell-grid renderer driven by struct vt ------------------ */
+
+#include "kappara/vt.h"
+
+/* Map a VT color (0..15 with VT_COLOR_BRIGHT bit) to a 32-bit ARGB
+ * value.  The standard 16-color VGA palette -- close enough to xterm
+ * defaults that programs that hardcode the basic 8 colors look right.
+ * VT_COLOR_DEFAULT picks "light grey" for fg and "black" for bg, the
+ * xterm convention. */
+static uint32_t fbcon_palette_fg[16] = {
+	0xff000000u, 0xffaa0000u, 0xff00aa00u, 0xffaa5500u,
+	0xff0000aau, 0xffaa00aau, 0xff00aaaau, 0xffaaaaaau,
+	0xff555555u, 0xffff5555u, 0xff55ff55u, 0xffffff55u,
+	0xff5555ffu, 0xffff55ffu, 0xff55ffffu, 0xffffffffu,
+};
+
+static uint32_t fbcon_argb_fg(uint8_t c)
+{
+	if (c == VT_COLOR_DEFAULT) return 0xffaaaaaau;	/* light grey */
+	return fbcon_palette_fg[c & 0xf];
+}
+
+static uint32_t fbcon_argb_bg(uint8_t c)
+{
+	if (c == VT_COLOR_DEFAULT) return 0xff000000u;	/* black */
+	return fbcon_palette_fg[c & 0xf];
+}
+
+/* Render one cell at grid position (row, col).  Caller is responsible
+ * for the surrounding dc cvac flush. */
+static void fbcon_render_cell(const struct vt_cell *cell, int row, int col)
+{
+	const struct framebuffer *fb = framebuffer_get();
+	if (!fb) return;
+	uint32_t fg = fbcon_argb_fg(cell->fg);
+	uint32_t bg = fbcon_argb_bg(cell->bg);
+	if (cell->flags & VT_FLAG_REVERSE) {
+		uint32_t t = fg; fg = bg; bg = t;
+	}
+	uint32_t x = (uint32_t)col * FBCON_CW;
+	uint32_t y = (uint32_t)row * FBCON_CH;
+	framebuffer_putc(x, y, (char)cell->ch, fg, bg, FBCON_SCALE);
+}
+
+/* Repaint the entire cell grid for the given VT.  The grid is laid
+ * out starting at (0,0) of the framebuffer; on a 1024x768 display
+ * with FBCON_SCALE=1 the grid is 80x24 chars = 640x192 pixels and
+ * leaves the bottom 576 rows untouched for the kprintf/splash band
+ * the existing tee mode uses. */
+void fbcon_render_vt(const struct vt *v)
+{
+	if (!framebuffer_get() || !v) return;
+	/* Clear the grid background to BG first so cells that have
+	 * never been written (or just got blanked) come out as the
+	 * default colour instead of stale splash pixels. */
+	framebuffer_rect(0, 0,
+	                 (uint32_t)VT_COLS * FBCON_CW,
+	                 (uint32_t)VT_ROWS * FBCON_CH,
+	                 0xff000000u);
+	for (int r = 0; r < VT_ROWS; r++) {
+		for (int c = 0; c < VT_COLS; c++) {
+			fbcon_render_cell(&v->cells[r][c], r, c);
+		}
+	}
+	fbcon_mark_dirty(0, (uint32_t)VT_ROWS * FBCON_CH);
+	fbcon_tee_flush();
+}

@@ -630,6 +630,45 @@ static void cmd_cat(int argc, char *argv[])
 	sys_close((int)fd);
 }
 
+/* vc <n> <text...>  -- write text to /dev/tty<n> without doing the
+ * resolve_path / open dance the echo command does.  Lets you put
+ * something into an INACTIVE tty's cell buffer; the bytes show up
+ * when you switch to that tty via Ctrl-A N. */
+static void cmd_vc(int argc, char *argv[])
+{
+	if (argc < 3) {
+		cwrite("usage: vc <n> <text...>\r\n");
+		return;
+	}
+	/* argv[1] is a single ASCII digit */
+	if (argv[1][0] < '0' || argv[1][0] > '9' || argv[1][1] != '\0') {
+		cwrite("vc: <n> must be a single digit\r\n");
+		return;
+	}
+	char path[16];
+	path[0] = '/'; path[1] = 'd'; path[2] = 'e'; path[3] = 'v';
+	path[4] = '/'; path[5] = 't'; path[6] = 't'; path[7] = 'y';
+	path[8] = argv[1][0]; path[9] = '\0';
+	long fd = sys_open(path, 0);
+	if (fd < 0) {
+		cwrite("vc: cannot open "); cwrite(path); cwrite("\r\n");
+		return;
+	}
+	char buf[256];
+	size_t off = 0;
+	for (int i = 2; i < argc; i++) {
+		if (i > 2 && off + 1 < sizeof(buf)) buf[off++] = ' ';
+		size_t l = ustrlen(argv[i]);
+		if (off + l > sizeof(buf)) l = sizeof(buf) - off;
+		for (size_t j = 0; j < l; j++) buf[off + j] = argv[i][j];
+		off += l;
+	}
+	if (off + 2 < sizeof(buf)) { buf[off++] = '\r'; buf[off++] = '\n'; }
+	(void)sys_write((int)fd, buf, off);
+	sys_close((int)fd);
+	cwrite("vc: wrote to "); cwrite(path); cwrite("\r\n");
+}
+
 static void cmd_echo(int argc, char *argv[])
 {
 	if (argc < 3) { cwrite("usage: echo <path> <text...>\r\n"); return; }
@@ -1518,6 +1557,7 @@ static void dispatch(char *line)
 
 	if      (!ustrcmp(argv[0], "help"))   cmd_help();
 	else if (!ustrcmp(argv[0], "pid"))    cmd_pid();
+	else if (!ustrcmp(argv[0], "vc"))     cmd_vc(argc, argv);
 	else if (!ustrcmp(argv[0], "pwd"))    cmd_pwd();
 	else if (!ustrcmp(argv[0], "cd"))     cmd_cd(argc, argv);
 	else if (!ustrcmp(argv[0], "ls"))     cmd_ls(argc, argv);
@@ -1595,13 +1635,25 @@ void _start(void)
 		sys_log(buf);
 	}
 
-	fd_console = (int)sys_open("/dev/console", 0); /* fd 0 = stdin  */
+	/* Phase 6: run on /dev/tty0 instead of /dev/console.  uart_rx_main
+	 * routes UART bytes to whichever /dev/tty<N> is currently active
+	 * (Ctrl-X N switches), so the shell on tty0 keeps working when
+	 * the user is "on" tty0 and goes quiet when they Ctrl-X to a
+	 * different tty.  ldterm above the tty driver carries termios
+	 * (raw + ISIG by default -- matches what this shell expects). */
+	fd_console = (int)sys_open("/dev/tty0", 0);	/* fd 0 = stdin  */
 	if (fd_console < 0) {
-		sys_log("init: open /dev/console failed");
+		/* Fall back to /dev/console if tty0 wasn't built (e.g.
+		 * pre-phase-3 kernel image).  Keeps the shell bootable
+		 * across kernel/userspace version mismatches. */
+		fd_console = (int)sys_open("/dev/console", 0);
+	}
+	if (fd_console < 0) {
+		sys_log("init: open tty0 + console failed");
 		for (;;) sys_yield();
 	}
-	sys_open("/dev/console", 0); /* fd 1 = stdout (for exec'd programs) */
-	sys_open("/dev/console", 0); /* fd 2 = stderr */
+	sys_open("/dev/tty0", 0);	/* fd 1 = stdout */
+	sys_open("/dev/tty0", 0);	/* fd 2 = stderr */
 
 	/*
 	 * Catch Ctrl-C.  The console driver intercepts byte 0x03,

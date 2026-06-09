@@ -100,6 +100,36 @@
 				 * their one-shot data is enqueued). */
 #define M_FLUSH		0x06	/* flush queues */
 #define M_ERROR		0x05	/* error from driver / module */
+#define M_IOCTL		0x09	/* ioctl command going DOWN */
+#define M_IOCACK	0x0c	/* successful ack going UP */
+#define M_IOCNAK	0x10	/* failure nak going UP */
+
+/* ---- Ioctl control block ------------------------------------------------
+ *
+ * SVR4 strioctl: ioctl(fd, cmd, &data) on a STREAMS file builds one
+ * of these (in the first mblk of an M_IOCTL chain) and sends it down
+ * the write side.  Modules and the driver inspect ic_cmd; if they
+ * recognise it they fill ic_error + ic_count, flip db_type to
+ * M_IOCACK (success) or M_IOCNAK (failure), and putnext back UP.
+ * The stream head wakes the calling thread and stream_ioctl copies
+ * the response payload back to user space.
+ *
+ *   ic_cmd     opaque command number (TCGETA, TCSETA, ...).
+ *   ic_count   on the way down: bytes in the b_cont payload.  On
+ *              the way back up: bytes in the response.  Set to 0
+ *              for "no payload" commands.
+ *   ic_error   0 on M_IOCACK, errno-shaped int on M_IOCNAK.
+ *   ic_tid     tid of the calling thread.  Lets the head match the
+ *              ack to the right waiter (one stream can have many
+ *              concurrent ioctl callers in principle, though only
+ *              one is realistic with the current shell).
+ */
+struct iocblk {
+	int  ic_cmd;
+	int  ic_count;
+	int  ic_error;
+	int  ic_tid;
+};
 
 /* ---- Data block --------------------------------------------------------- */
 
@@ -185,6 +215,14 @@ struct streamtab {
 /* ---- Public API --------------------------------------------------------- */
 
 void    streams_init(void);
+
+/* Line-discipline module (SVR4 ldterm).  ldterm_init registers it
+ * with the module registry so I_PUSH "ldterm" can find it.
+ * ldterm_selftest exercises canonical input, erase, VINTR, and
+ * OPOST on a self-contained synthetic queue stack. */
+void    ldterm_init(void);
+void    ldterm_selftest(void);
+void    ldterm_mioctl_selftest(void);
 
 mblk_t *allocb(size_t size, unsigned pri);
 void    freeb(mblk_t *mp);

@@ -237,22 +237,29 @@ long sys_sigsuspend_impl(uint32_t mask)
 	 * re-block the very signal we're about to dispatch -- the bug
 	 * that took the first masktest down.
 	 *
-	 * We sleep on thread_exit_wq even though we're not waiting
-	 * for a thread exit -- it's a convenient broadcast queue,
-	 * and kthread_signal pulls us off it surgically the moment
-	 * a signal arrives.  An incidental wake from someone else's
-	 * exit just retries the loop, which is harmless.
+	 * Sleep on the thread's PER-THREAD sigwait_wq, taking sq_lock
+	 * around both the mask install AND the (pending & ~mask) check.
+	 * kthread_signal takes the SAME sigwait_wq.sq_lock around the
+	 * sig_pending |=, so the check-then-sleep window is closed --
+	 * either we see the just-set bit and skip sleep, or we sleep
+	 * holding sq_lock and the signaler spins waiting for us to
+	 * release in switch_to_next's resumer (phase 5's extra_release
+	 * mechanism).  Mirrors phase 5c's sys_wait fix.
 	 */
 	struct kthread *t = curthread;
 	if (!t) return -1;
+
+	unsigned long flags = spin_lock_irq_save(&t->sigwait_wq.sq_lock);
 
 	t->sig_saved_mask         = t->sig_mask;
 	t->sig_mask_save_pending  = 1;
 	t->sig_mask               = mask & ~SIGBIT(SIGKILL);
 
 	while (!(t->sig_pending & ~t->sig_mask)) {
-		kthread_sleep_on(&thread_exit_wq);
+		kthread_sleep_on_locked(&t->sigwait_wq, flags);
+		flags = spin_lock_irq_save(&t->sigwait_wq.sq_lock);
 	}
+	spin_unlock_irq_restore(&t->sigwait_wq.sq_lock, flags);
 
 	return -1;	/* check_signals handles delivery + mask unwind */
 }
@@ -261,19 +268,104 @@ long sys_wait_impl(int tid)
 {
 	if (tid <= 0) return -1;
 	for (;;) {
-		/* kthread_find returns NULL for both "never existed" and
-		 * "exited (KT_DEAD or already reaped)" -- both are "tid
-		 * is gone, return 0".  We don't need to distinguish here
-		 * since we don't expose a status/exit-code yet. */
+		/* Take thread_exit_wq.sq_lock BEFORE reading kthread_find,
+		 * because kthread_exit sets state=KT_DEAD under the same
+		 * sq_lock.  Without holding sq_lock here, a waiter could
+		 * read state=KT_RUNNING (target still alive), then sleep
+		 * AFTER the target's wake (which observed an empty wq) --
+		 * the lost-wakeup hang seen in the phase-5 stress runs.
+		 * kthread_sleep_on_locked atomically transitions to
+		 * BLOCKED and releases sq_lock after ctx_switch save.
+		 * kthread_find returns NULL for both "never existed" and
+		 * "exited (KT_DEAD or already reaped)" -- both are "tid is
+		 * gone, return 0". */
+		unsigned long flags =
+			spin_lock_irq_save(&thread_exit_wq.sq_lock);
 		struct kthread *t = kthread_find((unsigned)tid);
-		if (!t) return 0;
+		if (!t) {
+			spin_unlock_irq_restore(&thread_exit_wq.sq_lock, flags);
+			return 0;
+		}
 
 		struct kthread *me = curthread;
-		if (me && (me->sig_pending & SIG_FATAL_MASK))
+		if (me && (me->sig_pending & SIG_FATAL_MASK)) {
+			spin_unlock_irq_restore(&thread_exit_wq.sq_lock, flags);
 			return -1;	/* EINTR shape */
+		}
 
-		kthread_sleep_on(&thread_exit_wq);
+		kthread_sleep_on_locked(&thread_exit_wq, flags);
 	}
+}
+
+/* ---- session / pgrp -- phase 5 ----------------------------------------
+ *
+ * Bare-minimum POSIX: setpgid(0,0) puts curthread into its own pgrp
+ * (with itself as leader, pgid == tid).  setsid() makes curthread
+ * both session leader AND pgrp leader, also clearing the controlling
+ * tty (which we don't track per-thread yet -- gap noted in the
+ * phase-5 design doc).
+ */
+
+long sys_setpgid_impl(int pid, int pgid)
+{
+	struct kthread *t = (pid == 0) ? curthread : kthread_find((unsigned)pid);
+	if (!t) return -1;
+	if (pgid < 0) return -1;
+	if (pgid == 0) pgid = (int)t->tid;
+	t->t_pgrp = (unsigned)pgid;
+	return 0;
+}
+
+long sys_getpgrp_impl(void)
+{
+	struct kthread *t = curthread;
+	return t ? (long)t->t_pgrp : -1;
+}
+
+long sys_setsid_impl(void)
+{
+	struct kthread *t = curthread;
+	if (!t) return -1;
+	/* POSIX says setsid fails if caller is already a pgrp leader;
+	 * we skip that check since we have no concept of pgrp-leader
+	 * uniqueness yet.  The effect of being a leader (pgid == tid)
+	 * is already what we install. */
+	t->t_session = t->tid;
+	t->t_pgrp    = t->tid;
+	return (long)t->tid;
+}
+
+/* Tcsetpgrp / tcgetpgrp wrap tty.c's per-minor fg_pgrp array.  fd
+ * must refer to a /dev/ttyN; checked via the underlying inode's
+ * cdev major.  We don't yet enforce "the calling session must own
+ * the controlling tty" -- another bookkeeping piece deferred for
+ * later. */
+#include "kappara/cdevsw.h"
+#include "kappara/vfs.h"
+#include "kappara/tty.h"
+
+static int fd_tty_minor(int fd)
+{
+	struct file *f = fd_get(fd);
+	if (!f || !f->f_inode) return -1;
+	if (MAJOR(f->f_inode->i_rdev) != CDEV_MAJ_TTY) return -1;
+	return (int)MINOR(f->f_inode->i_rdev);
+}
+
+long sys_tcsetpgrp_impl(int fd, int pgid)
+{
+	int minor = fd_tty_minor(fd);
+	if (minor < 0) return -1;
+	if (pgid < 0) return -1;
+	tty_set_fg_pgrp(minor, (unsigned)pgid);
+	return 0;
+}
+
+long sys_tcgetpgrp_impl(int fd)
+{
+	int minor = fd_tty_minor(fd);
+	if (minor < 0) return -1;
+	return (long)tty_fg_pgrp(minor);
 }
 
 void check_signals(struct trap_frame *tf)

@@ -163,6 +163,11 @@
 #define SCTLR_I			(1UL << 12)
 
 __attribute__((aligned(PAGE_SIZE))) static uint64_t l0_table[ENTRIES_PER_TABLE];
+
+unsigned long mmu_boot_l0_phys(void)
+{
+	return (unsigned long)(uintptr_t)l0_table;
+}
 __attribute__((aligned(PAGE_SIZE))) static uint64_t l1_table[ENTRIES_PER_TABLE];
 __attribute__((aligned(PAGE_SIZE))) static uint64_t l2_table[ENTRIES_PER_TABLE];
 
@@ -275,4 +280,109 @@ void mmu_init(void)
 		(unsigned long)(uintptr_t)l0_table,
 		(unsigned long)TCR_VALUE,
 		(unsigned long)MAIR_VALUE);
+}
+
+/* ---- Phase R1c2: per-process vm_map page tables ----------------------- */
+
+/*
+ * Each process gets its own L0 + L1 + L2 trinity.  The L0[0] entry
+ * points at the process's private L1; L1[0] points at the private L2
+ * (covering the low 1 GB) and L1[1] is the shared peripheral mapping
+ * carried over from boot.  L2 starts as a verbatim copy of the boot
+ * L2 -- which gives the process the same identity-mapped kernel
+ * region -- then sys_execve later overwrites the USER_VA L2 slot to
+ * point at this process's user code/data.
+ *
+ * Memory cost per process: 3 x 4 KiB = 12 KiB of page-table state,
+ * pmm-allocated, freed on process exit.
+ *
+ * The kernel runs in low-VA today, so EVERY process must keep the
+ * full kernel mapping live in its L2 -- otherwise switching to it
+ * would cause the kernel to fault on its own code.  When the kernel
+ * eventually moves to TTBR1_EL1 (high VA), per-process L2 will only
+ * need to cover user range.  Until then we eat the duplication.
+ */
+
+#include "kappara/process.h"
+
+/* Walk every L2 entry of the boot table and copy it into the new
+ * process's L2.  After this the process can run kernel code through
+ * the same identity mapping the boot CPU uses. */
+static void vmap_dup_kernel_l2(uint64_t *dst_l2)
+{
+	for (int i = 0; i < ENTRIES_PER_TABLE; i++)
+		dst_l2[i] = l2_table[i];
+}
+
+int mmu_vmap_create(struct vm_map *vm)
+{
+	if (!vm) return -1;
+
+	void *l0 = pmm_alloc();
+	void *l1 = pmm_alloc();
+	void *l2 = pmm_alloc();
+	if (!l0 || !l1 || !l2) {
+		if (l0) pmm_free(l0);
+		if (l1) pmm_free(l1);
+		if (l2) pmm_free(l2);
+		return -1;
+	}
+
+	uint64_t *l0_va = (uint64_t *)l0;
+	uint64_t *l1_va = (uint64_t *)l1;
+	uint64_t *l2_va = (uint64_t *)l2;
+
+	/* pmm returns zero pages, so unused entries are already 0
+	 * (invalid).  Just wire the three levels and copy the boot
+	 * L2 in. */
+	l0_va[0] = (uint64_t)(uintptr_t)l1 | D_VALID | D_TABLE;
+	l1_va[0] = (uint64_t)(uintptr_t)l2 | D_VALID | D_TABLE;
+	/* Inherit the peripheral 1 GB mapping at L1[1] from boot --
+	 * the kernel touches PL011 UART + GPIO + mailboxes through
+	 * here and would fault on switch otherwise. */
+	l1_va[1] = l1_table[1];
+
+	vmap_dup_kernel_l2(l2_va);
+
+	vm->l0_phys = (uint64_t)(uintptr_t)l0;
+	vm->l1_phys = (uint64_t)(uintptr_t)l1;
+	vm->l2_phys = (uint64_t)(uintptr_t)l2;
+	return 0;
+}
+
+void mmu_vmap_destroy(struct vm_map *vm)
+{
+	if (!vm) return;
+	if (vm->l0_phys) pmm_free((void *)(uintptr_t)vm->l0_phys);
+	if (vm->l1_phys) pmm_free((void *)(uintptr_t)vm->l1_phys);
+	if (vm->l2_phys) pmm_free((void *)(uintptr_t)vm->l2_phys);
+	vm->l0_phys = vm->l1_phys = vm->l2_phys = 0;
+}
+
+/* Install a 2 MB user-RW block at `va` -> `pa` in `vm`'s L2.  Same
+ * descriptor format mmu_map_user_2mb uses on the boot table.  No
+ * TLBI is issued because the new mapping isn't live until something
+ * later writes TTBR0_EL1 = vm->l0_phys. */
+void mmu_vmap_map_user_2mb(struct vm_map *vm, uint64_t va, uint64_t pa)
+{
+	if (!vm || !vm->l2_phys) return;
+	uint64_t *l2 = (uint64_t *)(uintptr_t)vm->l2_phys;
+	unsigned idx = (unsigned)(va >> BLOCK_2M_SHIFT) & 0x1ff;
+	l2[idx] = pa | D_VALID | D_ATTRIDX(ATTR_NORMAL_IDX) |
+		  D_AP_RW_EL0 | D_SH_INNER | D_AF;
+}
+
+/* Set the current CPU's TTBR0_EL1 to `vm`'s L0 and flush the local
+ * TLB.  Called from switch_to_next when crossing a process
+ * boundary; safe to call from any IRQ-masked kernel context. */
+void mmu_vmap_switch(const struct vm_map *vm)
+{
+	if (!vm) return;
+	__asm__ volatile (
+		"msr	ttbr0_el1, %0\n"
+		"isb\n"
+		"tlbi	vmalle1\n"
+		"dsb	ish\n"
+		"isb\n"
+		: : "r"(vm->l0_phys) : "memory");
 }

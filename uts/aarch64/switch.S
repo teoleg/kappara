@@ -112,12 +112,27 @@ context_switch:
 	ret
 
 /*
- * First-run entry for a thread created by kthread_create.  Its prepared
- * initial frame stores fn in x19 and arg in x20; this trampoline unmasks
- * IRQs (so the new thread is preemptible) and tail-calls fn(arg).
+ * First-run entry for a thread created by kthread_create.  Initial
+ * frame stores fn in x19 and arg in x20; arrives with DAIF.I set
+ * (arch_thread_init_frame initial saved DAIF = 0x80, see thread.c).
+ *
+ *   1. bl sched_finish_switch
+ *      Drains c->cpu_pending_requeue (push prev onto dispq with
+ *      t_lockp transition) and releases cpu_thread_lock that was
+ *      held across context_switch.  Must run with IRQs masked
+ *      because we still hold cpu_thread_lock at entry; an IRQ
+ *      that triggered swtch on this CPU would deadlock.
+ *
+ *   2. msr daifclr, #2
+ *      Unmask IRQs.  Now preemptible.
+ *
+ *   3. mov x0, x20; blr x19
+ *      Tail-call fn(arg).  If fn returns, fall through to
+ *      kthread_exit.
  */
 .global thread_trampoline
 thread_trampoline:
+	bl	sched_finish_switch
 	msr	daifclr, #2
 	mov	x0, x20
 	blr	x19
