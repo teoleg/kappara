@@ -340,10 +340,11 @@ void kmain(void)
 	 * Carve the user-mapped VA windows out of the PMM.
 	 *
 	 * The kernel runs identity-mapped (VA == PA).  user_init() and
-	 * exec_space_init() later call mmu_map_user_2mb() to remap three
+	 * exec_space_init() later call mmu_map_user_2mb() to remap four
 	 * L2 entries so that the EL0-accessible 2 MB blocks at
-	 * 0x10000000, 0x20000000, and 0x20200000 point at dedicated BSS
-	 * storage (user_storage / exec_storage / exec_stack_storage).
+	 * 0x10000000, 0x20000000, 0x20200000, and 0x20400000 point at
+	 * dedicated BSS storage (user_storage / exec_storage /
+	 * exec_stack_storage / exec_heap_storage).
 	 *
 	 * If we let PMM hand out a 4 KB page whose PA falls inside one of
 	 * those windows, the kernel's own access through the identity VA
@@ -358,13 +359,13 @@ void kmain(void)
 	 * ret jumps EL1 to a garbage address -- instruction abort at
 	 * something like 0x200a78725f747261 ("art_rx\n").
 	 *
-	 * The fix: split pmm enrolment around the three holes.  Lost RAM
-	 * is 6 MB, which is fine on a 1 GB Pi.
+	 * The fix: split pmm enrolment around the four holes.  Lost RAM
+	 * is 8 MB (was 6 MB before heap window), which is fine on a 1 GB Pi.
 	 */
 	#define USER_HOLE_BASE	0x10000000UL
 	#define USER_HOLE_END	0x10200000UL
 	#define EXEC_HOLE_BASE	0x20000000UL
-	#define EXEC_HOLE_END	0x20400000UL
+	#define EXEC_HOLE_END	0x20600000UL	/* covers exec+stack+heap windows */
 	uintptr_t k_end = (uintptr_t)__kernel_end;
 	pmm_init(k_end, k_end < USER_HOLE_BASE ? USER_HOLE_BASE : k_end);
 	pmm_add_range(USER_HOLE_END < k_end ? k_end : USER_HOLE_END,

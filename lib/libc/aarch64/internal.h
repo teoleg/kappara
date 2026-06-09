@@ -14,6 +14,7 @@
 #define __NR_sigaction   22
 #define __NR_sigprocmask 24
 #define __NR_sigsuspend  25
+#define __NR_brk         33
 
 static inline long __syscall1(long nr, long a0) {
     register long x0 __asm__("x0") = a0;

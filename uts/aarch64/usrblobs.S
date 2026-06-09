@@ -68,3 +68,11 @@ pipe_blob_end:
 pipework_blob_start:
 	.incbin "build/cmd/pipework.elf"
 pipework_blob_end:
+
+	.section ".rodata.malloctest_blob","a",%progbits
+	.balign 8
+	.global malloctest_blob_start
+	.global malloctest_blob_end
+malloctest_blob_start:
+	.incbin "build/cmd/malloctest.elf"
+malloctest_blob_end:
