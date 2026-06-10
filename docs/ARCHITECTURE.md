@@ -78,7 +78,12 @@ DAIF masked, we zero `.bss`, set up an initial stack, and `bl kmain`.
     tee that used to compete with QEMU's display thread is disabled
     by default — see commit `0cd91fd`).
 14. `sched_init` (make `main` tid 0), `timer_init(100)`.
-15. Spawn `uart_rx` and `user-init` kthreads.
+15. Spawn `uart_rx` and one `user-init-N` kthread per `/dev/ttyN`
+    (4 shells total).  Each shell enters EL0 with x0 = N so its
+    `_start` can open `/dev/ttyN` as fds 0/1/2.  `uart_rx_main`
+    routes UART bytes only to the active tty, so the three
+    background shells sit `BLOCKED` in `sys_read` until `Ctrl-X N`
+    switches the active minor.
 16. Drop into the idle loop: `kthread_yield(); wfi;` forever.
 
 ## Memory

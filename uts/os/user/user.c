@@ -84,6 +84,11 @@
 #define USER_SIZE	0x00200000UL
 #define USER_STACK_TOP	(USER_VA + USER_SIZE)
 
+/* User-mode stack slot size.  Used by both the multi-shell pool
+ * (user_spawn) and sys_spawn workers, all carved from user_storage
+ * top-down.  See the layout diagram further down. */
+#define SPAWN_STACK_SIZE	0x10000UL
+
 /*
  * Backing storage: a 2 MB-aligned slab in BSS.  This is the physical
  * memory the user 2 MB VA window will eventually map to.
@@ -139,20 +144,67 @@ void user_init(void)
 		(unsigned long)USER_VA);
 }
 
+#include "kappara/tty.h"
+#include "kappara/user.h"
+#include "kappara/vfs.h"
+
+/* Forward decl -- defined later, near sys_spawn_impl. */
+static unsigned spawn_next;
+
+/* Per-init-shell launch args.  Each entry of the multi-shell pool
+ * spawned by user_spawn carries the same EL0 entry point but a
+ * different stack slot + tty number (in user x0). */
+struct init_args {
+	uint64_t entry;
+	uint64_t sp;
+	uint64_t tty;
+};
+
 static void user_thread_main(void *arg)
 {
-	(void)arg;
-	kprintf("user: kthread entering EL0 (entry=0x%lx, sp=0x%lx)\n",
-		(unsigned long)USER_VA, (unsigned long)USER_STACK_TOP);
-	aarch64_enter_userspace(USER_VA, USER_STACK_TOP, 0);
+	struct init_args a = *(struct init_args *)arg;
+	kfree(arg);
+	kprintf("user: kthread entering EL0 tty=%lu (entry=0x%lx, sp=0x%lx)\n",
+		(unsigned long)a.tty, (unsigned long)a.entry,
+		(unsigned long)a.sp);
+	aarch64_enter_userspace(a.entry, a.sp, a.tty);
 	/* unreachable */
 }
 
 void user_spawn(void)
 {
-	struct kthread *t = kthread_create("user-init", user_thread_main, NULL);
-	if (t)
+	/* Spawn one shell per /dev/ttyN.  Shell N runs at the EL0 entry
+	 * USER_VA with SP = USER_STACK_TOP - N*64KB and x0 = N, so
+	 * init's _start can open /dev/ttyN as fds 0/1/2.  Only the
+	 * currently-active tty drives output to UART; inactive shells
+	 * paint into their cell buffer and surface on tty_switch.
+	 *
+	 * Bump spawn_next past the multi-shell slots so any future
+	 * sys_spawn-ed workers don't collide with the shell stacks. */
+	for (unsigned i = 0; i < NTTY; i++) {
+		struct init_args *a = kmalloc(sizeof(*a));
+		if (!a) {
+			kprintf("user_spawn: kmalloc failed for tty=%u\n", i);
+			continue;
+		}
+		a->entry = USER_VA;
+		a->sp    = USER_VA + USER_SIZE - (uint64_t)i * SPAWN_STACK_SIZE;
+		a->tty   = i;
+
+		char name[16];	/* "user-init-N" fits */
+		const char *src = "user-init-";
+		char       *dst = name;
+		while (*src) *dst++ = *src++;
+		*dst++ = (char)('0' + i);
+		*dst   = '\0';
+
+		struct kthread *t = kthread_create(name, user_thread_main, a);
+		if (!t) { kfree(a); continue; }
 		kthread_setclass(t, SCLASS_TS);
+	}
+	/* spawn_next is incremented BEFORE use in sys_spawn_impl, so the
+	 * first sys_spawn worker wants `++spawn_next` to equal NTTY. */
+	spawn_next = NTTY - 1;
 }
 
 /*
@@ -186,10 +238,10 @@ void user_spawn(void)
 #define EXEC_HEAP_VA   0x20400000UL	/* heap: grows up from here */
 #define EXEC_HEAP_SIZE 0x00200000UL	/* 2 MB ceiling */
 
-#define SPAWN_STACK_SIZE	0x10000UL
+/* SPAWN_STACK_SIZE is defined near the top of the file. */
 #define SPAWN_MAX		((USER_SIZE / SPAWN_STACK_SIZE) - 1)
 
-static unsigned spawn_next;
+/* spawn_next forward-declared earlier so user_spawn can reset it. */
 static unsigned exec_spawn_next;
 
 struct spawn_args {

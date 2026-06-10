@@ -1,12 +1,21 @@
 # ksh — kappara shell reference
 
-`ksh` is the userspace shell, running at EL0 as PID 2.  It opens
-`/dev/console` for input/output, prints a prompt, reads a line via the
-blocking STREAMS path, tokenizes on spaces, and dispatches to one of
-the commands below.  Line editing supports backspace and **up/down
-arrow** for command history (last 16 lines).
+`ksh` is the userspace shell, running at EL0.  The kernel spawns one
+instance per `/dev/ttyN` (4 by default), so there's a separate shell
+PID waiting on each virtual console: `user-init-0` on tty0,
+`user-init-1` on tty1, etc.  Each shell opens its own `/dev/ttyN` as
+fds 0/1/2.  `uart_rx_main` routes UART bytes only to the active tty,
+so the three background shells sit BLOCKED in `sys_read` until you
+`Ctrl-X N` to switch the active console.
 
-The prompt shows the current working directory: `kappara:/etc#`.
+Each shell prints a prompt with its current working directory:
+`kappara:/#`.  The opening banner names the tty, e.g.
+`kappara shell on tty0 -- type 'help' for commands`.
+
+Line editing supports backspace and **up/down arrow** for command
+history (last 16 lines).  Globals like `cwd`, `ked`/`vi` state, etc.
+are shared across all four shells; since only the active tty drives
+input, this matters in practice only if you `Ctrl-X` mid-edit.
 
 ## File system
 
