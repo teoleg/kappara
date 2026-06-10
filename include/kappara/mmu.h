@@ -48,6 +48,21 @@ void mmu_vmap_destroy    (struct vm_map *vm);
 void mmu_vmap_map_user_2mb(struct vm_map *vm,
                            unsigned long va, unsigned long pa);
 void mmu_vmap_switch     (const struct vm_map *vm);
+
+/* R6: 4 KB user-page mappings, backed by PMM pages.  Each call into
+ * a fresh 2 MB region allocates an L3 table on demand.  Returns 0 on
+ * success, -1 if PMM is exhausted. */
+int      mmu_vmap_map_user_4k    (struct vm_map *vm,
+                                  unsigned long va, unsigned long pa);
+
+/* Walk vm's page tables for `va` and return the kernel-side address
+ * the user PA is identity-mapped at (so kernel code can read/write
+ * the user page directly).  Returns NULL if the VA isn't mapped. */
+void    *mmu_vmap_user_va_to_kva (const struct vm_map *vm, unsigned long va);
+
+/* Remove a 4 KB user page mapping and pmm_free the backing page.
+ * Returns the freed PA, or 0 if unmapped. */
+unsigned long mmu_vmap_unmap_user_4k(struct vm_map *vm, unsigned long va);
 #endif
 
 #endif

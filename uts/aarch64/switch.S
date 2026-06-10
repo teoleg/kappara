@@ -141,6 +141,60 @@ thread_trampoline:
 	b	1b
 
 /*
+ * fork_trampoline -- first-run entry for a kthread minted by sys_fork.
+ *
+ * The fork helper laid down a kernel-stack layout like this (top down):
+ *
+ *     [stack_top]
+ *     [288 bytes -- struct trap_frame copy of the parent's tf with
+ *                   x0=0 and sp_el0 patched to the child's user SP]
+ *     [112 bytes -- swtch frame: 12 callee regs (x19..x30=fork_tramp)
+ *                   + saved DAIF (=0x80) + pad]
+ *     [stack_low...]
+ *
+ * Saved kthread.sp points at the swtch frame's base, exactly as for a
+ * normal kthread_create.  context_switch pops the 112-byte frame and
+ * ret's into fork_trampoline with SP == stack_top - 288 (the trap
+ * frame's base).
+ *
+ * Sequence:
+ *   1. bl sched_finish_switch (drops cpu_thread_lock held across swtch)
+ *   2. KERNEL_EXIT epilogue (inline below to keep this self-contained)
+ *      Restores user PC + PSTATE + GPRs from the trap frame, eret to
+ *      EL0 with x0=0.
+ *
+ * Runs with DAIF.I masked (saved DAIF in swtch frame was 0x80).  The
+ * KERNEL_EXIT msr daifset re-asserts the mask across the ELR/SPSR
+ * write window -- same race avoidance as the shared trap_tail.
+ */
+.global fork_trampoline
+fork_trampoline:
+	bl	sched_finish_switch
+	msr	daifset, #2
+	ldp	x10, x11, [sp, #16*16]
+	msr	elr_el1,  x10
+	msr	spsr_el1, x11
+	ldp	x30, x10, [sp, #16*15]
+	msr	sp_el0,   x10
+	ldp	x0,  x1,  [sp, #16*0]
+	ldp	x2,  x3,  [sp, #16*1]
+	ldp	x4,  x5,  [sp, #16*2]
+	ldp	x6,  x7,  [sp, #16*3]
+	ldp	x8,  x9,  [sp, #16*4]
+	ldp	x10, x11, [sp, #16*5]
+	ldp	x12, x13, [sp, #16*6]
+	ldp	x14, x15, [sp, #16*7]
+	ldp	x16, x17, [sp, #16*8]
+	ldp	x18, x19, [sp, #16*9]
+	ldp	x20, x21, [sp, #16*10]
+	ldp	x22, x23, [sp, #16*11]
+	ldp	x24, x25, [sp, #16*12]
+	ldp	x26, x27, [sp, #16*13]
+	ldp	x28, x29, [sp, #16*14]
+	add	sp, sp, #288
+	eret
+
+/*
  * void aarch64_enter_userspace(uint64_t entry, uint64_t sp_el0, uint64_t arg);
  *   x0 = entry PC for EL0
  *   x1 = user-mode SP

@@ -68,6 +68,7 @@ unrecognised command.  Source lives in `cmd/`.
 | `pipe`        | Create a pipe, write a message, read it back in the same thread. |
 | `pipework`    | Spawn a writer thread and a reader thread connected by a pipe; demonstrates blocking-read EOF detection. |
 | `malloctest`  | Exercise libc `malloc`/`free`/`calloc`/`realloc` end-to-end; smoke test for `SYS_brk` and the sbrk-backed allocator. |
+| `forktest`    | R5 smoke test: parent forks, child mutates a global, exits with status 42; parent waits and verifies the mutation didn't leak across the address-space boundary. |
 
 Exec-space programs can call `sys_spawn` to create sub-threads.  The
 kernel allocates their stacks from `exec_stack_storage` starting at

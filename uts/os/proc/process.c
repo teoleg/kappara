@@ -31,9 +31,10 @@
 #include "kappara/string.h"
 
 struct vm_map init_vm_map = {
-	.l0_phys = 0,	/* filled in at process_init -- see below */
-	.refs    = 1,	/* held by init_process */
-	.lock    = SPINLOCK_INIT,
+	.l0_phys  = 0,	/* filled in at process_init -- see below */
+	.heap_brk = 0,	/* boot map has no heap; sys_brk rejects */
+	.refs     = 1,	/* held by init_process */
+	.lock     = SPINLOCK_INIT,
 };
 
 struct process init_process = {
@@ -93,7 +94,8 @@ struct vm_map *vm_map_create(void)
 	struct vm_map *vm = kmalloc(sizeof(*vm));
 	if (!vm) return 0;
 	kmemset(vm, 0, sizeof(*vm));
-	vm->refs = 1;
+	vm->refs     = 1;
+	vm->heap_brk = 0;	/* sys_execve / sys_fork stamp this */
 #ifdef __aarch64__
 	if (mmu_vmap_create(vm) < 0) {
 		kfree(vm);

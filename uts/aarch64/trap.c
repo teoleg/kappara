@@ -148,6 +148,16 @@ void trap_dispatch(struct trap_frame *tf, unsigned vec_id)
 			return;
 		}
 
+		/* SYS_fork needs the trap frame to snapshot the caller's
+		 * EL0 state into the child kthread's saved-frame layout.
+		 * Routed here for the same reason as sigreturn. */
+		if ((long)tf->x[8] == SYS_fork) {
+			tf->x[0] = (uint64_t)sys_fork_impl(tf);
+			syscall_from_user = 0;
+			check_signals(tf);
+			return;
+		}
+
 		tf->x[0] = (uint64_t)syscall_dispatch(
 				(long)tf->x[8],
 				(long)tf->x[0], (long)tf->x[1], (long)tf->x[2],

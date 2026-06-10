@@ -151,14 +151,37 @@ attributes (AP[2:1] = 01).  That's the userspace 2 MB at VA
 VA              Size    Purpose
 0x10000000      2 MB    init binary (user_storage BSS + mmu_map_user_2mb)
                         Stack top = 0x10200000; spawned threads share this window
-0x20000000      2 MB    exec code (exec_storage BSS + mmu_map_user_2mb)
-0x20200000      2 MB    exec stack (exec_stack_storage BSS + mmu_map_user_2mb)
+0x20000000      2 MB    exec code      (exec_storage[slot])
+0x20200000      2 MB    exec stack     (exec_stack_storage[slot])
                         Stack top = 0x20400000
+0x20400000      2 MB    exec heap      (exec_heap_storage[slot])
+                        Grows up from EXEC_HEAP_VA, controlled by SYS_brk
 ```
 
-The init and exec windows are both mapped once at boot (`user_init` /
-`exec_space_init`) and reused for every process.  Only one exec'd
-program runs at a time (the shell calls `sys_wait` before accepting the
+R6: each exec'd process owns its own vm_map (L0/L1/L2/L3 page
+tables) with EXEC_VA/EXEC_STACK_VA/EXEC_HEAP_VA mapped 4 KB at a
+time onto PMM-allocated pages.  No fixed slot pool; the number of
+concurrent processes is bounded only by PMM size (every exec
+consumes roughly 2 MB of stack + a few KB of code + L3/L2/L1/L0
+tables).  `sys_execve` allocates code pages while copying PT_LOAD
+bytes and the full 2 MB stack range upfront.  `sys_fork` walks the
+parent's L3 tables and allocates a fresh PMM page for each
+already-mapped user page, kmemcpying parent->child before installing
+the mapping in the child's L3.  Same EL0 VAs, different physical
+pages -- real Unix fork semantics.  `vm_map_put` -> `mmu_vmap_destroy`
+walks the L3 tables and `pmm_free`'s every user page on the last
+reference.
+
+`sys_brk` lives in the kernel's per-process `vm_map.heap_brk`.
+Growing the break allocates PMM pages and installs 4 KB mappings;
+shrinking unmaps + frees them.  malloc and friends just call
+`brk(0)` / `brk(addr)` as before; the libc layer is unchanged.
+
+The init window (USER_VA at 0x10000000) is still mapped once at
+boot as a single shared 2 MB block (all four init shells share
+`user_storage`).  fork is only available to exec'd processes; init
+shells trying to fork get rejected.  Only one exec'd program runs at
+a time per shell (the shell calls `sys_wait` before accepting the
 next command).
 
 ### ELF loader (sys_execve)
@@ -511,6 +534,70 @@ level.  `exec_space_init` builds such a table from the cmd-ELF
 blob symbols and mounts the result at `/usr/bin`.  Future on-disk
 storage (S2 SD/EMMC) plugs in by swapping the `block_device` —
 nothing else above the kfs layer changes.
+
+## Networking
+
+SVR4-flavoured layout: STREAMS for user-facing surfaces and driver
+framing, direct C calls for the protocol stack itself.  Real Solaris
+made the same hybrid choice once pure-STREAMS in the hot path proved
+too slow.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ user: cmd/ping (later)                                  │
+├─────────────────────────────────────────────────────────┤
+│ syscall: open("/dev/lo0"), open("/dev/icmp") (later)    │
+├─────────────────────────────────────────────────────────┤
+│ STREAMS cdevs: /dev/lo0, /dev/icmp, /dev/udp, /dev/tcp  │
+├─────────────────────────────────────────────────────────┤
+│ Direct-call protocol stack:                             │
+│   icmp_input  (auto echo-reply, deliver to waiters)     │
+│   ip_input / ip_output (header build/parse, route)      │
+│   netif registry (longest-prefix match)                 │
+├─────────────────────────────────────────────────────────┤
+│ Drivers: lo0 (loopback), slip0 (UART, future)           │
+└─────────────────────────────────────────────────────────┘
+```
+
+`struct netif` is the bottom-of-stack abstraction.  Each driver
+(currently just `lo0`) registers a netif carrying a name, IP, mask,
+MTU, and a `tx` callback.  `netif_route(dst_ip)` walks the registry
+picking the longest-prefix-match netif for routing.
+
+`mblk_t` carries packets through every layer -- same data container
+STREAMS modules already use, so the network stack composes naturally
+with the rest of the system.
+
+`ip_output(dst, proto, mp)` prepends an IPv4 header and calls
+`netif->tx`.  Caller must allocate the mblk with `IP_HDR_LEN` bytes
+of headroom; `ip_output` rewinds `b_rptr` to fill the header in
+place.  `ip_input` (called by `netif_input` from the driver rx path)
+validates the header + checksum, strips it, and dispatches by
+proto byte to `icmp_input`, future `udp_input`, future `tcp_input`.
+
+ICMP: `icmp_input` auto-replies to type 8 (echo request) by flipping
+the type byte, recomputing the checksum, and re-calling `ip_output`
+with the same mblk -- zero allocations on the reply path.  Type 0
+(echo reply) is stashed in a single-slot waiter (`icmp_arm_waiter`
++ `icmp_wait_reply`) so the boot selftest and future `cmd/ping`
+can observe their pong.
+
+lo0 (`uts/os/net/lo.c`) has dual personality: a `netif` that
+`netif_input`'s its own tx mblks back synchronously, and a STREAMS
+cdev `/dev/lo0` for raw-IP injection from user space later.
+
+`net_selftest` (runs at boot after `buf_selftest`): sends an ICMP
+echo request to 127.0.0.1, verifies the reply lands.  The whole
+round-trip is one synchronous call chain since lo0 loops in tx
+context -- by the time `icmp_send_echo` returns, the reply has
+already been processed and stashed in the waiter.
+
+Not yet:
+- UDP, TCP transports
+- BSD sockets layer (or TPI-shaped open("/dev/udp") with M_PROTO
+  primitives)
+- SLIP framing on UART2 for off-machine connectivity
+- ARP (only needed for Ethernet, not lo0 or SLIP)
 
 ## Signals
 
