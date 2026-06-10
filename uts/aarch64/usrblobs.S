@@ -100,3 +100,11 @@ ping_blob_end:
 ifconfig_blob_start:
 	.incbin "build/cmd/ifconfig.elf"
 ifconfig_blob_end:
+
+	.section ".rodata.udptest_blob","a",%progbits
+	.balign 8
+	.global udptest_blob_start
+	.global udptest_blob_end
+udptest_blob_start:
+	.incbin "build/cmd/udptest.elf"
+udptest_blob_end:

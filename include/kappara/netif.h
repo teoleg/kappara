@@ -28,16 +28,21 @@
 
 struct msgb;
 typedef struct msgb mblk_t;
+struct streamtab;
 
 struct netif {
 	const char *name;	/* "lo0", "slip0", ... -- not freed; static */
 	uint32_t    ip;		/* host byte order, e.g. 127.0.0.1 = 0x7f000001 */
 	uint32_t    netmask;	/* host byte order, e.g. /8 = 0xff000000 */
 	unsigned    mtu;	/* bytes -- IP datagram cap */
-	/* Driver send.  Caller hands ownership of `mp` to the netif;
-	 * driver freemsg's it on completion.  Returns 0 on success,
-	 * -1 if the driver couldn't queue it.  Called with no specific
-	 * lock held; driver does its own locking. */
+	/* The driver's STREAMS personality.  IP (the multiplexor) builds
+	 * a kernel stream from this and I_LINKs it underneath at boot.
+	 * The qi_putp on the write side is the "tx" entry point now --
+	 * IP's wput putnexts mblks into it. */
+	struct streamtab *streamtab;
+	/* Legacy direct-call tx -- unused after the N2b STREAMS migration
+	 * but kept on the struct so future drivers that never grew a
+	 * streamtab (e.g., a one-off pseudo-iface) could still fit. */
 	int       (*tx)(struct netif *nif, mblk_t *mp);
 	struct netif *next;	/* registry linkage; netif_register sets */
 };
@@ -49,11 +54,5 @@ struct netif *netif_route   (uint32_t dst_ip);
  * non-zero to stop iteration; netif_for_each returns that value. */
 int           netif_for_each(int (*cb)(struct netif *nif, void *arg),
                              void *arg);
-
-/* Drivers call this when a packet arrives (rx interrupt, lo0
- * loopback fire, etc.).  Hands the mblk to the IP layer (calls
- * ip_input internally).  The caller hands ownership of mp to
- * netif_input. */
-void          netif_input   (struct netif *nif, mblk_t *mp);
 
 #endif

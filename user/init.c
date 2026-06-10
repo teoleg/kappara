@@ -390,7 +390,8 @@ static void cmd_help(void)
 		"  ifconfig               dump /proc/netif (interface list)\r\n"
 		"  <name>                 unknown commands look up /usr/bin/<name>\r\n"
 		"                         (ps, sigtest, masktest, waittest, segvtest,\r\n"
-		"                          crash, pipe, pipework, malloctest, forktest)\r\n");
+		"                          crash, pipe, pipework, malloctest, forktest,\r\n"
+		"                          udptest)\r\n");
 }
 
 static void cmd_pid(void)

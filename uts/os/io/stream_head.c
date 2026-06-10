@@ -58,11 +58,12 @@
 #include "kappara/signal.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
+#include "kappara/string.h"
 #include "kappara/termios.h"
 #include "kappara/tty.h"
 #include "kappara/uaccess.h"
-#include "kappara/string.h"
 #include "kappara/uart.h"
+#include "kappara/udp.h"
 #include "kappara/vfs.h"
 
 /* Forward-declared in streams.h. */
@@ -598,7 +599,192 @@ static int do_ipop(struct stdata *sd)
 	return 0;
 }
 
+/* ---- I_LINK / I_UNLINK -- STREAMS multiplexor linking ------------------ */
+/*
+ * SVR4 ioctl(upper_fd, I_LINK, lower_fd) joins two open streams: the
+ * upper stream's driver (a multiplexor like /dev/ip) gains a "lower
+ * link" handle pointing at the lower stream, and messages going UP
+ * from the lower driver are diverted into the upper driver's read
+ * queue instead of the lower stream head.  This is how IP gets
+ * multiple netifs (lo0, slip0, eth0) underneath it: each is opened
+ * as its own stream, then I_LINKed under /dev/ip.
+ *
+ * Mechanics:
+ *   1. Allocate a muxid (small integer; user gets this back).
+ *   2. Build an M_IOCTL{I_LINK} with a linkblk payload carrying
+ *      the lower stream's queue handles.
+ *   3. putnext down the upper stream's write side.  The upper
+ *      driver's wput recognises I_LINK, records the lower's
+ *      handles in its per-instance mux state, flips db_type to
+ *      M_IOCACK and putnexts back up.
+ *   4. Stream head receives the ACK via the existing sd_ioc_wq
+ *      rendezvous (same machinery as TCGETA/TCSETA).
+ *   5. On success the head rewires the lower stream's READ chain:
+ *      the queue whose q_next was the lower stream head now points
+ *      at the upper driver's drv_rq.  Lower-driver-side rput's
+ *      putnext now lands in the upper driver, which can demux on
+ *      proto byte (for IP) or whatever it tracks.
+ *
+ * I_UNLINK reverses the rewire and tells the upper driver to forget
+ * the link.  The lower stream is otherwise unchanged and can be
+ * closed normally afterwards (or another I_LINK can re-join it).
+ */
+
+#define MUX_MAX	16
+
+static struct muxlink {
+	int             muxid;        /* 0 = slot free; else 1..MUX_MAX */
+	struct stdata  *upper;
+	struct stdata  *lower;
+	queue_t        *rewired_q;    /* queue whose q_next we mutated */
+	queue_t        *saved_qnext;  /* original q_next; restored on UNLINK */
+} muxtab[MUX_MAX];
+
+static int alloc_muxid(void)
+{
+	for (int i = 0; i < MUX_MAX; i++) {
+		if (muxtab[i].muxid == 0)
+			return i + 1;
+	}
+	return -1;
+}
+
+static struct muxlink *find_mux(int muxid, struct stdata *upper)
+{
+	if (muxid < 1 || muxid > MUX_MAX) return NULL;
+	struct muxlink *m = &muxtab[muxid - 1];
+	if (m->muxid != muxid)      return NULL;
+	if (upper && m->upper != upper) return NULL;
+	return m;
+}
+
+/* Synchronously send an M_IOCTL down the upper stream's write side
+ * and block on the existing sd_ioc_wq rendezvous until sh_rq_putp
+ * catches the M_IOCACK / M_IOCNAK.  Returns the response mblk on
+ * success (caller frees it), NULL on alloc failure. */
+static mblk_t *send_iolink_ioctl(struct stdata *upper, int cmd,
+                                 const struct linkblk *lk)
+{
+	mblk_t *iocmp = allocb(sizeof(struct iocblk), 0);
+	if (!iocmp) return NULL;
+	iocmp->b_datap->db_type = M_IOCTL;
+	struct iocblk *ic = (struct iocblk *)iocmp->b_wptr;
+	ic->ic_cmd   = cmd;
+	ic->ic_count = (int)sizeof(struct linkblk);
+	ic->ic_error = 0;
+	ic->ic_tid   = curthread ? (int)curthread->tid : -1;
+	iocmp->b_wptr += sizeof(*ic);
+
+	mblk_t *data = allocb(sizeof(struct linkblk), 0);
+	if (!data) { freemsg(iocmp); return NULL; }
+	*(struct linkblk *)data->b_wptr = *lk;
+	data->b_wptr += sizeof(*lk);
+	iocmp->b_cont = data;
+
+	putnext(upper->sd_wq, iocmp);
+
+	unsigned long flags = spin_lock_irq_save(&upper->sd_ioc_wq.sq_lock);
+	while (upper->sd_ioc_response == NULL) {
+		kthread_sleep_on_locked(&upper->sd_ioc_wq, flags);
+		flags = spin_lock_irq_save(&upper->sd_ioc_wq.sq_lock);
+	}
+	mblk_t *resp = upper->sd_ioc_response;
+	upper->sd_ioc_response = NULL;
+	spin_unlock_irq_restore(&upper->sd_ioc_wq.sq_lock, flags);
+	return resp;
+}
+
+/* Find the queue just below the head on the lower stream's READ
+ * side -- the one whose q_next is lower->sd_rq.  That's the queue
+ * we rewire so data going UP enters the upper driver instead. */
+static queue_t *lower_top_rq(struct stdata *lower)
+{
+	queue_t *q = lower->sd_drv_rq;
+	while (q && q->q_next && q->q_next != lower->sd_rq)
+		q = q->q_next;
+	return (q && q->q_next == lower->sd_rq) ? q : NULL;
+}
+
+/* In-kernel I_LINK entry point used by both the user ioctl path
+ * (do_ilink) and the boot self-test.  Takes the upper and lower
+ * stdata directly. */
+long stream_ilink(struct stdata *upper, struct stdata *lower)
+{
+	if (!upper || !lower || !upper->sd_drv_rq || !lower->sd_drv_rq)
+		return -1;
+	if (upper == lower)
+		return -1;
+
+	int muxid = alloc_muxid();
+	if (muxid < 0) return -1;
+
+	struct linkblk lk = {
+		.l_qtop  = upper->sd_drv_wq,
+		.l_qbot  = lower->sd_wq,	/* head wq; putnext sends INTO */
+		.l_index = muxid,
+	};
+	mblk_t *resp = send_iolink_ioctl(upper, I_LINK, &lk);
+	if (!resp) return -1;
+
+	int ok = (resp->b_datap->db_type == M_IOCACK)
+	      && ((struct iocblk *)resp->b_rptr)->ic_error == 0;
+	freemsg(resp);
+	if (!ok) return -1;
+
+	queue_t *toprq = lower_top_rq(lower);
+	if (!toprq) return -1;
+
+	muxtab[muxid - 1].muxid       = muxid;
+	muxtab[muxid - 1].upper       = upper;
+	muxtab[muxid - 1].lower       = lower;
+	muxtab[muxid - 1].rewired_q   = toprq;
+	muxtab[muxid - 1].saved_qnext = toprq->q_next;
+	toprq->q_next = upper->sd_drv_rq;
+
+	return muxid;
+}
+
+long stream_iunlink(struct stdata *upper, int muxid)
+{
+	struct muxlink *m = find_mux(muxid, upper);
+	if (!m) return -1;
+
+	struct linkblk lk = {
+		.l_qtop  = upper->sd_drv_wq,
+		.l_qbot  = m->lower->sd_wq,
+		.l_index = muxid,
+	};
+	mblk_t *resp = send_iolink_ioctl(upper, I_UNLINK, &lk);
+	if (!resp) return -1;
+	int ok = resp->b_datap->db_type == M_IOCACK;
+	freemsg(resp);
+	if (!ok) return -1;
+
+	m->rewired_q->q_next = m->saved_qnext;
+	m->muxid = 0;
+	m->upper = m->lower = NULL;
+	m->rewired_q = m->saved_qnext = NULL;
+	return 0;
+}
+
+/* User-side wrappers: resolve fds and call the stdata-level API. */
+static long do_ilink(struct stdata *upper, int lower_fd)
+{
+	struct file *fl = fd_get(lower_fd);
+	if (!fl || fl->f_ops != &stream_fops || !fl->f_private)
+		return -1;
+	return stream_ilink(upper, (struct stdata *)fl->f_private);
+}
+
+static long do_iunlink(struct stdata *upper, int muxid)
+{
+	return stream_iunlink(upper, muxid);
+}
+
 /* ---- stream_fops -- the file_ops the VFS dispatches through ----------- */
+
+struct stdata *stream_build_kernel(struct streamtab *drv_st,
+                                    const char *name, unsigned minor);
 
 static struct stdata *stream_build(struct streamtab *drv_st, const char *name,
 				   unsigned minor)
@@ -717,6 +903,17 @@ static int stream_open(struct file *f)
 	 * it without disturbing that. */
 	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_TTY)
 		(void)do_ipush(sd, "ldterm");
+	/* /dev/icmp's cdev streamtab is ip_streamtab -- so opening it
+	 * gets a stream with IP at the bottom.  Autopush the icmp
+	 * module on top so the user-visible stream is icmp-over-ip.
+	 * Same shape as tty / ldterm. */
+	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_ICMP)
+		(void)do_ipush(sd, "icmp");
+	/* Same shape for /dev/udp: ip_streamtab at the bottom, udp
+	 * module autopushed on top.  User-visible stream is udp-over-ip
+	 * with TPI primitives via putmsg/getmsg. */
+	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_UDP)
+		(void)do_ipush(sd, "udp");
 
 	f->f_private = sd;
 	return 0;
@@ -790,8 +987,14 @@ static int stream_close(struct file *f)
 		while (q && q != sd->sd_drv_wq) {
 			queue_t *next = q->q_next;
 			queue_t *peer_q = q->q_link;
-			if (q->q_qinfo && q->q_qinfo->qi_qclose)
-				q->q_qinfo->qi_qclose(peer_q);
+			/* SVR4 convention: qclose is on the READ-side
+			 * qinit (rinit), not the write side.  Callers like
+			 * ldterm and the new icmp module follow this
+			 * convention -- check peer_q (which is the read
+			 * queue when walking write-side downward).  Mirror
+			 * the same shape used below for the driver pair. */
+			if (peer_q->q_qinfo && peer_q->q_qinfo->qi_qclose)
+				peer_q->q_qinfo->qi_qclose(peer_q);
 			drain_q(q);
 			drain_q(peer_q);
 			kfree(q);
@@ -1111,6 +1314,10 @@ static long stream_ioctl(struct file *f, int cmd, long arg)
 		return do_ipush(sd, (const char *)(uintptr_t)arg);
 	case I_POP:
 		return do_ipop(sd);
+	case I_LINK:
+		return do_ilink(sd, (int)arg);
+	case I_UNLINK:
+		return do_iunlink(sd, (int)arg);
 	default:
 		/* Everything else flows down the stream as M_IOCTL.  The
 		 * module or driver that owns the command (TCGETA on
@@ -1381,6 +1588,248 @@ static struct streamtab klog_streamtab = {
 extern struct streamtab fbcon_streamtab;
 #endif
 
+/* ---- In-kernel stream build/destroy used by selftest + future
+ *      built-in mux drivers (IP, etc.) that need to construct lower
+ *      streams without going through sys_open. */
+
+struct stdata *stream_build_kernel(struct streamtab *drv_st,
+                                    const char *name, unsigned minor)
+{
+	return stream_build(drv_st, name, minor);
+}
+
+int stream_push_kernel(struct stdata *sd, const char *modname)
+{
+	if (!sd) return -1;
+	return do_ipush(sd, modname);
+}
+
+void stream_destroy_kernel(struct stdata *sd)
+{
+	if (!sd) return;
+	/* Mirror stream_close's tear-down: drain queued mblks, walk
+	 * any pushed modules (qclose -> drain -> free), then the driver
+	 * pair, then the head pair, then stdata.  Selftests + future
+	 * built-in muxes that build kernel-side streams may have pushed
+	 * modules above the driver (e.g., the icmp selftest pushes
+	 * "icmp" on top of an ip_streamtab stream).  Without the module
+	 * walk, their qclose never fires and per-instance state like
+	 * IP upper-bindings leak. */
+	drain_q(sd->sd_rq);
+	drain_q(sd->sd_wq);
+
+	struct stdata **p = &all_open_streams;
+	while (*p && *p != sd) p = &(*p)->sd_all_next;
+	if (*p == sd) *p = sd->sd_all_next;
+
+	if (sd->sd_drv_wq) {
+		queue_t *q = sd->sd_wq->q_next;
+		while (q && q != sd->sd_drv_wq) {
+			queue_t *next = q->q_next;
+			queue_t *peer_q = q->q_link;
+			if (peer_q->q_qinfo && peer_q->q_qinfo->qi_qclose)
+				peer_q->q_qinfo->qi_qclose(peer_q);
+			drain_q(q);
+			drain_q(peer_q);
+			kfree(q);
+			kfree(peer_q);
+			q = next;
+		}
+		if (sd->sd_drv_rq->q_qinfo
+		    && sd->sd_drv_rq->q_qinfo->qi_qclose)
+			sd->sd_drv_rq->q_qinfo->qi_qclose(sd->sd_drv_rq);
+		drain_q(sd->sd_drv_rq);
+		drain_q(sd->sd_drv_wq);
+		kfree(sd->sd_drv_rq);
+		kfree(sd->sd_drv_wq);
+	}
+	kfree(sd->sd_rq);
+	kfree(sd->sd_wq);
+	kfree(sd);
+}
+
+/* ---- mux_demo driver: a tiny upper-side multiplexor for mux_selftest.
+ *
+ * Lives only to prove I_LINK actually wires the queue chain end-to-end.
+ * Recognises M_IOCTL{I_LINK} in its wput, records the linkblk's l_qbot
+ * in per-instance state, and forwards M_DATA going down to the linked
+ * lower stream's top via putnext.  On the read side it just forwards
+ * up to the stream head; the rewired chain from the lower driver lands
+ * us there.
+ */
+
+struct mux_demo_state {
+	queue_t *lower_wq;	/* l_qbot from linkblk */
+	int      linked;
+	int      muxid;
+};
+
+static int mux_demo_open(queue_t *q)
+{
+	struct mux_demo_state *s = kmalloc(sizeof(*s));
+	if (!s) return -1;
+	kmemset(s, 0, sizeof(*s));
+	q->q_ptr           = s;
+	OTHERQ(q)->q_ptr   = s;	/* mirror so wq can see it too */
+	return 0;
+}
+
+static int mux_demo_close(queue_t *q)
+{
+	struct mux_demo_state *s = q->q_ptr;
+	if (s) {
+		q->q_ptr = NULL;
+		OTHERQ(q)->q_ptr = NULL;
+		kfree(s);
+	}
+	return 0;
+}
+
+static int mux_demo_wq_putp(queue_t *q, mblk_t *mp)
+{
+	struct mux_demo_state *s = q->q_ptr;
+	if (!mp) return 0;
+
+	if (mp->b_datap->db_type == M_IOCTL) {
+		struct iocblk *ic = (struct iocblk *)mp->b_rptr;
+		if ((ic->ic_cmd == I_LINK || ic->ic_cmd == I_UNLINK)
+		    && mp->b_cont) {
+			struct linkblk *lk =
+			    (struct linkblk *)mp->b_cont->b_rptr;
+			if (ic->ic_cmd == I_LINK) {
+				if (s) {
+					s->lower_wq = lk->l_qbot;
+					s->muxid    = lk->l_index;
+					s->linked   = 1;
+				}
+			} else {	/* I_UNLINK */
+				if (s) {
+					s->lower_wq = NULL;
+					s->muxid    = 0;
+					s->linked   = 0;
+				}
+			}
+			ic->ic_error = 0;
+			mp->b_datap->db_type = M_IOCACK;
+			putnext(OTHERQ(q), mp);
+			return 0;
+		}
+		/* Unknown ioctl. */
+		struct iocblk *icn = (struct iocblk *)mp->b_rptr;
+		icn->ic_error = -1;
+		mp->b_datap->db_type = M_IOCNAK;
+		putnext(OTHERQ(q), mp);
+		return 0;
+	}
+
+	if (mp->b_datap->db_type == M_DATA && s && s->linked && s->lower_wq) {
+		/* Forward into the linked lower stream at its top. */
+		return putnext(s->lower_wq, mp);
+	}
+	freemsg(mp);
+	return 0;
+}
+
+static int mux_demo_rq_putp(queue_t *q, mblk_t *mp)
+{
+	/* Rewired lower stream is sending data up to us; pass straight
+	 * to the stream head. */
+	return putnext(q, mp);
+}
+
+static struct module_info mux_demo_minfo = {
+	.mi_idnum  = 500,
+	.mi_idname = "mux_demo",
+	.mi_minpsz = 0,
+	.mi_maxpsz = 4096,
+	.mi_hiwat  = 16384,
+	.mi_lowat  = 8192,
+};
+
+static struct qinit mux_demo_rinit = {
+	.qi_putp  = mux_demo_rq_putp,
+	.qi_qopen = mux_demo_open,
+	.qi_qclose= mux_demo_close,
+	.qi_minfo = &mux_demo_minfo,
+};
+static struct qinit mux_demo_winit = {
+	.qi_putp  = mux_demo_wq_putp,
+	.qi_minfo = &mux_demo_minfo,
+};
+static struct streamtab mux_demo_streamtab = {
+	.st_rdinit = &mux_demo_rinit,
+	.st_wrinit = &mux_demo_winit,
+};
+
+/* ---- mux_selftest: end-to-end I_LINK round trip ---------------------- */
+/*
+ *   user (write side) --> mux_demo head/wq
+ *                         |
+ *                         v  (mux_demo wq forwards M_DATA to lk->l_qbot)
+ *                       loop head/wq
+ *                         |
+ *                         v
+ *                       loop driver wq (echoes via putnext(OTHERQ(q), mp))
+ *                         |
+ *                         v  (loop drv_rq->q_next was rewired by I_LINK
+ *                             from loop_head_rq to mux_demo drv_rq)
+ *                       mux_demo drv_rq
+ *                         |
+ *                         v  (mux_demo rq forwards UP to its head)
+ *                       mux_demo head/rq <-- user reads here
+ */
+void mux_selftest(void)
+{
+	struct stdata *upper = stream_build_kernel(&mux_demo_streamtab,
+	                                            "mux_demo_test", 0);
+	struct stdata *lower = stream_build_kernel(&loop_streamtab,
+	                                            "loop_test", 0);
+	int ok = 1;
+
+	if (!upper || !lower) {
+		kprintf("mux: SELFTEST FAIL build\n");
+		ok = 0;
+		goto out;
+	}
+
+	long muxid = stream_ilink(upper, lower);
+	if (muxid <= 0) {
+		kprintf("mux: SELFTEST FAIL ilink rc=%ld\n", muxid);
+		ok = 0;
+		goto out;
+	}
+
+	/* Send M_DATA "K" down upper.  Round-trip: mux_demo.wput -> loop
+	 * via lk->l_qbot -> loop.wput echoes via OTHERQ -> rewired up
+	 * to mux_demo.drv_rq -> head_rq queued. */
+	mblk_t *mp = allocb(1, 0);
+	if (!mp) { ok = 0; goto out; }
+	*mp->b_wptr++ = 'K';
+	putnext(upper->sd_wq, mp);
+
+	mblk_t *got = getq(upper->sd_rq);
+	if (!got) {
+		kprintf("mux: SELFTEST FAIL no echo back\n");
+		ok = 0;
+	} else if ((got->b_wptr - got->b_rptr) != 1 || got->b_rptr[0] != 'K') {
+		kprintf("mux: SELFTEST FAIL bad payload\n");
+		ok = 0;
+		freemsg(got);
+	} else {
+		freemsg(got);
+	}
+
+	if (ok && stream_iunlink(upper, (int)muxid) != 0) {
+		kprintf("mux: SELFTEST FAIL iunlink\n");
+		ok = 0;
+	}
+
+out:
+	if (ok) kprintf("mux: selftest PASS\n");
+	if (upper) stream_destroy_kernel(upper);
+	if (lower) stream_destroy_kernel(lower);
+}
+
 void streams_head_init(void)
 {
 	/* Bring up the mblk/dblk/queue slab caches.  Must run before
@@ -1440,13 +1889,19 @@ void streams_head_init(void)
 	vfs_mknod_chrdev(dev, "tty2", MKDEV(CDEV_MAJ_TTY, 2));
 	vfs_mknod_chrdev(dev, "tty3", MKDEV(CDEV_MAJ_TTY, 3));
 
-	/* Networking: ip_init registers lo0 (netif + STREAMS cdev).
-	 * icmp_str_init registers /dev/icmp (STREAMS cdev for cmd/ping).
-	 * Both are published as /dev nodes here. */
-	ip_init();
-	vfs_mknod_chrdev(dev, "lo0",  MKDEV(CDEV_MAJ_LO,   0));
-	icmp_str_init();
+	/* Networking: register the icmp + udp STREAMS modules (so
+	 * I_PUSH "icmp" / "udp" and the corresponding /dev autopush
+	 * above can find them) and publish their /dev inodes.
+	 * ip_init() itself runs later from main.c -- it does the
+	 * I_LINK loop which needs curthread (post sched_init).
+	 *
+	 * /dev/icmp and /dev/udp both map to ip_streamtab (registered
+	 * by their module_init helpers); stream_open autopushes the
+	 * matching module on open. */
+	icmp_module_init();
+	udp_module_init();
 	vfs_mknod_chrdev(dev, "icmp", MKDEV(CDEV_MAJ_ICMP,  0));
+	vfs_mknod_chrdev(dev, "udp",  MKDEV(CDEV_MAJ_UDP,   0));
 
 	kprintf("stream_head: registered modules:");
 	for (struct stmod_entry *e = registry; e; e = e->next)

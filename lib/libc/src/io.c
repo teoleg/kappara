@@ -1,3 +1,4 @@
+#include <stropts.h>
 #include <unistd.h>
 #include "../aarch64/internal.h"
 
@@ -46,6 +47,24 @@ int wait(int tid)
 int pipe(int fds[2])
 {
     return (int)__syscall1(__NR_pipe, (long)(unsigned long)fds);
+}
+
+int putmsg(int fd, const struct strbuf *ctl,
+           const struct strbuf *data, int flags)
+{
+    return (int)__syscall4(__NR_putmsg, (long)fd,
+                           (long)(unsigned long)ctl,
+                           (long)(unsigned long)data,
+                           (long)flags);
+}
+
+int getmsg(int fd, struct strbuf *ctl,
+           struct strbuf *data, int *flagsp)
+{
+    return (int)__syscall4(__NR_getmsg, (long)fd,
+                           (long)(unsigned long)ctl,
+                           (long)(unsigned long)data,
+                           (long)(unsigned long)flagsp);
 }
 /* _exit lives in stdlib.c -- shared by exit() and the direct
  * _exit() callers.  Don't duplicate it here. */

@@ -1,85 +1,55 @@
 /*
- * kernel/net/lo.c -- loopback interface
+ * uts/os/net/lo.c -- loopback interface as a leaf STREAMS driver.
  *
- * Dual personality, classic SVR4:
+ * After the N2b migration lo0 is a pure SVR4 STREAMS driver.  Its
+ * write-side qi_putp loops the mblk straight back up via
  *
- *   - Internal: registers a `struct netif` (name "lo0", ip 127.0.0.1)
- *     with the netif registry, so ip_output can route there.  The
- *     netif's tx callback feeds the same mblk back into ip_input
- *     via netif_input.  Synchronous loopback: caller's stack sees
- *     the full round-trip before tx returns.
+ *     putnext(OTHERQ(q), mp);
  *
- *   - User-facing: registers as a STREAMS cdev /dev/lo0.  Open it
- *     and you get a stream that talks raw IP datagrams to lo0.
- *     Writing an mblk = "transmit packet"; the corresponding rx
- *     side delivers any packet sent to lo0's IP via the IP layer.
- *     Reserved for future use (kernel selftest doesn't need it).
+ * which would normally hit the lo0 stream's own head-rq.  But this
+ * stream is built at boot by ip_init() and immediately I_LINKed
+ * underneath IP -- so the I_LINK rewire points OTHERQ(q)->q_next
+ * at IP's drv_rq instead.  Loopback packets land in IP's rput which
+ * validates the header and demuxes by proto byte.  No netif_input
+ * callback, no direct ip_input call.  Pure putnext.
  *
- * No link-layer header.  The mblk's b_rptr..b_wptr at the netif
- * boundary IS the full IP datagram.
- *
- * Synchronous vs deferred
- * -----------------------
- * Real network drivers don't loop synchronously -- they enqueue an
- * mblk on an rx queue and an upcall thread later calls ip_input.
- * For lo0 we COULD use the streams srvp deferred mechanism, but for
- * the boot selftest a synchronous round-trip is cleaner: by the
- * time `icmp_send_echo` returns, the reply has already been
- * delivered.  The recursion depth is bounded by the number of
- * ICMP exchanges we're chaining (1 round-trip = 2 deep).
+ * lo0 still registers a struct netif so IP can find it for routing
+ * (the 127.0.0.0/8 prefix match).  The netif's `tx` callback is
+ * NULL: nothing calls it after the rewrite.  Identity (name, IP,
+ * netmask, MTU, streamtab pointer) is what the netif carries now;
+ * the data path is queues end-to-end.
  */
 
 #include <stdint.h>
 
-#include "kappara/cdevsw.h"
 #include "kappara/ip.h"
 #include "kappara/netif.h"
 #include "kappara/printk.h"
-#include "kappara/stream_head.h"
 #include "kappara/streams.h"
 
-/* ---- netif side --------------------------------------------------- */
+/* ---- STREAMS driver --------------------------------------------- */
 
-static struct netif lo0_nif;
-
-static int lo_tx(struct netif *nif, mblk_t *mp)
+static int lo_wq_putp(queue_t *q, mblk_t *mp)
 {
-	/* Loopback: hand the same mblk straight back to ip_input.
-	 * netif_input -> ip_input takes ownership and freemsg's at the
-	 * end of processing. */
-	netif_input(nif, mp);
-	return 0;
-}
-
-/* ---- /dev/lo0 STREAMS driver -------------------------------------- */
-/*
- * Open a stream to inject and receive raw IP packets on lo0.  Bytes
- * written down the stream are taken as a complete IP datagram and
- * handed to ip_output via lo_tx.  Bytes coming up come from
- * ip_input dispatching to "user receiver" -- not wired yet, so this
- * direction is reserved.
- */
-
-static int lo_drv_wq_putp(queue_t *q, mblk_t *mp)
-{
-	(void)q;
 	if (!mp) return 0;
 	if (mp->b_datap->db_type != M_DATA) {
 		freemsg(mp);
 		return 0;
 	}
-	/* The mblk is an IP datagram.  Inject it as if it had just
-	 * arrived on lo0.  IP layer takes ownership. */
-	netif_input(&lo0_nif, mp);
-	return 0;
+	/* OTHERQ(q) is the read side of this driver.  After I_LINK its
+	 * q_next is IP's drv_rq -- so the packet flows up into IP for
+	 * demux.  Before linking it would hit the lo0 stream-head's rq
+	 * and just queue there; the linker (ip_init) guarantees we're
+	 * linked before anyone sends to us. */
+	return putnext(OTHERQ(q), mp);
 }
 
-static int lo_drv_rq_putp(queue_t *q, mblk_t *mp)
+static int lo_rq_putp(queue_t *q, mblk_t *mp)
 {
 	return putnext(q, mp);
 }
 
-static struct module_info lo_drv_minfo = {
+static struct module_info lo_minfo = {
 	.mi_idnum  = 400,
 	.mi_idname = "lo0",
 	.mi_minpsz = 0,
@@ -88,29 +58,28 @@ static struct module_info lo_drv_minfo = {
 	.mi_lowat  = 8192,
 };
 
-static struct qinit lo_drv_rinit = {
-	.qi_putp = lo_drv_rq_putp, .qi_minfo = &lo_drv_minfo,
+static struct qinit lo_rinit = {
+	.qi_putp = lo_rq_putp, .qi_minfo = &lo_minfo,
 };
-static struct qinit lo_drv_winit = {
-	.qi_putp = lo_drv_wq_putp, .qi_minfo = &lo_drv_minfo,
+static struct qinit lo_winit = {
+	.qi_putp = lo_wq_putp, .qi_minfo = &lo_minfo,
 };
-
 static struct streamtab lo_streamtab = {
-	.st_rdinit = &lo_drv_rinit,
-	.st_wrinit = &lo_drv_winit,
+	.st_rdinit = &lo_rinit,
+	.st_wrinit = &lo_winit,
 };
 
-/* ---- init --------------------------------------------------------- */
+/* ---- netif registration ----------------------------------------- */
+
+static struct netif lo0_nif;
 
 void lo_init(void)
 {
-	lo0_nif.name    = "lo0";
-	lo0_nif.ip      = 0x7f000001u;	/* 127.0.0.1 */
-	lo0_nif.netmask = 0xff000000u;	/* /8 */
-	lo0_nif.mtu     = 1500;
-	lo0_nif.tx      = lo_tx;
+	lo0_nif.name     = "lo0";
+	lo0_nif.ip       = 0x7f000001u;	/* 127.0.0.1 */
+	lo0_nif.netmask  = 0xff000000u;	/* /8 */
+	lo0_nif.mtu      = 1500;
+	lo0_nif.streamtab = &lo_streamtab;
+	lo0_nif.tx       = NULL;	/* unused after STREAMS migration */
 	netif_register(&lo0_nif);
-
-	streams_register("lo0", &lo_streamtab);
-	cdev_register(CDEV_MAJ_LO, "lo0", &lo_streamtab);
 }

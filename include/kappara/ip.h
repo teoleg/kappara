@@ -74,19 +74,64 @@ static inline uint32_t htonl32(uint32_t v)
 #define ntohs16 htons16
 #define ntohl32 htonl32
 
-/* Build and send.  `dst_ip` is host byte order; `mp`'s b_rptr..b_wptr
- * is the L4 payload.  We prepend a 20-byte IPv4 header and call
- * netif_route -> netif->tx.  Returns 0 on success, -1 on routing
- * failure or driver tx failure (mp is freed on -1 too).  */
-int  ip_output(uint32_t dst_ip, uint8_t proto, mblk_t *mp);
+/* ---- IP M_PROTO primitives -----------------------------------------
+ *
+ * Upper modules / drivers exchange M_PROTO messages with IP using a
+ * tagged-union shape.  The first byte of the M_PROTO mblk identifies
+ * the primitive; the rest of the mblk is the payload struct.  This
+ * mirrors SVR4 TPI / DLPI's t_primitives encoding.
+ */
 
-/* Receive path -- netif drivers call netif_input which calls this.
- * We validate, strip the header, dispatch by proto.  Caller hands
- * ownership of mp. */
-void ip_input (struct netif *nif, mblk_t *mp);
+#define IP_T_SEND_REQ		1	/* upper -> IP: send M_DATA in b_cont */
+#define IP_T_BIND_REQ		2	/* upper -> IP: deliver proto to me   */
+#define IP_T_BIND_ACK		3	/* IP -> upper: bind succeeded         */
+#define IP_T_BIND_NAK		4	/* IP -> upper: bind failed            */
+#define IP_T_UNBIND_REQ		5	/* upper -> IP: stop delivering        */
+#define IP_T_UNBIND_ACK		6	/* IP -> upper: unbind succeeded       */
 
-/* Init (called once from kmain after streams_head_init).  Registers
- * the lo0 interface and any other built-in netifs. */
+/* IP_T_SEND_REQ: payload chained as b_cont(M_DATA). */
+struct ip_send_meta {
+	uint8_t  prim;		/* IP_T_SEND_REQ */
+	uint8_t  proto;
+	uint8_t  _pad[2];
+	uint32_t dst_ip;	/* host byte order */
+};
+
+/* IP_T_BIND_REQ / _ACK / _NAK / IP_T_UNBIND_REQ / _ACK: same shape.
+ * The `key` slot is generic protocol-specific demux discriminator --
+ * IP itself doesn't interpret it (modules may use it to encode
+ * local-port for UDP, etc).  Set to zero for plain proto-only bind. */
+struct ip_bind_meta {
+	uint8_t  prim;
+	uint8_t  proto;
+	uint8_t  _pad[2];
+	uint32_t key;
+};
+
+/* Build M_PROTO{IP_T_SEND_REQ} + M_DATA(payload), putnext into IP.
+ * mp's b_rptr..b_wptr is the L4 payload (with IP_HDR_LEN headroom
+ * reserved at b_rptr -- IP's wput rewinds to fill the header in
+ * place).  Returns 0 on success, -1 on alloc/route failure (mp
+ * freed either way).
+ *
+ * Convenience helper for in-kernel callers that don't have their
+ * own stream stacked above IP.  Modules pushed above IP just send
+ * M_PROTO+M_DATA via putnext(q, msg) directly. */
+int  ip_send (uint32_t dst_ip, uint8_t proto, mblk_t *mp);
+
+/* Register a netif's identity against its IP-multiplexor link slot
+ * after stream_ilink has succeeded.  IP's wput populates the slot's
+ * qbot at I_LINK time; this fills in the nif pointer so route lookup
+ * can match a destination against the lower's IP/netmask. */
+void ip_lower_register(int muxid, struct netif *nif);
+
+/* IP driver's streamtab.  Built into one kernel stream at boot for
+ * the control plane; each netif's stream gets I_LINKed under it. */
+extern struct streamtab ip_streamtab;
+
+/* Init (called once from kmain after streams_head_init).  Brings up
+ * the IP driver stream + walks the netif registry, building one
+ * kernel stream per netif and I_LINKing each underneath. */
 void ip_init  (void);
 
 /* Boot-time selftest -- sends an ICMP echo via 127.0.0.1, waits for

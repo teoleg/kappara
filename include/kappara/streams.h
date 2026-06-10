@@ -229,12 +229,25 @@ void    freeb(mblk_t *mp);
 void    freemsg(mblk_t *mp);
 size_t  msgdsize(const mblk_t *mp);
 
+/* dupb: new mblk sharing the same dblk via db_ref++.  dupmsg: dupb
+ * every link in the b_cont chain.  Used by mux demux to fan one
+ * arriving packet out to multiple bound upper streams without
+ * copying the payload bytes. */
+mblk_t *dupb (mblk_t *mp);
+mblk_t *dupmsg(mblk_t *mp);
+
 void    queue_init_pair(queue_t *rq, queue_t *wq,
 			struct qinit *rinit, struct qinit *winit);
 
 void    putq(queue_t *q, mblk_t *mp);
 mblk_t *getq(queue_t *q);
 int     putnext(queue_t *q, mblk_t *mp);
+
+/* SVR4 put: deliver directly to q's own qi_putp (no q_next walk).
+ * The mux demux primitive -- a driver crossing into a foreign
+ * stream via a queue pointer stashed at bind time uses put, not
+ * putnext, because there's no shared q_next chain to follow. */
+int     put    (queue_t *q, mblk_t *mp);
 
 /* Push mp back at the HEAD of q's deferred list.  Used by stream_read
  * when a read only partially consumed an mblk -- the rest needs to be

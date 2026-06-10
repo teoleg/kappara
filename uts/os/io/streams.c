@@ -158,6 +158,57 @@ size_t msgdsize(const mblk_t *mp)
 	return n;
 }
 
+/* SVR4 dupb: allocate a new mblk_t referencing the same dblk.  The
+ * buffer is NOT copied -- both mblks point at the same bytes -- but
+ * the dblk's refcount goes up by one, so freeb on either correctly
+ * decrements without freeing the shared buffer until the last
+ * reference goes away.  b_rptr / b_wptr / b_band / b_flag are
+ * copied so the new mblk sees the same window into the data; b_next
+ * / b_prev / b_cont are reset.
+ *
+ * Used by stream muxes (IP demux multicast) to fan a single arriving
+ * packet out to several bound upper streams without N copies of the
+ * payload bytes -- only N tiny mblk headers. */
+mblk_t *dupb(mblk_t *mp)
+{
+	if (!mp || !mp->b_datap)
+		return NULL;
+	mblk_t *cp = kmem_cache_alloc(&mblk_cache);
+	if (!cp)
+		return NULL;
+	cp->b_next  = NULL;
+	cp->b_prev  = NULL;
+	cp->b_cont  = NULL;
+	cp->b_rptr  = mp->b_rptr;
+	cp->b_wptr  = mp->b_wptr;
+	cp->b_datap = mp->b_datap;
+	cp->b_band  = mp->b_band;
+	cp->b_flag  = mp->b_flag;
+	mp->b_datap->db_ref++;
+	return cp;
+}
+
+/* SVR4 dupmsg: dupb every link in the b_cont chain.  Returns the
+ * head of a parallel chain, or NULL on alloc failure (partial chains
+ * are freed -- caller never sees a half-built message). */
+mblk_t *dupmsg(mblk_t *mp)
+{
+	mblk_t *head = NULL;
+	mblk_t *tail = NULL;
+	while (mp) {
+		mblk_t *cp = dupb(mp);
+		if (!cp) {
+			if (head) freemsg(head);
+			return NULL;
+		}
+		if (!head) head = cp;
+		if (tail)  tail->b_cont = cp;
+		tail = cp;
+		mp = mp->b_cont;
+	}
+	return head;
+}
+
 /* ---- Queue plumbing ----------------------------------------------------- */
 
 void queue_init_pair(queue_t *rq, queue_t *wq,
@@ -243,6 +294,23 @@ int putnext(queue_t *q, mblk_t *mp)
 		return -1;
 	}
 	return next->q_qinfo->qi_putp(next, mp);
+}
+
+/* SVR4 put(): invoke a queue's own qi_putp.  Unlike putnext (which
+ * traverses q->q_next), put delivers directly to the target queue
+ * without following any chain.  This is the mux primitive: a driver
+ * like IP whose rput needs to cross a stream boundary (to deliver
+ * a demultiplexed packet to an upper protocol's queue stashed at
+ * bind time) calls put on the foreign queue.  putnext would either
+ * follow the wrong chain or jump into the destination's "next" hop;
+ * put hits exactly the queue we have a pointer to. */
+int put(queue_t *q, mblk_t *mp)
+{
+	if (!q || !q->q_qinfo || !q->q_qinfo->qi_putp) {
+		freemsg(mp);
+		return -1;
+	}
+	return q->q_qinfo->qi_putp(q, mp);
 }
 
 /* ---- Service procedure scheduling -------------------------------------- */

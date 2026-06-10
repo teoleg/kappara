@@ -1,16 +1,19 @@
 /*
- * kernel/net/netif.c -- network interface registry + routing
+ * uts/os/net/netif.c -- network interface registry
  *
- * Walks a tiny singly-linked list of registered interfaces.  Each
- * lookup is O(N); we never have more than a handful of interfaces
- * so don't bother with a hash.  netif_input is a thin trampoline
- * into ip_input -- kept here so drivers don't need to pull in ip.h
- * directly.
+ * Carries the identity of each registered interface (name, IP,
+ * netmask, MTU, streamtab) so IP's mux can route by netmask after
+ * building one kernel stream per netif and I_LINKing it underneath.
+ *
+ * Walks a singly-linked list; we never have more than a handful of
+ * interfaces.  The longest-prefix-match `netif_route` helper isn't
+ * used by IP itself anymore (IP routes through ip_lowers[] which
+ * carries the netif pointer per linked stream) but is exposed for
+ * future callers that want the bare lookup.
  */
 
 #include <stdint.h>
 
-#include "kappara/ip.h"
 #include "kappara/netif.h"
 #include "kappara/printk.h"
 
@@ -59,11 +62,6 @@ struct netif *netif_route(uint32_t dst_ip)
 		}
 	}
 	return best;
-}
-
-void netif_input(struct netif *nif, mblk_t *mp)
-{
-	ip_input(nif, mp);
 }
 
 int netif_for_each(int (*cb)(struct netif *nif, void *arg), void *arg)
