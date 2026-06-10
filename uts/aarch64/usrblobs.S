@@ -76,3 +76,11 @@ pipework_blob_end:
 malloctest_blob_start:
 	.incbin "build/cmd/malloctest.elf"
 malloctest_blob_end:
+
+	.section ".rodata.forktest_blob","a",%progbits
+	.balign 8
+	.global forktest_blob_start
+	.global forktest_blob_end
+forktest_blob_start:
+	.incbin "build/cmd/forktest.elf"
+forktest_blob_end:

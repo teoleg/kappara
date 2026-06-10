@@ -29,11 +29,13 @@
 #include "kappara/printk.h"
 #include "kappara/process.h"
 #include "kappara/string.h"
+#include "kappara/user.h"	/* exec_slot_release */
 
 struct vm_map init_vm_map = {
-	.l0_phys = 0,	/* filled in at process_init -- see below */
-	.refs    = 1,	/* held by init_process */
-	.lock    = SPINLOCK_INIT,
+	.l0_phys   = 0,	/* filled in at process_init -- see below */
+	.exec_slot = -1, /* boot map has no exec slot */
+	.refs      = 1,	/* held by init_process */
+	.lock      = SPINLOCK_INIT,
 };
 
 struct process init_process = {
@@ -71,6 +73,10 @@ void vm_map_put(struct vm_map *vm)
 {
 	if (!vm) return;
 	if (--vm->refs > 0) return;
+	if (vm->exec_slot >= 0) {
+		exec_slot_release(vm->exec_slot);
+		vm->exec_slot = -1;
+	}
 	if (vm == &init_vm_map) {
 		/* Statically allocated, owns the boot page tables --
 		 * never freed.  Reaching zero refs would be a bug
@@ -93,7 +99,8 @@ struct vm_map *vm_map_create(void)
 	struct vm_map *vm = kmalloc(sizeof(*vm));
 	if (!vm) return 0;
 	kmemset(vm, 0, sizeof(*vm));
-	vm->refs = 1;
+	vm->refs      = 1;
+	vm->exec_slot = -1;	/* caller sets when binding to an exec slot */
 #ifdef __aarch64__
 	if (mmu_vmap_create(vm) < 0) {
 		kfree(vm);

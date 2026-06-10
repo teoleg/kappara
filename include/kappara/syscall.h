@@ -63,8 +63,12 @@
 #define SYS_tcsetpgrp	31	/* (fd, pgid) -> 0 -- set tty fg pgrp       */
 #define SYS_tcgetpgrp	32	/* (fd) -> pgid                             */
 #define SYS_brk		33	/* (uintptr_t addr) -> new break / -1      */
+#define SYS_fork	34	/* () -> child tid (parent) / 0 (child)    *
+				 * v0: child shares parent's vm_map, gets  *
+				 * its own stack slot with parent's stack  *
+				 * copied.  See docs/ARCHITECTURE.md.      */
 
-#define SYS_MAX		34
+#define SYS_MAX		35
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

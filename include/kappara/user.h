@@ -54,5 +54,25 @@ void sys_exit_impl(int status) __attribute__((noreturn));
  * Out-of-range: return -1. */
 long sys_brk_impl(uint64_t addr);
 
+/* Release an exec slot back to the pool.  Called by vm_map_put when
+ * the last reference to a vm_map bound to that slot drops. */
+void exec_slot_release(int slot);
+
+/* sys_fork -- R5.  Duplicates the calling exec'd process into a new
+ * one with its own physical backing for EXEC_VA/EXEC_STACK_VA/
+ * EXEC_HEAP_VA.  The child sees the parent's state at fork time;
+ * subsequent writes don't cross the boundary because both processes
+ * have their own vm_map mapping the same EL0 VAs to different
+ * physical pages.
+ *
+ * Returns child tid in the parent, 0 in the child, -1 on error
+ * (no free exec slot, vm_map_create failed, etc.).
+ *
+ * Only callable from an exec'd process (EXEC_VA range).  Init-shell
+ * threads sharing USER_VA can't fork -- they have no per-process
+ * physical backing. */
+struct trap_frame;
+long sys_fork_impl(struct trap_frame *parent_tf);
+
 #endif
 

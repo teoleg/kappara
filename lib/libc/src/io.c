@@ -33,13 +33,19 @@ pid_t getpid(void)
     return (pid_t)__syscall1(__NR_getpid, 0);
 }
 
+pid_t fork(void)
+{
+    return (pid_t)__syscall0(__NR_fork);
+}
+
+int wait(int tid)
+{
+    return (int)__syscall1(__NR_wait, (long)tid);
+}
+
 int pipe(int fds[2])
 {
     return (int)__syscall1(__NR_pipe, (long)(unsigned long)fds);
 }
-
-void _exit(int status)
-{
-    __syscall1(__NR_exit, (long)status);
-    __builtin_unreachable();
-}
+/* _exit lives in stdlib.c -- shared by exit() and the direct
+ * _exit() callers.  Don't duplicate it here. */

@@ -841,6 +841,10 @@ static void switch_to_next(int requeue_current, spinlock_t *extra_release)
 			}
 			pmm_free(t->stack_base);
 			if (t->sig_actions) kfree(t->sig_actions);
+			/* R5: drop the process ref this thread held.  Last
+			 * ref triggers vm_map_put, which releases the exec
+			 * slot back to the pool. */
+			if (t->t_proc) process_put(t->t_proc);
 			kfree(t);
 		}
 	}

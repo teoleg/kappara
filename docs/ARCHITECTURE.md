@@ -151,14 +151,28 @@ attributes (AP[2:1] = 01).  That's the userspace 2 MB at VA
 VA              Size    Purpose
 0x10000000      2 MB    init binary (user_storage BSS + mmu_map_user_2mb)
                         Stack top = 0x10200000; spawned threads share this window
-0x20000000      2 MB    exec code (exec_storage BSS + mmu_map_user_2mb)
-0x20200000      2 MB    exec stack (exec_stack_storage BSS + mmu_map_user_2mb)
+0x20000000      2 MB    exec code      (exec_storage[slot])
+0x20200000      2 MB    exec stack     (exec_stack_storage[slot])
                         Stack top = 0x20400000
+0x20400000      2 MB    exec heap      (exec_heap_storage[slot])
+                        Grows up from EXEC_HEAP_VA, controlled by SYS_brk
 ```
 
+R5: each exec'd process owns its own `slot` in a pool of `EXEC_SLOTS`
+(=2 today) BSS-resident 2 MB backings.  `sys_execve` allocates a free
+slot via `exec_slot_alloc`; `sys_fork` allocates a second slot and
+kmemcpys the parent's 6 MB of slot content into it before installing a
+child vm_map whose L2 maps the same EL0 VAs to the child slot's
+physical pages.  The TTBR0 swap on context-switch (see `switch_to_next`)
+hands each thread its own slot transparently.  `vm_map_put` releases
+the slot back to the pool on the last reference (kthread reap path).
+
 The init and exec windows are both mapped once at boot (`user_init` /
-`exec_space_init`) and reused for every process.  Only one exec'd
-program runs at a time (the shell calls `sys_wait` before accepting the
+`exec_space_init`) and reused for every process.  The boot l0 maps
+slot 0 as a "default view" -- no process actually runs on the boot
+vm_map for EXEC_VA, but having a valid mapping there means stray
+accesses don't fault.  Only one exec'd program runs at a time per
+shell (the shell calls `sys_wait` before accepting the
 next command).
 
 ### ELF loader (sys_execve)

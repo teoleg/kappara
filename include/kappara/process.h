@@ -47,6 +47,10 @@ struct vm_map {
 	uint64_t  l1_phys;	/* for teardown; arch-allocated by
 				 * mmu_vmap_create on aarch64 */
 	uint64_t  l2_phys;	/* L2 we mutate when mapping user pages */
+	/* R5: which exec process slot this vm_map's user mappings
+	 * point at.  -1 = no exec slot (init_vm_map, boot vm_map).
+	 * vm_map_put frees the slot when refs hit zero. */
+	int       exec_slot;
 	int       refs;		/* threads sharing this map */
 	spinlock_t lock;
 };

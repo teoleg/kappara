@@ -45,6 +45,7 @@
 #define SYS_tcsetpgrp	31
 #define SYS_tcgetpgrp	32
 #define SYS_brk		33
+#define SYS_fork	34
 
 #define SIG_BLOCK	0
 #define SIG_UNBLOCK	1
@@ -324,6 +325,11 @@ static inline long sys_tcgetpgrp(int fd)
 static inline long sys_brk(unsigned long addr)
 {
 	return _syscall1(SYS_brk, (long)addr);
+}
+
+static inline long sys_fork(void)
+{
+	return _syscall0(SYS_fork);
 }
 
 /* ioctl commands -- mirror include/kappara/stream_head.h. */
