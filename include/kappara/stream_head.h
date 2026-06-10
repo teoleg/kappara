@@ -95,6 +95,21 @@ struct stdata {
 
 void streams_head_init(void);
 
+/* In-kernel STREAMS API used by drivers and selftests that want to
+ * build streams without going through sys_open / cdev paths. */
+struct stdata *stream_build_kernel(struct streamtab *drv_st,
+                                    const char *name, unsigned minor);
+void           stream_destroy_kernel(struct stdata *sd);
+
+/* I_LINK / I_UNLINK at the in-kernel API level.  The ioctl path
+ * resolves fds to stdata and calls these.  Selftests can call them
+ * directly.  Returns muxid > 0 on success, -1 on failure. */
+long           stream_ilink  (struct stdata *upper, struct stdata *lower);
+long           stream_iunlink(struct stdata *upper, int muxid);
+
+/* Boot self-test exercising I_LINK end-to-end. */
+void           mux_selftest(void);
+
 /* Kthread entry point: poll PL011 RX FIFO and putnext received bytes
  * into the bottom of the active /dev/console read chain.  Spawned by
  * each arch's kmain before ksh so RX bytes don't get lost. */
@@ -130,6 +145,30 @@ extern struct file_ops stream_fops;
 #define I_PUSH		1	/* arg = const char *modname            */
 #define I_POP		2	/* arg = 0                              */
 #define I_LIST		3	/* arg = char* buffer; fills with names */
+#define I_LINK		4	/* arg = lower fd; returns muxid > 0    */
+#define I_UNLINK	5	/* arg = muxid                          */
+
+/*
+ * SVR4 linkblk -- payload of the M_IOCTL{I_LINK} message sent down
+ * the upper stream's write side.  The upper driver (mux) reads it
+ * out of the b_cont mblk and records l_qbot in its per-instance
+ * state so it can forward write-side traffic into the lower stream
+ * via putnext(l_qbot, mp).  The stream head also rewires the lower
+ * stream's read-side chain so messages going UP from the lower
+ * driver enter the upper driver's read queue instead of the lower
+ * stream head.
+ *
+ *   l_qtop   upper stream's driver write queue (advisory; the
+ *            driver knows where it lives).
+ *   l_qbot   lower stream's stream-head write queue.  putnext on
+ *            this hands data into the lower stack at its top.
+ *   l_index  muxid returned to the user; pass it to I_UNLINK.
+ */
+struct linkblk {
+	queue_t	*l_qtop;
+	queue_t	*l_qbot;
+	int	 l_index;
+};
 
 /*
  * SVR4 strbuf -- (maxlen, len, buf) triple used by putmsg / getmsg.

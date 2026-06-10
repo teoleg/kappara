@@ -459,6 +459,7 @@ void kmain(void)
 	buf_init();
 	bram_init();
 	buf_selftest();
+	mux_selftest();
 	net_selftest();
 	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ on core 0 */
 

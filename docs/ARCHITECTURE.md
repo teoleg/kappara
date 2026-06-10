@@ -429,6 +429,47 @@ MAJOR(rdev) to find the streamtab and build a stream around it.  No
 Linux-style "f_ops on every inode" — drivers live in cdevsw, not on
 the inode.
 
+### Multiplexors (I_LINK / I_UNLINK)
+
+A STREAMS multiplexor is a driver that talks to **multiple lower
+streams** as a single logical entity.  IP is the canonical example:
+one IP driver, many netifs (lo0, slip0, eth0) joined under it, and
+many upper protocols (UDP, ICMP, TCP) joined above it.
+
+`ioctl(upper_fd, I_LINK, lower_fd)` joins the lower stream beneath
+the upper stream's driver.  Mechanically:
+
+1. Stream head allocates a muxid (1..MUX_MAX), records `upper` and
+   `lower` in `muxtab[]`.
+2. Builds an M_IOCTL{`I_LINK`} carrying a `struct linkblk { l_qtop,
+   l_qbot, l_index }` -- `l_qbot` is the lower stream's head write
+   queue, used by the mux driver later for "putnext into the lower
+   stream's top".
+3. `putnext`'s the M_IOCTL down the upper stream's write side.  The
+   mux driver's `wput` recognises I_LINK, stores `l_qbot` and the
+   muxid in its per-instance state, flips db_type to M_IOCACK and
+   `putnext`s back up.
+4. On ack, the stream head **rewires the lower stream's read-side
+   chain**: the queue whose `q_next` was the lower head's `sd_rq`
+   now points at the **upper driver's** `drv_rq`.  After this,
+   data going up from the lower driver (via `putnext`) lands in the
+   upper driver's `rput`, which can demux on protocol byte (IP) or
+   whatever it tracks.
+
+`I_UNLINK` is symmetric: M_IOCTL{I_UNLINK} to the upper driver, on
+ack the saved `q_next` is restored.
+
+The in-kernel API (`stream_ilink` / `stream_iunlink`, taking stdata
+pointers directly) is what built-in mux drivers use; the ioctl path
+just resolves fds and calls through.  `mux_selftest` (runs at boot)
+exercises the full round trip with a tiny `mux_demo` driver as upper
+and the existing `loop` driver as lower.
+
+This is what lets us build the network stack as **real STREAMS
+modules** -- IP is a multiplexor with lo0/slip0/eth0 linked under,
+UDP/ICMP/TCP linked over -- rather than a direct-call protocol stack
+sandwiched between STREAMS endpoints.
+
 ### Pipes
 
 `sys_pipe` builds two pipe_end stdata and cross-wires
