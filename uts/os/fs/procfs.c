@@ -30,6 +30,7 @@
 #include "kappara/cdevsw.h"
 #include "kappara/ftrace.h"
 #include "kappara/kmem.h"
+#include "kappara/netif.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
 #include "kappara/proc.h"
@@ -278,6 +279,57 @@ static int proc_cpu_qopen(queue_t *q)
 	return 0;
 }
 
+/* ---- /proc/netif --------------------------------------------------- */
+/*
+ * One row per registered netif.  Columns:
+ *   NAME    interface name (lo0, slip0, ...)
+ *   FLAGS   text flags (UP for now; netifs that exist are always up)
+ *   MTU     IP datagram cap in bytes
+ *   IP      dotted-quad host address
+ *   MASK    dotted-quad netmask
+ *
+ * The columns match what `ifconfig -a` would print on SVR4.  Real
+ * Solaris shows per-zone state, multicast, broadcast, oerrors / ierrors;
+ * we have none of that infrastructure yet.
+ */
+
+static struct procbuf netif_pb;
+
+static void pb_dotted_quad(struct procbuf *b, uint32_t ip)
+{
+	pb_pad_dec(b, (ip >> 24) & 0xff, 0); pb_putc(b, '.');
+	pb_pad_dec(b, (ip >> 16) & 0xff, 0); pb_putc(b, '.');
+	pb_pad_dec(b, (ip >>  8) & 0xff, 0); pb_putc(b, '.');
+	pb_pad_dec(b,  ip        & 0xff, 0);
+}
+
+static int netif_one_row(struct netif *nif, void *arg)
+{
+	struct procbuf *b = arg;
+	pb_pad_str(b, nif->name, 8);
+	pb_str(b, "UP    ");
+	pb_pad_dec(b, nif->mtu, 6);
+	pb_str(b, "  ");
+	/* IP + mask in fixed-width slots so columns line up regardless
+	 * of octet width. */
+	size_t before = b->len;
+	pb_dotted_quad(b, nif->ip);
+	while ((b->len - before) < 16) pb_putc(b, ' ');
+	pb_dotted_quad(b, nif->netmask);
+	pb_putc(b, '\n');
+	return 0;
+}
+
+static int proc_netif_qopen(queue_t *q)
+{
+	pb_reset(&netif_pb);
+	pb_str(&netif_pb,
+	       "NAME    FLAGS  MTU     IP              NETMASK\n");
+	netif_for_each(netif_one_row, &netif_pb);
+	pb_flush_to_q(&netif_pb, q);
+	return 0;
+}
+
 /* ---- Read-side put: the head queues data; we never see reverse traffic. */
 
 static int proc_rq_putp(queue_t *q, mblk_t *mp)
@@ -321,6 +373,7 @@ PROC_DRIVER(mem,    proc_mem_qopen);
 PROC_DRIVER(slab,   proc_slab_qopen);
 PROC_DRIVER(stream, proc_stream_qopen);
 PROC_DRIVER(cpu,    proc_cpu_qopen);
+PROC_DRIVER(netif,  proc_netif_qopen);
 
 /* ---- /proc/ftrace --------------------------------------------------- */
 
@@ -398,6 +451,7 @@ void proc_init(void)
 	cdev_register(CDEV_MAJ_PROC_STREAM, "proc-stream", &stream_streamtab);
 	cdev_register(CDEV_MAJ_PROC_FTRACE, "proc-ftrace", &ftrace_streamtab);
 	cdev_register(CDEV_MAJ_PROC_CPU,    "proc-cpu",    &cpu_streamtab);
+	cdev_register(CDEV_MAJ_PROC_NETIF,  "proc-netif",  &netif_streamtab);
 
 	struct dentry *proc = vfs_mkdir(vfs_root(), "proc");
 	vfs_mknod_chrdev(proc, "ps",       MKDEV(CDEV_MAJ_PROC_PS,     0));
@@ -406,4 +460,5 @@ void proc_init(void)
 	vfs_mknod_chrdev(proc, "streams",  MKDEV(CDEV_MAJ_PROC_STREAM, 0));
 	vfs_mknod_chrdev(proc, "ftrace",   MKDEV(CDEV_MAJ_PROC_FTRACE, 0));
 	vfs_mknod_chrdev(proc, "cpuload",  MKDEV(CDEV_MAJ_PROC_CPU,    0));
+	vfs_mknod_chrdev(proc, "netif",    MKDEV(CDEV_MAJ_PROC_NETIF,  0));
 }

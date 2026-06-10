@@ -92,3 +92,11 @@ forktest_blob_end:
 ping_blob_start:
 	.incbin "build/cmd/ping.elf"
 ping_blob_end:
+
+	.section ".rodata.ifconfig_blob","a",%progbits
+	.balign 8
+	.global ifconfig_blob_start
+	.global ifconfig_blob_end
+ifconfig_blob_start:
+	.incbin "build/cmd/ifconfig.elf"
+ifconfig_blob_end:

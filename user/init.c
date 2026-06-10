@@ -387,6 +387,7 @@ static void cmd_help(void)
 		"  halt                   ask QEMU to exit (semihosting)\r\n"
 		"  ftrace [on|off|reset|dump]  per-CPU function tracer\r\n"
 		"  ping [ip] [count]      ICMP echo via /dev/icmp (default 127.0.0.1)\r\n"
+		"  ifconfig               dump /proc/netif (interface list)\r\n"
 		"  <name>                 unknown commands look up /usr/bin/<name>\r\n"
 		"                         (ps, sigtest, masktest, waittest, segvtest,\r\n"
 		"                          crash, pipe, pipework, malloctest, forktest)\r\n");

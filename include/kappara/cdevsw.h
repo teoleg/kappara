@@ -66,6 +66,7 @@ typedef uint32_t dev_t;
 #define CDEV_MAJ_TTY		14	/* /dev/tty0..tty3 -- multi-minor */
 #define CDEV_MAJ_LO		15	/* /dev/lo0 -- loopback iface     */
 #define CDEV_MAJ_ICMP		16	/* /dev/icmp -- ICMP echo device  */
+#define CDEV_MAJ_PROC_NETIF	17	/* /proc/netif -- interface list  */
 
 #define CDEV_MAX		32
 
