@@ -65,3 +65,12 @@ void netif_input(struct netif *nif, mblk_t *mp)
 {
 	ip_input(nif, mp);
 }
+
+int netif_for_each(int (*cb)(struct netif *nif, void *arg), void *arg)
+{
+	for (struct netif *n = netif_list; n; n = n->next) {
+		int r = cb(n, arg);
+		if (r) return r;
+	}
+	return 0;
+}

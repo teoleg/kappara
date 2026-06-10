@@ -181,6 +181,27 @@ when more runnable threads exist than cores.  Single-word reads,
 no locks — the sample may be stale by one instruction, which is
 fine for a diagnostic.
 
+### /proc/netif
+
+One row per registered network interface (`netif_for_each` walk of
+the registry).  Columns: name, flags, MTU, IPv4 address, netmask.
+The user-facing tool is `cmd/ifconfig`, which just reads this file
+and dumps it verbatim.  Real Solaris `ifconfig -a` shows much more
+(zone, multicast, broadcast, error counters); we'll add columns when
+we add the kernel state to back them.
+
+```
+kappara:/# cat /proc/netif
+NAME    FLAGS  MTU     IP              NETMASK
+lo0     UP      1500  127.0.0.1       255.0.0.0
+```
+
+Read-only.  There's no `ifconfig lo0 up` because every netif is
+statically registered at boot — nothing to mutate.  When SLIP and
+Ethernet drivers land with runtime-configurable IP/MTU, write-side
+ioctls (or a `/dev/dlpi`-shaped control stream) become the place to
+add mutation.
+
 ## How to add a new /proc entry
 
 Three steps:

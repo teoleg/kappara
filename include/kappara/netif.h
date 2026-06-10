@@ -45,6 +45,11 @@ struct netif {
 void          netif_register(struct netif *nif);
 struct netif *netif_route   (uint32_t dst_ip);
 
+/* Walk the registry in registration order (newest first).  cb returns
+ * non-zero to stop iteration; netif_for_each returns that value. */
+int           netif_for_each(int (*cb)(struct netif *nif, void *arg),
+                             void *arg);
+
 /* Drivers call this when a packet arrives (rx interrupt, lo0
  * loopback fire, etc.).  Hands the mblk to the IP layer (calls
  * ip_input internally).  The caller hands ownership of mp to

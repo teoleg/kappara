@@ -132,3 +132,14 @@ KERNEL_OBJS := \
 ```
 
 That's it — `-MMD -MP` picks up the header deps automatically.
+
+## Adding a /usr/bin command
+
+1. Create `cmd/<name>.c`.  It may include kernel ABI headers from
+   `include/kappara/` (e.g., `icmp.h` for the `struct icmp_ping_req`
+   layout) — `CMD_CFLAGS` already carries `-Iinclude`.
+2. Add `<name>` to `CMD_NAMES` in `Makefile`.
+3. Add an `.incbin` stanza to `uts/aarch64/usrblobs.S`.
+4. Add `extern char <name>_blob_start/end[]` and a `PAY(...)` entry
+   to `exec_space_init()` in `uts/os/user/user.c`.
+5. Update `docs/SHELL.md` (the /usr/bin table).
