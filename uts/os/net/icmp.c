@@ -150,8 +150,8 @@ void icmp_input(struct netif *nif, uint32_t src, uint32_t dst, mblk_t *mp)
 		uint16_t cs = ip_checksum(h, len);
 		h->checksum = htons16(cs);
 		(void)nif;
-		if (ip_output(src, IPPROTO_ICMP, mp) < 0) {
-			/* ip_output freed mp on failure */
+		if (ip_send(src, IPPROTO_ICMP, mp) < 0) {
+			/* ip_send freed mp on failure */
 		}
 		return;
 	}
@@ -187,7 +187,7 @@ int icmp_send_echo(uint32_t dst_ip, uint16_t id, uint16_t seq,
 	uint16_t cs = ip_checksum(h, ICMP_HDR_LEN + len);
 	h->checksum = htons16(cs);
 
-	return ip_output(dst_ip, IPPROTO_ICMP, mp);
+	return ip_send(dst_ip, IPPROTO_ICMP, mp);
 }
 
 /* ---- /dev/icmp STREAMS driver ------------------------------------- */

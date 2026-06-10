@@ -1849,11 +1849,13 @@ void streams_head_init(void)
 	vfs_mknod_chrdev(dev, "tty2", MKDEV(CDEV_MAJ_TTY, 2));
 	vfs_mknod_chrdev(dev, "tty3", MKDEV(CDEV_MAJ_TTY, 3));
 
-	/* Networking: ip_init registers lo0 (netif + STREAMS cdev).
-	 * icmp_str_init registers /dev/icmp (STREAMS cdev for cmd/ping).
-	 * Both are published as /dev nodes here. */
-	ip_init();
-	vfs_mknod_chrdev(dev, "lo0",  MKDEV(CDEV_MAJ_LO,   0));
+	/* Networking: /dev/icmp gets its node here so the /dev tree is
+	 * fully populated by the time the shell sees it.  ip_init()
+	 * itself is deferred to main.c -- it builds the IP multiplexor
+	 * control stream and I_LINKs every registered netif underneath,
+	 * which means it sleeps on sd_ioc_wq waiting for the I_LINK
+	 * ACK.  Sleeping needs curthread, which only exists after
+	 * sched_init().  streams_head_init runs before sched. */
 	icmp_str_init();
 	vfs_mknod_chrdev(dev, "icmp", MKDEV(CDEV_MAJ_ICMP,  0));
 

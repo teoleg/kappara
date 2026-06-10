@@ -4,7 +4,7 @@
  * Phase N1: protocol layer only.  ip_input dispatches datagrams here;
  * we strip the header and log the arrival (no bound sockets yet, so
  * every incoming datagram is dropped after logging).  udp_output
- * prepends the 8-byte UDP header and calls ip_output.
+ * prepends the 8-byte UDP header and calls ip_send.
  *
  * Phase N2 will add a per-stream binding table and the /dev/udp
  * STREAMS cdev with TPI-shaped M_PROTO messages (T_BIND_REQ,
@@ -72,5 +72,5 @@ int udp_output(uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
 	h->len      = htons16((uint16_t)payload_and_hdr);
 	h->checksum = 0;	/* RFC 768: zero = not computed */
 
-	return ip_output(dst_ip, IPPROTO_UDP, mp);
+	return ip_send(dst_ip, IPPROTO_UDP, mp);
 }

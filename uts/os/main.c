@@ -460,6 +460,10 @@ void kmain(void)
 	bram_init();
 	buf_selftest();
 	mux_selftest();
+	/* IP multiplexor stream + per-netif I_LINK: must happen after
+	 * sched_init so the I_LINK ACK path can take spinlocks (which
+	 * deref curthread under the hood).  Streams already up. */
+	ip_init();
 	net_selftest();
 	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ on core 0 */
 
