@@ -44,8 +44,8 @@ long sys_spawn_impl(uint64_t entry, uint64_t arg);
  * Returns the new thread's tid, or -1 on failure. */
 long sys_execve_impl(const char *path, int argc, const char *const argv[]);
 
-/* sys_exit -- terminate the calling thread.  Does not return. */
-void sys_exit_impl(void) __attribute__((noreturn));
+/* sys_exit -- terminate the calling thread with exit status.  Does not return. */
+void sys_exit_impl(int status) __attribute__((noreturn));
 
 /* sys_brk -- set the heap break for the current exec session.
  * addr == 0: return current break.

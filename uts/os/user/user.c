@@ -65,7 +65,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kappara/blkdev.h"
 #include "kappara/elf.h"
+#include "kappara/kfs.h"
 #include "kappara/kmem.h"
 #include "kappara/mmu.h"
 #include "kappara/pmm.h"
@@ -81,6 +83,11 @@
 #define USER_VA		0x10000000UL
 #define USER_SIZE	0x00200000UL
 #define USER_STACK_TOP	(USER_VA + USER_SIZE)
+
+/* User-mode stack slot size.  Used by both the multi-shell pool
+ * (user_spawn) and sys_spawn workers, all carved from user_storage
+ * top-down.  See the layout diagram further down. */
+#define SPAWN_STACK_SIZE	0x10000UL
 
 /*
  * Backing storage: a 2 MB-aligned slab in BSS.  This is the physical
@@ -137,20 +144,67 @@ void user_init(void)
 		(unsigned long)USER_VA);
 }
 
+#include "kappara/tty.h"
+#include "kappara/user.h"
+#include "kappara/vfs.h"
+
+/* Forward decl -- defined later, near sys_spawn_impl. */
+static unsigned spawn_next;
+
+/* Per-init-shell launch args.  Each entry of the multi-shell pool
+ * spawned by user_spawn carries the same EL0 entry point but a
+ * different stack slot + tty number (in user x0). */
+struct init_args {
+	uint64_t entry;
+	uint64_t sp;
+	uint64_t tty;
+};
+
 static void user_thread_main(void *arg)
 {
-	(void)arg;
-	kprintf("user: kthread entering EL0 (entry=0x%lx, sp=0x%lx)\n",
-		(unsigned long)USER_VA, (unsigned long)USER_STACK_TOP);
-	aarch64_enter_userspace(USER_VA, USER_STACK_TOP, 0);
+	struct init_args a = *(struct init_args *)arg;
+	kfree(arg);
+	kprintf("user: kthread entering EL0 tty=%lu (entry=0x%lx, sp=0x%lx)\n",
+		(unsigned long)a.tty, (unsigned long)a.entry,
+		(unsigned long)a.sp);
+	aarch64_enter_userspace(a.entry, a.sp, a.tty);
 	/* unreachable */
 }
 
 void user_spawn(void)
 {
-	struct kthread *t = kthread_create("user-init", user_thread_main, NULL);
-	if (t)
+	/* Spawn one shell per /dev/ttyN.  Shell N runs at the EL0 entry
+	 * USER_VA with SP = USER_STACK_TOP - N*64KB and x0 = N, so
+	 * init's _start can open /dev/ttyN as fds 0/1/2.  Only the
+	 * currently-active tty drives output to UART; inactive shells
+	 * paint into their cell buffer and surface on tty_switch.
+	 *
+	 * Bump spawn_next past the multi-shell slots so any future
+	 * sys_spawn-ed workers don't collide with the shell stacks. */
+	for (unsigned i = 0; i < NTTY; i++) {
+		struct init_args *a = kmalloc(sizeof(*a));
+		if (!a) {
+			kprintf("user_spawn: kmalloc failed for tty=%u\n", i);
+			continue;
+		}
+		a->entry = USER_VA;
+		a->sp    = USER_VA + USER_SIZE - (uint64_t)i * SPAWN_STACK_SIZE;
+		a->tty   = i;
+
+		char name[16];	/* "user-init-N" fits */
+		const char *src = "user-init-";
+		char       *dst = name;
+		while (*src) *dst++ = *src++;
+		*dst++ = (char)('0' + i);
+		*dst   = '\0';
+
+		struct kthread *t = kthread_create(name, user_thread_main, a);
+		if (!t) { kfree(a); continue; }
 		kthread_setclass(t, SCLASS_TS);
+	}
+	/* spawn_next is incremented BEFORE use in sys_spawn_impl, so the
+	 * first sys_spawn worker wants `++spawn_next` to equal NTTY. */
+	spawn_next = NTTY - 1;
 }
 
 /*
@@ -184,10 +238,10 @@ void user_spawn(void)
 #define EXEC_HEAP_VA   0x20400000UL	/* heap: grows up from here */
 #define EXEC_HEAP_SIZE 0x00200000UL	/* 2 MB ceiling */
 
-#define SPAWN_STACK_SIZE	0x10000UL
+/* SPAWN_STACK_SIZE is defined near the top of the file. */
 #define SPAWN_MAX		((USER_SIZE / SPAWN_STACK_SIZE) - 1)
 
-static unsigned spawn_next;
+/* spawn_next forward-declared earlier so user_spawn can reset it. */
 static unsigned exec_spawn_next;
 
 struct spawn_args {
@@ -253,10 +307,10 @@ long sys_spawn_impl(uint64_t entry, uint64_t arg)
 	return (long)t->tid;
 }
 
-void sys_exit_impl(void) __attribute__((noreturn));
-void sys_exit_impl(void)
+void sys_exit_impl(int status) __attribute__((noreturn));
+void sys_exit_impl(int status)
 {
-	kthread_exit();
+	kthread_exit(status);
 	for (;;)
 		;
 }
@@ -419,44 +473,46 @@ void exec_space_init(void)
 		(unsigned long)EXEC_STACK_TOP,
 		(unsigned long)hello_priv.size);
 
-	/* Create /usr/bin hierarchy and register /usr/bin programs. */
+	/*
+	 * /usr/bin -- R0: kfs-on-ramdisk instead of in-kernel blob
+	 * registration.  Build a payload table from the cmd ELF blobs
+	 * (still .incbin'd into the kernel image) and copy them into the
+	 * ramdisk via mkimage; mount the resulting filesystem at
+	 * /usr/bin.  The exec loader's read_file_kernel path is unchanged
+	 * -- it just reads through the regfile file_ops, which now go
+	 * through the buf cache and block device instead of memcpy from
+	 * rodata.  Same code, real storage layer.
+	 *
+	 * The cmd blobs stay in kernel rodata for now because the
+	 * raspi3b -kernel boot path has no initrd story; once the SD/EMMC
+	 * driver (S2) lands, the same kfs path picks up bytes from real
+	 * storage and the blobs can leave the kernel image.
+	 */
+#define PAY(name_str, sym_start, sym_end) \
+	{ name_str, (sym_start), (uint32_t)((sym_end) - (sym_start)) }
+	const struct kfs_payload usrbin_payloads[] = {
+		PAY("ps",         ps_blob_start,         ps_blob_end),
+		PAY("sigtest",    sigtest_blob_start,    sigtest_blob_end),
+		PAY("masktest",   masktest_blob_start,   masktest_blob_end),
+		PAY("waittest",   waittest_blob_start,   waittest_blob_end),
+		PAY("segvtest",   segvtest_blob_start,   segvtest_blob_end),
+		PAY("crash",      crash_blob_start,      crash_blob_end),
+		PAY("pipe",       pipe_blob_start,       pipe_blob_end),
+		PAY("pipework",   pipework_blob_start,   pipework_blob_end),
+		PAY("malloctest", malloctest_blob_start, malloctest_blob_end),
+	};
+#undef PAY
+	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);
+
+	kfs_mkimage(ramdisk_get(), usrbin_payloads, n_usrbin);
+
 	struct dentry *usr    = vfs_mkdir(vfs_root(), "usr");
 	struct dentry *usrbin = vfs_mkdir(usr, "bin");
-
-	static struct blob_priv ps_priv, sigtest_priv, masktest_priv,
-	                        waittest_priv, segvtest_priv, crash_priv,
-	                        pipe_priv, pipework_priv, malloctest_priv;
-
-#define REG(dir, name, priv, s, e) do { \
-	(priv).data = (const unsigned char *)(s); \
-	(priv).size = (size_t)((e) - (s)); \
-	vfs_mknod_regfile((dir), (name), &blob_fops, &(priv)); \
-} while (0)
-
-	REG(usrbin, "ps",       ps_priv,       ps_blob_start,       ps_blob_end);
-	REG(usrbin, "sigtest",  sigtest_priv,  sigtest_blob_start,  sigtest_blob_end);
-	REG(usrbin, "masktest", masktest_priv, masktest_blob_start, masktest_blob_end);
-	REG(usrbin, "waittest", waittest_priv, waittest_blob_start, waittest_blob_end);
-	REG(usrbin, "segvtest", segvtest_priv, segvtest_blob_start, segvtest_blob_end);
-	REG(usrbin, "crash",    crash_priv,    crash_blob_start,    crash_blob_end);
-	REG(usrbin, "pipe",     pipe_priv,     pipe_blob_start,     pipe_blob_end);
-	REG(usrbin, "pipework",  pipework_priv,  pipework_blob_start,  pipework_blob_end);
-	REG(usrbin, "malloctest", malloctest_priv, malloctest_blob_start, malloctest_blob_end);
-
-#undef REG
-
-	kprintf("exec: /usr/bin registered: ps(%lu) sigtest(%lu) masktest(%lu) "
-		"waittest(%lu) segvtest(%lu) crash(%lu) pipe(%lu) pipework(%lu) "
-		"malloctest(%lu)\n",
-		(unsigned long)ps_priv.size,
-		(unsigned long)sigtest_priv.size,
-		(unsigned long)masktest_priv.size,
-		(unsigned long)waittest_priv.size,
-		(unsigned long)segvtest_priv.size,
-		(unsigned long)crash_priv.size,
-		(unsigned long)pipe_priv.size,
-		(unsigned long)pipework_priv.size,
-		(unsigned long)malloctest_priv.size);
+	if (kfs_mount(ramdisk_get(), usrbin) < 0)
+		kprintf("exec: kfs_mount /usr/bin failed\n");
+	else
+		kprintf("exec: /usr/bin mounted from ramdisk (%u files)\n",
+		        n_usrbin);
 }
 
 /* ---- ELF loader ---- */

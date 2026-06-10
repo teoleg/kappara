@@ -117,8 +117,8 @@ static long sys_spawn(long a0, long a1, long a2, long a3, long a4, long a5)
 
 static long sys_exit(long a0, long a1, long a2, long a3, long a4, long a5)
 {
-	(void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-	sys_exit_impl();
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	sys_exit_impl((int)a0);
 	return 0;	/* unreachable */
 }
 
@@ -166,7 +166,7 @@ static long sys_halt(long a0, long a1, long a2, long a3, long a4, long a5)
 	for (;;) __asm__ volatile ("wfi");
 }
 
-static long sys_lsl(long a0, long a1, long a2, long a3, long a4, long a5)
+static long sys_ll(long a0, long a1, long a2, long a3, long a4, long a5)
 {
 	(void)a3; (void)a4; (void)a5;
 	char kpath[128];
@@ -433,7 +433,7 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_unlink] = sys_unlink,
 	[SYS_rmdir]  = sys_rmdir,
 	[SYS_kill]   = sys_kill,
-	[SYS_lsl]         = sys_lsl,
+	[SYS_ll]          = sys_ll,
 	[SYS_halt]        = sys_halt,
 	[SYS_sigaction]   = sys_sigaction,
 	[SYS_sigprocmask] = sys_sigprocmask,

@@ -9,7 +9,7 @@ static void pipe_writer(long packed)
     const char *msg = "pipe-writer: greetings from a second EL0 thread";
     sys_write(keep, msg, (size_t)strlen(msg));
     sys_close(keep);
-    sys_exit();
+    sys_exit(0);
 }
 
 static void pipe_reader(long packed)
@@ -28,7 +28,7 @@ static void pipe_reader(long packed)
         sys_log(log);
     }
     sys_close(keep);
-    sys_exit();
+    sys_exit(0);
 }
 
 int main(int argc, char **argv)

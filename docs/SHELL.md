@@ -1,19 +1,28 @@
 # ksh — kappara shell reference
 
-`ksh` is the userspace shell, running at EL0 as PID 2.  It opens
-`/dev/console` for input/output, prints a prompt, reads a line via the
-blocking STREAMS path, tokenizes on spaces, and dispatches to one of
-the commands below.  Line editing supports backspace and **up/down
-arrow** for command history (last 16 lines).
+`ksh` is the userspace shell, running at EL0.  The kernel spawns one
+instance per `/dev/ttyN` (4 by default), so there's a separate shell
+PID waiting on each virtual console: `user-init-0` on tty0,
+`user-init-1` on tty1, etc.  Each shell opens its own `/dev/ttyN` as
+fds 0/1/2.  `uart_rx_main` routes UART bytes only to the active tty,
+so the three background shells sit BLOCKED in `sys_read` until you
+`Ctrl-X N` to switch the active console.
 
-The prompt shows the current working directory: `kappara:/etc#`.
+Each shell prints a prompt with its current working directory:
+`kappara:/#`.  The opening banner names the tty, e.g.
+`kappara shell on tty0 -- type 'help' for commands`.
+
+Line editing supports backspace and **up/down arrow** for command
+history (last 16 lines).  Globals like `cwd`, `ked`/`vi` state, etc.
+are shared across all four shells; since only the active tty drives
+input, this matters in practice only if you `Ctrl-X` mid-edit.
 
 ## File system
 
 | Command                    | What it does                                                |
 |----------------------------|-------------------------------------------------------------|
 | `ls [path]`                | List directory entries (names only).                         |
-| `lsl [path]`               | "ls -l": each row is `type size name`.  For chrdevs the size column shows `major,minor`. |
+| `ll [path]`               | "ls -l": each row is `type size name`.  For chrdevs the size column shows `major,minor`. |
 | `cd [path]`                | Change directory.  `.`, `..`, mixed `..` are all canonicalized.  No arg = `/`.  The target is probed with `sys_ls` first -- non-existent paths and regular files are rejected without mutating cwd. |
 | `pwd`                      | Print working directory.                                    |
 | `cat <path>`               | Dump a file's bytes to the console.                         |
@@ -42,10 +51,11 @@ The prompt shows the current working directory: `kappara:/etc#`.
 
 ## /usr/bin — standalone ELF programs
 
-These programs live as ELF blobs embedded in the kernel image and are
-registered at `/usr/bin/` in the VFS.  Typing their name without `exec`
-works because the shell's PATH fallback automatically tries
-`/usr/bin/<name>` for any unrecognised command.  Source lives in `cmd/`.
+These programs are ELF blobs embedded in the kernel image (in
+`uts/aarch64/usrblobs.S`) that get copied at boot into a kfs ramdisk
+mounted at `/usr/bin`.  Typing their name without `exec` works because
+the shell's PATH fallback automatically tries `/usr/bin/<name>` for any
+unrecognised command.  Source lives in `cmd/`.
 
 | Program       | What it does                                                  |
 |---------------|---------------------------------------------------------------|
@@ -57,6 +67,7 @@ works because the shell's PATH fallback automatically tries
 | `crash`       | Dereference NULL directly — no spawn.  The exec thread takes the EL0 data-abort fault, gets SIGSEGV'd, and exits. |
 | `pipe`        | Create a pipe, write a message, read it back in the same thread. |
 | `pipework`    | Spawn a writer thread and a reader thread connected by a pipe; demonstrates blocking-read EOF detection. |
+| `malloctest`  | Exercise libc `malloc`/`free`/`calloc`/`realloc` end-to-end; smoke test for `SYS_brk` and the sbrk-backed allocator. |
 
 Exec-space programs can call `sys_spawn` to create sub-threads.  The
 kernel allocates their stacks from `exec_stack_storage` starting at
@@ -69,8 +80,8 @@ call so every exec'd program gets a fresh pool.
 `int main(int argc, char **argv)`; `argv[0]` is the resolved path (or
 the command name for PATH-fallback dispatch).  The libc provides
 `printf`/`puts`, `FILE*` (`fopen`/`fread`/`fwrite`/`fprintf`,
-`stdin`/`stdout`/`stderr` on fds 0/1/2), and `malloc`/`free` against a
-512 KB BSS arena.
+`stdin`/`stdout`/`stderr` on fds 0/1/2), and `malloc`/`free` against
+a free-list allocator backed by `SYS_brk`.
 
 ## Streams / device I/O
 
@@ -98,31 +109,22 @@ A small session that exercises most of it:
 
 ```
 kappara:/# ls
-etc
+usr
+bin
 proc
 dev
-kappara:/# cd /etc
-kappara:/etc# lsl
-reg       31 motd
-reg       93 readme
-reg       50 hello.txt
-kappara:/etc# cat motd
-no soup for you, only streams.
-kappara:/etc# echo greeting hello world
-wrote 12 bytes
-kappara:/etc# cat greeting
-hello world
-kappara:/etc# ked greeting
-ked: /etc/greeting (1 lines)
-* p
-1: hello world
-* a
-this is the second line
-.
-* w
-35 bytes
-* q
-kappara:/etc# cd ..
+kappara:/# ll /usr/bin
+reg    10144 malloctest
+reg    12136 pipework
+reg    11768 pipe
+reg    11472 crash
+reg    11832 segvtest
+reg    11872 waittest
+reg    11968 masktest
+reg    11824 sigtest
+reg    11584 ps
+kappara:/# malloctest
+malloctest: PASS
 kappara:/# cat /proc/ps
   TID  STATE   NAME
     0  READY   main
@@ -211,7 +213,7 @@ something exotic.
 
 ### Implementation notes
 
-- Listing is parsed from `sys_lsl`'s output.  The size field is
+- Listing is parsed from `sys_ll`'s output.  The size field is
   8-char right-justified (or `MMMM,NNN` for chrdevs), so the parser
   splits each line at the *last* space before `\n` — everything to
   the right is the name, everything to the left is metadata.

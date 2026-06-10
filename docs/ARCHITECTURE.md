@@ -66,13 +66,25 @@ DAIF masked, we zero `.bss`, set up an initial stack, and `bl kmain`.
 9. `proc_init` — register `/proc/*` cdevs.
 10. `user_init` — copy the embedded user blob into the EL0 2 MB
     region, ic iallu, mmu_map_user_2mb.
-11. `ramdisk_init` + `kfs_mkimage` + `kfs_mount` — give us `/etc`.
-12. Draw the splash on the framebuffer (one-time write; the kprintf
+11. `ramdisk_init` — zero the kfs backing store.  Must precede
+    `exec_space_init` because the latter calls `kfs_mkimage` to
+    populate `/usr/bin`; reversing the order silently wipes the
+    fresh content.
+12. `exec_space_init` — map the EL0 exec/stack/heap 2 MB windows,
+    register `/bin/hello` (in-kernel blob), build a `kfs_payload`
+    table from the cmd ELFs and call `kfs_mkimage` + `kfs_mount` to
+    publish `/usr/bin` on the ramdisk.
+13. Draw the splash on the framebuffer (one-time write; the kprintf
     tee that used to compete with QEMU's display thread is disabled
     by default — see commit `0cd91fd`).
-13. `sched_init` (make `main` tid 0), `timer_init(100)`.
-14. Spawn `uart_rx` and `user-init` kthreads.
-15. Drop into the idle loop: `kthread_yield(); wfi;` forever.
+14. `sched_init` (make `main` tid 0), `timer_init(100)`.
+15. Spawn `uart_rx` and one `user-init-N` kthread per `/dev/ttyN`
+    (4 shells total).  Each shell enters EL0 with x0 = N so its
+    `_start` can open `/dev/ttyN` as fds 0/1/2.  `uart_rx_main`
+    routes UART bytes only to the active tty, so the three
+    background shells sit `BLOCKED` in `sys_read` until `Ctrl-X N`
+    switches the active minor.
+16. Drop into the idle loop: `kthread_yield(); wfi;` forever.
 
 ## Memory
 
@@ -187,9 +199,14 @@ Exec stack frame at entry (grows down from `EXEC_STACK_TOP = 0x20400000`):
 calls `main(argc, argv)`.
 
 Programs in `/bin` are ELF blobs incbin'd into the kernel image
-(`uts/aarch64/helloblob.S`).  Programs in `/usr/bin` are similarly
-embedded via `uts/aarch64/usrblobs.S`; source lives in `cmd/`.  Both
-sets use `blob_fops` in the VFS — no ramdisk overhead.
+(`uts/aarch64/helloblob.S`) and registered via `blob_fops` in the VFS.
+Programs in `/usr/bin` are embedded via `uts/aarch64/usrblobs.S`
+(source lives in `cmd/`) and copied at boot into the kfs ramdisk by
+`exec_space_init` — at runtime `/usr/bin` is a kfs mount, not a
+collection of in-memory inodes.  The exec loader doesn't care which
+shape it's reading: `read_file_kernel` goes through `f_ops->read`,
+which fans out to `blob_read` for `/bin` and `regfile_read` (through
+the block device) for `/usr/bin`.
 
 The shell opens `/dev/console` three times at startup to fill fds 0
 (stdin), 1 (stdout), and 2 (stderr).  Exec'd programs inherit these so
@@ -224,15 +241,20 @@ so it has no host-OS dependencies.
 | `aarch64/internal.h`    | `__syscall1/__syscall3`, syscall numbers, `ssize_t`.          |
 | `src/string.c`          | `strlen`, `strcpy`, `strncpy`, `memcpy`, `memset`, `strcmp`. |
 | `src/printf.c`          | `printf`, `vprintf`, `sprintf`, `snprintf`, `vsnprintf`.      |
-| `src/malloc.c`          | `malloc`, `free`, `calloc`, `realloc` — 512 KB static BSS arena, first-fit with coalescing. No `sbrk` syscall needed. |
+| `src/malloc.c`          | `malloc`, `free`, `calloc`, `realloc` — free-list allocator backed by `SYS_brk`.  `heap_grow()` calls `brk(0)` + `brk(cur+n)` (rounded up to 4 KB) to extend the heap on demand. |
 | `src/file.c`            | `FILE*` layer: `fopen/fclose/fread/fwrite/fgets/fputs/fputc/fgetc`, `fprintf/vfprintf`, `puts/putchar`.  `stdin/stdout/stderr` backed by fd 0/1/2. |
 | `src/io.c`              | `read`, `write`, `open`, `close`, `pipe`, `_exit`.            |
 | `include/`              | `<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<unistd.h>`, `<stddef.h>`, `<stdarg.h>`, `<sys/types.h>`. |
 
-The malloc arena is a `static unsigned char _heap[512*1024]` in BSS.
-Because `sys_execve_impl` zeroes `exec_storage` before copying PT_LOAD
-segments, the BSS (which includes `_heap`) is always clean at program
-entry — no `sbrk` or zero-page mapping is needed.
+The malloc heap lives in a dedicated 2 MB user-VA window at
+`EXEC_HEAP_VA = 0x20400000` mapped to `exec_heap_storage` in kernel
+BSS.  `SYS_brk(addr)` advances the break within `[EXEC_HEAP_VA,
+EXEC_HEAP_VA+2MB)`; `sys_execve_impl` resets the break to
+`EXEC_HEAP_VA` and zeroes `exec_heap_storage` so every program starts
+with a fresh heap.  Because the heap window's user VA is remapped to
+the BSS PA, the matching kernel-VA range
+`[0x20400000, 0x20600000)` is excluded from the PMM (see the
+`EXEC_HOLE_END` carve-out in `main.c`).
 
 `FILE*` wraps an `int fd` and delegates to the raw `read`/`write`
 syscall wrappers in `io.c`.  It has no knowledge of STREAMS; the
@@ -478,9 +500,17 @@ block 2   root dirent table
 block 3+  data, subdir dirent tables
 ```
 
-Each file gets `KFS_BLOCKS_PER_FILE` contiguous blocks pre-allocated.
-The bitmap supports alloc/free, so `rm` actually returns blocks to
-the pool (see commit `fb3f938`).
+Each file gets `KFS_BLOCKS_PER_FILE` contiguous blocks pre-allocated
+(32 blocks = 16 KB per file, sized for the cmd ELFs).  The bitmap
+supports alloc/free, so `rm` actually returns blocks to the pool
+(see commit `fb3f938`).
+
+`kfs_mkimage` is data-driven: callers pass a `struct kfs_payload[]`
+of `{name, data, size}` tuples and mkimage lays them out at root
+level.  `exec_space_init` builds such a table from the cmd-ELF
+blob symbols and mounts the result at `/usr/bin`.  Future on-disk
+storage (S2 SD/EMMC) plugs in by swapping the `block_device` —
+nothing else above the kfs layer changes.
 
 ## Signals
 

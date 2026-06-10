@@ -17,8 +17,10 @@
  *
  * Storage size
  * ------------
- * RAMDISK_BLOCKS is the count of 512 B sectors.  64 = 32 KB, which
- * is plenty for our tiny kfs (super + dir + a few small files).
+ * RAMDISK_BLOCKS is the count of 512 B sectors.  Sized to fit the
+ * cmd ELF programs (each ~12 KB) that R0 boots from kfs instead
+ * of in-kernel blob registration.  1024 blocks = 512 KB which is
+ * plenty for the 9 programs we ship today plus headroom.
  */
 
 #include <stddef.h>
@@ -28,7 +30,7 @@
 #include "kappara/printk.h"
 #include "kappara/string.h"
 
-#define RAMDISK_BLOCKS	64
+#define RAMDISK_BLOCKS	1024
 
 static unsigned char ramdisk_storage[RAMDISK_BLOCKS * BLK_SIZE];
 

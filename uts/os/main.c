@@ -377,16 +377,12 @@ void kmain(void)
 	streams_head_init();
 	proc_init();
 	user_init();
-	exec_space_init();
-
-	/* Boot a ramdisk-backed kfs and mount it at /etc.
-	 * The mkimage call writes the canned files into the ramdisk
-	 * the first time (no formatter tool yet), then mount discovers
-	 * them via the block-device interface as if from real storage. */
+	/* ramdisk_init zeroes the backing storage and must run BEFORE
+	 * exec_space_init, which calls kfs_mkimage to populate /usr/bin.
+	 * Reversing this order silently wipes the freshly-written cmd
+	 * ELF blocks. */
 	ramdisk_init();
-	kfs_mkimage(ramdisk_get());
-	struct dentry *etc = vfs_mkdir(vfs_root(), "etc");
-	kfs_mount(ramdisk_get(), etc);
+	exec_space_init();
 
 	/* Draw the boot splash now that everything else is up.  The FB
 	 * was already negotiated by discover_gpu_reserve(); if that

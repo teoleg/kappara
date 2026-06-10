@@ -364,7 +364,7 @@ static void cmd_help(void)
 		"  pwd                    print current directory\r\n"
 		"  cd [path]              change current directory\r\n"
 		"  ls [path]              list a directory\r\n"
-		"  lsl [path]             list with type + size (ls -l)\r\n"
+		"  ll [path]              list with type + size (ls -l)\r\n"
 		"  open <path>            open and remember as $fd\r\n"
 		"  close                  close $fd\r\n"
 		"  read [n]               read up to n bytes from $fd\r\n"
@@ -419,7 +419,7 @@ static void cmd_ls(int argc, char *argv[])
 	}
 }
 
-static void cmd_lsl(int argc, char *argv[])
+static void cmd_ll(int argc, char *argv[])
 {
 	char path[128];
 	if (argc > 1)
@@ -430,7 +430,7 @@ static void cmd_lsl(int argc, char *argv[])
 		path[i] = '\0';
 	}
 	char out[512];
-	long n = sys_lsl(path, out, sizeof(out));
+	long n = sys_ll(path, out, sizeof(out));
 	if (n < 0) {
 		cwrite("lsl: cannot access '"); cwrite(path); cwrite("'\r\n");
 		return;
@@ -1457,7 +1457,7 @@ static void worker_main(long arg)
 		}
 		sys_yield();
 	}
-	sys_exit();
+	sys_exit(0);
 }
 
 static void cmd_spawn(int argc, char *argv[])
@@ -1561,7 +1561,7 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "pwd"))    cmd_pwd();
 	else if (!ustrcmp(argv[0], "cd"))     cmd_cd(argc, argv);
 	else if (!ustrcmp(argv[0], "ls"))     cmd_ls(argc, argv);
-	else if (!ustrcmp(argv[0], "lsl"))    cmd_lsl(argc, argv);
+	else if (!ustrcmp(argv[0], "ll"))     cmd_ll(argc, argv);
 	else if (!ustrcmp(argv[0], "open"))   cmd_open(argc, argv);
 	else if (!ustrcmp(argv[0], "close"))  cmd_close();
 	else if (!ustrcmp(argv[0], "read"))   cmd_read(argc, argv);
@@ -1605,14 +1605,21 @@ static void dispatch(char *line)
 /* -------- entry -------- */
 
 __attribute__((noreturn, section(".text._start")))
-void _start(void)
+void _start(long my_tty)
 {
+	/* my_tty came from the kernel via aarch64_enter_userspace's
+	 * 3rd arg (lands in user x0).  Each shell binds to its own
+	 * /dev/tty<my_tty>; only the active tty's bytes are routed by
+	 * uart_rx_main, so the other shells sit blocked in read_line
+	 * until Ctrl-X switches the active minor. */
 	{
 		char buf[80];
 		const char *p = "init: pid=";
 		char *q = buf;
 		while (*p) *q++ = *p++;
-		udec(q, sys_getpid());
+		q = udec(q, sys_getpid());
+		*q++ = ' '; *q++ = 't'; *q++ = 't'; *q++ = 'y'; *q++ = '=';
+		udec(q, (unsigned)my_tty);
 		sys_log(buf);
 	}
 
@@ -1635,25 +1642,27 @@ void _start(void)
 		sys_log(buf);
 	}
 
-	/* Phase 6: run on /dev/tty0 instead of /dev/console.  uart_rx_main
-	 * routes UART bytes to whichever /dev/tty<N> is currently active
-	 * (Ctrl-X N switches), so the shell on tty0 keeps working when
-	 * the user is "on" tty0 and goes quiet when they Ctrl-X to a
-	 * different tty.  ldterm above the tty driver carries termios
-	 * (raw + ISIG by default -- matches what this shell expects). */
-	fd_console = (int)sys_open("/dev/tty0", 0);	/* fd 0 = stdin  */
+	/* Phase 6: each shell binds to its own /dev/tty<my_tty>.
+	 * uart_rx_main routes UART bytes to whichever /dev/tty<N> is
+	 * currently active (Ctrl-X N switches), so each shell reads
+	 * only when it's the active console.  ldterm above the tty
+	 * driver carries termios (raw + ISIG by default). */
+	char tty_path[12] = "/dev/tty?";
+	tty_path[8] = (char)('0' + (my_tty & 0xf));
+	tty_path[9] = '\0';
+	fd_console = (int)sys_open(tty_path, 0);	/* fd 0 = stdin  */
 	if (fd_console < 0) {
-		/* Fall back to /dev/console if tty0 wasn't built (e.g.
-		 * pre-phase-3 kernel image).  Keeps the shell bootable
-		 * across kernel/userspace version mismatches. */
+		/* Fall back to /dev/console if the requested tty isn't
+		 * built (e.g. pre-phase-3 kernel image).  Keeps the shell
+		 * bootable across kernel/userspace version mismatches. */
 		fd_console = (int)sys_open("/dev/console", 0);
 	}
 	if (fd_console < 0) {
-		sys_log("init: open tty0 + console failed");
+		sys_log("init: open tty + console failed");
 		for (;;) sys_yield();
 	}
-	sys_open("/dev/tty0", 0);	/* fd 1 = stdout */
-	sys_open("/dev/tty0", 0);	/* fd 2 = stderr */
+	sys_open(tty_path, 0);		/* fd 1 = stdout */
+	sys_open(tty_path, 0);		/* fd 2 = stderr */
 
 	/*
 	 * Catch Ctrl-C.  The console driver intercepts byte 0x03,
@@ -1670,7 +1679,17 @@ void _start(void)
 		sys_sigaction(SIGINT, &sa, 0);
 	}
 
-	cwrite("\r\nkappara shell (userspace) -- type 'help' for commands\r\n");
+	{
+		char banner[80];
+		const char *p = "\r\nkappara shell on tty";
+		char *q = banner;
+		while (*p) *q++ = *p++;
+		*q++ = (char)('0' + (my_tty & 0xf));
+		p = " -- type 'help' for commands\r\n";
+		while (*p) *q++ = *p++;
+		*q = '\0';
+		cwrite(banner);
+	}
 
 	char line[LINE_MAX];
 	for (;;) {

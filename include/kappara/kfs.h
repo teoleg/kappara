@@ -64,8 +64,10 @@ struct kfs_dirent {
 
 /* Each file is given a fixed number of contiguous blocks at mkimage
  * time so it has room to grow when written.  Real on-disk filesystems
- * use a free-block bitmap + indirect blocks; we cheat. */
-#define KFS_BLOCKS_PER_FILE	4
+ * use a free-block bitmap + indirect blocks; we cheat.  32 blocks =
+ * 16 KB per file -- large enough for the cmd ELF programs the R0
+ * /usr/bin mount holds (~12 KB each) with a bit of headroom. */
+#define KFS_BLOCKS_PER_FILE	32
 
 /* In-memory per-file metadata pointed at by inode i_private. */
 struct kfs_file {
@@ -92,7 +94,18 @@ struct kfs_dir {
 /* Forward decl for vfs.h dependency. */
 struct dentry;
 
-void kfs_mkimage(struct block_device *bd);
+/* mkimage payload entry: one file's name and bytes.  kfs_mkimage
+ * lays these out in order at root level, each in its own
+ * KFS_BLOCKS_PER_FILE-block slot.  Pass NULL/0 for an empty
+ * filesystem. */
+struct kfs_payload {
+	const char *name;
+	const void *data;
+	uint32_t    size;
+};
+
+void kfs_mkimage(struct block_device *bd,
+		 const struct kfs_payload *payloads, unsigned n);
 int  kfs_mount  (struct block_device *bd, struct dentry *mountpoint);
 
 #endif

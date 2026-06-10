@@ -43,7 +43,7 @@
  *   KC_MAX_ENT 128       Per-panel entry cap.  /proc + / + /dev together
  *                        are nowhere near that; if a real dir overflows
  *                        we silently truncate.
- *   raw[4096]            Static scratch for sys_lsl output (shared).
+ *   raw[4096]            Static scratch for sys_ll output (shared).
  *
  * No malloc.  All buffers are file-scope or stack.
  */
@@ -273,7 +273,7 @@ static void kc_print_size(long v, int width)
 /* ---- directory loader -------------------------------------------------- */
 
 /*
- * Parse one line of sys_lsl output: "<3-tag> <8-size> <name>\n".
+ * Parse one line of sys_ll output: "<3-tag> <8-size> <name>\n".
  *   tag  : "dir" | "reg" | "chr" (3 chars exactly)
  *   size : 8-char field, right-aligned decimal, or "MMMM,NNN" for chrdev
  *   name : up to next \n
@@ -344,7 +344,7 @@ static void kc_panel_load(struct kc_panel *p)
 		e->size = 0;
 	}
 
-	long n = sys_lsl(p->path, kc_scratch, sizeof(kc_scratch));
+	long n = sys_ll(p->path, kc_scratch, sizeof(kc_scratch));
 	if (n < 0) return;
 
 	int off = 0;
