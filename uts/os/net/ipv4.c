@@ -22,6 +22,7 @@
 #include "kappara/icmp.h"
 #include "kappara/ip.h"
 #include "kappara/netif.h"
+#include "kappara/udp.h"
 #include "kappara/printk.h"
 #include "kappara/streams.h"
 #include "kappara/string.h"
@@ -151,8 +152,10 @@ void ip_input(struct netif *nif, mblk_t *mp)
 		icmp_input(nif, src, dst, mp);
 		return;
 	case IPPROTO_UDP:
+		udp_input(nif, src, dst, mp);
+		return;
 	case IPPROTO_TCP:
-		/* not yet -- next commit */
+		/* not yet */
 		freemsg(mp);
 		return;
 	default:

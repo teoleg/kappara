@@ -386,9 +386,10 @@ static void cmd_help(void)
 		"  exec <path>            load & run an ELF from /bin (or any path)\r\n"
 		"  halt                   ask QEMU to exit (semihosting)\r\n"
 		"  ftrace [on|off|reset|dump]  per-CPU function tracer\r\n"
+		"  ping [ip] [count]      ICMP echo via /dev/icmp (default 127.0.0.1)\r\n"
 		"  <name>                 unknown commands look up /usr/bin/<name>\r\n"
 		"                         (ps, sigtest, masktest, waittest, segvtest,\r\n"
-		"                          crash, pipe, pipework, malloctest)\r\n");
+		"                          crash, pipe, pipework, malloctest, forktest)\r\n");
 }
 
 static void cmd_pid(void)

@@ -56,6 +56,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/uts/os/net/netif.o \
         $(BUILD)/uts/os/net/ipv4.o \
         $(BUILD)/uts/os/net/icmp.o \
+        $(BUILD)/uts/os/net/udp.o \
         $(BUILD)/uts/os/net/lo.o \
         $(BUILD)/uts/os/user/user.o \
         $(BUILD)/uts/os/main.o
@@ -281,7 +282,7 @@ $(LIBC_A): $(LIBC_OBJS)
 
 # ---- /usr/bin standalone ELF programs --------------------------------
 CMD_BUILD  := build/cmd
-CMD_NAMES  := ps sigtest masktest waittest segvtest crash pipe pipework malloctest forktest
+CMD_NAMES  := ps sigtest masktest waittest segvtest crash pipe pipework malloctest forktest ping
 CMD_ELFS   := $(addprefix $(CMD_BUILD)/, $(addsuffix .elf, $(CMD_NAMES)))
 
 CMD_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
@@ -289,7 +290,8 @@ CMD_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
               -fno-stack-protector -fno-pie -fno-pic \
               -mcpu=cortex-a53 -mgeneral-regs-only \
               -O2 -g \
-              -I$(LIBC_DIR)/include
+              -I$(LIBC_DIR)/include \
+              -Iinclude
 
 $(CMD_BUILD)/%.o: cmd/%.c | $(CMD_BUILD)
 	$(USER_CC) $(CMD_CFLAGS) -c $< -o $@

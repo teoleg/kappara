@@ -544,15 +544,17 @@ too slow.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ user: cmd/ping (later)                                  │
+│ user: cmd/ping  (open /dev/icmp, write req, read rep)   │
 ├─────────────────────────────────────────────────────────┤
-│ syscall: open("/dev/lo0"), open("/dev/icmp") (later)    │
+│ syscall: open("/dev/icmp"), write/read icmp_ping_req/rep │
 ├─────────────────────────────────────────────────────────┤
-│ STREAMS cdevs: /dev/lo0, /dev/icmp, /dev/udp, /dev/tcp  │
+│ STREAMS cdevs: /dev/lo0 (raw IP), /dev/icmp (echo ping) │
+│   (future: /dev/udp TPI, /dev/tcp TPI)                  │
 ├─────────────────────────────────────────────────────────┤
 │ Direct-call protocol stack:                             │
-│   icmp_input  (auto echo-reply, deliver to waiters)     │
-│   ip_input / ip_output (header build/parse, route)      │
+│   icmp_input  (auto echo-reply; deliver to STREAMS rq)  │
+│   udp_input / udp_output  (header strip/build; N2 TPI)  │
+│   ip_input / ip_output  (header build/parse, route)     │
 │   netif registry (longest-prefix match)                 │
 ├─────────────────────────────────────────────────────────┤
 │ Drivers: lo0 (loopback), slip0 (UART, future)           │
@@ -572,30 +574,50 @@ with the rest of the system.
 `netif->tx`.  Caller must allocate the mblk with `IP_HDR_LEN` bytes
 of headroom; `ip_output` rewinds `b_rptr` to fill the header in
 place.  `ip_input` (called by `netif_input` from the driver rx path)
-validates the header + checksum, strips it, and dispatches by
-proto byte to `icmp_input`, future `udp_input`, future `tcp_input`.
+validates the header + checksum, strips it, and dispatches by proto
+byte to `icmp_input` or `udp_input`; TCP drops for now.
 
-ICMP: `icmp_input` auto-replies to type 8 (echo request) by flipping
-the type byte, recomputing the checksum, and re-calling `ip_output`
-with the same mblk -- zero allocations on the reply path.  Type 0
-(echo reply) is stashed in a single-slot waiter (`icmp_arm_waiter`
-+ `icmp_wait_reply`) so the boot selftest and future `cmd/ping`
-can observe their pong.
+ICMP (`uts/os/net/icmp.c`): `icmp_input` auto-replies to type 8
+(echo request) by flipping the type byte, recomputing the checksum,
+and re-calling `ip_output` with the same mblk -- zero allocations on
+the reply path.  Type 0 (echo reply) is delivered to whichever waiter
+registered for that `(id, seq)` pair: either the boot selftest's
+single-slot waiter (`icmp_arm_waiter` + `icmp_wait_reply`) or a
+per-stream STREAMS waiter (`icmp_arm_waiter_stream`, registered by the
+`/dev/icmp` driver on each write).
 
-lo0 (`uts/os/net/lo.c`) has dual personality: a `netif` that
-`netif_input`'s its own tx mblks back synchronously, and a STREAMS
-cdev `/dev/lo0` for raw-IP injection from user space later.
+`/dev/icmp` (major 16, `uts/os/net/icmp.c`): SVR4 STREAMS cdev for
+user-space ICMP echo.  Protocol: write a `struct icmp_ping_req`
+(dst_ip, id, seq in host byte order), read back a `struct
+icmp_ping_rep` (src_ip, id, seq, rtt_ms).  `cmd/ping` uses this
+interface.  lo0 is synchronous so the reply mblk is already on the
+stream-head read queue before the write syscall returns; a single
+`read()` immediately after `write()` is sufficient.
 
-`net_selftest` (runs at boot after `buf_selftest`): sends an ICMP
-echo request to 127.0.0.1, verifies the reply lands.  The whole
-round-trip is one synchronous call chain since lo0 loops in tx
-context -- by the time `icmp_send_echo` returns, the reply has
-already been processed and stashed in the waiter.
+UDP (`uts/os/net/udp.c`): header strip/build in place; incoming
+datagrams are currently logged and dropped (no bound sockets yet).
+Phase N2 will add a `/dev/udp` STREAMS cdev with TPI-shaped M_PROTO
+messages (T_BIND_REQ, T_UNITDATA_REQ, T_UNITDATA_IND).
+
+lo0 (`uts/os/net/lo.c`) has dual personality: a `netif` that feeds
+its own tx mblks synchronously back to ip_input, and a STREAMS cdev
+`/dev/lo0` (major 15) for raw-IP injection from user space.
+
+`net_selftest` (runs at boot): sends an ICMP echo request to
+127.0.0.1 via the boot waiter, verifies the reply.  The round-trip is
+one synchronous call chain; by the time `icmp_send_echo` returns the
+reply has already been processed.
+
+**Device major assignments (network):**
+
+| Major | Name  | Source              | Purpose                       |
+|-------|-------|---------------------|-------------------------------|
+| 15    | lo0   | `uts/os/net/lo.c`   | Raw-IP loopback STREAMS cdev  |
+| 16    | icmp  | `uts/os/net/icmp.c` | ICMP echo req/rep STREAMS cdev|
 
 Not yet:
-- UDP, TCP transports
-- BSD sockets layer (or TPI-shaped open("/dev/udp") with M_PROTO
-  primitives)
+- `/dev/udp` TPI STREAMS cdev (N2)
+- TCP transport and `/dev/tcp`
 - SLIP framing on UART2 for off-machine connectivity
 - ARP (only needed for Ethernet, not lo0 or SLIP)
 

@@ -686,6 +686,8 @@ extern char malloctest_blob_start[];
 extern char malloctest_blob_end[];
 extern char forktest_blob_start[];
 extern char forktest_blob_end[];
+extern char ping_blob_start[];
+extern char ping_blob_end[];
 
 static struct blob_priv hello_priv;
 
@@ -718,7 +720,7 @@ void exec_space_init(void)
 			"  /usr/bin   user programs on the kfs ramdisk\n"
 			"  /etc       this directory (motd, readme)\n"
 			"  /proc      kernel state via STREAMS cdevs\n"
-			"  /dev       tty0..3, console, klog, fbcon, null, loop\n";
+			"  /dev       tty0..3, lo0, icmp, console, klog, null\n";
 		static const char motd_buf[] =
 			"no soup for you, only streams.\n";
 		static struct blob_priv readme_priv = {
@@ -762,6 +764,7 @@ void exec_space_init(void)
 		PAY("pipework",   pipework_blob_start,   pipework_blob_end),
 		PAY("malloctest", malloctest_blob_start, malloctest_blob_end),
 		PAY("forktest",   forktest_blob_start,   forktest_blob_end),
+		PAY("ping",       ping_blob_start,       ping_blob_end),
 	};
 #undef PAY
 	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);

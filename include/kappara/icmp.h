@@ -63,4 +63,33 @@ int  icmp_wait_reply(uint16_t id, uint16_t seq, unsigned timeout_ms);
  * loopback) finds the slot ready. */
 void icmp_arm_waiter(uint16_t id, uint16_t seq);
 
+/* ---- /dev/icmp STREAMS cdev ----------------------------------------
+ *
+ * User-kernel protocol: write a struct icmp_ping_req, read back a
+ * struct icmp_ping_rep.  Both are M_DATA blocks.  Fields are in host
+ * byte order.
+ */
+
+struct icmp_ping_req {
+	uint32_t dst_ip;	/* host byte order */
+	uint16_t id;
+	uint16_t seq;
+};
+
+struct icmp_ping_rep {
+	uint32_t src_ip;	/* host byte order */
+	uint16_t id;
+	uint16_t seq;
+	int16_t  rtt_ms;	/* 0 = synchronous loopback, -1 = timeout */
+};
+
+/* Arm a STREAMS-based reply waiter.  rq is the driver's read-side
+ * queue; the reply mblk (struct icmp_ping_rep) is delivered there. */
+struct queue;
+void icmp_arm_waiter_stream(uint16_t id, uint16_t seq, struct queue *rq,
+                            uint32_t dst_ip);
+
+/* Register the /dev/icmp STREAMS cdev. */
+void icmp_str_init(void);
+
 #endif
