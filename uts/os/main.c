@@ -38,6 +38,7 @@
 #include "kappara/proc.h"
 #include "kappara/buf.h"
 #include "kappara/ip.h"
+#include "kappara/udp.h"
 #include "kappara/process.h"
 #include "kappara/sched.h"
 #include "kappara/vt.h"
@@ -465,6 +466,12 @@ void kmain(void)
 	 * deref curthread under the hood).  Streams already up. */
 	ip_init();
 	net_selftest();
+	/* UDP TPI selftest: exercises the same M_PROTO bind / send /
+	 * receive path that user-space /dev/udp clients use. */
+	if (udp_selftest_run() < 0)
+		kprintf("udp: SELFTEST FAIL\n");
+	else
+		kprintf("udp: selftest PASS\n");
 	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ on core 0 */
 
 	/* Smoke-test the kallsyms table by walking our own frame chain

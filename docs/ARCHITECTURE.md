@@ -696,20 +696,63 @@ which derefs `curthread`.  It:
    calls `ip_lower_register(muxid, nif)` so the netif identity is
    available for routing.
 
+### UDP module (`uts/os/net/udp.c`)
+
+Same shape as ICMP: a pushable STREAMS module, not a driver.
+`/dev/udp`'s cdev entry maps to `ip_streamtab`; `stream_open`
+autopushes `"udp"` on top.  Per-open state lives in `struct
+udp_state` (local_port, bound flag).
+
+The user ABI is the SVR4 TPI primitive set, delivered via
+`putmsg` / `getmsg`:
+
+| Primitive       | Direction       | Carries                                |
+|-----------------|-----------------|----------------------------------------|
+| `T_BIND_REQ`    | user → kernel   | `t_bind_req{port}` (port=0 → ephemeral) |
+| `T_BIND_ACK`    | kernel → user   | `t_bind_ack{port}` (actual port bound) |
+| `T_BIND_NAK`    | kernel → user   | `t_bind_nak{reason}`                   |
+| `T_UNITDATA_REQ`| user → kernel   | `t_unitdata_req{dst_ip,dst_port}` + M_DATA payload |
+| `T_UNITDATA_IND`| kernel → user   | `t_unitdata_ind{src_ip,src_port}` + M_DATA payload |
+
+UDP's wput on `T_BIND_REQ` records `local_port` and sends
+M_PROTO{IP_T_BIND_REQ, proto=17, key=local_port} down to IP.  IP
+records the binding in `ip_uppers[]` (proto=17, key=port).  The
+`key` is the protocol-specific demux discriminator; IP itself does
+not look at the UDP header to extract the port -- it just keeps
+the binding indexed by (proto, key, upper_rq).  Two UDP modules
+trying to bind the same port collide on IP's duplicate-bind check
+and the second gets a NAK.
+
+UDP's wput on `T_UNITDATA_REQ` validates the bind, copies the
+M_DATA payload into a fresh mblk with `IP_HDR_LEN + UDP_HDR_LEN`
+headroom, prepends the UDP header (`src_port = local_port`,
+`dst_port` and length from the request, checksum 0), wraps in
+M_PROTO{IP_T_SEND_REQ, proto=17, dst_ip}, and `putnext`s down to
+IP.  IP prepends the IP header in the further-reserved headroom
+and routes via netmask.
+
+UDP's rput receives demuxed M_DATA from IP (via cross-stream
+`put`), parses the UDP header, **filters by dst_port** matching
+`local_port`, strips the UDP header, and wraps the body in
+M_PROTO{T_UNITDATA_IND, src_ip, src_port} for `putnext` UP to the
+stream head.  The filter is here (not at IP demux) because IP
+multicasts to all proto=17 bindings regardless of key -- key is
+only consulted for the duplicate-bind check at bind time.  Real
+SVR4 IP does the same; UDP filtering at the transport is correct
+encapsulation.
+
 ### Device major assignments (network):
 
-| Major | Name  | Source              | Purpose                       |
-|-------|-------|---------------------|-------------------------------|
-| 16    | icmp  | `ip_streamtab` + autopush `"icmp"` module | ICMP raw-echo endpoint |
+| Major | Name  | Source              | Purpose                                  |
+|-------|-------|---------------------|------------------------------------------|
+| 16    | icmp  | `ip_streamtab` + autopush `"icmp"` module | ICMP raw-echo endpoint     |
+| 18    | udp   | `ip_streamtab` + autopush `"udp"` module  | UDP TPI datagram endpoint  |
 
 (Major 15 was a leaf-driver `/dev/lo0` for raw-IP user injection.
 Removed in N2b; the role belongs to a future `/dev/ip` once we
 expose the IP mux to user space.)
 
 Not yet:
-- `/dev/udp` TPI STREAMS driver with `T_BIND_REQ` / `T_UNITDATA_REQ`
-  / `T_UNITDATA_IND` (N2d).  Will use `ip_bind_meta.key` to encode
-  the local port for fine-grained demux.
 - A demo pushable filter (`pktfilter`) inserted at a layer boundary
   to prove composability (N2e)
 - TCP transport and `/dev/tcp`

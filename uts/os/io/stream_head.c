@@ -58,11 +58,12 @@
 #include "kappara/signal.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
+#include "kappara/string.h"
 #include "kappara/termios.h"
 #include "kappara/tty.h"
 #include "kappara/uaccess.h"
-#include "kappara/string.h"
 #include "kappara/uart.h"
+#include "kappara/udp.h"
 #include "kappara/vfs.h"
 
 /* Forward-declared in streams.h. */
@@ -908,6 +909,11 @@ static int stream_open(struct file *f)
 	 * Same shape as tty / ldterm. */
 	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_ICMP)
 		(void)do_ipush(sd, "icmp");
+	/* Same shape for /dev/udp: ip_streamtab at the bottom, udp
+	 * module autopushed on top.  User-visible stream is udp-over-ip
+	 * with TPI primitives via putmsg/getmsg. */
+	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_UDP)
+		(void)do_ipush(sd, "udp");
 
 	f->f_private = sd;
 	return 0;
@@ -1883,16 +1889,19 @@ void streams_head_init(void)
 	vfs_mknod_chrdev(dev, "tty2", MKDEV(CDEV_MAJ_TTY, 2));
 	vfs_mknod_chrdev(dev, "tty3", MKDEV(CDEV_MAJ_TTY, 3));
 
-	/* Networking: register the icmp STREAMS module (so I_PUSH "icmp"
-	 * and the /dev/icmp autopush above can find it) and publish the
-	 * /dev/icmp inode.  ip_init() itself runs later from main.c --
-	 * it does the I_LINK loop which needs curthread (post sched_init).
+	/* Networking: register the icmp + udp STREAMS modules (so
+	 * I_PUSH "icmp" / "udp" and the corresponding /dev autopush
+	 * above can find them) and publish their /dev inodes.
+	 * ip_init() itself runs later from main.c -- it does the
+	 * I_LINK loop which needs curthread (post sched_init).
 	 *
-	 * /dev/icmp's cdev maps to ip_streamtab (registered by
-	 * icmp_module_init); stream_open autopushes "icmp" on open so
-	 * the user-visible stream is icmp-module-over-ip-driver. */
+	 * /dev/icmp and /dev/udp both map to ip_streamtab (registered
+	 * by their module_init helpers); stream_open autopushes the
+	 * matching module on open. */
 	icmp_module_init();
+	udp_module_init();
 	vfs_mknod_chrdev(dev, "icmp", MKDEV(CDEV_MAJ_ICMP,  0));
+	vfs_mknod_chrdev(dev, "udp",  MKDEV(CDEV_MAJ_UDP,   0));
 
 	kprintf("stream_head: registered modules:");
 	for (struct stmod_entry *e = registry; e; e = e->next)

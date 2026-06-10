@@ -70,6 +70,7 @@ unrecognised command.  Source lives in `cmd/`.
 | `malloctest`  | Exercise libc `malloc`/`free`/`calloc`/`realloc` end-to-end; smoke test for `SYS_brk` and the sbrk-backed allocator. |
 | `forktest`    | R5 smoke test: parent forks, child mutates a global, exits with status 42; parent waits and verifies the mutation didn't leak across the address-space boundary. |
 | `ping [ip] [count]` | Send ICMP echo requests via `/dev/icmp` (STREAMS cdev).  Default target `127.0.0.1`, default count 4.  Prints `PONG from A.B.C.D: seq=N rtt=Xms` per reply.  Works over loopback only for now (no SLIP/Ethernet yet). |
+| `udptest`     | TPI smoke test for `/dev/udp`: binds port 12345 via `putmsg(T_BIND_REQ)`, sends a 9-byte payload to 127.0.0.1:12345 via `putmsg(T_UNITDATA_REQ)`, reads it back via `getmsg(T_UNITDATA_IND)`, verifies the payload round-tripped intact. |
 | `ifconfig`    | Dump `/proc/netif` (one row per registered netif: name, flags, MTU, IP, netmask).  Read-only — all netifs are statically registered at boot. |
 
 Exec-space programs can call `sys_spawn` to create sub-threads.  The
