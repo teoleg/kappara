@@ -65,7 +65,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kappara/blkdev.h"
 #include "kappara/elf.h"
+#include "kappara/kfs.h"
 #include "kappara/kmem.h"
 #include "kappara/mmu.h"
 #include "kappara/pmm.h"
@@ -419,44 +421,46 @@ void exec_space_init(void)
 		(unsigned long)EXEC_STACK_TOP,
 		(unsigned long)hello_priv.size);
 
-	/* Create /usr/bin hierarchy and register /usr/bin programs. */
+	/*
+	 * /usr/bin -- R0: kfs-on-ramdisk instead of in-kernel blob
+	 * registration.  Build a payload table from the cmd ELF blobs
+	 * (still .incbin'd into the kernel image) and copy them into the
+	 * ramdisk via mkimage; mount the resulting filesystem at
+	 * /usr/bin.  The exec loader's read_file_kernel path is unchanged
+	 * -- it just reads through the regfile file_ops, which now go
+	 * through the buf cache and block device instead of memcpy from
+	 * rodata.  Same code, real storage layer.
+	 *
+	 * The cmd blobs stay in kernel rodata for now because the
+	 * raspi3b -kernel boot path has no initrd story; once the SD/EMMC
+	 * driver (S2) lands, the same kfs path picks up bytes from real
+	 * storage and the blobs can leave the kernel image.
+	 */
+#define PAY(name_str, sym_start, sym_end) \
+	{ name_str, (sym_start), (uint32_t)((sym_end) - (sym_start)) }
+	const struct kfs_payload usrbin_payloads[] = {
+		PAY("ps",         ps_blob_start,         ps_blob_end),
+		PAY("sigtest",    sigtest_blob_start,    sigtest_blob_end),
+		PAY("masktest",   masktest_blob_start,   masktest_blob_end),
+		PAY("waittest",   waittest_blob_start,   waittest_blob_end),
+		PAY("segvtest",   segvtest_blob_start,   segvtest_blob_end),
+		PAY("crash",      crash_blob_start,      crash_blob_end),
+		PAY("pipe",       pipe_blob_start,       pipe_blob_end),
+		PAY("pipework",   pipework_blob_start,   pipework_blob_end),
+		PAY("malloctest", malloctest_blob_start, malloctest_blob_end),
+	};
+#undef PAY
+	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);
+
+	kfs_mkimage(ramdisk_get(), usrbin_payloads, n_usrbin);
+
 	struct dentry *usr    = vfs_mkdir(vfs_root(), "usr");
 	struct dentry *usrbin = vfs_mkdir(usr, "bin");
-
-	static struct blob_priv ps_priv, sigtest_priv, masktest_priv,
-	                        waittest_priv, segvtest_priv, crash_priv,
-	                        pipe_priv, pipework_priv, malloctest_priv;
-
-#define REG(dir, name, priv, s, e) do { \
-	(priv).data = (const unsigned char *)(s); \
-	(priv).size = (size_t)((e) - (s)); \
-	vfs_mknod_regfile((dir), (name), &blob_fops, &(priv)); \
-} while (0)
-
-	REG(usrbin, "ps",       ps_priv,       ps_blob_start,       ps_blob_end);
-	REG(usrbin, "sigtest",  sigtest_priv,  sigtest_blob_start,  sigtest_blob_end);
-	REG(usrbin, "masktest", masktest_priv, masktest_blob_start, masktest_blob_end);
-	REG(usrbin, "waittest", waittest_priv, waittest_blob_start, waittest_blob_end);
-	REG(usrbin, "segvtest", segvtest_priv, segvtest_blob_start, segvtest_blob_end);
-	REG(usrbin, "crash",    crash_priv,    crash_blob_start,    crash_blob_end);
-	REG(usrbin, "pipe",     pipe_priv,     pipe_blob_start,     pipe_blob_end);
-	REG(usrbin, "pipework",  pipework_priv,  pipework_blob_start,  pipework_blob_end);
-	REG(usrbin, "malloctest", malloctest_priv, malloctest_blob_start, malloctest_blob_end);
-
-#undef REG
-
-	kprintf("exec: /usr/bin registered: ps(%lu) sigtest(%lu) masktest(%lu) "
-		"waittest(%lu) segvtest(%lu) crash(%lu) pipe(%lu) pipework(%lu) "
-		"malloctest(%lu)\n",
-		(unsigned long)ps_priv.size,
-		(unsigned long)sigtest_priv.size,
-		(unsigned long)masktest_priv.size,
-		(unsigned long)waittest_priv.size,
-		(unsigned long)segvtest_priv.size,
-		(unsigned long)crash_priv.size,
-		(unsigned long)pipe_priv.size,
-		(unsigned long)pipework_priv.size,
-		(unsigned long)malloctest_priv.size);
+	if (kfs_mount(ramdisk_get(), usrbin) < 0)
+		kprintf("exec: kfs_mount /usr/bin failed\n");
+	else
+		kprintf("exec: /usr/bin mounted from ramdisk (%u files)\n",
+		        n_usrbin);
 }
 
 /* ---- ELF loader ---- */

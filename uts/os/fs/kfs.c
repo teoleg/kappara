@@ -525,26 +525,10 @@ static struct file_ops kfs_dir_fops = {
 	.inactive = kfs_dir_inactive,
 };
 
-/* ---- mkimage: build a fresh fs in `bd` from baked-in files --------- */
+/* ---- mkimage: build a fresh fs in `bd` from the caller's payload table --- */
 
-struct payload {
-	const char	*name;
-	const char	*data;
-	uint32_t	 size;
-};
-
-#define PL(name, str)	{ name, str, (uint32_t)(sizeof(str) - 1) }
-
-static const struct payload payloads[] = {
-	PL("hello.txt", "hello, kfs!\nthis came off block 2 of the ramdisk.\n"),
-	PL("readme",    "kappara filesystem v1\nflat directory, read-only, "
-			"backed by a ramdisk that resets every boot.\n"),
-	PL("motd",      "no soup for you, only streams.\n"),
-};
-
-#define NPAYLOADS (sizeof(payloads) / sizeof(payloads[0]))
-
-void kfs_mkimage(struct block_device *bd)
+void kfs_mkimage(struct block_device *bd,
+		 const struct kfs_payload *payloads, unsigned n_payloads)
 {
 	/* Build the bitmap in memory as we lay things out, then flush
 	 * it to KFS_BITMAP_BLOCK at the end.  We use the static
@@ -560,7 +544,7 @@ void kfs_mkimage(struct block_device *bd)
 	struct kfs_super sb;
 	kmemset(&sb, 0, sizeof(sb));
 	sb.magic     = KFS_MAGIC;
-	sb.num_files = NPAYLOADS;
+	sb.num_files = n_payloads;
 	bd->bd_write(bd, KFS_SUPER_BLOCK, &sb);
 
 	struct kfs_dirent dir[KFS_DIRENTS];
@@ -574,8 +558,8 @@ void kfs_mkimage(struct block_device *bd)
 	 * them.
 	 */
 	uint32_t cur_block = KFS_ROOT_BLOCK + 1;
-	for (unsigned i = 0; i < NPAYLOADS && i < KFS_DIRENTS; i++) {
-		const struct payload *p = &payloads[i];
+	for (unsigned i = 0; i < n_payloads && i < KFS_DIRENTS; i++) {
+		const struct kfs_payload *p = &payloads[i];
 		size_t nlen = 0;
 		while (p->name[nlen] && nlen < KFS_NAME_MAX - 1) {
 			dir[i].name[nlen] = p->name[nlen];
@@ -586,8 +570,8 @@ void kfs_mkimage(struct block_device *bd)
 		dir[i].size_bytes    = p->size;
 		dir[i].type          = KFS_TYPE_FILE;
 
-		const char *src = p->data;
-		uint32_t    rem = p->size;
+		const unsigned char *src = (const unsigned char *)p->data;
+		uint32_t             rem = p->size;
 		for (uint32_t b = 0; b < KFS_BLOCKS_PER_FILE; b++) {
 			unsigned char buf[BLK_SIZE];
 			kmemset(buf, 0, sizeof(buf));
@@ -608,7 +592,7 @@ void kfs_mkimage(struct block_device *bd)
 	bd->bd_write(bd, KFS_BITMAP_BLOCK, kfs_mnt.bitmap);
 
 	kprintf("kfs: mkimage wrote %u files (blocks used: 0..%u)\n",
-		(unsigned)NPAYLOADS, (unsigned)(cur_block - 1));
+		n_payloads, (unsigned)(cur_block - 1));
 }
 
 /* ---- mount: pull metadata off the device, attach to the VFS -------- */
@@ -689,7 +673,7 @@ int kfs_mount(struct block_device *bd, struct dentry *mountpoint)
 
 	kfs_mount_dir(bd, KFS_ROOT_BLOCK, mountpoint);
 
-	kprintf("kfs: mounted '%s' on /%s\n",
+	kprintf("kfs: mounted '%s' at mountpoint '%s'\n",
 		bd->bd_name, mountpoint->d_name);
 	return 0;
 }
