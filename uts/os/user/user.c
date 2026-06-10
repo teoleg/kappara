@@ -89,18 +89,18 @@
  * top-down.  See the layout diagram further down. */
 #define SPAWN_STACK_SIZE	0x10000UL
 
-/* R5: per-process exec backing.  See the bigger comment block down at
- * the storage-array declarations for what each slot owns.  These
- * counters + lookup helpers are hoisted up here so sys_spawn_impl
- * (defined earlier in the file) can read them. */
-#define EXEC_SLOTS	2
-
-static int      exec_slot_used[EXEC_SLOTS];
-static uint64_t exec_heap_brk[EXEC_SLOTS];
-static unsigned exec_spawn_next_per_slot[EXEC_SLOTS];
-
-/* Forward decls -- definitions follow. */
-static int cur_exec_slot(void);
+/* R6: per-process exec state lives on the current thread's vm_map.
+ * Helper returns a pointer at the vm_map's spawn-slot counter, or
+ * NULL if the caller isn't on a per-process vm_map (init shell on
+ * the boot map). */
+static unsigned *cur_exec_spawn_next(void)
+{
+	struct kthread *t = curthread;
+	if (!t || !t->t_proc || !t->t_proc->vm) return 0;
+	struct vm_map *vm = t->t_proc->vm;
+	if (vm->heap_brk == 0) return 0;	/* boot vm_map, no per-proc state */
+	return &vm->spawn_next;
+}
 
 /*
  * Backing storage: a 2 MB-aligned slab in BSS.  This is the physical
@@ -288,12 +288,16 @@ long sys_spawn_impl(uint64_t entry, uint64_t arg)
 		unsigned slot = ++spawn_next;
 		stack_top = USER_VA + USER_SIZE - (uint64_t)slot * SPAWN_STACK_SIZE;
 	} else if (entry >= EXEC_VA && entry < EXEC_VA + EXEC_SIZE) {
-		int es = cur_exec_slot();
-		if (exec_spawn_next_per_slot[es] >= SPAWN_MAX) {
-			kprintf("sys_spawn: exec pool exhausted (slot %d)\n", es);
+		unsigned *sn = cur_exec_spawn_next();
+		if (!sn) {
+			kprintf("sys_spawn: no per-process spawn counter\n");
 			return -1;
 		}
-		unsigned slot = ++exec_spawn_next_per_slot[es];
+		if (*sn >= SPAWN_MAX) {
+			kprintf("sys_spawn: exec pool exhausted\n");
+			return -1;
+		}
+		unsigned slot = ++*sn;
 		/* slot 1 = EXEC_STACK_TOP - 64KB; main exec thread owns the top 64KB */
 		stack_top = EXEC_STACK_TOP - (uint64_t)slot * SPAWN_STACK_SIZE;
 	} else {
@@ -357,76 +361,104 @@ void sys_exit_impl(int status)
  */
 
 /*
- * R5: per-process exec backing.  Each "exec process slot" has its own
- * physical EXEC_VA/EXEC_STACK_VA/EXEC_HEAP_VA backing so fork() can
- * give the child a copy of the parent's address space without
- * sharing pages.  Slot 0 is the boot-table default (every exec runs
- * there until a fork happens); fork allocates slot 1 for the child.
+ * R6: per-process exec memory backing.
  *
- * The per-process vm_map's L2 maps EXEC_VA / EXEC_STACK_VA /
- * EXEC_HEAP_VA to slot N's physical pages; mmu_vmap_switch swaps
- * TTBR0 on context switch so each thread sees its own slot.
+ * Each exec'd process owns its own vm_map (L0/L1/L2/L3 page tables)
+ * with EXEC_VA/EXEC_STACK_VA/EXEC_HEAP_VA mapped 4 KB at a time onto
+ * PMM-allocated pages.  No fixed slot pool; the number of concurrent
+ * processes is bounded only by PMM size.
  *
- * Memory budget: 2 slots * 6 MB = 12 MB BSS.  Bump EXEC_SLOTS to 4
- * to allow concurrent forks across multiple shells; cost is 6 MB
- * per extra slot.
+ * Page lifecycle:
+ *   - sys_execve allocates code pages (one per 4 KB of PT_LOAD), the
+ *     full stack region (512 pages = 2 MB), and zero heap pages.
+ *     The heap break starts at EXEC_HEAP_VA and grows via sys_brk.
+ *   - sys_fork allocates fresh pages for every user page in the
+ *     parent's vm_map and kmemcpys content; child's heap_brk and
+ *     spawn_next inherit from parent.
+ *   - On process exit, vm_map_put -> mmu_vmap_destroy walks L3
+ *     tables, pmm_free's user pages, then frees the L3s + L0/L1/L2.
  */
-/* EXEC_SLOTS, exec_slot_used[], exec_heap_brk[],
- * exec_spawn_next_per_slot[], and cur_exec_slot() are forward-declared
- * up by SPAWN_STACK_SIZE so sys_spawn_impl can read them.  The big
- * 6 MB-per-slot storage arrays live here. */
 
-__attribute__((aligned(0x200000)))
-static unsigned char exec_storage[EXEC_SLOTS][EXEC_SIZE];
-
-__attribute__((aligned(0x200000)))
-static unsigned char exec_stack_storage[EXEC_SLOTS][EXEC_SIZE];
-
-__attribute__((aligned(0x200000)))
-static unsigned char exec_heap_storage[EXEC_SLOTS][EXEC_HEAP_SIZE];
-
-static int exec_slot_alloc(void)
+/* Allocate `count` fresh PMM pages and map them at consecutive 4 KB
+ * VAs starting at va_base in vm.  Returns 0 on success, -1 on PMM
+ * exhaustion (already-mapped pages stay mapped for the caller to
+ * clean up via mmu_vmap_destroy). */
+static int vmap_alloc_pages(struct vm_map *vm, uint64_t va_base,
+                            unsigned count, int zero)
 {
-	for (int i = 0; i < EXEC_SLOTS; i++) {
-		if (!exec_slot_used[i]) {
-			exec_slot_used[i] = 1;
-			return i;
+	for (unsigned i = 0; i < count; i++) {
+		void *p = pmm_alloc();
+		if (!p) return -1;
+		if (zero) kmemset(p, 0, PAGE_SIZE);
+		if (mmu_vmap_map_user_4k(vm, va_base + (uint64_t)i * PAGE_SIZE,
+		                         (uintptr_t)p) < 0) {
+			pmm_free(p);
+			return -1;
 		}
 	}
-	return -1;
+	return 0;
 }
 
-static void exec_slot_free(int slot)
+/* Copy bytes from the kernel into a user VA inside vm.  Walks vm's
+ * L3 for each page to find its kernel-identity address.  Caller is
+ * responsible for making sure the user VA range is mapped. */
+static int vmap_copyin(struct vm_map *vm, uint64_t user_va,
+                       const void *src, size_t len)
 {
-	if (slot >= 0 && slot < EXEC_SLOTS)
-		exec_slot_used[slot] = 0;
-}
-
-void exec_slot_release(int slot)
-{
-	exec_slot_free(slot);
-}
-
-/* Resolve the exec slot for the current thread.  Returns 0 (the
- * boot slot) when the caller is on the boot vm_map -- works for
- * legacy code paths that haven't migrated to per-process slots. */
-static int cur_exec_slot(void)
-{
-	struct kthread *t = curthread;
-	if (!t || !t->t_proc || !t->t_proc->vm) return 0;
-	int s = t->t_proc->vm->exec_slot;
-	return (s >= 0) ? s : 0;
+	const unsigned char *s = src;
+	while (len > 0) {
+		void *kva = mmu_vmap_user_va_to_kva(vm, user_va);
+		if (!kva) return -1;
+		size_t avail = PAGE_SIZE - (user_va & PAGE_MASK);
+		size_t n     = (len < avail) ? len : avail;
+		kmemcpy(kva, s, n);
+		s        += n;
+		user_va  += n;
+		len      -= n;
+	}
+	return 0;
 }
 
 long sys_brk_impl(uint64_t addr)
 {
-	int slot = cur_exec_slot();
-	if (addr == 0)
-		return (long)exec_heap_brk[slot];
+	struct kthread *t = curthread;
+	if (!t || !t->t_proc || !t->t_proc->vm) return -1;
+	struct vm_map *vm = t->t_proc->vm;
+	if (vm->heap_brk == 0) return -1;	/* boot vm_map */
+
+	if (addr == 0) return (long)vm->heap_brk;
 	if (addr < EXEC_HEAP_VA || addr > EXEC_HEAP_VA + EXEC_HEAP_SIZE)
 		return -1;
-	exec_heap_brk[slot] = addr;
-	return (long)exec_heap_brk[slot];
+
+	uint64_t old_brk = vm->heap_brk;
+	uint64_t old_top = (old_brk + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
+	uint64_t new_top = (addr     + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
+
+	if (new_top > old_top) {
+		/* Grow: allocate + map (new_top - old_top) / PAGE_SIZE pages. */
+		unsigned n = (unsigned)((new_top - old_top) / PAGE_SIZE);
+		if (vmap_alloc_pages(vm, old_top, n, /*zero=*/1) < 0) {
+			kprintf("sys_brk: PMM exhausted growing heap to 0x%lx\n",
+				(unsigned long)addr);
+			return -1;
+		}
+	} else if (new_top < old_top) {
+		/* Shrink: unmap + free pages [new_top..old_top). */
+		for (uint64_t v = new_top; v < old_top; v += PAGE_SIZE)
+			mmu_vmap_unmap_user_4k(vm, v);
+	}
+
+	vm->heap_brk = addr;
+	/* Heap shape changed; flush TLB so subsequent loads see fresh
+	 * mappings.  mmu_vmap_switch issues a tlbi vmalle1; we mirror
+	 * that here for the simpler "current process changed its own
+	 * map" case. */
+	__asm__ volatile (
+		"dsb	ishst\n"
+		"tlbi	vmalle1\n"
+		"dsb	ish\n"
+		"isb\n" ::: "memory");
+	return (long)vm->heap_brk;
 }
 
 /* ---- R5: fork ----------------------------------------------------- */
@@ -451,6 +483,26 @@ static void fork_child_thunk(void *arg)
 	kthread_exit(-1);
 }
 
+/* Walk each user VA in the parent's vm_map, allocate a fresh PMM
+ * page in the child, copy parent->child bytes, install the child
+ * mapping.  Skips unmapped pages so we only touch what's live. */
+static int fork_clone_pages(struct vm_map *cvm, struct vm_map *pvm,
+                            uint64_t va_start, uint64_t va_end)
+{
+	for (uint64_t va = va_start; va < va_end; va += PAGE_SIZE) {
+		void *src = mmu_vmap_user_va_to_kva(pvm, va);
+		if (!src) continue;	/* not mapped in parent */
+		void *p = pmm_alloc();
+		if (!p) return -1;
+		kmemcpy(p, src, PAGE_SIZE);
+		if (mmu_vmap_map_user_4k(cvm, va, (uintptr_t)p) < 0) {
+			pmm_free(p);
+			return -1;
+		}
+	}
+	return 0;
+}
+
 long sys_fork_impl(struct trap_frame *parent_tf)
 {
 	struct kthread *parent_t = curthread;
@@ -458,42 +510,39 @@ long sys_fork_impl(struct trap_frame *parent_tf)
 		kprintf("fork: no parent process\n");
 		return -1;
 	}
-	int parent_slot = parent_t->t_proc->vm->exec_slot;
-	if (parent_slot < 0) {
-		kprintf("fork: parent is not exec'd (slot=%d)\n", parent_slot);
+	struct vm_map *pvm = parent_t->t_proc->vm;
+	if (pvm->heap_brk == 0) {
+		kprintf("fork: parent is not exec'd (boot vm_map)\n");
 		return -1;
 	}
 
-	/* Refuse if parent's EL0 PC isn't in the exec window -- that
-	 * means we're somehow being called from a non-exec'd context
-	 * (an init shell, etc.) and the assumption that EXEC_VA covers
-	 * the user code wouldn't hold. */
+	/* Refuse if parent's EL0 PC isn't in the exec window. */
 	if (parent_tf->elr < EXEC_VA || parent_tf->elr >= EXEC_VA + EXEC_SIZE) {
 		kprintf("fork: parent elr 0x%lx outside exec window\n",
 			(unsigned long)parent_tf->elr);
 		return -1;
 	}
 
-	int child_slot = exec_slot_alloc();
-	if (child_slot < 0) {
-		kprintf("fork: no free exec slot (EXEC_SLOTS=%d)\n", EXEC_SLOTS);
+	/* Build child vm_map and walk parent's three user regions
+	 * (code, stack, heap), per-page allocating + copying. */
+	struct vm_map *cvm = vm_map_create();
+	if (!cvm) {
+		kprintf("fork: vm_map_create failed\n");
 		return -1;
 	}
 
-	/* Copy parent's slot contents into child's slot.  This is the
-	 * eager-copy version of fork; COW is a future optimisation
-	 * (would need 4 KB page mappings instead of the 2 MB blocks
-	 * we use today). */
-	kmemcpy(exec_storage[child_slot],       exec_storage[parent_slot],
-	        EXEC_SIZE);
-	kmemcpy(exec_stack_storage[child_slot], exec_stack_storage[parent_slot],
-	        EXEC_SIZE);
-	kmemcpy(exec_heap_storage[child_slot],  exec_heap_storage[parent_slot],
-	        EXEC_HEAP_SIZE);
+	if (fork_clone_pages(cvm, pvm, EXEC_VA, EXEC_VA + EXEC_SIZE) < 0 ||
+	    fork_clone_pages(cvm, pvm, EXEC_STACK_VA,
+	                     EXEC_STACK_VA + EXEC_SIZE) < 0 ||
+	    fork_clone_pages(cvm, pvm, EXEC_HEAP_VA,
+	                     EXEC_HEAP_VA + EXEC_HEAP_SIZE) < 0) {
+		kprintf("fork: PMM exhausted during page clone\n");
+		vm_map_put(cvm);	/* destroy frees the partial mappings */
+		return -1;
+	}
 
-	/* Inherit heap break + spawn-pool counter. */
-	exec_heap_brk[child_slot]            = exec_heap_brk[parent_slot];
-	exec_spawn_next_per_slot[child_slot] = exec_spawn_next_per_slot[parent_slot];
+	cvm->heap_brk   = pvm->heap_brk;
+	cvm->spawn_next = pvm->spawn_next;
 
 	/* Flush D-cache + invalidate I-cache for the freshly-copied
 	 * code pages so the child fetches them cleanly. */
@@ -504,26 +553,11 @@ long sys_fork_impl(struct trap_frame *parent_tf)
 		"isb\n"
 		::: "memory");
 
-	/* Build child vm_map.  Same EL0 VAs, different PA backings. */
-	struct vm_map *cvm = vm_map_create();
-	if (!cvm) {
-		kprintf("fork: vm_map_create failed\n");
-		exec_slot_free(child_slot);
-		return -1;
-	}
-	cvm->exec_slot = child_slot;
-	mmu_vmap_map_user_2mb(cvm, EXEC_VA,
-		(uintptr_t)exec_storage[child_slot]);
-	mmu_vmap_map_user_2mb(cvm, EXEC_STACK_VA,
-		(uintptr_t)exec_stack_storage[child_slot]);
-	mmu_vmap_map_user_2mb(cvm, EXEC_HEAP_VA,
-		(uintptr_t)exec_heap_storage[child_slot]);
-
 	struct process *cp = process_alloc(cvm);
 	vm_map_put(cvm);	/* process_alloc bumped the ref */
 	if (!cp) {
 		kprintf("fork: process_alloc failed\n");
-		/* vm_map_put released the slot via exec_slot_release. */
+		/* vm_map_put on cvm above freed the user pages. */
 		return -1;
 	}
 
@@ -657,15 +691,10 @@ static struct blob_priv hello_priv;
 
 void exec_space_init(void)
 {
-	/* Map slot 0 in the boot l0 table so that any code path that
-	 * stumbles into EXEC_VA before an actual sys_execve still
-	 * resolves to *some* valid backing.  We deliberately do NOT
-	 * mark slot 0 as in-use here: exec'd processes each install
-	 * their own vm_map, and the slot allocator should hand out
-	 * slot 0 to whichever fork/exec asks first. */
-	mmu_map_user_2mb(EXEC_VA,       (uintptr_t)exec_storage[0]);
-	mmu_map_user_2mb(EXEC_STACK_VA, (uintptr_t)exec_stack_storage[0]);
-	mmu_map_user_2mb(EXEC_HEAP_VA,  (uintptr_t)exec_heap_storage[0]);
+	/* R6: no boot-table mapping needed for EXEC_VA -- each exec'd
+	 * process installs its own per-page mappings via vm_map.
+	 * Anything that stumbles into EXEC_VA without a per-process
+	 * vm_map will translation-fault (caught by trap_dispatch). */
 
 	/* Create /bin and register embedded ELF blobs. */
 	struct dentry *bin = vfs_mkdir(vfs_root(), "bin");
@@ -839,45 +868,65 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 		kprintf("execve: no program headers\n"); return -1;
 	}
 
-	/* R5: allocate a process slot.  Slot 0 is always available
-	 * until a fork happens; with EXEC_SLOTS=2, the second exec on a
-	 * busy system can fail.  Tune EXEC_SLOTS up for concurrent
-	 * forks across shells. */
-	int slot = exec_slot_alloc();
-	if (slot < 0) {
-		kprintf("execve: no free exec slot (EXEC_SLOTS=%d in use)\n",
-			EXEC_SLOTS);
+	/* R6: build a fresh vm_map and allocate per-page user storage
+	 * from PMM.  No fixed slot pool.  Order of operations:
+	 *   1. vm_map_create
+	 *   2. map + alloc code pages, copy PT_LOAD bytes into them
+	 *   3. map + alloc the full 2 MB stack range
+	 *   4. set heap_brk = EXEC_HEAP_VA (no heap pages yet)
+	 *   5. write argv onto the now-mapped stack
+	 *   6. process_alloc + bind to thread + dispatch
+	 *
+	 * Any failure mid-way unwinds via vm_map_put -> mmu_vmap_destroy,
+	 * which walks the L3 tables and frees the partially-installed
+	 * user pages. */
+	struct vm_map *vm = vm_map_create();
+	if (!vm) {
+		kprintf("execve: vm_map_create failed\n");
 		return -1;
 	}
 
-	/* Reset this slot's spawn counter + heap break. */
-	exec_spawn_next_per_slot[slot] = 0;
-	exec_heap_brk[slot]            = EXEC_HEAP_VA;
-
-	/* Zero this slot's exec storage so BSS segments start clean. */
-	kmemset(exec_storage[slot],       0, EXEC_SIZE);
-	kmemset(exec_stack_storage[slot], 0, EXEC_SIZE);
-	kmemset(exec_heap_storage[slot],  0, EXEC_HEAP_SIZE);
-
-	/* Copy PT_LOAD segments into this slot's exec_storage. */
+	/* (2) Code: walk PT_LOAD, allocate pages, copy bytes. */
 	for (unsigned i = 0; i < eh->e_phnum; i++) {
 		Elf64_Phdr *ph = (Elf64_Phdr *)(elf_read_buf +
 				 eh->e_phoff + (uint64_t)i * eh->e_phentsize);
-		if (ph->p_type != PT_LOAD || ph->p_filesz == 0) continue;
+		if (ph->p_type != PT_LOAD) continue;
 
 		if (ph->p_vaddr < EXEC_VA ||
-		    ph->p_vaddr + ph->p_filesz > EXEC_VA + EXEC_SIZE) {
+		    ph->p_vaddr + ph->p_memsz > EXEC_VA + EXEC_SIZE) {
 			kprintf("execve: LOAD segment 0x%lx+0x%lx "
 				"outside exec window\n",
 				(unsigned long)ph->p_vaddr,
-				(unsigned long)ph->p_filesz);
-			exec_slot_free(slot);
+				(unsigned long)ph->p_memsz);
+			vm_map_put(vm);
 			return -1;
 		}
-		size_t dst_off = (size_t)(ph->p_vaddr - EXEC_VA);
-		kmemcpy(exec_storage[slot] + dst_off,
-			elf_read_buf + ph->p_offset,
-			(size_t)ph->p_filesz);
+		uint64_t seg_start = ph->p_vaddr & ~(uint64_t)PAGE_MASK;
+		uint64_t seg_end   = (ph->p_vaddr + ph->p_memsz + PAGE_SIZE - 1)
+		                     & ~(uint64_t)PAGE_MASK;
+		unsigned n_pages   = (unsigned)((seg_end - seg_start) / PAGE_SIZE);
+		if (vmap_alloc_pages(vm, seg_start, n_pages, /*zero=*/1) < 0) {
+			kprintf("execve: PMM exhausted allocating code\n");
+			vm_map_put(vm);
+			return -1;
+		}
+		if (ph->p_filesz > 0) {
+			if (vmap_copyin(vm, ph->p_vaddr,
+			                elf_read_buf + ph->p_offset,
+			                ph->p_filesz) < 0) {
+				vm_map_put(vm);
+				return -1;
+			}
+		}
+	}
+
+	/* (3) Stack: allocate the entire 2 MB region upfront.  TODO:
+	 * lazy/demand allocation via EL0 page faults is a future R6b. */
+	if (vmap_alloc_pages(vm, EXEC_STACK_VA, EXEC_SIZE / PAGE_SIZE,
+	                     /*zero=*/1) < 0) {
+		kprintf("execve: PMM exhausted allocating stack\n");
+		vm_map_put(vm);
+		return -1;
 	}
 
 	/* Flush D-cache and invalidate I-cache for the new code pages. */
@@ -888,9 +937,14 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 		"isb\n"
 		::: "memory");
 
-	/* --- exec stack setup ---
+	/* (4) Initialise heap break + per-process spawn counter. */
+	vm->heap_brk   = EXEC_HEAP_VA;
+	vm->spawn_next = 0;
+
+	/* (5) exec stack setup -- write argv onto the mapped stack via
+	 * vmap_copyin (which walks vm's L3 to find each page).
 	 *
-	 * Layout (grows down from EXEC_STACK_TOP = 0x20400000):
+	 * Stack layout (grows down from EXEC_STACK_TOP):
 	 *   [string data -- argv strings packed from top down]
 	 *   [16-byte alignment pad]
 	 *   [argv[argc] = NULL,  8 bytes]
@@ -903,92 +957,62 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 	uint64_t sp = EXEC_STACK_TOP;
 	uint64_t uva_strings[EXEC_MAX_ARGS];
 
-	unsigned char *slot_stack = exec_stack_storage[slot];
-
 	/* Pack strings from top down */
 	for (int i = effective_argc - 1; i >= 0; i--) {
 		size_t len = kstrlen(argv[i]) + 1;  /* include NUL */
 		sp -= (uint64_t)len;
 		sp &= ~(uint64_t)7;                 /* 8-byte align */
-		size_t off = (size_t)(sp - EXEC_STACK_VA);
-		kmemcpy(slot_stack + off, argv[i], len);
+		if (vmap_copyin(vm, sp, argv[i], len) < 0) {
+			kprintf("execve: argv string copyin failed\n");
+			vm_map_put(vm);
+			return -1;
+		}
 		uva_strings[i] = sp;
 	}
 
 	/* 16-byte align before pointer array */
 	sp &= ~(uint64_t)15;
 
-	/* The pointer table is (effective_argc + 1) words (pointers + NULL)
-	 * plus 1 word for argc = effective_argc + 2 words total.
-	 * If that count is odd the final SP lands on an 8-byte boundary,
-	 * violating the AArch64 ABI 16-byte alignment requirement.
-	 * Insert a padding word so the total is always even. */
 	if ((effective_argc + 2) & 1) {
 		sp -= 8;
-		*(uint64_t *)(slot_stack + (sp - EXEC_STACK_VA)) = 0;
+		uint64_t zero = 0;
+		vmap_copyin(vm, sp, &zero, sizeof(zero));
 	}
 
 	/* argv[argc] = NULL terminator */
 	sp -= 8;
-	*(uint64_t *)(slot_stack + (sp - EXEC_STACK_VA)) = 0;
+	uint64_t null_word = 0;
+	vmap_copyin(vm, sp, &null_word, sizeof(null_word));
 
 	/* argv[argc-1] .. argv[0] */
 	for (int i = effective_argc - 1; i >= 0; i--) {
 		sp -= 8;
-		*(uint64_t *)(slot_stack + (sp - EXEC_STACK_VA)) = uva_strings[i];
+		vmap_copyin(vm, sp, &uva_strings[i], sizeof(uva_strings[i]));
 	}
 
 	/* argc — SP is 16-byte aligned here */
 	sp -= 8;
-	*(uint64_t *)(slot_stack + (sp - EXEC_STACK_VA)) = (uint64_t)effective_argc;
+	uint64_t argc_word = (uint64_t)effective_argc;
+	vmap_copyin(vm, sp, &argc_word, sizeof(argc_word));
 
 	struct exec_args *a = kmalloc(sizeof(*a));
-	if (!a) { exec_slot_free(slot); return -1; }
+	if (!a) { vm_map_put(vm); return -1; }
 	a->entry = eh->e_entry;
 	a->sp    = sp;   /* SP points at argc word on the exec stack */
 
-	/* Compute the basename FIRST and pass it into kthread_create so
-	 * t->name reflects the program name before the new thread is
-	 * dispatched.  Otherwise, on SMP a peer CPU can pick up the
-	 * thread and call /proc/ps's pb_str(t->name) while we're still
-	 * setting t->comm here -- the snapshot would show the placeholder
-	 * "exec" instead of e.g. "ps". */
 	const char *base = path;
 	for (const char *p = path; *p; p++)
 		if (*p == '/') base = p + 1;
 
 	struct kthread *t = kthread_create_no_dispatch(base,
 	                                               exec_thread_main, a);
-	if (!t) { kfree(a); return -1; }
-
-	/* R5: each exec gets its own process + vm_map mapping the EL0
-	 * windows to the freshly-allocated slot.  vm->exec_slot owns
-	 * the slot release on the last vm_map_put.
-	 *
-	 * Order matters here: we MUST install the new t_proc on the
-	 * thread BEFORE kthread_dispatch hands it to the scheduler.
-	 * Otherwise the new thread could run with t_proc still
-	 * pointing at init_process and end up using the wrong TTBR0
-	 * the first time the dispatcher schedules it. */
-	struct vm_map *vm = vm_map_create();
-	if (!vm) {
-		kprintf("execve: vm_map_create failed\n");
-		kfree(a);
-		exec_slot_free(slot);
-		return -1;
-	}
-	vm->exec_slot = slot;
-	mmu_vmap_map_user_2mb(vm, EXEC_VA,       (uintptr_t)exec_storage[slot]);
-	mmu_vmap_map_user_2mb(vm, EXEC_STACK_VA, (uintptr_t)exec_stack_storage[slot]);
-	mmu_vmap_map_user_2mb(vm, EXEC_HEAP_VA,  (uintptr_t)exec_heap_storage[slot]);
+	if (!t) { kfree(a); vm_map_put(vm); return -1; }
 
 	struct process *p = process_alloc(vm);
 	vm_map_put(vm);	/* process_alloc bumped vm refs */
 	if (!p) {
 		kprintf("execve: process_alloc failed\n");
 		kfree(a);
-		/* vm_map_put above already released the slot via
-		 * exec_slot_release. */
 		return -1;
 	}
 

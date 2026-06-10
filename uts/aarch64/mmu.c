@@ -350,9 +350,17 @@ int mmu_vmap_create(struct vm_map *vm)
 	return 0;
 }
 
+/* Defined further down with the rest of the 4 KB-mapping code. */
+static void vmap_free_user_l3s(uint64_t *l2);
+
 void mmu_vmap_destroy(struct vm_map *vm)
 {
 	if (!vm) return;
+	if (vm->l2_phys) {
+		/* Walk L2 for user L3 tables; free user pages + the L3
+		 * itself.  Kernel BLOCK entries are skipped (D_TABLE off). */
+		vmap_free_user_l3s((uint64_t *)(uintptr_t)vm->l2_phys);
+	}
 	if (vm->l0_phys) pmm_free((void *)(uintptr_t)vm->l0_phys);
 	if (vm->l1_phys) pmm_free((void *)(uintptr_t)vm->l1_phys);
 	if (vm->l2_phys) pmm_free((void *)(uintptr_t)vm->l2_phys);
@@ -370,6 +378,122 @@ void mmu_vmap_map_user_2mb(struct vm_map *vm, uint64_t va, uint64_t pa)
 	unsigned idx = (unsigned)(va >> BLOCK_2M_SHIFT) & 0x1ff;
 	l2[idx] = pa | D_VALID | D_ATTRIDX(ATTR_NORMAL_IDX) |
 		  D_AP_RW_EL0 | D_SH_INNER | D_AF;
+}
+
+/* ---- R6: 4 KB user page mappings via L3 tables -------------------- */
+
+/* Mask of PA bits in a descriptor: bits 12..47 (4 KB-aligned, 48-bit PA). */
+#define D_PA_MASK	0x0000fffffffff000UL
+
+/* Get or allocate the L3 table covering `va` in `vm`.  Converts the
+ * L2 entry from a (possibly-stale kernel) BLOCK into a TABLE pointing
+ * at the fresh L3 the first time the 2 MB region is touched.  Returns
+ * the L3's kernel VA (== PA, since kernel is identity-mapped), or
+ * NULL on PMM exhaustion. */
+static uint64_t *vmap_l3_for(struct vm_map *vm, uint64_t va)
+{
+	if (!vm || !vm->l2_phys) return NULL;
+	uint64_t *l2 = (uint64_t *)(uintptr_t)vm->l2_phys;
+	unsigned idx = (unsigned)(va >> BLOCK_2M_SHIFT) & 0x1ff;
+	uint64_t e = l2[idx];
+	if ((e & D_VALID) && (e & D_TABLE)) {
+		/* Already pointing at an L3 we installed earlier. */
+		return (uint64_t *)(uintptr_t)(e & D_PA_MASK);
+	}
+	void *l3 = pmm_alloc();
+	if (!l3) return NULL;
+	/* pmm_alloc returns zeroed pages, so all L3 entries start
+	 * invalid -- nothing pmm_free's stale data into the wrong VA. */
+	l2[idx] = (uint64_t)(uintptr_t)l3 | D_VALID | D_TABLE;
+	return (uint64_t *)l3;
+}
+
+/* Install a 4 KB user-RW page at `va` -> `pa` in `vm`.  Allocates an
+ * L3 covering the surrounding 2 MB region on first use.  Returns 0
+ * on success, -1 on PMM exhaustion.  No TLBI here; the new mapping
+ * goes live the next time vm's TTBR0 is loaded. */
+int mmu_vmap_map_user_4k(struct vm_map *vm, uint64_t va, uint64_t pa)
+{
+	uint64_t *l3 = vmap_l3_for(vm, va);
+	if (!l3) return -1;
+	unsigned idx = (unsigned)(va >> PAGE_SHIFT) & 0x1ff;
+	/* D_TABLE bit at L3 is the AArch64 "page descriptor" marker
+	 * -- it MUST be set on a valid page entry.  An L3 entry with
+	 * D_TABLE clear is treated as a reserved descriptor and faults. */
+	l3[idx] = (pa & D_PA_MASK) | D_VALID | D_TABLE |
+		  D_ATTRIDX(ATTR_NORMAL_IDX) |
+		  D_AP_RW_EL0 | D_SH_INNER | D_AF;
+	return 0;
+}
+
+/* Translate a user VA into the kernel-side identity address (which
+ * is the same as the PA since the kernel is identity-mapped) for
+ * direct kernel access to the user page.  Returns NULL if the VA
+ * has no L3 mapping installed.
+ *
+ * Used by sys_execve to write argv onto the user stack and by
+ * sys_fork to walk parent pages when copying. */
+void *mmu_vmap_user_va_to_kva(const struct vm_map *vm, uint64_t va)
+{
+	if (!vm || !vm->l2_phys) return NULL;
+	uint64_t *l2 = (uint64_t *)(uintptr_t)vm->l2_phys;
+	unsigned l2_idx = (unsigned)(va >> BLOCK_2M_SHIFT) & 0x1ff;
+	uint64_t e2 = l2[l2_idx];
+	if (!(e2 & D_VALID)) return NULL;
+	if (!(e2 & D_TABLE)) {
+		/* 2 MB block (legacy path).  Direct PA + offset. */
+		uint64_t pa = e2 & D_PA_MASK;
+		return (void *)(uintptr_t)(pa + (va & (BLOCK_2M_SIZE - 1)));
+	}
+	uint64_t *l3 = (uint64_t *)(uintptr_t)(e2 & D_PA_MASK);
+	unsigned l3_idx = (unsigned)(va >> PAGE_SHIFT) & 0x1ff;
+	uint64_t e3 = l3[l3_idx];
+	if (!(e3 & D_VALID)) return NULL;
+	uint64_t pa = e3 & D_PA_MASK;
+	return (void *)(uintptr_t)(pa + (va & PAGE_MASK));
+}
+
+/* Unmap a single 4 KB user page from `vm` and pmm_free the backing
+ * page.  No-op if the VA isn't mapped.  Returns the PA that was
+ * freed, or 0. */
+uint64_t mmu_vmap_unmap_user_4k(struct vm_map *vm, uint64_t va)
+{
+	if (!vm || !vm->l2_phys) return 0;
+	uint64_t *l2 = (uint64_t *)(uintptr_t)vm->l2_phys;
+	unsigned l2_idx = (unsigned)(va >> BLOCK_2M_SHIFT) & 0x1ff;
+	uint64_t e2 = l2[l2_idx];
+	if (!(e2 & D_VALID) || !(e2 & D_TABLE)) return 0;
+	uint64_t *l3 = (uint64_t *)(uintptr_t)(e2 & D_PA_MASK);
+	unsigned l3_idx = (unsigned)(va >> PAGE_SHIFT) & 0x1ff;
+	uint64_t e3 = l3[l3_idx];
+	if (!(e3 & D_VALID)) return 0;
+	uint64_t pa = e3 & D_PA_MASK;
+	l3[l3_idx] = 0;
+	pmm_free((void *)(uintptr_t)pa);
+	return pa;
+}
+
+/* Walk vm's L2.  For every entry that's a TABLE in a user-range
+ * slot (everything below the kernel L1[1] window), free the L3's
+ * page-pointed-at user pages then the L3 itself.  Called from
+ * mmu_vmap_destroy.  Boot L2 entries (kernel identity mappings) are
+ * BLOCKS, not TABLES, so they're naturally skipped. */
+static void vmap_free_user_l3s(uint64_t *l2)
+{
+	for (int i = 0; i < ENTRIES_PER_TABLE; i++) {
+		uint64_t e = l2[i];
+		if (!(e & D_VALID) || !(e & D_TABLE))
+			continue;
+		uint64_t *l3 = (uint64_t *)(uintptr_t)(e & D_PA_MASK);
+		for (int j = 0; j < ENTRIES_PER_TABLE; j++) {
+			uint64_t pe = l3[j];
+			if (!(pe & D_VALID)) continue;
+			uint64_t pa = pe & D_PA_MASK;
+			pmm_free((void *)(uintptr_t)pa);
+		}
+		pmm_free(l3);
+		l2[i] = 0;
+	}
 }
 
 /* Set the current CPU's TTBR0_EL1 to `vm`'s L0 and flush the local

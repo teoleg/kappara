@@ -158,21 +158,30 @@ VA              Size    Purpose
                         Grows up from EXEC_HEAP_VA, controlled by SYS_brk
 ```
 
-R5: each exec'd process owns its own `slot` in a pool of `EXEC_SLOTS`
-(=2 today) BSS-resident 2 MB backings.  `sys_execve` allocates a free
-slot via `exec_slot_alloc`; `sys_fork` allocates a second slot and
-kmemcpys the parent's 6 MB of slot content into it before installing a
-child vm_map whose L2 maps the same EL0 VAs to the child slot's
-physical pages.  The TTBR0 swap on context-switch (see `switch_to_next`)
-hands each thread its own slot transparently.  `vm_map_put` releases
-the slot back to the pool on the last reference (kthread reap path).
+R6: each exec'd process owns its own vm_map (L0/L1/L2/L3 page
+tables) with EXEC_VA/EXEC_STACK_VA/EXEC_HEAP_VA mapped 4 KB at a
+time onto PMM-allocated pages.  No fixed slot pool; the number of
+concurrent processes is bounded only by PMM size (every exec
+consumes roughly 2 MB of stack + a few KB of code + L3/L2/L1/L0
+tables).  `sys_execve` allocates code pages while copying PT_LOAD
+bytes and the full 2 MB stack range upfront.  `sys_fork` walks the
+parent's L3 tables and allocates a fresh PMM page for each
+already-mapped user page, kmemcpying parent->child before installing
+the mapping in the child's L3.  Same EL0 VAs, different physical
+pages -- real Unix fork semantics.  `vm_map_put` -> `mmu_vmap_destroy`
+walks the L3 tables and `pmm_free`'s every user page on the last
+reference.
 
-The init and exec windows are both mapped once at boot (`user_init` /
-`exec_space_init`) and reused for every process.  The boot l0 maps
-slot 0 as a "default view" -- no process actually runs on the boot
-vm_map for EXEC_VA, but having a valid mapping there means stray
-accesses don't fault.  Only one exec'd program runs at a time per
-shell (the shell calls `sys_wait` before accepting the
+`sys_brk` lives in the kernel's per-process `vm_map.heap_brk`.
+Growing the break allocates PMM pages and installs 4 KB mappings;
+shrinking unmaps + frees them.  malloc and friends just call
+`brk(0)` / `brk(addr)` as before; the libc layer is unchanged.
+
+The init window (USER_VA at 0x10000000) is still mapped once at
+boot as a single shared 2 MB block (all four init shells share
+`user_storage`).  fork is only available to exec'd processes; init
+shells trying to fork get rejected.  Only one exec'd program runs at
+a time per shell (the shell calls `sys_wait` before accepting the
 next command).
 
 ### ELF loader (sys_execve)

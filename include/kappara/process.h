@@ -47,10 +47,15 @@ struct vm_map {
 	uint64_t  l1_phys;	/* for teardown; arch-allocated by
 				 * mmu_vmap_create on aarch64 */
 	uint64_t  l2_phys;	/* L2 we mutate when mapping user pages */
-	/* R5: which exec process slot this vm_map's user mappings
-	 * point at.  -1 = no exec slot (init_vm_map, boot vm_map).
-	 * vm_map_put frees the slot when refs hit zero. */
-	int       exec_slot;
+	/* R6: per-process heap break.  Starts at EXEC_HEAP_VA after
+	 * exec; sys_brk advances it by allocating PMM pages and
+	 * installing 4 KB mappings via mmu_vmap_map_user_4k.  Init
+	 * shells (boot vm_map) carry heap_brk=0 and reject brk. */
+	uint64_t  heap_brk;
+	/* R6: sys_spawn stack-slot counter, per-process so spawned
+	 * threads in one process don't collide with another process's
+	 * slots even when both share the same EL0 stack VA range. */
+	unsigned  spawn_next;
 	int       refs;		/* threads sharing this map */
 	spinlock_t lock;
 };
