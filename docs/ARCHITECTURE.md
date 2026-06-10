@@ -535,6 +535,70 @@ blob symbols and mounts the result at `/usr/bin`.  Future on-disk
 storage (S2 SD/EMMC) plugs in by swapping the `block_device` —
 nothing else above the kfs layer changes.
 
+## Networking
+
+SVR4-flavoured layout: STREAMS for user-facing surfaces and driver
+framing, direct C calls for the protocol stack itself.  Real Solaris
+made the same hybrid choice once pure-STREAMS in the hot path proved
+too slow.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ user: cmd/ping (later)                                  │
+├─────────────────────────────────────────────────────────┤
+│ syscall: open("/dev/lo0"), open("/dev/icmp") (later)    │
+├─────────────────────────────────────────────────────────┤
+│ STREAMS cdevs: /dev/lo0, /dev/icmp, /dev/udp, /dev/tcp  │
+├─────────────────────────────────────────────────────────┤
+│ Direct-call protocol stack:                             │
+│   icmp_input  (auto echo-reply, deliver to waiters)     │
+│   ip_input / ip_output (header build/parse, route)      │
+│   netif registry (longest-prefix match)                 │
+├─────────────────────────────────────────────────────────┤
+│ Drivers: lo0 (loopback), slip0 (UART, future)           │
+└─────────────────────────────────────────────────────────┘
+```
+
+`struct netif` is the bottom-of-stack abstraction.  Each driver
+(currently just `lo0`) registers a netif carrying a name, IP, mask,
+MTU, and a `tx` callback.  `netif_route(dst_ip)` walks the registry
+picking the longest-prefix-match netif for routing.
+
+`mblk_t` carries packets through every layer -- same data container
+STREAMS modules already use, so the network stack composes naturally
+with the rest of the system.
+
+`ip_output(dst, proto, mp)` prepends an IPv4 header and calls
+`netif->tx`.  Caller must allocate the mblk with `IP_HDR_LEN` bytes
+of headroom; `ip_output` rewinds `b_rptr` to fill the header in
+place.  `ip_input` (called by `netif_input` from the driver rx path)
+validates the header + checksum, strips it, and dispatches by
+proto byte to `icmp_input`, future `udp_input`, future `tcp_input`.
+
+ICMP: `icmp_input` auto-replies to type 8 (echo request) by flipping
+the type byte, recomputing the checksum, and re-calling `ip_output`
+with the same mblk -- zero allocations on the reply path.  Type 0
+(echo reply) is stashed in a single-slot waiter (`icmp_arm_waiter`
++ `icmp_wait_reply`) so the boot selftest and future `cmd/ping`
+can observe their pong.
+
+lo0 (`uts/os/net/lo.c`) has dual personality: a `netif` that
+`netif_input`'s its own tx mblks back synchronously, and a STREAMS
+cdev `/dev/lo0` for raw-IP injection from user space later.
+
+`net_selftest` (runs at boot after `buf_selftest`): sends an ICMP
+echo request to 127.0.0.1, verifies the reply lands.  The whole
+round-trip is one synchronous call chain since lo0 loops in tx
+context -- by the time `icmp_send_echo` returns, the reply has
+already been processed and stashed in the waiter.
+
+Not yet:
+- UDP, TCP transports
+- BSD sockets layer (or TPI-shaped open("/dev/udp") with M_PROTO
+  primitives)
+- SLIP framing on UART2 for off-machine connectivity
+- ARP (only needed for Ethernet, not lo0 or SLIP)
+
 ## Signals
 
 Per-thread state: `sig_pending` (bitmap), `sig_mask` (blocked bits),

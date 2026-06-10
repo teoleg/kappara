@@ -53,6 +53,10 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/uts/os/io/vt.o \
         $(BUILD)/uts/os/io/ldterm.o \
         $(BUILD)/uts/os/io/tty.o \
+        $(BUILD)/uts/os/net/netif.o \
+        $(BUILD)/uts/os/net/ipv4.o \
+        $(BUILD)/uts/os/net/icmp.o \
+        $(BUILD)/uts/os/net/lo.o \
         $(BUILD)/uts/os/user/user.o \
         $(BUILD)/uts/os/main.o
     KSYM_STUB_OBJ := $(BUILD)/uts/aarch64/kallsyms_stub.o

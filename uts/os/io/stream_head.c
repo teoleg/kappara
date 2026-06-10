@@ -49,6 +49,7 @@
 
 #include "kappara/cdevsw.h"
 #include "kappara/fbcon.h"
+#include "kappara/ip.h"
 #include "kappara/klog.h"
 #include "kappara/kmem.h"
 #include "kappara/printk.h"
@@ -1437,6 +1438,12 @@ void streams_head_init(void)
 	vfs_mknod_chrdev(dev, "tty1", MKDEV(CDEV_MAJ_TTY, 1));
 	vfs_mknod_chrdev(dev, "tty2", MKDEV(CDEV_MAJ_TTY, 2));
 	vfs_mknod_chrdev(dev, "tty3", MKDEV(CDEV_MAJ_TTY, 3));
+
+	/* Networking: ip_init registers lo0 as both a netif and a
+	 * STREAMS cdev (CDEV_MAJ_LO).  Publish the /dev node here so
+	 * future cmd/ping (and any raw-IP user code) can open it. */
+	ip_init();
+	vfs_mknod_chrdev(dev, "lo0", MKDEV(CDEV_MAJ_LO, 0));
 
 	kprintf("stream_head: registered modules:");
 	for (struct stmod_entry *e = registry; e; e = e->next)
