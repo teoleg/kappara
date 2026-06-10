@@ -590,90 +590,126 @@ at all."
 ┌─────────────────────────────────────────────────────────┐
 │ user: cmd/ping  (open /dev/icmp, write req, read rep)   │
 ├─────────────────────────────────────────────────────────┤
-│ STREAMS cdev: /dev/icmp (major 16) -- echo ping driver   │
-│   wput: build M_PROTO{ip_send_meta} + M_DATA(payload),  │
-│         arm reply waiter, putnext into IP stream         │
-│   (future: /dev/udp TPI driver, /dev/tcp TPI driver)    │
+│ stream head                                              │
 ├─────────────────────────────────────────────────────────┤
-│ IP multiplexor (ip_streamtab, uts/os/net/ipv4.c)         │
-│   wput: M_PROTO+M_DATA in.  Prepend IPv4 header in       │
-│         payload headroom; route to one lower by netmask  │
-│         match in ip_lowers[]; putnext into lower's qbot. │
-│   rput: M_DATA up from a lower (rewired via I_LINK).     │
-│         Validate header, strip, dispatch by proto byte   │
-│         via ip_dispatch_input -> icmp_input / udp_input. │
-│   I_LINK / I_UNLINK in its wput record / release lower   │
-│         link slots; ip_lower_register backfills nif.     │
+│ icmp module  (uts/os/net/icmp.c, struct icmp_streamtab)  │
+│   qopen: alloc state, auto-assign icmp_id, putnext       │
+│          M_PROTO{IP_T_BIND_REQ, proto=1} down            │
+│   wput:  M_DATA{icmp_ping_req}: stamp our icmp_id, arm  │
+│          (id, seq) waiter, build ICMP header, putnext    │
+│          M_PROTO{IP_T_SEND_REQ}+M_DATA(payload) down     │
+│   rput:  M_PROTO{IP_T_BIND_ACK} → bound=1                │
+│          M_DATA: filter by icmp_id; type=8 auto-reply    │
+│          via putnext(WR(q), ...); type=0 match waiter,   │
+│          putnext UP formatted icmp_ping_rep              │
+│   qclose: putnext UNBIND_REQ down, free state            │
+├─────────────────────────────────────────────────────────┤
+│ IP multiplexor (uts/os/net/ipv4.c, struct ip_streamtab)  │
+│   wput: M_IOCTL{I_LINK/I_UNLINK}: lower-side bookkeeping │
+│         M_PROTO{IP_T_SEND_REQ}+M_DATA: build header,     │
+│           route via netmask in ip_lowers[], putnext      │
+│           into lower->qbot                               │
+│         M_PROTO{IP_T_BIND_REQ/IP_T_UNBIND_REQ}: register │
+│           (proto, key, upper_rq) in ip_uppers[]; ACK     │
+│           back UP via putnext(OTHERQ)                    │
+│   rput: validate IPv4, strip, demux via ip_uppers[];     │
+│         multicast via dupmsg when N matches              │
+│         (cross-stream delivery uses put(), not putnext)  │
 ├─────────────────────────────────────────────────────────┤
 │ Netif leaf STREAMS drivers (one stream each):           │
 │   lo0 (loopback): wput putnexts OTHERQ(q) -- the I_LINK  │
-│         rewire points its q_next at IP's drv_rq, so the  │
-│         loopback packet enters IP from below as if it    │
-│         had just arrived on an external wire.            │
+│         rewire points its q_next at IP's drv_rq          │
 │   slip0 (UART, future)                                  │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**`struct netif`** carries identity only (name, IP, netmask, MTU,
-streamtab).  IP uses it for routing; the per-link `qbot` (the lower
-stream's head wq) lives in `ip_lowers[]` and is the actual handle
-IP putnexts through.  The legacy `tx` callback is unused after the
-N2b STREAMS migration; kept on the struct as a NULL field for future
-non-streams pseudo-interfaces if those ever appear.
+### IP M_PROTO primitives
 
-**`mblk_t`** carries packets through every queue boundary -- same
-container STREAMS modules use for tty bytes and pipes.  Reserved
-`IP_HDR_LEN` headroom at allocb time means the IP header is written
-in place on the way out (no extra mblk alloc), and the rewired chain
-brings the mblk back up with the header still on it for IP's rput
-to strip.
+Every inter-layer interaction between an upper module and the IP
+driver is an M_PROTO message tagged by a `prim` byte at offset 0
+of the M_PROTO mblk's b_rptr (the SVR4 TPI / DLPI shape).  IP
+recognises:
 
-**`ip_send(dst_ip, proto, mp)`** is the in-kernel convenience helper.
-It allocates an M_PROTO mblk carrying `struct ip_send_meta { dst_ip,
-proto }`, chains the caller's M_DATA payload as `b_cont`, and
-`putnext`s the pair into `ip_ctl_sd->sd_wq` -- the kernel-only IP
-control stream built at boot.  IP's wput decodes the meta, prepends
-the header, routes, putnexts down.
+| Primitive          | Direction       | Carries                                    |
+|--------------------|-----------------|---------------------------------------------|
+| `IP_T_SEND_REQ`    | upper → IP      | `ip_send_meta{dst_ip, proto}` + M_DATA b_cont |
+| `IP_T_BIND_REQ`    | upper → IP      | `ip_bind_meta{proto, key}`                 |
+| `IP_T_BIND_ACK`    | IP → upper      | `ip_bind_meta{proto, key}` (matches request) |
+| `IP_T_BIND_NAK`    | IP → upper      | `ip_bind_meta{proto, key}` (slot full / dup) |
+| `IP_T_UNBIND_REQ`  | upper → IP      | `ip_bind_meta{proto, key}`                 |
+| `IP_T_UNBIND_ACK`  | IP → upper      | `ip_bind_meta{proto, key}`                 |
 
-**ICMP (`uts/os/net/icmp.c`)** auto-replies to type 8 (echo request)
-by flipping the type byte, recomputing the checksum, and calling
-`ip_send` with the same mblk -- zero allocations on the reply path.
-Type 0 (echo reply) is delivered to either the boot selftest's
-single-slot waiter (`icmp_arm_waiter` + `icmp_wait_reply`) or a
-per-stream STREAMS waiter (`icmp_arm_waiter_stream`, registered by
-the `/dev/icmp` driver on each write).  ICMP itself becomes a
-pushable STREAMS module above IP in N2c.
+The `key` is a protocol-specific demux discriminator that IP
+itself doesn't interpret -- ICMP leaves it 0 (binding by proto
+alone); UDP will populate it with the local port.
 
-**UDP (`uts/os/net/udp.c`)** has header strip/build in place;
-incoming datagrams are currently logged and dropped (no bound
-sockets yet).  N2d adds a `/dev/udp` TPI-shaped STREAMS driver
-(T_BIND_REQ, T_UNITDATA_REQ, T_UNITDATA_IND).
+### Multi-bind multicast demux
 
-**lo0 (`uts/os/net/lo.c`)** is the canonical leaf STREAMS driver.
-Its wput does `putnext(OTHERQ(q), mp)` -- which after I_LINK targets
-IP's drv_rq via the rewired q_next.  `ip_init` builds one lo0 stream
-at boot via `stream_build_kernel(&lo_streamtab, "lo0", 0)` and
-`stream_ilink`s it under `ip_ctl_sd`.
+`ip_uppers[]` is a fixed-size table of up to 16 active bindings.
+On incoming packet, IP's rput walks the table looking for entries
+matching the packet's proto byte and collects all matches; then
+`dupmsg` for all but the last delivery and `put(upper_rq, mp)` to
+each match.  Cross-stream delivery uses `put` (the SVR4 primitive
+that invokes a queue's own `qi_putp` directly without following
+`q_next`) because the rput's source stream and the upper bind's
+stream are not in the same `q_next` chain -- `putnext` would walk
+the wrong way.
 
-**Boot ordering matters.**  `ip_init` is called from `main.c` *after*
-`sched_init` because `stream_ilink` blocks on `sd_ioc_wq` (the
-M_IOCTL ACK rendezvous), and `spin_lock_irq_save` derefs `curthread`.
-Before `sched_init` there is no thread context.  Don't move `ip_init`
-back into `streams_head_init`.
+Each ICMP module instance gets a 16-bit `icmp_id` auto-assigned
+at `qopen` time from a global counter (skipping zero).  Outgoing
+echo requests are stamped with this id; incoming demuxed packets
+that arrive at the module's `rq_putp` are filtered by id and
+dropped if they don't match.  Two concurrent `cmd/ping`s get
+distinct ids, each filters by its own, both work.  Same shape
+Solaris uses for raw-ICMP endpoints.
 
-**Device major assignments (network):**
+### Stream tear-down for STREAMS modules
+
+`stream_close` (and `stream_destroy_kernel`) walk pushed modules
+top-down and call each one's `qi_qclose` on its **read-side**
+qinit before draining and freeing the queues.  SVR4 convention.
+The icmp module's `qclose` is what fires the `IP_T_UNBIND_REQ`
+that releases the bind slot in IP -- without that call, sequential
+opens of `/dev/icmp` would silently leak `ip_uppers[]` entries and
+hit the duplicate-bind check.
+
+### `/dev/icmp` autopush
+
+`/dev/icmp`'s cdev entry maps to `ip_streamtab`.  On open, `stream_open`
+detects `MAJOR(rdev) == CDEV_MAJ_ICMP` and `do_ipush`es the `"icmp"`
+module on top of the freshly-built IP stream.  Same mechanism as
+`ldterm` autopush on `/dev/tty*`.  The icmp module's qopen runs after
+the push completes (all q_next wiring is in place) so its first
+`putnext(WR(rq), bind_mp)` reaches the IP wput cleanly.
+
+### Boot wiring
+
+`ip_init()` runs from `main.c` *after* `sched_init` (not from
+`streams_head_init`) because `stream_ilink` blocks on `sd_ioc_wq`
+which derefs `curthread`.  It:
+1. Calls `lo_init()` to register the lo0 netif in the registry.
+2. Builds the kernel-only IP control stream `ip_ctl_sd`.  All
+   in-kernel `ip_send(...)` calls go through this stream; users
+   open separate `/dev/icmp` streams that get demuxed cross-stream.
+3. Walks `netif_for_each`, builds one kernel stream per netif from
+   its `streamtab`, `stream_ilink`s each under `ip_ctl_sd`, and
+   calls `ip_lower_register(muxid, nif)` so the netif identity is
+   available for routing.
+
+### Device major assignments (network):
 
 | Major | Name  | Source              | Purpose                       |
 |-------|-------|---------------------|-------------------------------|
-| 16    | icmp  | `uts/os/net/icmp.c` | ICMP echo req/rep STREAMS cdev|
+| 16    | icmp  | `ip_streamtab` + autopush `"icmp"` module | ICMP raw-echo endpoint |
 
-(Major 15 was `/dev/lo0` for raw-IP user injection.  Removed in N2b;
-the role belongs to a future `/dev/ip` once we expose the IP mux to
-user space.)
+(Major 15 was a leaf-driver `/dev/lo0` for raw-IP user injection.
+Removed in N2b; the role belongs to a future `/dev/ip` once we
+expose the IP mux to user space.)
 
 Not yet:
-- ICMP as a real STREAMS module above IP (N2c)
-- `/dev/udp` TPI STREAMS driver (N2d)
+- `/dev/udp` TPI STREAMS driver with `T_BIND_REQ` / `T_UNITDATA_REQ`
+  / `T_UNITDATA_IND` (N2d).  Will use `ip_bind_meta.key` to encode
+  the local port for fine-grained demux.
 - A demo pushable filter (`pktfilter`) inserted at a layer boundary
   to prove composability (N2e)
 - TCP transport and `/dev/tcp`

@@ -38,12 +38,12 @@ static int parse_ipv4(const char *s, uint32_t *out)
 	return 0;
 }
 
-static int do_ping(int fd, uint32_t dst_ip, uint16_t id, uint16_t seq)
+static int do_ping(int fd, uint32_t dst_ip, uint16_t seq)
 {
 	struct icmp_ping_req req;
 	req.dst_ip = dst_ip;
-	req.id     = id;
 	req.seq    = seq;
+	req._pad   = 0;
 
 	if (write(fd, &req, sizeof(req)) != (ssize_t)sizeof(req)) {
 		puts("ping: write failed");
@@ -98,7 +98,7 @@ int main(int argc, char **argv)
 
 	int ok = 0, fail = 0;
 	for (int i = 0; i < count; i++) {
-		if (do_ping(fd, dst, 0xBEEF, (uint16_t)(i + 1)) == 0)
+		if (do_ping(fd, dst, (uint16_t)(i + 1)) == 0)
 			ok++;
 		else
 			fail++;

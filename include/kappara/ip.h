@@ -74,34 +74,50 @@ static inline uint32_t htonl32(uint32_t v)
 #define ntohs16 htons16
 #define ntohl32 htonl32
 
-/* ---- IP-as-STREAMS-multiplexor send metadata -----------------------
+/* ---- IP M_PROTO primitives -----------------------------------------
  *
- * Callers send M_PROTO{struct ip_send_meta} + M_DATA(payload) to IP's
- * write side.  IP's wput decodes the meta, prepends the 20-byte IPv4
- * header to the payload, routes by netmask to one of its I_LINKed
- * lower streams (one per netif), and putnexts the rewritten payload
- * down.  ip_send() is the convenience helper that builds the M_PROTO
- * + M_DATA pair and putnexts into the IP driver's stream.
+ * Upper modules / drivers exchange M_PROTO messages with IP using a
+ * tagged-union shape.  The first byte of the M_PROTO mblk identifies
+ * the primitive; the rest of the mblk is the payload struct.  This
+ * mirrors SVR4 TPI / DLPI's t_primitives encoding.
  */
+
+#define IP_T_SEND_REQ		1	/* upper -> IP: send M_DATA in b_cont */
+#define IP_T_BIND_REQ		2	/* upper -> IP: deliver proto to me   */
+#define IP_T_BIND_ACK		3	/* IP -> upper: bind succeeded         */
+#define IP_T_BIND_NAK		4	/* IP -> upper: bind failed            */
+#define IP_T_UNBIND_REQ		5	/* upper -> IP: stop delivering        */
+#define IP_T_UNBIND_ACK		6	/* IP -> upper: unbind succeeded       */
+
+/* IP_T_SEND_REQ: payload chained as b_cont(M_DATA). */
 struct ip_send_meta {
-	uint32_t dst_ip;	/* host byte order */
+	uint8_t  prim;		/* IP_T_SEND_REQ */
 	uint8_t  proto;
-	uint8_t  _pad[3];
+	uint8_t  _pad[2];
+	uint32_t dst_ip;	/* host byte order */
 };
 
-/* Build M_PROTO{ip_send_meta} + M_DATA(payload), putnext into IP.
+/* IP_T_BIND_REQ / _ACK / _NAK / IP_T_UNBIND_REQ / _ACK: same shape.
+ * The `key` slot is generic protocol-specific demux discriminator --
+ * IP itself doesn't interpret it (modules may use it to encode
+ * local-port for UDP, etc).  Set to zero for plain proto-only bind. */
+struct ip_bind_meta {
+	uint8_t  prim;
+	uint8_t  proto;
+	uint8_t  _pad[2];
+	uint32_t key;
+};
+
+/* Build M_PROTO{IP_T_SEND_REQ} + M_DATA(payload), putnext into IP.
  * mp's b_rptr..b_wptr is the L4 payload (with IP_HDR_LEN headroom
  * reserved at b_rptr -- IP's wput rewinds to fill the header in
  * place).  Returns 0 on success, -1 on alloc/route failure (mp
- * freed either way). */
+ * freed either way).
+ *
+ * Convenience helper for in-kernel callers that don't have their
+ * own stream stacked above IP.  Modules pushed above IP just send
+ * M_PROTO+M_DATA via putnext(q, msg) directly. */
 int  ip_send (uint32_t dst_ip, uint8_t proto, mblk_t *mp);
-
-/* Called by IP driver's rput once the IP header has been validated
- * and stripped.  Dispatches by proto byte to icmp_input / udp_input.
- * Lives here (not file-static in ipv4.c) so unit-style selftests can
- * inject mblks straight into the demux. */
-void ip_dispatch_input(uint32_t src, uint32_t dst, uint8_t proto,
-                       mblk_t *mp);
 
 /* Register a netif's identity against its IP-multiplexor link slot
  * after stream_ilink has succeeded.  IP's wput populates the slot's

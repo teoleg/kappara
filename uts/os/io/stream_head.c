@@ -902,6 +902,12 @@ static int stream_open(struct file *f)
 	 * it without disturbing that. */
 	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_TTY)
 		(void)do_ipush(sd, "ldterm");
+	/* /dev/icmp's cdev streamtab is ip_streamtab -- so opening it
+	 * gets a stream with IP at the bottom.  Autopush the icmp
+	 * module on top so the user-visible stream is icmp-over-ip.
+	 * Same shape as tty / ldterm. */
+	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_ICMP)
+		(void)do_ipush(sd, "icmp");
 
 	f->f_private = sd;
 	return 0;
@@ -975,8 +981,14 @@ static int stream_close(struct file *f)
 		while (q && q != sd->sd_drv_wq) {
 			queue_t *next = q->q_next;
 			queue_t *peer_q = q->q_link;
-			if (q->q_qinfo && q->q_qinfo->qi_qclose)
-				q->q_qinfo->qi_qclose(peer_q);
+			/* SVR4 convention: qclose is on the READ-side
+			 * qinit (rinit), not the write side.  Callers like
+			 * ldterm and the new icmp module follow this
+			 * convention -- check peer_q (which is the read
+			 * queue when walking write-side downward).  Mirror
+			 * the same shape used below for the driver pair. */
+			if (peer_q->q_qinfo && peer_q->q_qinfo->qi_qclose)
+				peer_q->q_qinfo->qi_qclose(peer_q);
 			drain_q(q);
 			drain_q(peer_q);
 			kfree(q);
@@ -1580,13 +1592,23 @@ struct stdata *stream_build_kernel(struct streamtab *drv_st,
 	return stream_build(drv_st, name, minor);
 }
 
+int stream_push_kernel(struct stdata *sd, const char *modname)
+{
+	if (!sd) return -1;
+	return do_ipush(sd, modname);
+}
+
 void stream_destroy_kernel(struct stdata *sd)
 {
 	if (!sd) return;
-	/* No modules pushed, no peer, no console_active wiring in
-	 * streams we built here.  Drain queued mblks, give the driver
-	 * a chance to free its per-instance state via qi_qclose, then
-	 * release the queue pair + stdata. */
+	/* Mirror stream_close's tear-down: drain queued mblks, walk
+	 * any pushed modules (qclose -> drain -> free), then the driver
+	 * pair, then the head pair, then stdata.  Selftests + future
+	 * built-in muxes that build kernel-side streams may have pushed
+	 * modules above the driver (e.g., the icmp selftest pushes
+	 * "icmp" on top of an ip_streamtab stream).  Without the module
+	 * walk, their qclose never fires and per-instance state like
+	 * IP upper-bindings leak. */
 	drain_q(sd->sd_rq);
 	drain_q(sd->sd_wq);
 
@@ -1595,6 +1617,18 @@ void stream_destroy_kernel(struct stdata *sd)
 	if (*p == sd) *p = sd->sd_all_next;
 
 	if (sd->sd_drv_wq) {
+		queue_t *q = sd->sd_wq->q_next;
+		while (q && q != sd->sd_drv_wq) {
+			queue_t *next = q->q_next;
+			queue_t *peer_q = q->q_link;
+			if (peer_q->q_qinfo && peer_q->q_qinfo->qi_qclose)
+				peer_q->q_qinfo->qi_qclose(peer_q);
+			drain_q(q);
+			drain_q(peer_q);
+			kfree(q);
+			kfree(peer_q);
+			q = next;
+		}
 		if (sd->sd_drv_rq->q_qinfo
 		    && sd->sd_drv_rq->q_qinfo->qi_qclose)
 			sd->sd_drv_rq->q_qinfo->qi_qclose(sd->sd_drv_rq);
@@ -1849,14 +1883,15 @@ void streams_head_init(void)
 	vfs_mknod_chrdev(dev, "tty2", MKDEV(CDEV_MAJ_TTY, 2));
 	vfs_mknod_chrdev(dev, "tty3", MKDEV(CDEV_MAJ_TTY, 3));
 
-	/* Networking: /dev/icmp gets its node here so the /dev tree is
-	 * fully populated by the time the shell sees it.  ip_init()
-	 * itself is deferred to main.c -- it builds the IP multiplexor
-	 * control stream and I_LINKs every registered netif underneath,
-	 * which means it sleeps on sd_ioc_wq waiting for the I_LINK
-	 * ACK.  Sleeping needs curthread, which only exists after
-	 * sched_init().  streams_head_init runs before sched. */
-	icmp_str_init();
+	/* Networking: register the icmp STREAMS module (so I_PUSH "icmp"
+	 * and the /dev/icmp autopush above can find it) and publish the
+	 * /dev/icmp inode.  ip_init() itself runs later from main.c --
+	 * it does the I_LINK loop which needs curthread (post sched_init).
+	 *
+	 * /dev/icmp's cdev maps to ip_streamtab (registered by
+	 * icmp_module_init); stream_open autopushes "icmp" on open so
+	 * the user-visible stream is icmp-module-over-ip-driver. */
+	icmp_module_init();
 	vfs_mknod_chrdev(dev, "icmp", MKDEV(CDEV_MAJ_ICMP,  0));
 
 	kprintf("stream_head: registered modules:");

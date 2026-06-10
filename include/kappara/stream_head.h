@@ -101,6 +101,12 @@ struct stdata *stream_build_kernel(struct streamtab *drv_st,
                                     const char *name, unsigned minor);
 void           stream_destroy_kernel(struct stdata *sd);
 
+/* In-kernel I_PUSH equivalent.  Used by the icmp boot selftest to
+ * push the icmp module on top of an IP-driver stream without going
+ * through sys_ioctl. */
+int            stream_push_kernel  (struct stdata *sd,
+                                    const char *modname);
+
 /* I_LINK / I_UNLINK at the in-kernel API level.  The ioctl path
  * resolves fds to stdata and calls these.  Selftests can call them
  * directly.  Returns muxid > 0 on success, -1 on failure. */

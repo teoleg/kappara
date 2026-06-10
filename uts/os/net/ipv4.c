@@ -1,42 +1,48 @@
 /*
  * uts/os/net/ipv4.c -- IPv4 as a STREAMS multiplexor driver
  *
- * After the N2b rewrite IP is no longer a pair of direct-call
- * functions sandwiched between STREAMS endpoints.  It's a real
- * SVR4-style multiplexor:
+ * IP is a full SVR4-style multiplexor: multiple lower streams (one
+ * per netif, joined via I_LINK from ip_init) AND multiple upper
+ * bindings (one per transport module instance, registered via
+ * M_PROTO{IP_T_BIND_REQ}).  All routing is putnext + put across
+ * queue boundaries -- there are no direct C calls between IP and
+ * a transport module.
  *
- *   - At boot, one kernel-only stream is built over ip_streamtab
- *     and held by ip_ctl_sd.  Each netif registered via
- *     netif_register exposes a streamtab; for each, the boot path
- *     builds a per-netif stream and stream_ilink's it underneath
- *     ip_ctl_sd.  IP's wput records the lower's l_qbot + muxid at
- *     I_LINK time; ip_lower_register backfills the netif pointer
- *     so route lookup can match by IP/netmask.
+ * Lower side
+ * ----------
+ * `ip_lowers[]` keeps (muxid, qbot, nif) per linked netif.  ip_wput
+ * on M_IOCTL{I_LINK} populates qbot+muxid; the boot loop in ip_init
+ * backfills nif via ip_lower_register so route lookup can match a
+ * destination against the lower's (ip, netmask).
  *
- *   - Sending: ip_send() builds an M_PROTO{ip_send_meta} +
- *     M_DATA(payload) pair and putnext's it into ip_ctl_sd's wq.
- *     IP's wput decodes the meta, prepends the IP header in the
- *     payload's reserved headroom, picks a lower by route, and
- *     putnext's the payload mblk into lower->qbot (the lower
- *     stream's head wq).  The M_PROTO mblk is freed.
+ * Upper side
+ * ----------
+ * `ip_uppers[]` keeps (proto, key, upper_rq) per bound module
+ * instance.  ip_wput on M_PROTO{IP_T_BIND_REQ} records the
+ * sender's OTHERQ (its read queue) so ip_rput can deliver
+ * demultiplexed packets back across the stream boundary using
+ * put() (not putnext -- there is no shared q_next chain across
+ * streams).  Multiple uppers can bind the same proto; rx is
+ * multicast via dupmsg so each gets a copy.  Filtering by deeper
+ * key (ICMP id, UDP local port) is the module's job.
  *
- *   - Receiving: each lower stream's read-side chain was rewired
- *     by I_LINK so its driver's putnext-up enters ip's drv_rq.
- *     IP's rput validates the header, strips it, and demuxes by
- *     proto byte via ip_dispatch_input (icmp_input / udp_input).
- *     ICMP and UDP become real STREAMS modules in N2c; for now
- *     they're direct callees so this commit is contained.
+ * Send side
+ * ---------
+ * M_PROTO{IP_T_SEND_REQ} + M_DATA(payload).  ip_wput prepends the
+ * IPv4 header in the payload's reserved headroom, routes by
+ * longest-prefix-match against ip_lowers[], putnexts down into
+ * lower->qbot.
  *
- * Headroom discipline (unchanged):
- *   ip_send's caller allocates the payload mblk with IP_HDR_LEN
- *   bytes of headroom; ip_wput rewinds b_rptr to expose 20 bytes
- *   and fills the IPv4 header in place.  No allocation on the tx
- *   path.
+ * Receive side
+ * ------------
+ * Each lower's drv_rq->q_next was rewired by I_LINK to point at
+ * IP's drv_rq.  lo0_wput's putnext(OTHERQ) hits IP's rput; future
+ * SLIP/Ethernet drivers' rx threads will do the same.  ip_rput
+ * validates the header, strips it, demuxes via ip_uppers[].
  */
 
 #include <stdint.h>
 
-#include "kappara/icmp.h"
 #include "kappara/ip.h"
 #include "kappara/kmem.h"
 #include "kappara/netif.h"
@@ -45,14 +51,9 @@
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
 #include "kappara/string.h"
-#include "kappara/udp.h"
 
-/* Increment-by-one packet ID -- gives every datagram a unique 16-bit
- * tag without needing real entropy. */
 static uint16_t ip_id_next;
 
-/* RFC 1071 one's-complement sum.  Used for the IPv4 header AND for
- * ICMP body checksums (they're the same algorithm). */
 uint16_t ip_checksum(const void *buf, unsigned len)
 {
 	const uint8_t *p = (const uint8_t *)buf;
@@ -63,38 +64,34 @@ uint16_t ip_checksum(const void *buf, unsigned len)
 		p   += 2;
 		len -= 2;
 	}
-	if (len) {
-		sum += (uint32_t)(p[0] << 8);
-	}
+	if (len) sum += (uint32_t)(p[0] << 8);
 	while (sum >> 16)
 		sum = (sum & 0xffff) + (sum >> 16);
 	return (uint16_t)~sum;
 }
 
 /* ---- Mux state ----------------------------------------------------- */
-/*
- * Fixed-size lower table.  Real Solaris IP keeps a dynamic list of
- * `ill_t` (interface link layer) entries; at our scale a 4-slot
- * static array covers lo0 + slip0 + a future ethernet + a spare.
- * No locking yet: links happen at boot, never get rewritten at
- * runtime.  When we add hot-plug interfaces, ip_lock goes here.
- */
 
 #define IP_MAX_LOWERS	4
+#define IP_MAX_UPPERS	16
 
 static struct ip_lower {
-	int           muxid;	/* 0 = slot free */
-	queue_t      *qbot;	/* lower stream's head wq -- putnext sends INTO */
-	struct netif *nif;	/* identity for route match (NULL until
-				 * ip_lower_register backfills) */
+	int           muxid;
+	queue_t      *qbot;
+	struct netif *nif;
 } ip_lowers[IP_MAX_LOWERS];
 
-/* The boot-time IP control stream.  Every kernel-side ip_send
- * routes through here so we never have to know which user stream
- * to use. */
+static struct ip_upper {
+	int       active;
+	uint8_t   proto;
+	uint32_t  key;		/* opaque, module-defined */
+	queue_t  *upper_rq;	/* IP rput -> put(upper_rq, mp) */
+} ip_uppers[IP_MAX_UPPERS];
+
 static struct stdata *ip_ctl_sd;
 
-/* Walk ip_lowers picking the longest-prefix-match netif. */
+/* ---- Routing ------------------------------------------------------- */
+
 static struct ip_lower *ip_route(uint32_t dst_ip)
 {
 	struct ip_lower *best = NULL;
@@ -105,9 +102,6 @@ static struct ip_lower *ip_route(uint32_t dst_ip)
 		if ((dst_ip & l->nif->netmask)
 		    != (l->nif->ip & l->nif->netmask))
 			continue;
-		/* Inline popcount via Kernighan's loop -- same trick
-		 * netif.c uses; -mgeneral-regs-only would otherwise
-		 * call out to libgcc's __popcountdi2. */
 		uint32_t v = l->nif->netmask;
 		unsigned p = 0;
 		while (v) { v &= v - 1; p++; }
@@ -130,13 +124,67 @@ void ip_lower_register(int muxid, struct netif *nif)
 	kprintf("ip: lower_register muxid=%d not found\n", muxid);
 }
 
-/* ---- IP driver: wput -- send side --------------------------------- */
-/*
- * Three message types arrive on the write side:
- *   M_IOCTL{I_LINK / I_UNLINK}: record / release a lower link slot
- *   M_PROTO{ip_send_meta} + M_DATA(payload): outbound packet
- *   anything else: drop
- */
+/* ---- Bind table management ---------------------------------------- */
+
+static int ip_bind(uint8_t proto, uint32_t key, queue_t *upper_rq)
+{
+	/* Reject exact duplicates: same (proto, key, upper_rq) bound
+	 * twice indicates a leak.  Same (proto, key) from a DIFFERENT
+	 * upper is fine -- that's the multicast case (multiple ping
+	 * processes, multiple raw socket listeners). */
+	for (int i = 0; i < IP_MAX_UPPERS; i++) {
+		if (!ip_uppers[i].active) continue;
+		if (ip_uppers[i].proto    == proto
+		 && ip_uppers[i].key      == key
+		 && ip_uppers[i].upper_rq == upper_rq)
+			return -1;
+	}
+	for (int i = 0; i < IP_MAX_UPPERS; i++) {
+		if (!ip_uppers[i].active) {
+			ip_uppers[i].active   = 1;
+			ip_uppers[i].proto    = proto;
+			ip_uppers[i].key      = key;
+			ip_uppers[i].upper_rq = upper_rq;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static int ip_unbind(uint8_t proto, uint32_t key, queue_t *upper_rq)
+{
+	for (int i = 0; i < IP_MAX_UPPERS; i++) {
+		if (!ip_uppers[i].active) continue;
+		if (ip_uppers[i].proto    != proto)    continue;
+		if (ip_uppers[i].key      != key)      continue;
+		if (ip_uppers[i].upper_rq != upper_rq) continue;
+		ip_uppers[i].active   = 0;
+		ip_uppers[i].upper_rq = NULL;
+		return 0;
+	}
+	return -1;
+}
+
+/* Reply M_PROTO with prim flipped to the ACK / NAK opcode, sent
+ * back UP this stream's read side via putnext.  The bind came down
+ * from one queue above us; the reply rides the same chain back up
+ * and reaches that queue's rput. */
+static void ip_bind_reply(queue_t *ip_drv_wq, uint8_t prim, uint8_t proto,
+                          uint32_t key)
+{
+	mblk_t *mp = allocb(sizeof(struct ip_bind_meta), 0);
+	if (!mp) return;
+	mp->b_datap->db_type = M_PROTO;
+	struct ip_bind_meta *m = (struct ip_bind_meta *)mp->b_wptr;
+	m->prim   = prim;
+	m->proto  = proto;
+	m->key    = key;
+	m->_pad[0] = m->_pad[1] = 0;
+	mp->b_wptr += sizeof(*m);
+	putnext(OTHERQ(ip_drv_wq), mp);
+}
+
+/* ---- IP wput -- send side + bind handling ------------------------- */
 
 static int ip_handle_link(queue_t *q, mblk_t *mp)
 {
@@ -173,7 +221,7 @@ static int ip_handle_link(queue_t *q, mblk_t *mp)
 	return 0;
 }
 
-static int ip_wput_data(mblk_t *meta_mp)
+static int ip_handle_send(mblk_t *meta_mp)
 {
 	struct ip_send_meta *meta = (struct ip_send_meta *)meta_mp->b_rptr;
 	mblk_t *mp = meta_mp->b_cont;
@@ -230,9 +278,45 @@ static int ip_wput_data(mblk_t *meta_mp)
 	return putnext(lower->qbot, mp);
 }
 
+static int ip_handle_bind(queue_t *q, mblk_t *mp)
+{
+	if ((mp->b_wptr - mp->b_rptr) < (int)sizeof(struct ip_bind_meta)) {
+		freemsg(mp);
+		return -1;
+	}
+	struct ip_bind_meta *m = (struct ip_bind_meta *)mp->b_rptr;
+	uint8_t  prim  = m->prim;
+	uint8_t  proto = m->proto;
+	uint32_t key   = m->key;
+	freemsg(mp);
+
+	/* The bind came down from the module directly above us on this
+	 * stream.  Walking q (IP's drv_wq) → OTHERQ → q_next gives us
+	 * the upper module's READ queue, which is where IP rput will
+	 * later put() demuxed packets.  putnext sends the ACK back up
+	 * the same chain. */
+	queue_t *upper_rq = OTHERQ(q)->q_next;
+	if (!upper_rq) {
+		ip_bind_reply(q, IP_T_BIND_NAK, proto, key);
+		return -1;
+	}
+	int rc = (prim == IP_T_BIND_REQ)
+		? ip_bind(proto, key, upper_rq)
+		: ip_unbind(proto, key, upper_rq);
+
+	uint8_t reply_prim;
+	if (prim == IP_T_BIND_REQ)
+		reply_prim = (rc == 0) ? IP_T_BIND_ACK : IP_T_BIND_NAK;
+	else
+		reply_prim = IP_T_UNBIND_ACK;	/* unbind never naks */
+	ip_bind_reply(q, reply_prim, proto, key);
+	return 0;
+}
+
 static int ip_wput(queue_t *q, mblk_t *mp)
 {
 	if (!mp) return 0;
+
 	if (mp->b_datap->db_type == M_IOCTL) {
 		struct iocblk *ic = (struct iocblk *)mp->b_rptr;
 		if (ic->ic_cmd == I_LINK || ic->ic_cmd == I_UNLINK)
@@ -242,43 +326,54 @@ static int ip_wput(queue_t *q, mblk_t *mp)
 		putnext(OTHERQ(q), mp);
 		return 0;
 	}
+
 	if (mp->b_datap->db_type == M_PROTO) {
-		if ((mp->b_wptr - mp->b_rptr)
-		    < (int)sizeof(struct ip_send_meta)) {
+		if ((mp->b_wptr - mp->b_rptr) < 1) {
 			freemsg(mp);
 			return -1;
 		}
-		return ip_wput_data(mp);
+		uint8_t prim = mp->b_rptr[0];
+		if (prim == IP_T_SEND_REQ) {
+			if ((mp->b_wptr - mp->b_rptr)
+			    < (int)sizeof(struct ip_send_meta)) {
+				freemsg(mp);
+				return -1;
+			}
+			return ip_handle_send(mp);
+		}
+		if (prim == IP_T_BIND_REQ || prim == IP_T_UNBIND_REQ)
+			return ip_handle_bind(q, mp);
+		freemsg(mp);
+		return -1;
 	}
+
 	freemsg(mp);
 	return 0;
 }
 
-/* ---- IP driver: rput -- receive side ------------------------------ */
-/*
- * Reached by putnext-from-lower after the I_LINK rewire.  The mblk's
- * b_rptr..b_wptr is a complete IPv4 datagram (lower drivers don't
- * strip anything).  We validate, strip, demux.
- */
+/* ---- IP rput -- demux ---------------------------------------------- */
 
-void ip_dispatch_input(uint32_t src, uint32_t dst, uint8_t proto,
-                       mblk_t *mp)
+static void ip_demux(uint8_t proto, mblk_t *mp)
 {
-	switch (proto) {
-	case IPPROTO_ICMP:
-		icmp_input(NULL, src, dst, mp);
-		return;
-	case IPPROTO_UDP:
-		udp_input(NULL, src, dst, mp);
-		return;
-	case IPPROTO_TCP:
-		freemsg(mp);
-		return;
-	default:
-		kprintf("ip: drop unknown proto %u\n", proto);
+	/* Two-pass: collect matches first, then deliver -- so we know
+	 * which match is "last" and gets the original mblk (others
+	 * dupmsg).  Saves the alloc on the common single-bind case. */
+	queue_t *matches[IP_MAX_UPPERS];
+	int n = 0;
+	for (int i = 0; i < IP_MAX_UPPERS && n < IP_MAX_UPPERS; i++) {
+		if (!ip_uppers[i].active)         continue;
+		if (ip_uppers[i].proto != proto)  continue;
+		matches[n++] = ip_uppers[i].upper_rq;
+	}
+	if (n == 0) {
 		freemsg(mp);
 		return;
 	}
+	for (int j = 0; j < n - 1; j++) {
+		mblk_t *cpy = dupmsg(mp);
+		if (cpy) put(matches[j], cpy);
+	}
+	put(matches[n - 1], mp);
 }
 
 static int ip_rput(queue_t *q, mblk_t *mp)
@@ -320,15 +415,13 @@ static int ip_rput(queue_t *q, mblk_t *mp)
 		return 0;
 	}
 
-	uint32_t src = ntohl32(h->src_ip);
-	uint32_t dst = ntohl32(h->dst_ip);
 	uint8_t  proto = h->proto;
 	mp->b_rptr += ihl_bytes;
-	ip_dispatch_input(src, dst, proto, mp);
+	ip_demux(proto, mp);
 	return 0;
 }
 
-/* ---- ip_send ------------------------------------------------------ */
+/* ---- ip_send convenience helper ----------------------------------- */
 
 int ip_send(uint32_t dst_ip, uint8_t proto, mblk_t *mp)
 {
@@ -343,9 +436,10 @@ int ip_send(uint32_t dst_ip, uint8_t proto, mblk_t *mp)
 	}
 	meta->b_datap->db_type = M_PROTO;
 	struct ip_send_meta *m = (struct ip_send_meta *)meta->b_wptr;
-	m->dst_ip = dst_ip;
+	m->prim   = IP_T_SEND_REQ;
 	m->proto  = proto;
-	m->_pad[0] = m->_pad[1] = m->_pad[2] = 0;
+	m->_pad[0] = m->_pad[1] = 0;
+	m->dst_ip = dst_ip;
 	meta->b_wptr += sizeof(*m);
 	meta->b_cont  = mp;
 	return putnext(ip_ctl_sd->sd_wq, meta);
@@ -420,35 +514,14 @@ void ip_init(void)
 }
 
 /* ---- boot selftest ------------------------------------------------ */
-/*
- * Sends an ICMP echo to 127.0.0.1 and verifies the reply.  Identical
- * call pattern to the old selftest -- icmp_send_echo now routes
- * through the IP STREAMS multiplexor instead of the direct-call
- * ip_output.  lo0's wput loops back via putnext(OTHERQ) and the
- * rewired chain delivers the reply to IP's rput which dispatches
- * back into icmp_input on the same thread.
- */
+
+extern int  net_run_icmp_selftest(uint32_t dst, uint16_t seq);
 
 void net_selftest(void)
 {
-	int ok = 1;
-	static const char payload[] = "kappara/ping/v1";
-	const uint16_t id  = 0xABCD;
-	const uint16_t seq = 1;
-
-	icmp_arm_waiter(id, seq);
-	int rc = icmp_send_echo(0x7f000001u, id, seq,
-	                        payload, sizeof(payload) - 1);
-	if (rc < 0) {
-		kprintf("net: SELFTEST FAIL send_echo rc=%d\n", rc);
+	if (net_run_icmp_selftest(0x7f000001u, 1) < 0) {
+		kprintf("net: SELFTEST FAIL\n");
 		return;
 	}
-
-	if (icmp_wait_reply(id, seq, /*ms=*/100) < 0) {
-		kprintf("net: SELFTEST FAIL no reply\n");
-		ok = 0;
-	}
-
-	if (ok)
-		kprintf("net: selftest PASS\n");
+	kprintf("net: selftest PASS\n");
 }
