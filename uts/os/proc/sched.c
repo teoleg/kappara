@@ -81,17 +81,17 @@
 
 #include <stdint.h>
 
-#include "kappara/ipi.h"
-#include "kappara/kmem.h"
-#include "kappara/mmu.h"
-#include "kappara/pmm.h"
-#include "kappara/printk.h"
-#include "kappara/process.h"
-#include "kappara/signal.h"
-#include "kappara/streams.h"
-#include "kappara/sched.h"
-#include "kappara/string.h"
-#include "kappara/vfs.h"
+#include "kappara/arch/ipi.h"
+#include "kappara/core/kmem.h"
+#include "kappara/arch/mmu.h"
+#include "kappara/core/pmm.h"
+#include "kappara/core/printk.h"
+#include "kappara/proc/process.h"
+#include "kappara/proc/signal.h"
+#include "kappara/io/streams.h"
+#include "kappara/proc/sched.h"
+#include "kappara/core/string.h"
+#include "kappara/fs/vfs.h"
 
 extern void context_switch(void **save_sp, void *new_sp);
 
@@ -126,7 +126,7 @@ static spinlock_t      to_reap_lock = SPINLOCK_INIT;
 
 /*
  * Sentinel for `kthread.t_lockp` mid-transition (phase 1: declared,
- * not yet used).  See include/kappara/thread_lock.h for the role.
+ * not yet used).  See include/kappara/core/thread_lock.h for the role.
  * No code spin_locks this; it's just a uniquely-identifiable
  * non-NULL pointer.
  */

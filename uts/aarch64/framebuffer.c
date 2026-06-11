@@ -42,10 +42,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/font8x8.h"
-#include "kappara/framebuffer.h"
-#include "kappara/mailbox.h"
-#include "kappara/printk.h"
+#include "kappara/arch/font8x8.h"
+#include "kappara/arch/framebuffer.h"
+#include "kappara/arch/mailbox.h"
+#include "kappara/core/printk.h"
 
 #define MBOX_TAG_SET_PHYS_WH	0x00048003u
 #define MBOX_TAG_SET_VIRT_WH	0x00048004u

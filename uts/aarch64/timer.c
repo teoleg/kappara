@@ -61,10 +61,10 @@
 
 #include <stdint.h>
 
-#include "kappara/ipi.h"
-#include "kappara/printk.h"
-#include "kappara/sched.h"
-#include "kappara/timer.h"
+#include "kappara/arch/ipi.h"
+#include "kappara/core/printk.h"
+#include "kappara/proc/sched.h"
+#include "kappara/arch/timer.h"
 #include "platform.h"
 
 static uint64_t tick_cycles;

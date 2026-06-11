@@ -12,10 +12,10 @@
 
 #include <stdint.h>
 
-#include "kappara/bdevsw.h"
-#include "kappara/buf.h"
-#include "kappara/printk.h"
-#include "kappara/string.h"
+#include "kappara/fs/bdevsw.h"
+#include "kappara/fs/buf.h"
+#include "kappara/core/printk.h"
+#include "kappara/core/string.h"
 
 #define BRAM_BLOCKS	64
 

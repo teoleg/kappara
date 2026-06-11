@@ -1,10 +1,10 @@
 /*
- * include/kappara/bdevsw.h -- SVR4-style block-device switch
+ * include/kappara/fs/bdevsw.h -- SVR4-style block-device switch
  *
  * Parallel to cdevsw.h: the kernel keeps a bdevsw[] indexed by
  * major number; each entry holds the driver's block-I/O entry
  * points.  Block I/O always flows through the buffer cache
- * (kappara/buf.h), so drivers only ever see fully-formed struct
+ * (kappara/fs/buf.h), so drivers only ever see fully-formed struct
  * buf requests, never raw bytes.
  *
  * Phase S1.  See docs/ARCHITECTURE.md (eventual block-IO section)
@@ -25,9 +25,9 @@
 
 #include <stdint.h>
 
-#include "kappara/cdevsw.h"	/* dev_t / MAJOR / MINOR / MKDEV */
+#include "kappara/io/cdevsw.h"	/* dev_t / MAJOR / MINOR / MKDEV */
 
-struct buf;	/* fwd; defined in kappara/buf.h */
+struct buf;	/* fwd; defined in kappara/fs/buf.h */
 
 /* Block-device entry.  Drivers register one of these via
  * bdev_register; the buffer-cache calls into it when a cache miss

@@ -1,5 +1,5 @@
 /*
- * include/kappara/stream_head.h -- STREAMS stream-head + fd plumbing
+ * include/kappara/io/stream_head.h -- STREAMS stream-head + fd plumbing
  *
  * The stream head is the per-open piece that sits at the top of a
  * STREAMS stack and bridges user-facing syscalls (read / write /
@@ -48,8 +48,8 @@
 
 #include <stddef.h>
 
-#include "kappara/sched.h"	/* struct wait_queue */
-#include "kappara/streams.h"
+#include "kappara/proc/sched.h"	/* struct wait_queue */
+#include "kappara/io/streams.h"
 
 /* sd_flags bits. */
 #define SD_EOF		(1u << 0)	/* peer (if any) has closed; reads
@@ -141,7 +141,7 @@ void              streams_for_each_open(void (*cb)(struct stdata *sd,
 					void *arg);
 
 /* sys_open / sys_close / sys_read / sys_write / sys_ioctl / sys_putmsg /
- * sys_getmsg now live in include/kappara/vfs.h -- they dispatch via the
+ * sys_getmsg now live in include/kappara/fs/vfs.h -- they dispatch via the
  * VFS through each inode's file_ops vtable.  stream_fops is the
  * file_ops the VFS picks up when an opened inode is a character
  * special file whose i_private is a struct streamtab *. */

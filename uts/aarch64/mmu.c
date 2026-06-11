@@ -105,9 +105,9 @@
 
 #include <stdint.h>
 
-#include "kappara/mmu.h"
-#include "kappara/pmm.h"
-#include "kappara/printk.h"
+#include "kappara/arch/mmu.h"
+#include "kappara/core/pmm.h"
+#include "kappara/core/printk.h"
 #include "platform.h"
 
 #define ENTRIES_PER_TABLE	512
@@ -303,7 +303,7 @@ void mmu_init(void)
  * need to cover user range.  Until then we eat the duplication.
  */
 
-#include "kappara/process.h"
+#include "kappara/proc/process.h"
 
 /* Walk every L2 entry of the boot table and copy it into the new
  * process's L2.  After this the process can run kernel code through

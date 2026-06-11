@@ -1,5 +1,5 @@
 /*
- * include/kappara/process.h -- Unix process structure
+ * include/kappara/proc/process.h -- Unix process structure
  *
  * A process owns an address space + a set of threads + a row in the
  * process table.  kappara's threading model up to R1 fused thread and
@@ -24,9 +24,9 @@
 
 #include <stdint.h>
 
-#include "kappara/spinlock.h"
+#include "kappara/core/spinlock.h"
 
-struct kthread;	/* fwd; defined in kappara/sched.h */
+struct kthread;	/* fwd; defined in kappara/proc/sched.h */
 
 /*
  * Per-process virtual memory map.

@@ -2,7 +2,7 @@
  * kernel/io/buf.c -- block-IO buffer cache
  *
  * SVR4 verbs: getblk / brelse / bread / bwrite / bdwrite.  See
- * include/kappara/buf.h for the API + flag set.
+ * include/kappara/fs/buf.h for the API + flag set.
  *
  * Phase S1.
  *
@@ -28,12 +28,12 @@
 
 #include <stdint.h>
 
-#include "kappara/bdevsw.h"
-#include "kappara/buf.h"
-#include "kappara/kmem.h"
-#include "kappara/pmm.h"
-#include "kappara/printk.h"
-#include "kappara/string.h"
+#include "kappara/fs/bdevsw.h"
+#include "kappara/fs/buf.h"
+#include "kappara/core/kmem.h"
+#include "kappara/core/pmm.h"
+#include "kappara/core/printk.h"
+#include "kappara/core/string.h"
 
 static struct buf       buf_pool[BUF_POOL_SIZE];
 static struct buf      *buf_hash[BUF_HASH_BUCKETS];

@@ -15,13 +15,13 @@
 
 #include <stdint.h>
 
-#include "kappara/kmem.h"
+#include "kappara/core/kmem.h"
 #include "kappara/net/pktfilter.h"
 #include "kappara/net/udp.h"		/* T_UNITDATA_REQ + struct t_unitdata_req */
-#include "kappara/printk.h"
-#include "kappara/stream_head.h"
-#include "kappara/streams.h"
-#include "kappara/string.h"
+#include "kappara/core/printk.h"
+#include "kappara/io/stream_head.h"
+#include "kappara/io/streams.h"
+#include "kappara/core/string.h"
 
 struct pf_state {
 	int        enabled;

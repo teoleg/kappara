@@ -62,10 +62,10 @@
 #include <stdarg.h>
 #include <stdint.h>
 
-#include "kappara/fbcon.h"
-#include "kappara/klog.h"
-#include "kappara/printk.h"
-#include "kappara/uart.h"
+#include "kappara/io/fbcon.h"
+#include "kappara/core/klog.h"
+#include "kappara/core/printk.h"
+#include "kappara/arch/uart.h"
 
 /*
  * Serialisation: kprintf acquires uart_lock (held across the entire

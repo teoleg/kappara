@@ -44,15 +44,15 @@
 
 #include <stdint.h>
 
-#include "kappara/printk.h"
-#include "kappara/sched.h"
-#include "kappara/signal.h"
-#include "kappara/stream_head.h"
-#include "kappara/streams.h"
-#include "kappara/syscall.h"
-#include "kappara/uaccess.h"
-#include "kappara/user.h"
-#include "kappara/vfs.h"
+#include "kappara/core/printk.h"
+#include "kappara/proc/sched.h"
+#include "kappara/proc/signal.h"
+#include "kappara/io/stream_head.h"
+#include "kappara/io/streams.h"
+#include "kappara/abi/syscall.h"
+#include "kappara/core/uaccess.h"
+#include "kappara/proc/user.h"
+#include "kappara/fs/vfs.h"
 
 typedef long (*syscall_fn)(long, long, long, long, long, long);
 

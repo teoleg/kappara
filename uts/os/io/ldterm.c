@@ -35,15 +35,15 @@
 
 #include <stdint.h>
 
-#include "kappara/kmem.h"
-#include "kappara/printk.h"
-#include "kappara/sched.h"
-#include "kappara/signal.h"
-#include "kappara/streams.h"
-#include "kappara/stream_head.h"
-#include "kappara/string.h"
-#include "kappara/termios.h"
-#include "kappara/tty.h"
+#include "kappara/core/kmem.h"
+#include "kappara/core/printk.h"
+#include "kappara/proc/sched.h"
+#include "kappara/proc/signal.h"
+#include "kappara/io/streams.h"
+#include "kappara/io/stream_head.h"
+#include "kappara/core/string.h"
+#include "kappara/io/termios.h"
+#include "kappara/io/tty.h"
 
 /* ---- per-instance state -------------------------------------------------- */
 
@@ -646,8 +646,8 @@ void ldterm_selftest(void)
  * straight through).  Verifies TCGETA returns the default termios,
  * TCSETA installs a flipped value, and a second TCGETA reads it back.
  */
-#include "kappara/sched.h"
-#include "kappara/vfs.h"
+#include "kappara/proc/sched.h"
+#include "kappara/fs/vfs.h"
 
 void ldterm_mioctl_selftest(void)
 {

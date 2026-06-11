@@ -59,8 +59,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/mailbox.h"
-#include "kappara/printk.h"
+#include "kappara/arch/mailbox.h"
+#include "kappara/core/printk.h"
 #include "platform.h"
 
 #define MBOX_READ	(PLAT_MBOX_BASE + 0x00)

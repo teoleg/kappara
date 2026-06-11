@@ -1,5 +1,5 @@
 /*
- * include/kappara/vfs.h -- minimal in-memory VFS + fd table
+ * include/kappara/fs/vfs.h -- minimal in-memory VFS + fd table
  * =========================================================
  *
  * What this is
@@ -54,7 +54,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/stream_head.h"	/* struct strbuf */
+#include "kappara/io/stream_head.h"	/* struct strbuf */
 
 enum inode_type {
 	INODE_DIR    = 1,
@@ -116,7 +116,7 @@ struct inode {
 	 * is a different shape -- we don't need it here.
 	 *
 	 * Touched ONLY via vfs_iget / vfs_iput, which route through
-	 * atomic_inc / atomic_dec_and_test in include/kappara/atomic.h
+	 * atomic_inc / atomic_dec_and_test in include/kappara/core/atomic.h
 	 * so concurrent close() on multiple CPUs can't race the drop.
 	 * Plain `++` / `--` is a bug.  See the matching contract on
 	 * struct file::f_refs below. */
@@ -138,7 +138,7 @@ struct file {
 	/* SVR4 f_count.  Number of fdt slots (across every thread)
 	 * that still name this file.  Touched ONLY via file_get /
 	 * file_put inside vfs.c -- those route through atomic_inc /
-	 * atomic_dec_and_test (include/kappara/atomic.h) so
+	 * atomic_dec_and_test (include/kappara/core/atomic.h) so
 	 * concurrent dup() + close() on different CPUs can't lose an
 	 * increment or both think they did the last drop.  Initial
 	 * value is assigned plain at struct-creation time (no other

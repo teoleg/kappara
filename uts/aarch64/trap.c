@@ -43,15 +43,15 @@
 
 #include <stdint.h>
 
-#include "kappara/kallsyms.h"
-#include "kappara/printk.h"
-#include "kappara/sched.h"	/* cur */
-#include "kappara/signal.h"
-#include "kappara/syscall.h"
-#include "kappara/timer.h"
-#include "kappara/trap.h"
-#include "kappara/uaccess.h"
-#include "kappara/user.h"	/* sys_exit_impl */
+#include "kappara/core/kallsyms.h"
+#include "kappara/core/printk.h"
+#include "kappara/proc/sched.h"	/* cur */
+#include "kappara/proc/signal.h"
+#include "kappara/abi/syscall.h"
+#include "kappara/arch/timer.h"
+#include "kappara/arch/trap.h"
+#include "kappara/core/uaccess.h"
+#include "kappara/proc/user.h"	/* sys_exit_impl */
 
 extern char vectors[];
 

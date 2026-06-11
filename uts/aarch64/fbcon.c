@@ -43,11 +43,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/fbcon.h"
-#include "kappara/framebuffer.h"
-#include "kappara/printk.h"
-#include "kappara/stream_head.h"
-#include "kappara/streams.h"
+#include "kappara/io/fbcon.h"
+#include "kappara/arch/framebuffer.h"
+#include "kappara/core/printk.h"
+#include "kappara/io/stream_head.h"
+#include "kappara/io/streams.h"
 
 /*
  * FBCON_SCALE = 1 keeps the per-character cost low enough that
@@ -262,7 +262,7 @@ void fbcon_init_cursor(uint32_t y)
 
 /* ---- Phase 7: cell-grid renderer driven by struct vt ------------------ */
 
-#include "kappara/vt.h"
+#include "kappara/io/vt.h"
 
 /* Map a VT color (0..15 with VT_COLOR_BRIGHT bit) to a 32-bit ARGB
  * value.  The standard 16-color VGA palette -- close enough to xterm

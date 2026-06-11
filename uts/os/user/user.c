@@ -65,19 +65,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/blkdev.h"
-#include "kappara/elf.h"
-#include "kappara/kfs.h"
-#include "kappara/kmem.h"
-#include "kappara/mmu.h"
-#include "kappara/pmm.h"
-#include "kappara/printk.h"
-#include "kappara/process.h"
-#include "kappara/sched.h"
-#include "kappara/string.h"
-#include "kappara/syscall.h"
-#include "kappara/user.h"
-#include "kappara/vfs.h"
+#include "kappara/fs/blkdev.h"
+#include "kappara/abi/elf.h"
+#include "kappara/fs/kfs.h"
+#include "kappara/core/kmem.h"
+#include "kappara/arch/mmu.h"
+#include "kappara/core/pmm.h"
+#include "kappara/core/printk.h"
+#include "kappara/proc/process.h"
+#include "kappara/proc/sched.h"
+#include "kappara/core/string.h"
+#include "kappara/abi/syscall.h"
+#include "kappara/proc/user.h"
+#include "kappara/fs/vfs.h"
 
 /* User VA where we'll publish the program.  Must be 2 MB aligned. */
 #define USER_VA		0x10000000UL
@@ -157,10 +157,10 @@ void user_init(void)
 		(unsigned long)USER_VA);
 }
 
-#include "kappara/trap.h"
-#include "kappara/tty.h"
-#include "kappara/user.h"
-#include "kappara/vfs.h"
+#include "kappara/arch/trap.h"
+#include "kappara/io/tty.h"
+#include "kappara/proc/user.h"
+#include "kappara/fs/vfs.h"
 
 /* Forward decl -- defined later, near sys_spawn_impl. */
 static unsigned spawn_next;

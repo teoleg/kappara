@@ -11,8 +11,8 @@
 
 #include <stddef.h>
 
-#include "kappara/cdevsw.h"
-#include "kappara/printk.h"
+#include "kappara/io/cdevsw.h"
+#include "kappara/core/printk.h"
 
 static struct cdev_entry cdevsw[CDEV_MAX];
 

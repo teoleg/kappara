@@ -1,5 +1,5 @@
 /*
- * include/kappara/kfs.h -- "kappara file system" v2
+ * include/kappara/fs/kfs.h -- "kappara file system" v2
  *
  * Disk layout (each block = 512 B):
  *
@@ -33,7 +33,7 @@
 
 #include <stdint.h>
 
-#include "kappara/blkdev.h"
+#include "kappara/fs/blkdev.h"
 
 #define KFS_MAGIC	0x014b4653u	/* 'KFS\1' little-endian */
 

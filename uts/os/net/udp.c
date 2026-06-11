@@ -47,15 +47,15 @@
 
 #include <stdint.h>
 
-#include "kappara/cdevsw.h"
-#include "kappara/kmem.h"
+#include "kappara/io/cdevsw.h"
+#include "kappara/core/kmem.h"
 #include "kappara/net/ip.h"
 #include "kappara/net/udp.h"
-#include "kappara/printk.h"
-#include "kappara/sched.h"
-#include "kappara/stream_head.h"
-#include "kappara/streams.h"
-#include "kappara/string.h"
+#include "kappara/core/printk.h"
+#include "kappara/proc/sched.h"
+#include "kappara/io/stream_head.h"
+#include "kappara/io/streams.h"
+#include "kappara/core/string.h"
 
 /* ---- Per-instance state ------------------------------------------- */
 

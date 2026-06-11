@@ -1,5 +1,5 @@
 /*
- * include/kappara/tty.h -- multi-minor TTY (virtual console) driver
+ * include/kappara/io/tty.h -- multi-minor TTY (virtual console) driver
  *
  * Phase 3 of the virtual-console roadmap.  Each minor `i` in the
  * range 0..NTTY-1 owns one `struct tty_minor`: an instance of the
@@ -26,11 +26,11 @@
 
 #include <stdint.h>
 
-#include "kappara/vt.h"
+#include "kappara/io/vt.h"
 
 #define NTTY	4
 
-struct stdata;	/* fwd; defined in kappara/stream_head.h */
+struct stdata;	/* fwd; defined in kappara/io/stream_head.h */
 
 struct tty_minor {
 	struct vt        vt;

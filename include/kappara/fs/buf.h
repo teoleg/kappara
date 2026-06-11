@@ -1,5 +1,5 @@
 /*
- * include/kappara/buf.h -- block-IO buffer cache
+ * include/kappara/fs/buf.h -- block-IO buffer cache
  *
  * The fs-agnostic byte cache that sits between filesystems and
  * block-device drivers.  Filesystems call bread(dev, blkno) to
@@ -39,9 +39,9 @@
 
 #include <stdint.h>
 
-#include "kappara/cdevsw.h"
-#include "kappara/sched.h"
-#include "kappara/spinlock.h"
+#include "kappara/io/cdevsw.h"
+#include "kappara/proc/sched.h"
+#include "kappara/core/spinlock.h"
 
 #define BUF_BLOCK_SIZE	4096		/* bytes per cache slot       */
 #define BUF_POOL_SIZE	32		/* total cache slots          */

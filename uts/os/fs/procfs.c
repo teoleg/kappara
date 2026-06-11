@@ -27,18 +27,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/cdevsw.h"
-#include "kappara/ftrace.h"
-#include "kappara/kmem.h"
+#include "kappara/io/cdevsw.h"
+#include "kappara/core/ftrace.h"
+#include "kappara/core/kmem.h"
 #include "kappara/net/netif.h"
-#include "kappara/pmm.h"
-#include "kappara/printk.h"
-#include "kappara/proc.h"
-#include "kappara/sched.h"
-#include "kappara/stream_head.h"
-#include "kappara/streams.h"
-#include "kappara/string.h"
-#include "kappara/vfs.h"
+#include "kappara/core/pmm.h"
+#include "kappara/core/printk.h"
+#include "kappara/fs/proc.h"
+#include "kappara/proc/sched.h"
+#include "kappara/io/stream_head.h"
+#include "kappara/io/streams.h"
+#include "kappara/core/string.h"
+#include "kappara/fs/vfs.h"
 
 /* ---- Tiny text formatter into a fixed buffer ------------------------ */
 

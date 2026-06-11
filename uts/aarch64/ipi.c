@@ -2,7 +2,7 @@
  * arch/aarch64/ipi.c -- BCM2836 mailbox-based IPI backend
  * =======================================================
  *
- * See include/kappara/ipi.h for the contract.
+ * See include/kappara/arch/ipi.h for the contract.
  *
  * Layout reminder (from platform/pi3.h):
  *
@@ -18,8 +18,8 @@
 
 #include <stdint.h>
 
-#include "kappara/ipi.h"
-#include "kappara/sched.h"
+#include "kappara/arch/ipi.h"
+#include "kappara/proc/sched.h"
 #include "platform.h"
 
 static inline unsigned this_cpu_id(void)

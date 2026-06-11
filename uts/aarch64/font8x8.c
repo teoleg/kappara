@@ -19,7 +19,7 @@
 
 #include <stdint.h>
 
-#include "kappara/font8x8.h"
+#include "kappara/arch/font8x8.h"
 
 /* Helper macros to make glyph rows readable -- each one is a string
  * of dots and Xs that I then translate to the corresponding bits.

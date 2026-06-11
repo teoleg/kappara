@@ -9,7 +9,7 @@
  * Phase S1.
  */
 
-#include "kappara/bdevsw.h"
+#include "kappara/fs/bdevsw.h"
 
 static struct bdev_entry *bdev_table[BDEV_MAX];
 

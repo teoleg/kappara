@@ -36,7 +36,7 @@
 
 #include <stddef.h>
 
-#include "kappara/klog.h"
+#include "kappara/core/klog.h"
 
 #define KLOG_SIZE	8192
 
