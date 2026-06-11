@@ -752,9 +752,51 @@ encapsulation.
 Removed in N2b; the role belongs to a future `/dev/ip` once we
 expose the IP mux to user space.)
 
+### pktfilter -- the composability proof
+
+`pktfilter` is a tiny STREAMS module shipped to demonstrate the
+runtime-modular property the whole N2 rewrite was justified by.  It
+is **not** part of any default stack; users I_PUSH it onto an open
+TPI stream by hand:
+
+```c
+int fd = open("/dev/udp", O_RDWR);
+ioctl(fd, I_PUSH, (long)"pktfilter");
+/* ... configure via PF_T_SET_REQ M_PROTO ... */
+/* ... send + see counters increment ... */
+ioctl(fd, I_POP, 0);
+```
+
+After the push the stack is `head -> pktfilter -> udp -> ip`.
+pktfilter's wput inspects M_PROTO mblks heading down:
+
+- `T_UNITDATA_REQ` is matched against `(enabled, drop_dst_ip,
+  drop_dst_port)`.  Matching messages are freed (counted as
+  `dropped`).  Non-matching pass through to UDP unchanged
+  (counted as `passed`).
+- `PF_T_SET_REQ` / `PF_T_STATS_REQ` are pktfilter's own control
+  primitives -- consumed at the module, replies (`PF_T_SET_ACK`
+  / `PF_T_STATS_RES`) putnext UP to the head.
+- Everything else (`T_BIND_REQ`, `M_DATA`, `M_IOCTL`, ...) is
+  passed through unchanged so the bind/unbind handshake and any
+  other unrelated control traffic still reach UDP.
+
+pktfilter's rput is pure passthrough.  Inbound packets reach UDP
+via IP's demux `put()` directly into UDP's rq, bypassing pktfilter
+entirely -- a deliberate consequence of the multiplexor model.
+Inbound filtering belongs at a different hook point (a future
+`ip_hook_input` or a pktfilter pushed on `ip_ctl_sd` itself).
+
+`cmd/pktfilttest` exercises the full push-configure-drop-pop cycle
+and is the regression test that proves: a third-party STREAMS
+module written long after the stack was built can slot in at
+runtime, observe and modify outbound traffic, expose its own
+control protocol via M_PROTO, and unwind cleanly via I_POP.  That
+property is what justifies the per-packet putnext cost.
+
 Not yet:
-- A demo pushable filter (`pktfilter`) inserted at a layer boundary
-  to prove composability (N2e)
+- Inbound filter hook (would mirror outbound for the symmetric
+  shape Solaris IPFilter has)
 - TCP transport and `/dev/tcp`
 - SLIP framing on UART2 for off-machine connectivity
 - ARP (only needed for Ethernet, not lo0 or SLIP)

@@ -53,6 +53,7 @@
 #include "kappara/ip.h"
 #include "kappara/klog.h"
 #include "kappara/kmem.h"
+#include "kappara/pktfilter.h"
 #include "kappara/printk.h"
 #include "kappara/sched.h"
 #include "kappara/signal.h"
@@ -1900,6 +1901,10 @@ void streams_head_init(void)
 	 * matching module on open. */
 	icmp_module_init();
 	udp_module_init();
+	/* pktfilter is a pure I_PUSH'able demo filter -- no cdev, no
+	 * autopush.  Users opt in by issuing ioctl(fd, I_PUSH,
+	 * "pktfilter") on an open /dev/udp (or any TPI stream). */
+	pktfilter_module_init();
 	vfs_mknod_chrdev(dev, "icmp", MKDEV(CDEV_MAJ_ICMP,  0));
 	vfs_mknod_chrdev(dev, "udp",  MKDEV(CDEV_MAJ_UDP,   0));
 

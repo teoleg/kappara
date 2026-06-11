@@ -692,6 +692,8 @@ extern char ifconfig_blob_start[];
 extern char ifconfig_blob_end[];
 extern char udptest_blob_start[];
 extern char udptest_blob_end[];
+extern char pktfilttest_blob_start[];
+extern char pktfilttest_blob_end[];
 
 static struct blob_priv hello_priv;
 
@@ -771,6 +773,7 @@ void exec_space_init(void)
 		PAY("ping",       ping_blob_start,       ping_blob_end),
 		PAY("ifconfig",   ifconfig_blob_start,   ifconfig_blob_end),
 		PAY("udptest",    udptest_blob_start,    udptest_blob_end),
+		PAY("pktfilttest", pktfilttest_blob_start, pktfilttest_blob_end),
 	};
 #undef PAY
 	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);

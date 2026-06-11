@@ -10,6 +10,7 @@
 #define __NR_write       6
 #define __NR_putmsg      8
 #define __NR_getmsg      9
+#define __NR_ioctl       7
 #define __NR_pipe        11
 #define __NR_exit        16
 #define __NR_kill        19
