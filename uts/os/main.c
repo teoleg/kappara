@@ -49,6 +49,7 @@
 #include "kappara/io/vt.h"
 #include "kappara/net/ip.h"
 #include "kappara/net/slip.h"
+#include "kappara/net/tcp.h"
 #include "kappara/net/udp.h"
 #include "kappara/proc/process.h"
 #include "kappara/proc/sched.h"
@@ -473,6 +474,10 @@ void kmain(void)
 		kprintf("udp: SELFTEST FAIL\n");
 	else
 		kprintf("udp: selftest PASS\n");
+	if (tcp_selftest_run() < 0)
+		kprintf("tcp: SELFTEST FAIL\n");
+	else
+		kprintf("tcp: selftest PASS\n");
 	/* Bring up SLIP on the mini-UART after IP is ready -- slip_init
 	 * needs ip_attach_stream to I_LINK the slip0 stream underneath. */
 	slip_init();

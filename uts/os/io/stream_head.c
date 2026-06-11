@@ -55,6 +55,7 @@
 #include "kappara/net/ip.h"
 #include "kappara/net/pktfilter.h"
 #include "kappara/net/slip.h"
+#include "kappara/net/tcp.h"
 #include "kappara/net/udp.h"
 #include "kappara/core/printk.h"
 #include "kappara/proc/sched.h"
@@ -916,6 +917,9 @@ static int stream_open(struct file *f)
 	 * with TPI primitives via putmsg/getmsg. */
 	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_UDP)
 		(void)do_ipush(sd, "udp");
+	/* And /dev/tcp: ip_streamtab + autopushed tcp module. */
+	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_TCP)
+		(void)do_ipush(sd, "tcp");
 
 	f->f_private = sd;
 	return 0;
@@ -1902,6 +1906,7 @@ void streams_head_init(void)
 	 * matching module on open. */
 	icmp_module_init();
 	udp_module_init();
+	tcp_module_init();
 	/* pktfilter is a pure I_PUSH'able demo filter -- no cdev, no
 	 * autopush.  Users opt in by issuing ioctl(fd, I_PUSH,
 	 * "pktfilter") on an open /dev/udp (or any TPI stream). */
@@ -1912,6 +1917,7 @@ void streams_head_init(void)
 	slip_module_init();
 	vfs_mknod_chrdev(dev, "icmp", MKDEV(CDEV_MAJ_ICMP,  0));
 	vfs_mknod_chrdev(dev, "udp",  MKDEV(CDEV_MAJ_UDP,   0));
+	vfs_mknod_chrdev(dev, "tcp",  MKDEV(CDEV_MAJ_TCP,   0));
 
 	kprintf("stream_head: registered modules:");
 	for (struct stmod_entry *e = registry; e; e = e->next)

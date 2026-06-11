@@ -58,6 +58,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/uts/os/net/ipv4.o \
         $(BUILD)/uts/os/net/icmp.o \
         $(BUILD)/uts/os/net/udp.o \
+        $(BUILD)/uts/os/net/tcp.o \
         $(BUILD)/uts/os/net/pktfilter.o \
         $(BUILD)/uts/os/net/slip.o \
         $(BUILD)/uts/os/net/lo.o \

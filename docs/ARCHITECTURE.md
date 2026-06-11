@@ -748,6 +748,33 @@ encapsulation.
 |-------|-------|---------------------|------------------------------------------|
 | 16    | icmp  | `ip_streamtab` + autopush `"icmp"` module | ICMP raw-echo endpoint     |
 | 18    | udp   | `ip_streamtab` + autopush `"udp"` module  | UDP TPI datagram endpoint  |
+| 19    | tcp   | `ip_streamtab` + autopush `"tcp"` module  | TCP TPI connection endpoint (T1a: bind only) |
+
+### TCP -- planned in phases (currently T1a)
+
+Same architectural shape as UDP: a STREAMS module above IP with a
+TPI user ABI delivered via putmsg/getmsg.  The `key` field of
+`ip_bind_meta` packs `(local_port << 16) | remote_port` so IP's
+exact-match demux delivers a segment straight to the right TCP
+endpoint, no multicast needed once T1b lights up.
+
+TPI primitives (locked in across phases; see
+`include/kappara/net/tcp.h`):
+
+| Phase | Primitives                                                       |
+|-------|------------------------------------------------------------------|
+| T1a   | T_BIND_REQ / T_BIND_ACK / T_BIND_NAK (via IP_T_BIND_REQ)         |
+| T1b   | T_CONN_REQ / T_CONN_CON (active open: SYN, SYN-ACK, ACK)         |
+| T1c   | T_DATA_REQ / T_DATA_IND (seq/ack tracking; no retransmit yet)    |
+| T1d   | T_CONN_IND / T_CONN_RES (passive open + accept queue)            |
+| T1e   | T_ORDREL_REQ / T_ORDREL_IND (FIN handshake) + T_DISCON_REQ/IND   |
+| T1f   | retransmit timer + RTT estimation                                |
+| T1g   | cmd/tcptest end-to-end                                           |
+
+At T1a unimplemented primitives bounce back with
+`T_DISCON_IND{reason=NOTSUP}` so users get a clear error rather
+than silent drops.  The header is the locked-in ABI; subsequent
+phases only fill in handler bodies.
 
 (Major 15 was a leaf-driver `/dev/lo0` for raw-IP user injection.
 Removed in N2b; the role belongs to a future `/dev/ip` once we
