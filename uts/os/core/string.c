@@ -13,7 +13,7 @@
  * can `__attribute__((alias("kmemset")))` here in one place.
  */
 
-#include "kappara/string.h"
+#include "kappara/core/string.h"
 
 void *kmemset(void *dst, int c, size_t n)
 {

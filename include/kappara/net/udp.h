@@ -1,5 +1,5 @@
 /*
- * include/kappara/udp.h -- UDP as a STREAMS module above IP, with
+ * include/kappara/net/udp.h -- UDP as a STREAMS module above IP, with
  *                          a TPI-shaped M_PROTO user ABI.
  *
  * /dev/udp's cdev maps to ip_streamtab.  stream_open autopushes

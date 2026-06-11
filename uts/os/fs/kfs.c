@@ -2,7 +2,7 @@
  * kernel/kfs.c -- mount / mkimage for the v2 kappara filesystem
  * =============================================================
  *
- * See include/kappara/kfs.h for the on-disk layout.  This file:
+ * See include/kappara/fs/kfs.h for the on-disk layout.  This file:
  *
  *   1. kfs_mkimage(bd)   formats `bd`: superblock at block 0, the
  *                        free-block bitmap at block 1, the root
@@ -43,12 +43,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/blkdev.h"
-#include "kappara/kfs.h"
-#include "kappara/kmem.h"
-#include "kappara/printk.h"
-#include "kappara/string.h"
-#include "kappara/vfs.h"
+#include "kappara/fs/blkdev.h"
+#include "kappara/fs/kfs.h"
+#include "kappara/core/kmem.h"
+#include "kappara/core/printk.h"
+#include "kappara/core/string.h"
+#include "kappara/fs/vfs.h"
 
 /* ---- regular-file file_ops ----------------------------------------- */
 

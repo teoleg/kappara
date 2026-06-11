@@ -78,11 +78,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/kmem.h"
-#include "kappara/pmm.h"
-#include "kappara/printk.h"
-#include "kappara/spinlock.h"
-#include "kappara/string.h"
+#include "kappara/core/kmem.h"
+#include "kappara/core/pmm.h"
+#include "kappara/core/printk.h"
+#include "kappara/core/spinlock.h"
+#include "kappara/core/string.h"
 
 /* One lock per cache would be more scalable, but for now a single
  * coarse-grained lock around every cache mutation is enough to keep

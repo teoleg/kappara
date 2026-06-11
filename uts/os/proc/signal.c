@@ -27,13 +27,13 @@
  * (QEMU TCG doesn't care) coherent across the I-side.
  */
 
-#include "kappara/printk.h"
-#include "kappara/sched.h"
-#include "kappara/signal.h"
-#include "kappara/trap.h"
-#include "kappara/uaccess.h"
-#include "kappara/user.h"	/* sys_exit_impl */
-#include "kappara/kmem.h"
+#include "kappara/core/printk.h"
+#include "kappara/proc/sched.h"
+#include "kappara/proc/signal.h"
+#include "kappara/arch/trap.h"
+#include "kappara/core/uaccess.h"
+#include "kappara/proc/user.h"	/* sys_exit_impl */
+#include "kappara/core/kmem.h"
 
 extern void *kmalloc(size_t size);
 extern void  kmemset(void *dst, int v, size_t n);
@@ -340,9 +340,9 @@ long sys_setsid_impl(void)
  * cdev major.  We don't yet enforce "the calling session must own
  * the controlling tty" -- another bookkeeping piece deferred for
  * later. */
-#include "kappara/cdevsw.h"
-#include "kappara/vfs.h"
-#include "kappara/tty.h"
+#include "kappara/io/cdevsw.h"
+#include "kappara/fs/vfs.h"
+#include "kappara/io/tty.h"
 
 static int fd_tty_minor(int fd)
 {

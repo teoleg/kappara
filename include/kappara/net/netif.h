@@ -1,5 +1,5 @@
 /*
- * include/kappara/netif.h -- network interface (DLPI-flavoured)
+ * include/kappara/net/netif.h -- network interface (DLPI-flavoured)
  *
  * A `netif` is the bottom of the kappara network stack: the thing
  * that actually puts bytes "on the wire" (or, for lo0, into a queue

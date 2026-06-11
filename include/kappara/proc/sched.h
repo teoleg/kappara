@@ -1,5 +1,5 @@
 /*
- * include/kappara/sched.h -- kernel thread + scheduler API
+ * include/kappara/proc/sched.h -- kernel thread + scheduler API
  *
  * kappara's threading model is intentionally tiny:
  *
@@ -18,9 +18,9 @@
 
 #include <stdint.h>
 
-#include "kappara/spinlock.h"
+#include "kappara/core/spinlock.h"
 
-struct process;	/* fwd; defined in kappara/process.h */
+struct process;	/* fwd; defined in kappara/proc/process.h */
 
 enum kt_state {
 	KT_READY = 0,
@@ -161,7 +161,7 @@ struct kthread {
 	 *
 	 * Future code mutates t state ONLY after acquiring *t_lockp,
 	 * with retries when t_lockp changes mid-acquire (see
-	 * thread_lock() in include/kappara/thread_lock.h, added in
+	 * thread_lock() in include/kappara/core/thread_lock.h, added in
 	 * phase 1).  This is what closes the steal-mid-save race that
 	 * the "/proc/ps text in a recycled stack page's saved-register
 	 * slots" panic exposed.
@@ -213,7 +213,7 @@ struct kthread {
 	struct kthread *next;
 	/* Pending-signal bitmap.  sys_kill sets bits, check_signals
 	 * (from trap_dispatch's SVC return) consumes them.  See
-	 * include/kappara/signal.h for the layout and SIGBIT(). */
+	 * include/kappara/proc/signal.h for the layout and SIGBIT(). */
 	uint32_t       sig_pending;
 	/* Currently-blocked signals.  pending & ~mask is what
 	 * check_signals will actually deliver.  SIGKILL bypasses
@@ -275,7 +275,7 @@ struct kthread {
  * this lock only when stealing work or migrating a thread; the
  * common case is uncontended.
  */
-struct queue;	/* fwd; STREAMS queue_t -- see kappara/streams.h */
+struct queue;	/* fwd; STREAMS queue_t -- see kappara/io/streams.h */
 
 struct cpu {
 	unsigned         cpu_id;

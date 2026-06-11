@@ -22,10 +22,10 @@
 
 #include <stdint.h>
 
-#include "kappara/ip.h"
-#include "kappara/netif.h"
-#include "kappara/printk.h"
-#include "kappara/streams.h"
+#include "kappara/net/ip.h"
+#include "kappara/net/netif.h"
+#include "kappara/core/printk.h"
+#include "kappara/io/streams.h"
 
 /* ---- STREAMS driver --------------------------------------------- */
 

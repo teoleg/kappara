@@ -6,7 +6,7 @@
  * -----------------
  * The bottom layer of the STREAMS subsystem: message allocation
  * and a simple per-queue deferred-message list.  See the comment
- * at the top of include/kappara/streams.h for the framework
+ * at the top of include/kappara/io/streams.h for the framework
  * overview and the data-structure diagrams.
  *
  * What's in here
@@ -59,12 +59,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/kmem.h"
-#include "kappara/printk.h"
-#include "kappara/sched.h"	/* curcpu, cpu_srvq_* */
-#include "kappara/spinlock.h"
-#include "kappara/streams.h"
-#include "kappara/string.h"
+#include "kappara/core/kmem.h"
+#include "kappara/core/printk.h"
+#include "kappara/proc/sched.h"	/* curcpu, cpu_srvq_* */
+#include "kappara/core/spinlock.h"
+#include "kappara/io/streams.h"
+#include "kappara/core/string.h"
 
 static struct kmem_cache mblk_cache;
 static struct kmem_cache dblk_cache;

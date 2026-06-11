@@ -8,6 +8,7 @@ ifeq ($(ARCH),aarch64)
     ARCH_OBJS     := \
         $(BUILD)/uts/aarch64/boot.o \
         $(BUILD)/uts/aarch64/uart.o \
+        $(BUILD)/uts/aarch64/miniuart.o \
         $(BUILD)/uts/aarch64/vectors.o \
         $(BUILD)/uts/aarch64/trap.o \
         $(BUILD)/uts/aarch64/mmu.o \
@@ -57,6 +58,9 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/uts/os/net/ipv4.o \
         $(BUILD)/uts/os/net/icmp.o \
         $(BUILD)/uts/os/net/udp.o \
+        $(BUILD)/uts/os/net/tcp.o \
+        $(BUILD)/uts/os/net/pktfilter.o \
+        $(BUILD)/uts/os/net/slip.o \
         $(BUILD)/uts/os/net/lo.o \
         $(BUILD)/uts/os/user/user.o \
         $(BUILD)/uts/os/main.o
@@ -282,7 +286,7 @@ $(LIBC_A): $(LIBC_OBJS)
 
 # ---- /usr/bin standalone ELF programs --------------------------------
 CMD_BUILD  := build/cmd
-CMD_NAMES  := ps sigtest masktest waittest segvtest crash pipe pipework malloctest forktest ping ifconfig udptest
+CMD_NAMES  := ps sigtest masktest waittest segvtest crash pipe pipework malloctest forktest ping ifconfig udptest pktfilttest
 CMD_ELFS   := $(addprefix $(CMD_BUILD)/, $(addsuffix .elf, $(CMD_NAMES)))
 
 CMD_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \

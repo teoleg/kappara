@@ -68,9 +68,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/pmm.h"
-#include "kappara/printk.h"
-#include "kappara/spinlock.h"
+#include "kappara/core/pmm.h"
+#include "kappara/core/printk.h"
+#include "kappara/core/spinlock.h"
 
 static uintptr_t freelist;
 static size_t    free_count;

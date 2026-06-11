@@ -39,7 +39,7 @@
 
 #include <stdint.h>
 
-#include "kappara/spinlock.h"
+#include "kappara/core/spinlock.h"
 #include "platform.h"
 
 /*

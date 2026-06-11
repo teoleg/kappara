@@ -55,19 +55,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/atomic.h"
-#include "kappara/cdevsw.h"
-#include "kappara/kmem.h"
-#include "kappara/printk.h"
-#include "kappara/sched.h"
-#include "kappara/string.h"
-#include "kappara/uaccess.h"
-#include "kappara/vfs.h"
+#include "kappara/core/atomic.h"
+#include "kappara/io/cdevsw.h"
+#include "kappara/core/kmem.h"
+#include "kappara/core/printk.h"
+#include "kappara/proc/sched.h"
+#include "kappara/core/string.h"
+#include "kappara/core/uaccess.h"
+#include "kappara/fs/vfs.h"
 
 /* The single chrdev file_ops table -- defined in kernel/stream_head.c.
  * All STREAMS chrdev inodes hang their VFS dispatch off this one
  * vtable; the per-driver behavior is reached through cdevsw[MAJOR(rdev)]
- * inside the stream_*  methods.  See include/kappara/cdevsw.h. */
+ * inside the stream_*  methods.  See include/kappara/io/cdevsw.h. */
 extern struct file_ops stream_fops;
 
 /* ---- Root of the in-memory tree --------------------------------------- */
@@ -370,7 +370,7 @@ struct file *fd_get(int fd)
  *     close + vfs_iput + kfree.
  *
  * Both helpers route through atomic_inc / atomic_dec_and_test in
- * include/kappara/atomic.h -- never write raw `f->f_refs++` or
+ * include/kappara/core/atomic.h -- never write raw `f->f_refs++` or
  * `--f->f_refs`, those lose updates under SMP and have driven at
  * least one panic into this tree already. */
 static void file_get(struct file *f)

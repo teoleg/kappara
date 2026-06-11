@@ -43,14 +43,14 @@
 
 #include <stdint.h>
 
-#include "kappara/ip.h"
-#include "kappara/kmem.h"
-#include "kappara/netif.h"
-#include "kappara/printk.h"
-#include "kappara/sched.h"
-#include "kappara/stream_head.h"
-#include "kappara/streams.h"
-#include "kappara/string.h"
+#include "kappara/core/kmem.h"
+#include "kappara/net/ip.h"
+#include "kappara/net/netif.h"
+#include "kappara/core/printk.h"
+#include "kappara/proc/sched.h"
+#include "kappara/io/stream_head.h"
+#include "kappara/io/streams.h"
+#include "kappara/core/string.h"
 
 static uint16_t ip_id_next;
 
@@ -122,6 +122,21 @@ void ip_lower_register(int muxid, struct netif *nif)
 		}
 	}
 	kprintf("ip: lower_register muxid=%d not found\n", muxid);
+}
+
+uint32_t ip_route_src(uint32_t dst_ip)
+{
+	struct ip_lower *l = ip_route(dst_ip);
+	return (l && l->nif) ? l->nif->ip : 0;
+}
+
+long ip_attach_stream(struct stdata *netif_sd, struct netif *nif)
+{
+	if (!ip_ctl_sd || !netif_sd || !nif) return -1;
+	long muxid = stream_ilink(ip_ctl_sd, netif_sd);
+	if (muxid <= 0) return -1;
+	ip_lower_register((int)muxid, nif);
+	return muxid;
 }
 
 /* ---- Bind table management ---------------------------------------- */
@@ -352,12 +367,33 @@ static int ip_wput(queue_t *q, mblk_t *mp)
 }
 
 /* ---- IP rput -- demux ---------------------------------------------- */
+/*
+ * After stripping the IP header we prepend an M_PROTO
+ * IP_T_UNITDATA_IND carrying (src_ip, dst_ip) so each upper module
+ * sees the source address without having to keep the IP header
+ * around.  Modules read the indication, advance to b_cont for the
+ * actual payload, and free the whole chain when done.
+ */
 
-static void ip_demux(uint8_t proto, mblk_t *mp)
+static mblk_t *build_unitdata_ind(uint8_t proto,
+                                  uint32_t src_ip, uint32_t dst_ip)
 {
-	/* Two-pass: collect matches first, then deliver -- so we know
-	 * which match is "last" and gets the original mblk (others
-	 * dupmsg).  Saves the alloc on the common single-bind case. */
+	mblk_t *ind = allocb(sizeof(struct ip_unitdata_ind), 0);
+	if (!ind) return NULL;
+	ind->b_datap->db_type = M_PROTO;
+	struct ip_unitdata_ind *u = (struct ip_unitdata_ind *)ind->b_wptr;
+	u->prim    = IP_T_UNITDATA_IND;
+	u->proto   = proto;
+	u->_pad[0] = u->_pad[1] = 0;
+	u->src_ip  = src_ip;
+	u->dst_ip  = dst_ip;
+	ind->b_wptr += sizeof(*u);
+	return ind;
+}
+
+static void ip_demux(uint8_t proto, uint32_t src_ip, uint32_t dst_ip,
+                     mblk_t *body)
+{
 	queue_t *matches[IP_MAX_UPPERS];
 	int n = 0;
 	for (int i = 0; i < IP_MAX_UPPERS && n < IP_MAX_UPPERS; i++) {
@@ -366,14 +402,30 @@ static void ip_demux(uint8_t proto, mblk_t *mp)
 		matches[n++] = ip_uppers[i].upper_rq;
 	}
 	if (n == 0) {
-		freemsg(mp);
+		freemsg(body);
 		return;
 	}
+	/* Multicast: each match gets its own (ind, body_copy) chain.
+	 * dupmsg shares the underlying dblks via db_ref++ so only the
+	 * tiny mblk_t headers are duplicated. */
 	for (int j = 0; j < n - 1; j++) {
-		mblk_t *cpy = dupmsg(mp);
-		if (cpy) put(matches[j], cpy);
+		mblk_t *body_cpy = dupmsg(body);
+		mblk_t *ind = build_unitdata_ind(proto, src_ip, dst_ip);
+		if (!ind || !body_cpy) {
+			if (body_cpy) freemsg(body_cpy);
+			if (ind)      freemsg(ind);
+			continue;
+		}
+		ind->b_cont = body_cpy;
+		put(matches[j], ind);
 	}
-	put(matches[n - 1], mp);
+	mblk_t *ind = build_unitdata_ind(proto, src_ip, dst_ip);
+	if (!ind) {
+		freemsg(body);
+		return;
+	}
+	ind->b_cont = body;
+	put(matches[n - 1], ind);
 }
 
 static int ip_rput(queue_t *q, mblk_t *mp)
@@ -415,9 +467,11 @@ static int ip_rput(queue_t *q, mblk_t *mp)
 		return 0;
 	}
 
-	uint8_t  proto = h->proto;
+	uint32_t src_ip = ntohl32(h->src_ip);
+	uint32_t dst_ip = ntohl32(h->dst_ip);
+	uint8_t  proto  = h->proto;
 	mp->b_rptr += ihl_bytes;
-	ip_demux(proto, mp);
+	ip_demux(proto, src_ip, dst_ip, mp);
 	return 0;
 }
 

@@ -108,3 +108,11 @@ ifconfig_blob_end:
 udptest_blob_start:
 	.incbin "build/cmd/udptest.elf"
 udptest_blob_end:
+
+	.section ".rodata.pktfilttest_blob","a",%progbits
+	.balign 8
+	.global pktfilttest_blob_start
+	.global pktfilttest_blob_end
+pktfilttest_blob_start:
+	.incbin "build/cmd/pktfilttest.elf"
+pktfilttest_blob_end:

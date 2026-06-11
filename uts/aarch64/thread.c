@@ -12,9 +12,9 @@
 
 #include <stdint.h>
 
-#include "kappara/sched.h"
-#include "kappara/string.h"
-#include "kappara/trap.h"
+#include "kappara/proc/sched.h"
+#include "kappara/core/string.h"
+#include "kappara/arch/trap.h"
 
 extern void thread_trampoline(void);
 extern void fork_trampoline(void);

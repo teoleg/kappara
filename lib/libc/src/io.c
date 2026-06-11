@@ -66,5 +66,10 @@ int getmsg(int fd, struct strbuf *ctl,
                            (long)(unsigned long)data,
                            (long)(unsigned long)flagsp);
 }
+
+int ioctl(int fd, int cmd, long arg)
+{
+    return (int)__syscall3(__NR_ioctl, (long)fd, (long)cmd, arg);
+}
 /* _exit lives in stdlib.c -- shared by exit() and the direct
  * _exit() callers.  Don't duplicate it here. */

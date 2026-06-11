@@ -24,34 +24,36 @@
 
 #include <stdint.h>
 
-#include "kappara/blkdev.h"
-#include "kappara/fbcon.h"
-#include "kappara/framebuffer.h"
-#include "kappara/ftrace.h"
-#include "kappara/ipi.h"
-#include "kappara/kallsyms.h"
-#include "kappara/kfs.h"
-#include "kappara/kmem.h"
-#include "kappara/mmu.h"
-#include "kappara/pmm.h"
-#include "kappara/printk.h"
-#include "kappara/proc.h"
-#include "kappara/buf.h"
-#include "kappara/ip.h"
-#include "kappara/udp.h"
-#include "kappara/process.h"
-#include "kappara/sched.h"
-#include "kappara/vt.h"
-#include "kappara/tty.h"
-#include "kappara/stream_head.h"
-#include "kappara/streams.h"
-#include "kappara/string.h"
-#include "kappara/syscall.h"
-#include "kappara/vfs.h"
-#include "kappara/timer.h"
-#include "kappara/trap.h"
-#include "kappara/uart.h"
-#include "kappara/user.h"
+#include "kappara/abi/syscall.h"
+#include "kappara/arch/framebuffer.h"
+#include "kappara/arch/ipi.h"
+#include "kappara/arch/mmu.h"
+#include "kappara/arch/timer.h"
+#include "kappara/arch/trap.h"
+#include "kappara/arch/uart.h"
+#include "kappara/core/ftrace.h"
+#include "kappara/core/kallsyms.h"
+#include "kappara/core/kmem.h"
+#include "kappara/core/pmm.h"
+#include "kappara/core/printk.h"
+#include "kappara/core/string.h"
+#include "kappara/fs/blkdev.h"
+#include "kappara/fs/buf.h"
+#include "kappara/fs/kfs.h"
+#include "kappara/fs/proc.h"
+#include "kappara/fs/vfs.h"
+#include "kappara/io/fbcon.h"
+#include "kappara/io/stream_head.h"
+#include "kappara/io/streams.h"
+#include "kappara/io/tty.h"
+#include "kappara/io/vt.h"
+#include "kappara/net/ip.h"
+#include "kappara/net/slip.h"
+#include "kappara/net/tcp.h"
+#include "kappara/net/udp.h"
+#include "kappara/proc/process.h"
+#include "kappara/proc/sched.h"
+#include "kappara/proc/user.h"
 #include "platform.h"
 
 extern char __kernel_end[];
@@ -472,6 +474,13 @@ void kmain(void)
 		kprintf("udp: SELFTEST FAIL\n");
 	else
 		kprintf("udp: selftest PASS\n");
+	if (tcp_selftest_run() < 0)
+		kprintf("tcp: SELFTEST FAIL\n");
+	else
+		kprintf("tcp: selftest PASS\n");
+	/* Bring up SLIP on the mini-UART after IP is ready -- slip_init
+	 * needs ip_attach_stream to I_LINK the slip0 stream underneath. */
+	slip_init();
 	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ on core 0 */
 
 	/* Smoke-test the kallsyms table by walking our own frame chain

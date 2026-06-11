@@ -29,8 +29,8 @@
  * the next printable char picks up.
  */
 
-#include "kappara/vt.h"
-#include "kappara/printk.h"
+#include "kappara/io/vt.h"
+#include "kappara/core/printk.h"
 
 /* ---- cell-buffer primitives ------------------------------------------- */
 

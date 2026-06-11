@@ -2,7 +2,7 @@
  * kernel/uaccess.c -- bounds-checked copy between user and kernel
  * ===============================================================
  *
- * See include/kappara/uaccess.h for the contract.  This file is
+ * See include/kappara/core/uaccess.h for the contract.  This file is
  * the implementation: a per-syscall flag (syscall_from_user) plus
  * three byte-copy primitives, all of which refuse pointers outside
  * the user-mapped window.
@@ -33,8 +33,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/printk.h"
-#include "kappara/uaccess.h"
+#include "kappara/core/printk.h"
+#include "kappara/core/uaccess.h"
 
 /*
  * Recognised user windows.  Keep in sync with kernel/user.c.

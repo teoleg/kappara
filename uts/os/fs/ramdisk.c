@@ -26,9 +26,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/blkdev.h"
-#include "kappara/printk.h"
-#include "kappara/string.h"
+#include "kappara/fs/blkdev.h"
+#include "kappara/core/printk.h"
+#include "kappara/core/string.h"
 
 #define RAMDISK_BLOCKS	1024
 

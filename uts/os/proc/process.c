@@ -1,7 +1,7 @@
 /*
  * kernel/process.c -- Unix process bookkeeping
  *
- * Phase R1 chunk 1.  See include/kappara/process.h for the bigger
+ * Phase R1 chunk 1.  See include/kappara/proc/process.h for the bigger
  * picture; this file implements:
  *
  *   - init_vm_map / init_process: the bootstrap entities that every
@@ -23,12 +23,12 @@
 
 #include <stdint.h>
 
-#include "kappara/kmem.h"
-#include "kappara/mmu.h"
-#include "kappara/pmm.h"
-#include "kappara/printk.h"
-#include "kappara/process.h"
-#include "kappara/string.h"
+#include "kappara/core/kmem.h"
+#include "kappara/arch/mmu.h"
+#include "kappara/core/pmm.h"
+#include "kappara/core/printk.h"
+#include "kappara/proc/process.h"
+#include "kappara/core/string.h"
 
 struct vm_map init_vm_map = {
 	.l0_phys  = 0,	/* filled in at process_init -- see below */

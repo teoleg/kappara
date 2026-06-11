@@ -391,7 +391,7 @@ static void cmd_help(void)
 		"  <name>                 unknown commands look up /usr/bin/<name>\r\n"
 		"                         (ps, sigtest, masktest, waittest, segvtest,\r\n"
 		"                          crash, pipe, pipework, malloctest, forktest,\r\n"
-		"                          udptest)\r\n");
+		"                          udptest, pktfilttest)\r\n");
 }
 
 static void cmd_pid(void)

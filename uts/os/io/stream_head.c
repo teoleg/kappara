@@ -47,24 +47,27 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/cdevsw.h"
-#include "kappara/fbcon.h"
-#include "kappara/icmp.h"
-#include "kappara/ip.h"
-#include "kappara/klog.h"
-#include "kappara/kmem.h"
-#include "kappara/printk.h"
-#include "kappara/sched.h"
-#include "kappara/signal.h"
-#include "kappara/stream_head.h"
-#include "kappara/streams.h"
-#include "kappara/string.h"
-#include "kappara/termios.h"
-#include "kappara/tty.h"
-#include "kappara/uaccess.h"
-#include "kappara/uart.h"
-#include "kappara/udp.h"
-#include "kappara/vfs.h"
+#include "kappara/io/cdevsw.h"
+#include "kappara/io/fbcon.h"
+#include "kappara/core/klog.h"
+#include "kappara/core/kmem.h"
+#include "kappara/net/icmp.h"
+#include "kappara/net/ip.h"
+#include "kappara/net/pktfilter.h"
+#include "kappara/net/slip.h"
+#include "kappara/net/tcp.h"
+#include "kappara/net/udp.h"
+#include "kappara/core/printk.h"
+#include "kappara/proc/sched.h"
+#include "kappara/proc/signal.h"
+#include "kappara/io/stream_head.h"
+#include "kappara/io/streams.h"
+#include "kappara/core/string.h"
+#include "kappara/io/termios.h"
+#include "kappara/io/tty.h"
+#include "kappara/core/uaccess.h"
+#include "kappara/arch/uart.h"
+#include "kappara/fs/vfs.h"
 
 /* Forward-declared in streams.h. */
 extern void streams_init(void);
@@ -914,6 +917,9 @@ static int stream_open(struct file *f)
 	 * with TPI primitives via putmsg/getmsg. */
 	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_UDP)
 		(void)do_ipush(sd, "udp");
+	/* And /dev/tcp: ip_streamtab + autopushed tcp module. */
+	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_TCP)
+		(void)do_ipush(sd, "tcp");
 
 	f->f_private = sd;
 	return 0;
@@ -1900,8 +1906,18 @@ void streams_head_init(void)
 	 * matching module on open. */
 	icmp_module_init();
 	udp_module_init();
+	tcp_module_init();
+	/* pktfilter is a pure I_PUSH'able demo filter -- no cdev, no
+	 * autopush.  Users opt in by issuing ioctl(fd, I_PUSH,
+	 * "pktfilter") on an open /dev/udp (or any TPI stream). */
+	pktfilter_module_init();
+	/* slip is the framing layer that bridges the mini-UART byte
+	 * stream to IP.  slip_init (in main.c, after ip_init) builds
+	 * the actual stream and I_LINKs it under IP. */
+	slip_module_init();
 	vfs_mknod_chrdev(dev, "icmp", MKDEV(CDEV_MAJ_ICMP,  0));
 	vfs_mknod_chrdev(dev, "udp",  MKDEV(CDEV_MAJ_UDP,   0));
+	vfs_mknod_chrdev(dev, "tcp",  MKDEV(CDEV_MAJ_TCP,   0));
 
 	kprintf("stream_head: registered modules:");
 	for (struct stmod_entry *e = registry; e; e = e->next)

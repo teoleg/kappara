@@ -2,7 +2,7 @@
  * kernel/ftrace.c -- per-CPU function tracer (cyg-profile based)
  * ==============================================================
  *
- * See include/kappara/ftrace.h for the contract.  This TU is always
+ * See include/kappara/core/ftrace.h for the contract.  This TU is always
  * compiled with -fno-instrument-functions (overridden in the Makefile)
  * so the tracer's own code does not recurse into itself.  Likewise
  * for printk.c, uart.c, string.c, and kallsyms.c -- they sit on the
@@ -21,9 +21,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/ftrace.h"
-#include "kappara/kallsyms.h"
-#include "kappara/streams.h"
+#include "kappara/core/ftrace.h"
+#include "kappara/core/kallsyms.h"
+#include "kappara/io/streams.h"
 
 #define FT_NCPU		4
 #define FT_RING_SZ	256		/* must be power of 2 */

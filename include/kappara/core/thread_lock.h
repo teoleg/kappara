@@ -1,5 +1,5 @@
 /*
- * include/kappara/thread_lock.h -- Solaris polymorphic thread-state lock
+ * include/kappara/core/thread_lock.h -- Solaris polymorphic thread-state lock
  * ======================================================================
  *
  * Each kthread carries `t_lockp` -- a pointer to whichever spinlock
@@ -13,7 +13,7 @@
  *
  * This header defines the locking primitives.  The transition rules --
  * which lock owns a thread in which state -- live in the comment on
- * `struct kthread::t_lockp` in include/kappara/sched.h.
+ * `struct kthread::t_lockp` in include/kappara/proc/sched.h.
  *
  * Phase 1 (introductory commit): these primitives exist and the per-
  * thread/per-CPU locks are initialised, but nothing reads t_lockp
@@ -22,8 +22,8 @@
 #ifndef KAPPARA_THREAD_LOCK_H
 #define KAPPARA_THREAD_LOCK_H
 
-#include "kappara/sched.h"
-#include "kappara/spinlock.h"
+#include "kappara/proc/sched.h"
+#include "kappara/core/spinlock.h"
 
 /*
  * Sentinel value for `kthread.t_lockp` during a thread_lock_transfer

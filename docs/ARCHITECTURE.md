@@ -630,14 +630,15 @@ driver is an M_PROTO message tagged by a `prim` byte at offset 0
 of the M_PROTO mblk's b_rptr (the SVR4 TPI / DLPI shape).  IP
 recognises:
 
-| Primitive          | Direction       | Carries                                    |
-|--------------------|-----------------|---------------------------------------------|
-| `IP_T_SEND_REQ`    | upper → IP      | `ip_send_meta{dst_ip, proto}` + M_DATA b_cont |
-| `IP_T_BIND_REQ`    | upper → IP      | `ip_bind_meta{proto, key}`                 |
-| `IP_T_BIND_ACK`    | IP → upper      | `ip_bind_meta{proto, key}` (matches request) |
-| `IP_T_BIND_NAK`    | IP → upper      | `ip_bind_meta{proto, key}` (slot full / dup) |
-| `IP_T_UNBIND_REQ`  | upper → IP      | `ip_bind_meta{proto, key}`                 |
-| `IP_T_UNBIND_ACK`  | IP → upper      | `ip_bind_meta{proto, key}`                 |
+| Primitive            | Direction       | Carries                                    |
+|----------------------|-----------------|---------------------------------------------|
+| `IP_T_SEND_REQ`      | upper → IP      | `ip_send_meta{dst_ip, proto}` + M_DATA b_cont |
+| `IP_T_BIND_REQ`      | upper → IP      | `ip_bind_meta{proto, key}`                 |
+| `IP_T_BIND_ACK`      | IP → upper      | `ip_bind_meta{proto, key}` (matches request) |
+| `IP_T_BIND_NAK`      | IP → upper      | `ip_bind_meta{proto, key}` (slot full / dup) |
+| `IP_T_UNBIND_REQ`    | upper → IP      | `ip_bind_meta{proto, key}`                 |
+| `IP_T_UNBIND_ACK`    | IP → upper      | `ip_bind_meta{proto, key}`                 |
+| `IP_T_UNITDATA_IND`  | IP → upper      | `ip_unitdata_ind{proto, src_ip, dst_ip}` + M_DATA b_cont (the demuxed payload after IP-header strip) |
 
 The `key` is a protocol-specific demux discriminator that IP
 itself doesn't interpret -- ICMP leaves it 0 (binding by proto
@@ -747,16 +748,161 @@ encapsulation.
 |-------|-------|---------------------|------------------------------------------|
 | 16    | icmp  | `ip_streamtab` + autopush `"icmp"` module | ICMP raw-echo endpoint     |
 | 18    | udp   | `ip_streamtab` + autopush `"udp"` module  | UDP TPI datagram endpoint  |
+| 19    | tcp   | `ip_streamtab` + autopush `"tcp"` module  | TCP TPI connection endpoint (T1a: bind only) |
+
+### TCP -- planned in phases (currently T1a)
+
+Same architectural shape as UDP: a STREAMS module above IP with a
+TPI user ABI delivered via putmsg/getmsg.  The `key` field of
+`ip_bind_meta` packs `(local_port << 16) | remote_port` so IP's
+exact-match demux delivers a segment straight to the right TCP
+endpoint, no multicast needed once T1b lights up.
+
+TPI primitives (locked in across phases; see
+`include/kappara/net/tcp.h`):
+
+| Phase | Status | Primitives                                                       |
+|-------|--------|------------------------------------------------------------------|
+| T1a   | ✓ done | T_BIND_REQ / T_BIND_ACK / T_BIND_NAK (via IP_T_BIND_REQ)         |
+| T1b   | ✓ done | T_CONN_REQ / T_CONN_CON + 3-way handshake (active + passive)     |
+| T1c   |        | T_DATA_REQ / T_DATA_IND (seq/ack tracking; no retransmit yet)    |
+| T1d   |        | T_CONN_IND / T_CONN_RES (proper LISTEN + accept queue)           |
+| T1e   |        | T_ORDREL_REQ / T_ORDREL_IND (FIN handshake) + T_DISCON_REQ/IND   |
+| T1f   |        | retransmit timer + RTT estimation                                |
+| T1g   |        | cmd/tcptest end-to-end                                           |
+
+T1b currently uses a simplified single-connection listener: a TCB in
+BOUND state accepts the first SYN inline, transitions to
+SYN_RECEIVED, and morphs into the established connection on ACK.
+T1d will split this properly into a LISTEN state with an accept
+queue producing child TCBs per inbound connection.
+
+Critical lo0 detail: state transitions are updated BEFORE the
+synchronous `tcp_send_segment` call, not after.  lo0's tx loops
+back into IP demux on the calling thread's stack, which re-enters
+`tcp_rq_putp` with the response before the calling function has
+returned.  If the state hasn't been updated by then, the recursive
+callback sees stale state and drops the response.  Same shape ICMP
+already had to work around in N2c (icmp_arm_waiter before
+icmp_send_echo).
+
+At T1a unimplemented primitives bounce back with
+`T_DISCON_IND{reason=NOTSUP}` so users get a clear error rather
+than silent drops.  The header is the locked-in ABI; subsequent
+phases only fill in handler bodies.
 
 (Major 15 was a leaf-driver `/dev/lo0` for raw-IP user injection.
 Removed in N2b; the role belongs to a future `/dev/ip` once we
 expose the IP mux to user space.)
 
+### pktfilter -- the composability proof
+
+`pktfilter` is a tiny STREAMS module shipped to demonstrate the
+runtime-modular property the whole N2 rewrite was justified by.  It
+is **not** part of any default stack; users I_PUSH it onto an open
+TPI stream by hand:
+
+```c
+int fd = open("/dev/udp", O_RDWR);
+ioctl(fd, I_PUSH, (long)"pktfilter");
+/* ... configure via PF_T_SET_REQ M_PROTO ... */
+/* ... send + see counters increment ... */
+ioctl(fd, I_POP, 0);
+```
+
+After the push the stack is `head -> pktfilter -> udp -> ip`.
+pktfilter's wput inspects M_PROTO mblks heading down:
+
+- `T_UNITDATA_REQ` is matched against `(enabled, drop_dst_ip,
+  drop_dst_port)`.  Matching messages are freed (counted as
+  `dropped`).  Non-matching pass through to UDP unchanged
+  (counted as `passed`).
+- `PF_T_SET_REQ` / `PF_T_STATS_REQ` are pktfilter's own control
+  primitives -- consumed at the module, replies (`PF_T_SET_ACK`
+  / `PF_T_STATS_RES`) putnext UP to the head.
+- Everything else (`T_BIND_REQ`, `M_DATA`, `M_IOCTL`, ...) is
+  passed through unchanged so the bind/unbind handshake and any
+  other unrelated control traffic still reach UDP.
+
+pktfilter's rput is pure passthrough.  Inbound packets reach UDP
+via IP's demux `put()` directly into UDP's rq, bypassing pktfilter
+entirely -- a deliberate consequence of the multiplexor model.
+Inbound filtering belongs at a different hook point (a future
+`ip_hook_input` or a pktfilter pushed on `ip_ctl_sd` itself).
+
+`cmd/pktfilttest` exercises the full push-configure-drop-pop cycle
+and is the regression test that proves: a third-party STREAMS
+module written long after the stack was built can slot in at
+runtime, observe and modify outbound traffic, expose its own
+control protocol via M_PROTO, and unwind cleanly via I_POP.  That
+property is what justifies the per-packet putnext cost.
+
+### SLIP -- off-host connectivity over the mini-UART
+
+SLIP follows the SVR4 / Solaris `slattach` shape: a STREAMS module
+pushed on top of a raw serial port, and the resulting stream is the
+netif from IP's POV after `I_LINK`.  Three pieces in
+`uts/os/net/slip.c`:
+
+1. `miniuart_streamtab` -- a leaf STREAMS driver on the BCM2837
+   mini-UART hardware (`uts/aarch64/miniuart.c`).  wput emits each
+   M_DATA byte via `miniuart_tx_byte()`; rput is a passthrough that
+   the rx kthread feeds.
+
+2. `slip_streamtab` -- the SLIP framing module:
+   - `wput` accepts an outbound IP packet (M_DATA from IP via I_LINK),
+     byte-stuffs per RFC 1055 (END=0xC0, ESC=0xDB, ESC_END=0xDC,
+     ESC_ESC=0xDD), prefixes and suffixes with END, putnexts down.
+   - `rput` consumes byte-stream M_DATA from the mini-UART driver,
+     runs the unstuffing state machine into a per-instance frame
+     mblk (allocated to MTU=296 at qopen).  On every END byte the
+     accumulated frame is putnext'd up; after I_LINK that delivers
+     into IP's rput.
+
+3. `slip_init()` (called from `main.c` after `ip_init`):
+   - `miniuart_init(115200)`
+   - `stream_build_kernel(&miniuart_streamtab, "slip0_serial", 0)`
+   - `stream_push_kernel(sd, "slip")` -- now `head -> slip -> miniuart`
+   - Spawns the `miniuart_rx` kthread; passes `sd->sd_drv_rq` so
+     each batch of received bytes is `allocb`'d + `putnext`'d up
+     into the SLIP module's rput
+   - `netif_register(slip0)` with `streamtab=NULL` (pre-built)
+   - `ip_attach_stream(sd, &slip0_nif)` -- I_LINK the slip stream
+     under IP's control stream and backfill the netif identity
+
+Default config: slip0 = 192.168.10.2/30, peer = 192.168.10.1,
+MTU = 296.  Once SLIP is up, an outbound packet to anything in
+`192.168.10.0/30` routes through slip0 automatically because IP's
+longest-prefix-match (`ip_route` over `ip_lowers[]`) picks the
+/30 over lo0's /8 for that subnet.
+
+Host-side smoke test on Linux:
+
+```
+qemu-system-aarch64 -M raspi3b -kernel build/aarch64/kernel8.img \
+    -serial mon:stdio -serial pty                       # second pty
+# QEMU prints: char device redirected to /dev/pts/N
+slattach -L -p slip -s 115200 /dev/pts/N &
+ifconfig sl0 192.168.10.1 pointopoint 192.168.10.2 up
+ping 192.168.10.2
+```
+
+`ip_attach_stream(struct stdata *, struct netif *)` is the new
+in-`ipv4.c` helper for drivers that build their own bottom stream
+(SLIP today; future Ethernet / virtio-net likewise).  Returns the
+muxid and backfills the netif's row in `ip_lowers[]`.
+
+UART rx is polled by the dedicated `miniuart_rx` kthread (same
+shape PL011's `uart_rx_main` uses) -- no interrupt handler yet.
+Switching all serial paths to interrupt-driven rx is a separate
+cleanup.
+
 Not yet:
-- A demo pushable filter (`pktfilter`) inserted at a layer boundary
-  to prove composability (N2e)
+- Inbound filter hook (would mirror outbound for the symmetric
+  shape Solaris IPFilter has)
 - TCP transport and `/dev/tcp`
-- SLIP framing on UART2 for off-machine connectivity
+- Interrupt-driven serial rx (replaces both PL011 and mini-UART
+  kthreads with proper IRQ-driven byte delivery)
 - ARP (only needed for Ethernet, not lo0 or SLIP)
 
 ## Signals

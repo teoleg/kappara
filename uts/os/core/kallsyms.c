@@ -3,7 +3,7 @@
  *
  * The symbol table lives in the .kallsyms section, populated by
  * tools/gen_kallsyms.sh after the first link.  Format is documented
- * in include/kappara/kallsyms.h; entries are sorted by address so
+ * in include/kappara/core/kallsyms.h; entries are sorted by address so
  * lookup is a binary search.
  *
  * Backtrace
@@ -19,8 +19,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kappara/kallsyms.h"
-#include "kappara/printk.h"
+#include "kappara/core/kallsyms.h"
+#include "kappara/core/printk.h"
 
 #define KSYM_MAGIC	0x4d59534bu	/* 'KSYM' little-endian */
 

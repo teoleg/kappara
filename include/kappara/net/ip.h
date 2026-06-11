@@ -1,5 +1,5 @@
 /*
- * include/kappara/ip.h -- IPv4 layer
+ * include/kappara/net/ip.h -- IPv4 layer
  *
  * Header format (RFC 791) and the two entry points the rest of the
  * stack uses:
@@ -88,6 +88,7 @@ static inline uint32_t htonl32(uint32_t v)
 #define IP_T_BIND_NAK		4	/* IP -> upper: bind failed            */
 #define IP_T_UNBIND_REQ		5	/* upper -> IP: stop delivering        */
 #define IP_T_UNBIND_ACK		6	/* IP -> upper: unbind succeeded       */
+#define IP_T_UNITDATA_IND	7	/* IP -> upper: packet arrived         */
 
 /* IP_T_SEND_REQ: payload chained as b_cont(M_DATA). */
 struct ip_send_meta {
@@ -108,6 +109,22 @@ struct ip_bind_meta {
 	uint32_t key;
 };
 
+/* IP_T_UNITDATA_IND: prepended by IP's rput onto every demuxed
+ * packet so the upper module sees the source / destination IP that
+ * was in the wire header (which IP has already stripped from the
+ * M_DATA payload chained as b_cont).  Without this header an upper
+ * has no way to know who sent the packet -- the IP header is gone
+ * by the time it reaches the module.  ICMP needs src_ip to know
+ * where to auto-reply; UDP needs it to fill T_UNITDATA_IND for
+ * the user's getmsg. */
+struct ip_unitdata_ind {
+	uint8_t  prim;		/* IP_T_UNITDATA_IND */
+	uint8_t  proto;
+	uint8_t  _pad[2];
+	uint32_t src_ip;	/* host byte order */
+	uint32_t dst_ip;
+};
+
 /* Build M_PROTO{IP_T_SEND_REQ} + M_DATA(payload), putnext into IP.
  * mp's b_rptr..b_wptr is the L4 payload (with IP_HDR_LEN headroom
  * reserved at b_rptr -- IP's wput rewinds to fill the header in
@@ -124,6 +141,20 @@ int  ip_send (uint32_t dst_ip, uint8_t proto, mblk_t *mp);
  * qbot at I_LINK time; this fills in the nif pointer so route lookup
  * can match a destination against the lower's IP/netmask. */
 void ip_lower_register(int muxid, struct netif *nif);
+
+/* Look up the source IP that IP would put on an outbound packet to
+ * `dst_ip` -- i.e., the chosen lower's netif IP.  Used by transport
+ * layers (TCP) to compute pseudo-header checksums before handing
+ * the packet down.  Returns 0 if there is no route. */
+uint32_t ip_route_src(uint32_t dst_ip);
+
+/* Attach a pre-built lower stream as a netif under IP.  Used by SLIP
+ * (and any future driver that opens its own bottom stream rather
+ * than handing IP a streamtab to build from).  stream_ilink's the
+ * given stream under ip_ctl_sd and backfills nif on success.
+ * Returns the muxid (>0) on success, -1 on failure. */
+struct stdata;
+long ip_attach_stream(struct stdata *netif_sd, struct netif *nif);
 
 /* IP driver's streamtab.  Built into one kernel stream at boot for
  * the control plane; each netif's stream gets I_LINKed under it. */

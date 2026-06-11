@@ -1,7 +1,7 @@
 /*
  * kernel/tty.c -- multi-minor TTY (virtual console) driver
  *
- * Phase 3 of the virtual-console roadmap.  See kappara/tty.h for
+ * Phase 3 of the virtual-console roadmap.  See kappara/io/tty.h for
  * the big picture and what's deferred.
  *
  * Stream stack shape (per /dev/ttyN):
@@ -27,16 +27,16 @@
 
 #include <stdint.h>
 
-#include "kappara/cdevsw.h"
-#include "kappara/fbcon.h"
-#include "kappara/kmem.h"
-#include "kappara/printk.h"
-#include "kappara/stream_head.h"
-#include "kappara/streams.h"
-#include "kappara/string.h"
-#include "kappara/tty.h"
-#include "kappara/uart.h"
-#include "kappara/vt.h"
+#include "kappara/io/cdevsw.h"
+#include "kappara/io/fbcon.h"
+#include "kappara/core/kmem.h"
+#include "kappara/core/printk.h"
+#include "kappara/io/stream_head.h"
+#include "kappara/io/streams.h"
+#include "kappara/core/string.h"
+#include "kappara/io/tty.h"
+#include "kappara/arch/uart.h"
+#include "kappara/io/vt.h"
 
 static struct tty_minor tty_minors[NTTY];
 static int              tty_active_minor;
