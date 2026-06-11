@@ -630,14 +630,15 @@ driver is an M_PROTO message tagged by a `prim` byte at offset 0
 of the M_PROTO mblk's b_rptr (the SVR4 TPI / DLPI shape).  IP
 recognises:
 
-| Primitive          | Direction       | Carries                                    |
-|--------------------|-----------------|---------------------------------------------|
-| `IP_T_SEND_REQ`    | upper → IP      | `ip_send_meta{dst_ip, proto}` + M_DATA b_cont |
-| `IP_T_BIND_REQ`    | upper → IP      | `ip_bind_meta{proto, key}`                 |
-| `IP_T_BIND_ACK`    | IP → upper      | `ip_bind_meta{proto, key}` (matches request) |
-| `IP_T_BIND_NAK`    | IP → upper      | `ip_bind_meta{proto, key}` (slot full / dup) |
-| `IP_T_UNBIND_REQ`  | upper → IP      | `ip_bind_meta{proto, key}`                 |
-| `IP_T_UNBIND_ACK`  | IP → upper      | `ip_bind_meta{proto, key}`                 |
+| Primitive            | Direction       | Carries                                    |
+|----------------------|-----------------|---------------------------------------------|
+| `IP_T_SEND_REQ`      | upper → IP      | `ip_send_meta{dst_ip, proto}` + M_DATA b_cont |
+| `IP_T_BIND_REQ`      | upper → IP      | `ip_bind_meta{proto, key}`                 |
+| `IP_T_BIND_ACK`      | IP → upper      | `ip_bind_meta{proto, key}` (matches request) |
+| `IP_T_BIND_NAK`      | IP → upper      | `ip_bind_meta{proto, key}` (slot full / dup) |
+| `IP_T_UNBIND_REQ`    | upper → IP      | `ip_bind_meta{proto, key}`                 |
+| `IP_T_UNBIND_ACK`    | IP → upper      | `ip_bind_meta{proto, key}`                 |
+| `IP_T_UNITDATA_IND`  | IP → upper      | `ip_unitdata_ind{proto, src_ip, dst_ip}` + M_DATA b_cont (the demuxed payload after IP-header strip) |
 
 The `key` is a protocol-specific demux discriminator that IP
 itself doesn't interpret -- ICMP leaves it 0 (binding by proto

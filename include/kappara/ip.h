@@ -88,6 +88,7 @@ static inline uint32_t htonl32(uint32_t v)
 #define IP_T_BIND_NAK		4	/* IP -> upper: bind failed            */
 #define IP_T_UNBIND_REQ		5	/* upper -> IP: stop delivering        */
 #define IP_T_UNBIND_ACK		6	/* IP -> upper: unbind succeeded       */
+#define IP_T_UNITDATA_IND	7	/* IP -> upper: packet arrived         */
 
 /* IP_T_SEND_REQ: payload chained as b_cont(M_DATA). */
 struct ip_send_meta {
@@ -106,6 +107,22 @@ struct ip_bind_meta {
 	uint8_t  proto;
 	uint8_t  _pad[2];
 	uint32_t key;
+};
+
+/* IP_T_UNITDATA_IND: prepended by IP's rput onto every demuxed
+ * packet so the upper module sees the source / destination IP that
+ * was in the wire header (which IP has already stripped from the
+ * M_DATA payload chained as b_cont).  Without this header an upper
+ * has no way to know who sent the packet -- the IP header is gone
+ * by the time it reaches the module.  ICMP needs src_ip to know
+ * where to auto-reply; UDP needs it to fill T_UNITDATA_IND for
+ * the user's getmsg. */
+struct ip_unitdata_ind {
+	uint8_t  prim;		/* IP_T_UNITDATA_IND */
+	uint8_t  proto;
+	uint8_t  _pad[2];
+	uint32_t src_ip;	/* host byte order */
+	uint32_t dst_ip;
 };
 
 /* Build M_PROTO{IP_T_SEND_REQ} + M_DATA(payload), putnext into IP.

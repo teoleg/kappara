@@ -225,26 +225,50 @@ static int icmp_rq_putp(queue_t *q, mblk_t *mp)
 		return -1;
 	}
 
-	/* IP bind reply path. */
-	if (mp->b_datap->db_type == M_PROTO) {
+	/* M_PROTO is either an IP bind handshake reply (IP_T_BIND_ACK,
+	 * IP_T_BIND_NAK, IP_T_UNBIND_ACK) or IP_T_UNITDATA_IND (inbound
+	 * demuxed packet header carrying src_ip + dst_ip with the M_DATA
+	 * payload chained as b_cont).  Same first-byte tagged-union
+	 * dispatch the rest of the stack uses. */
+	if (mp->b_datap->db_type != M_PROTO) {
+		freemsg(mp);
+		return 0;
+	}
+	if ((mp->b_wptr - mp->b_rptr) < 1) {
+		freemsg(mp);
+		return 0;
+	}
+	uint8_t prim = mp->b_rptr[0];
+
+	if (prim == IP_T_BIND_ACK || prim == IP_T_BIND_NAK
+	 || prim == IP_T_UNBIND_ACK) {
 		icmp_handle_ack_nak(s, mp);
 		return 0;
 	}
 
-	if (mp->b_datap->db_type != M_DATA) {
+	if (prim != IP_T_UNITDATA_IND
+	    || (mp->b_wptr - mp->b_rptr)
+	       < (int)sizeof(struct ip_unitdata_ind)
+	    || !mp->b_cont) {
 		freemsg(mp);
 		return 0;
 	}
 
-	/* Demuxed proto=1 packet from IP.  Validate ICMP header. */
-	unsigned len = (unsigned)(mp->b_wptr - mp->b_rptr);
+	struct ip_unitdata_ind *ind = (struct ip_unitdata_ind *)mp->b_rptr;
+	uint32_t src_ip = ind->src_ip;
+	mblk_t *body = mp->b_cont;
+	mp->b_cont = NULL;
+	freeb(mp);	/* free just the M_PROTO header; body retained */
+
+	/* Validate ICMP header. */
+	unsigned len = (unsigned)(body->b_wptr - body->b_rptr);
 	if (len < ICMP_HDR_LEN) {
-		freemsg(mp);
+		freemsg(body);
 		return 0;
 	}
-	struct icmp_hdr *h = (struct icmp_hdr *)mp->b_rptr;
+	struct icmp_hdr *h = (struct icmp_hdr *)body->b_rptr;
 	if (ip_checksum(h, len) != 0) {
-		freemsg(mp);
+		freemsg(body);
 		return 0;
 	}
 
@@ -253,37 +277,25 @@ static int icmp_rq_putp(queue_t *q, mblk_t *mp)
 
 	/* Per-instance id filter: drop anything not addressed to us. */
 	if (pkt_id != s->icmp_id) {
-		freemsg(mp);
+		freemsg(body);
 		return 0;
 	}
 
 	if (h->type == ICMP_TYPE_ECHO_REQUEST) {
-		/* Auto-reply.  Flip type, recompute checksum, send down
-		 * through this same stream via WR(q). */
+		/* Auto-reply.  Flip type, recompute checksum, send back
+		 * to the original source carried in the IND. */
 		h->type     = ICMP_TYPE_ECHO_REPLY;
 		h->checksum = 0;
 		uint16_t cs = ip_checksum(h, len);
 		h->checksum = htons16(cs);
-		/* Reply goes back to the original source -- our own IP
-		 * for the loopback case.  We don't have the IP header
-		 * anymore (IP stripped it), so we use the netif-routing
-		 * trick: send to 127.0.0.1 in the loopback case.  For
-		 * real off-host requests, IP would need to carry src in
-		 * the M_PROTO header it hands up.  Phase N2c keeps the
-		 * loopback case; cross-machine requires the upgrade.
-		 *
-		 * Workaround for now: stash the src in a static via the
-		 * IP M_PROTO indication mblk... not done.  Re-use lo0
-		 * loopback by sending to 127.0.0.1.  TODO before SLIP
-		 * lands: add IP_T_UNITDATA_IND with (src_ip) field. */
-		(void)icmp_send_to_ip(WR(q), 0x7f000001u, mp);
+		(void)icmp_send_to_ip(WR(q), src_ip, body);
 		return 0;
 	}
 
 	if (h->type == ICMP_TYPE_ECHO_REPLY) {
 		if (s->ping_armed && s->ping_seq == pkt_seq) {
 			s->ping_armed  = 0;
-			s->ping_src_ip = 0x7f000001u;	/* TODO: from IND */
+			s->ping_src_ip = src_ip;
 
 			/* Deliver the formatted reply UP to the stream
 			 * head so the user's read() sees it. */
@@ -298,11 +310,11 @@ static int icmp_rq_putp(queue_t *q, mblk_t *mp)
 				putnext(q, rmp);
 			}
 		}
-		freemsg(mp);
+		freemsg(body);
 		return 0;
 	}
 
-	freemsg(mp);
+	freemsg(body);
 	return 0;
 }
 

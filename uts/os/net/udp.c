@@ -308,45 +308,59 @@ static int udp_rq_putp(queue_t *q, mblk_t *mp)
 		return -1;
 	}
 
-	/* IP bind / unbind acks. */
-	if (mp->b_datap->db_type == M_PROTO) {
+	/* Everything from IP is M_PROTO -- either bind/unbind ack
+	 * (handshake) or IP_T_UNITDATA_IND (inbound packet header +
+	 * M_DATA payload chained as b_cont).  First byte selects. */
+	if (mp->b_datap->db_type != M_PROTO) {
+		freemsg(mp);
+		return 0;
+	}
+	if ((mp->b_wptr - mp->b_rptr) < 1) {
+		freemsg(mp);
+		return 0;
+	}
+	uint8_t prim = mp->b_rptr[0];
+
+	if (prim == IP_T_BIND_ACK || prim == IP_T_BIND_NAK
+	 || prim == IP_T_UNBIND_ACK) {
 		handle_ip_ack(q, s, mp);
 		return 0;
 	}
 
-	if (mp->b_datap->db_type != M_DATA) {
+	if (prim != IP_T_UNITDATA_IND
+	    || (mp->b_wptr - mp->b_rptr)
+	       < (int)sizeof(struct ip_unitdata_ind)
+	    || !mp->b_cont) {
 		freemsg(mp);
 		return 0;
 	}
 
-	/* Incoming UDP packet -- IP header already stripped.  Parse the
-	 * UDP header, filter by dst_port, deliver upward as
-	 * T_UNITDATA_IND.  The packet's IP header is gone so we don't
-	 * know the source IP here yet -- IP needs to carry it upward in
-	 * an M_PROTO header for full correctness.  N2c carries the same
-	 * TODO; for the loopback selftest the src is also us. */
-	unsigned len = (unsigned)(mp->b_wptr - mp->b_rptr);
+	struct ip_unitdata_ind *ind = (struct ip_unitdata_ind *)mp->b_rptr;
+	uint32_t src_ip = ind->src_ip;
+	mblk_t *body = mp->b_cont;
+	mp->b_cont = NULL;
+	freeb(mp);	/* free just the M_PROTO header */
+
+	unsigned len = (unsigned)(body->b_wptr - body->b_rptr);
 	if (len < UDP_HDR_LEN) {
-		freemsg(mp);
+		freemsg(body);
 		return 0;
 	}
-	struct udp_hdr *h = (struct udp_hdr *)mp->b_rptr;
+	struct udp_hdr *h = (struct udp_hdr *)body->b_rptr;
 	uint16_t sport = ntohs16(h->src_port);
 	uint16_t dport = ntohs16(h->dst_port);
 	uint16_t ulen  = ntohs16(h->len);
 	if (ulen > len || ulen < UDP_HDR_LEN) {
-		freemsg(mp);
+		freemsg(body);
 		return 0;
 	}
 	if (dport != s->local_port) {
-		freemsg(mp);
+		freemsg(body);
 		return 0;
 	}
 
-	mp->b_rptr += UDP_HDR_LEN;
-	/* TODO: pass IP src up through ip_uppers' upward M_PROTO; using
-	 * loopback addr here for now. */
-	deliver_unitdata_ind(q, 0x7f000001u, sport, mp);
+	body->b_rptr += UDP_HDR_LEN;
+	deliver_unitdata_ind(q, src_ip, sport, body);
 	return 0;
 }
 
