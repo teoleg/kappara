@@ -124,6 +124,15 @@ void ip_lower_register(int muxid, struct netif *nif)
 	kprintf("ip: lower_register muxid=%d not found\n", muxid);
 }
 
+long ip_attach_stream(struct stdata *netif_sd, struct netif *nif)
+{
+	if (!ip_ctl_sd || !netif_sd || !nif) return -1;
+	long muxid = stream_ilink(ip_ctl_sd, netif_sd);
+	if (muxid <= 0) return -1;
+	ip_lower_register((int)muxid, nif);
+	return muxid;
+}
+
 /* ---- Bind table management ---------------------------------------- */
 
 static int ip_bind(uint8_t proto, uint32_t key, queue_t *upper_rq)

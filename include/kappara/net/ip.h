@@ -142,6 +142,14 @@ int  ip_send (uint32_t dst_ip, uint8_t proto, mblk_t *mp);
  * can match a destination against the lower's IP/netmask. */
 void ip_lower_register(int muxid, struct netif *nif);
 
+/* Attach a pre-built lower stream as a netif under IP.  Used by SLIP
+ * (and any future driver that opens its own bottom stream rather
+ * than handing IP a streamtab to build from).  stream_ilink's the
+ * given stream under ip_ctl_sd and backfills nif on success.
+ * Returns the muxid (>0) on success, -1 on failure. */
+struct stdata;
+long ip_attach_stream(struct stdata *netif_sd, struct netif *nif);
+
 /* IP driver's streamtab.  Built into one kernel stream at boot for
  * the control plane; each netif's stream gets I_LINKed under it. */
 extern struct streamtab ip_streamtab;

@@ -54,6 +54,7 @@
 #include "kappara/net/icmp.h"
 #include "kappara/net/ip.h"
 #include "kappara/net/pktfilter.h"
+#include "kappara/net/slip.h"
 #include "kappara/net/udp.h"
 #include "kappara/core/printk.h"
 #include "kappara/proc/sched.h"
@@ -1905,6 +1906,10 @@ void streams_head_init(void)
 	 * autopush.  Users opt in by issuing ioctl(fd, I_PUSH,
 	 * "pktfilter") on an open /dev/udp (or any TPI stream). */
 	pktfilter_module_init();
+	/* slip is the framing layer that bridges the mini-UART byte
+	 * stream to IP.  slip_init (in main.c, after ip_init) builds
+	 * the actual stream and I_LINKs it under IP. */
+	slip_module_init();
 	vfs_mknod_chrdev(dev, "icmp", MKDEV(CDEV_MAJ_ICMP,  0));
 	vfs_mknod_chrdev(dev, "udp",  MKDEV(CDEV_MAJ_UDP,   0));
 

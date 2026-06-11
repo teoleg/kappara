@@ -92,7 +92,7 @@ int main(int argc, char **argv)
 	}
 
 	uint32_t s = dst;
-	printf("PING %u.%u.%u.%u via lo0\n",
+	printf("PING %u.%u.%u.%u\n",
 	       (s >> 24) & 0xff, (s >> 16) & 0xff,
 	       (s >>  8) & 0xff,  s        & 0xff);
 

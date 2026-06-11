@@ -48,6 +48,7 @@
 #include "kappara/io/tty.h"
 #include "kappara/io/vt.h"
 #include "kappara/net/ip.h"
+#include "kappara/net/slip.h"
 #include "kappara/net/udp.h"
 #include "kappara/proc/process.h"
 #include "kappara/proc/sched.h"
@@ -472,6 +473,9 @@ void kmain(void)
 		kprintf("udp: SELFTEST FAIL\n");
 	else
 		kprintf("udp: selftest PASS\n");
+	/* Bring up SLIP on the mini-UART after IP is ready -- slip_init
+	 * needs ip_attach_stream to I_LINK the slip0 stream underneath. */
+	slip_init();
 	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ on core 0 */
 
 	/* Smoke-test the kallsyms table by walking our own frame chain

@@ -795,11 +795,72 @@ runtime, observe and modify outbound traffic, expose its own
 control protocol via M_PROTO, and unwind cleanly via I_POP.  That
 property is what justifies the per-packet putnext cost.
 
+### SLIP -- off-host connectivity over the mini-UART
+
+SLIP follows the SVR4 / Solaris `slattach` shape: a STREAMS module
+pushed on top of a raw serial port, and the resulting stream is the
+netif from IP's POV after `I_LINK`.  Three pieces in
+`uts/os/net/slip.c`:
+
+1. `miniuart_streamtab` -- a leaf STREAMS driver on the BCM2837
+   mini-UART hardware (`uts/aarch64/miniuart.c`).  wput emits each
+   M_DATA byte via `miniuart_tx_byte()`; rput is a passthrough that
+   the rx kthread feeds.
+
+2. `slip_streamtab` -- the SLIP framing module:
+   - `wput` accepts an outbound IP packet (M_DATA from IP via I_LINK),
+     byte-stuffs per RFC 1055 (END=0xC0, ESC=0xDB, ESC_END=0xDC,
+     ESC_ESC=0xDD), prefixes and suffixes with END, putnexts down.
+   - `rput` consumes byte-stream M_DATA from the mini-UART driver,
+     runs the unstuffing state machine into a per-instance frame
+     mblk (allocated to MTU=296 at qopen).  On every END byte the
+     accumulated frame is putnext'd up; after I_LINK that delivers
+     into IP's rput.
+
+3. `slip_init()` (called from `main.c` after `ip_init`):
+   - `miniuart_init(115200)`
+   - `stream_build_kernel(&miniuart_streamtab, "slip0_serial", 0)`
+   - `stream_push_kernel(sd, "slip")` -- now `head -> slip -> miniuart`
+   - Spawns the `miniuart_rx` kthread; passes `sd->sd_drv_rq` so
+     each batch of received bytes is `allocb`'d + `putnext`'d up
+     into the SLIP module's rput
+   - `netif_register(slip0)` with `streamtab=NULL` (pre-built)
+   - `ip_attach_stream(sd, &slip0_nif)` -- I_LINK the slip stream
+     under IP's control stream and backfill the netif identity
+
+Default config: slip0 = 192.168.10.2/30, peer = 192.168.10.1,
+MTU = 296.  Once SLIP is up, an outbound packet to anything in
+`192.168.10.0/30` routes through slip0 automatically because IP's
+longest-prefix-match (`ip_route` over `ip_lowers[]`) picks the
+/30 over lo0's /8 for that subnet.
+
+Host-side smoke test on Linux:
+
+```
+qemu-system-aarch64 -M raspi3b -kernel build/aarch64/kernel8.img \
+    -serial mon:stdio -serial pty                       # second pty
+# QEMU prints: char device redirected to /dev/pts/N
+slattach -L -p slip -s 115200 /dev/pts/N &
+ifconfig sl0 192.168.10.1 pointopoint 192.168.10.2 up
+ping 192.168.10.2
+```
+
+`ip_attach_stream(struct stdata *, struct netif *)` is the new
+in-`ipv4.c` helper for drivers that build their own bottom stream
+(SLIP today; future Ethernet / virtio-net likewise).  Returns the
+muxid and backfills the netif's row in `ip_lowers[]`.
+
+UART rx is polled by the dedicated `miniuart_rx` kthread (same
+shape PL011's `uart_rx_main` uses) -- no interrupt handler yet.
+Switching all serial paths to interrupt-driven rx is a separate
+cleanup.
+
 Not yet:
 - Inbound filter hook (would mirror outbound for the symmetric
   shape Solaris IPFilter has)
 - TCP transport and `/dev/tcp`
-- SLIP framing on UART2 for off-machine connectivity
+- Interrupt-driven serial rx (replaces both PL011 and mini-UART
+  kthreads with proper IRQ-driven byte delivery)
 - ARP (only needed for Ethernet, not lo0 or SLIP)
 
 ## Signals

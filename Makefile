@@ -8,6 +8,7 @@ ifeq ($(ARCH),aarch64)
     ARCH_OBJS     := \
         $(BUILD)/uts/aarch64/boot.o \
         $(BUILD)/uts/aarch64/uart.o \
+        $(BUILD)/uts/aarch64/miniuart.o \
         $(BUILD)/uts/aarch64/vectors.o \
         $(BUILD)/uts/aarch64/trap.o \
         $(BUILD)/uts/aarch64/mmu.o \
@@ -58,6 +59,7 @@ ifeq ($(ARCH),aarch64)
         $(BUILD)/uts/os/net/icmp.o \
         $(BUILD)/uts/os/net/udp.o \
         $(BUILD)/uts/os/net/pktfilter.o \
+        $(BUILD)/uts/os/net/slip.o \
         $(BUILD)/uts/os/net/lo.o \
         $(BUILD)/uts/os/user/user.o \
         $(BUILD)/uts/os/main.o
