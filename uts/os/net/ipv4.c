@@ -124,6 +124,12 @@ void ip_lower_register(int muxid, struct netif *nif)
 	kprintf("ip: lower_register muxid=%d not found\n", muxid);
 }
 
+uint32_t ip_route_src(uint32_t dst_ip)
+{
+	struct ip_lower *l = ip_route(dst_ip);
+	return (l && l->nif) ? l->nif->ip : 0;
+}
+
 long ip_attach_stream(struct stdata *netif_sd, struct netif *nif)
 {
 	if (!ip_ctl_sd || !netif_sd || !nif) return -1;

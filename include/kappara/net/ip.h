@@ -142,6 +142,12 @@ int  ip_send (uint32_t dst_ip, uint8_t proto, mblk_t *mp);
  * can match a destination against the lower's IP/netmask. */
 void ip_lower_register(int muxid, struct netif *nif);
 
+/* Look up the source IP that IP would put on an outbound packet to
+ * `dst_ip` -- i.e., the chosen lower's netif IP.  Used by transport
+ * layers (TCP) to compute pseudo-header checksums before handing
+ * the packet down.  Returns 0 if there is no route. */
+uint32_t ip_route_src(uint32_t dst_ip);
+
 /* Attach a pre-built lower stream as a netif under IP.  Used by SLIP
  * (and any future driver that opens its own bottom stream rather
  * than handing IP a streamtab to build from).  stream_ilink's the

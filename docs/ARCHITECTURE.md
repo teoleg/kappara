@@ -761,15 +761,30 @@ endpoint, no multicast needed once T1b lights up.
 TPI primitives (locked in across phases; see
 `include/kappara/net/tcp.h`):
 
-| Phase | Primitives                                                       |
-|-------|------------------------------------------------------------------|
-| T1a   | T_BIND_REQ / T_BIND_ACK / T_BIND_NAK (via IP_T_BIND_REQ)         |
-| T1b   | T_CONN_REQ / T_CONN_CON (active open: SYN, SYN-ACK, ACK)         |
-| T1c   | T_DATA_REQ / T_DATA_IND (seq/ack tracking; no retransmit yet)    |
-| T1d   | T_CONN_IND / T_CONN_RES (passive open + accept queue)            |
-| T1e   | T_ORDREL_REQ / T_ORDREL_IND (FIN handshake) + T_DISCON_REQ/IND   |
-| T1f   | retransmit timer + RTT estimation                                |
-| T1g   | cmd/tcptest end-to-end                                           |
+| Phase | Status | Primitives                                                       |
+|-------|--------|------------------------------------------------------------------|
+| T1a   | ✓ done | T_BIND_REQ / T_BIND_ACK / T_BIND_NAK (via IP_T_BIND_REQ)         |
+| T1b   | ✓ done | T_CONN_REQ / T_CONN_CON + 3-way handshake (active + passive)     |
+| T1c   |        | T_DATA_REQ / T_DATA_IND (seq/ack tracking; no retransmit yet)    |
+| T1d   |        | T_CONN_IND / T_CONN_RES (proper LISTEN + accept queue)           |
+| T1e   |        | T_ORDREL_REQ / T_ORDREL_IND (FIN handshake) + T_DISCON_REQ/IND   |
+| T1f   |        | retransmit timer + RTT estimation                                |
+| T1g   |        | cmd/tcptest end-to-end                                           |
+
+T1b currently uses a simplified single-connection listener: a TCB in
+BOUND state accepts the first SYN inline, transitions to
+SYN_RECEIVED, and morphs into the established connection on ACK.
+T1d will split this properly into a LISTEN state with an accept
+queue producing child TCBs per inbound connection.
+
+Critical lo0 detail: state transitions are updated BEFORE the
+synchronous `tcp_send_segment` call, not after.  lo0's tx loops
+back into IP demux on the calling thread's stack, which re-enters
+`tcp_rq_putp` with the response before the calling function has
+returned.  If the state hasn't been updated by then, the recursive
+callback sees stale state and drops the response.  Same shape ICMP
+already had to work around in N2c (icmp_arm_waiter before
+icmp_send_echo).
 
 At T1a unimplemented primitives bounce back with
 `T_DISCON_IND{reason=NOTSUP}` so users get a clear error rather
