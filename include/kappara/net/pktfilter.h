@@ -1,5 +1,5 @@
 /*
- * include/kappara/pktfilter.h -- demo pushable STREAMS filter
+ * include/kappara/net/pktfilter.h -- demo pushable STREAMS filter
  *
  * pktfilter is the proof-of-composability piece for the N2 network
  * stack rewrite: a STREAMS module that can be I_PUSHed onto an open

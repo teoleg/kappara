@@ -48,14 +48,14 @@
 #include <stdint.h>
 
 #include "kappara/cdevsw.h"
-#include "kappara/ip.h"
 #include "kappara/kmem.h"
+#include "kappara/net/ip.h"
+#include "kappara/net/udp.h"
 #include "kappara/printk.h"
 #include "kappara/sched.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
 #include "kappara/string.h"
-#include "kappara/udp.h"
 
 /* ---- Per-instance state ------------------------------------------- */
 

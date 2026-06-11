@@ -1,5 +1,5 @@
 /*
- * include/kappara/icmp.h -- ICMP as a STREAMS module above IP
+ * include/kappara/net/icmp.h -- ICMP as a STREAMS module above IP
  *
  * After the N2c rewrite ICMP is a STREAMS module (not a driver):
  * /dev/icmp opens an IP-driver stream and stream_open auto-pushes

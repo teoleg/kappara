@@ -12,7 +12,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
-#include "kappara/icmp.h"
+#include "kappara/net/icmp.h"
 
 /* Parse "a.b.c.d" into host-byte-order uint32_t.
  * Returns 0 on success, -1 on bad input. */

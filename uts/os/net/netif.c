@@ -14,7 +14,7 @@
 
 #include <stdint.h>
 
-#include "kappara/netif.h"
+#include "kappara/net/netif.h"
 #include "kappara/printk.h"
 
 static struct netif *netif_list;

@@ -26,8 +26,8 @@
 #include <stropts.h>
 #include <string.h>
 #include <unistd.h>
-#include "kappara/pktfilter.h"
-#include "kappara/udp.h"
+#include "kappara/net/pktfilter.h"
+#include "kappara/net/udp.h"
 
 static int bind_port(int fd, uint16_t port)
 {

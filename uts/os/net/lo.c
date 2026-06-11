@@ -22,8 +22,8 @@
 
 #include <stdint.h>
 
-#include "kappara/ip.h"
-#include "kappara/netif.h"
+#include "kappara/net/ip.h"
+#include "kappara/net/netif.h"
 #include "kappara/printk.h"
 #include "kappara/streams.h"
 

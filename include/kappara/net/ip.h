@@ -1,5 +1,5 @@
 /*
- * include/kappara/ip.h -- IPv4 layer
+ * include/kappara/net/ip.h -- IPv4 layer
  *
  * Header format (RFC 791) and the two entry points the rest of the
  * stack uses:

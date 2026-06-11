@@ -49,11 +49,12 @@
 
 #include "kappara/cdevsw.h"
 #include "kappara/fbcon.h"
-#include "kappara/icmp.h"
-#include "kappara/ip.h"
 #include "kappara/klog.h"
 #include "kappara/kmem.h"
-#include "kappara/pktfilter.h"
+#include "kappara/net/icmp.h"
+#include "kappara/net/ip.h"
+#include "kappara/net/pktfilter.h"
+#include "kappara/net/udp.h"
 #include "kappara/printk.h"
 #include "kappara/sched.h"
 #include "kappara/signal.h"
@@ -64,7 +65,6 @@
 #include "kappara/tty.h"
 #include "kappara/uaccess.h"
 #include "kappara/uart.h"
-#include "kappara/udp.h"
 #include "kappara/vfs.h"
 
 /* Forward-declared in streams.h. */

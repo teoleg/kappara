@@ -1,7 +1,7 @@
 /*
  * uts/os/net/pktfilter.c -- demo pushable STREAMS filter module.
  *
- * See include/kappara/pktfilter.h for the full layering picture.
+ * See include/kappara/net/pktfilter.h for the full layering picture.
  * In short: I_PUSH "pktfilter" inserts this module between the
  * stream head and whatever's below; wput inspects M_PROTO traffic
  * heading down, drops T_UNITDATA_REQ packets that match a runtime-
@@ -16,12 +16,12 @@
 #include <stdint.h>
 
 #include "kappara/kmem.h"
-#include "kappara/pktfilter.h"
+#include "kappara/net/pktfilter.h"
+#include "kappara/net/udp.h"		/* T_UNITDATA_REQ + struct t_unitdata_req */
 #include "kappara/printk.h"
 #include "kappara/stream_head.h"
 #include "kappara/streams.h"
 #include "kappara/string.h"
-#include "kappara/udp.h"		/* T_UNITDATA_REQ + struct t_unitdata_req */
 
 struct pf_state {
 	int        enabled;

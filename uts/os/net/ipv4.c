@@ -43,9 +43,9 @@
 
 #include <stdint.h>
 
-#include "kappara/ip.h"
 #include "kappara/kmem.h"
-#include "kappara/netif.h"
+#include "kappara/net/ip.h"
+#include "kappara/net/netif.h"
 #include "kappara/printk.h"
 #include "kappara/sched.h"
 #include "kappara/stream_head.h"

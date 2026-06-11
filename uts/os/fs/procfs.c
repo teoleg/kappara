@@ -30,7 +30,7 @@
 #include "kappara/cdevsw.h"
 #include "kappara/ftrace.h"
 #include "kappara/kmem.h"
-#include "kappara/netif.h"
+#include "kappara/net/netif.h"
 #include "kappara/pmm.h"
 #include "kappara/printk.h"
 #include "kappara/proc.h"
