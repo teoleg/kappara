@@ -765,7 +765,7 @@ TPI primitives (locked in across phases; see
 |-------|--------|------------------------------------------------------------------|
 | T1a   | ✓ done | T_BIND_REQ / T_BIND_ACK / T_BIND_NAK (via IP_T_BIND_REQ)         |
 | T1b   | ✓ done | T_CONN_REQ / T_CONN_CON + 3-way handshake (active + passive)     |
-| T1c   |        | T_DATA_REQ / T_DATA_IND (seq/ack tracking; no retransmit yet)    |
+| T1c   | ✓ done | T_DATA_REQ / T_DATA_IND (in-order seq/ack; no retransmit yet)    |
 | T1d   |        | T_CONN_IND / T_CONN_RES (proper LISTEN + accept queue)           |
 | T1e   |        | T_ORDREL_REQ / T_ORDREL_IND (FIN handshake) + T_DISCON_REQ/IND   |
 | T1f   |        | retransmit timer + RTT estimation                                |

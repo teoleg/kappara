@@ -11,8 +11,15 @@
  *            and morphs into the established connection on first
  *            SYN.  T1d will split LISTEN from accepted connections
  *            via a proper accept queue.
+ * Phase T1c: data send/recv (T_TCP_DATA_REQ / _IND) with in-order
+ *            sequence/ack tracking.  Out-of-order segments are
+ *            dropped; T1f's reorder buffer + retransmit lights up
+ *            once a peer that actually drops things is in scope.
+ *            Every received segment is ACK'd inline (no delayed
+ *            ACK); the piggyback path is exercised when both sides
+ *            send data simultaneously.
  *
- * Inbound segment flow (T1b):
+ * Inbound segment flow:
  *   ip_demux -> tcp_rq_putp (one M_PROTO+M_DATA per fanout)
  *     filter: dst_port == s->local_port  (otherwise drop)
  *     dispatch by s->state:
@@ -20,11 +27,15 @@
  *       BOUND        + SYN      -> learn (remote_ip,port), send SYN+ACK,
  *                                  SYN_RECEIVED
  *       SYN_RECEIVED + ACK      -> ESTABLISHED, T_CONN_CON
- *       ESTABLISHED  + DATA/ACK -> drop (T1c implements data)
+ *       ESTABLISHED  + ACK      -> advance snd_una if seg_ack newer
+ *       ESTABLISHED  + data     -> if seg_seq==rcv_nxt and remote
+ *                                  matches: copy bytes, advance
+ *                                  rcv_nxt, send ACK, T_DATA_IND up
  *
- * The bind table key is (local_port << 16) | remote_port.  T1a/T1b
- * use rport=0; T1c will start refining the key for connected
- * sockets so IP demux delivers segments precisely.
+ * The bind table key is (local_port << 16) | remote_port.  T1a/T1b/T1c
+ * use rport=0; T1d's accept queue lets us refine the key for connected
+ * sockets so IP demux delivers segments precisely instead of
+ * multicasting to every TCP endpoint that has to filter at its rput.
  *
  * Per-flow checksums use the standard TCP/UDP pseudo-header
  * (src_ip, dst_ip, 0, proto, tcp_len) prepended to the segment.
@@ -223,12 +234,45 @@ static void reply_conn_con(queue_t *rq, uint32_t dst_ip, uint16_t dst_port)
 	putnext(rq, mp);
 }
 
-/* ---- Segment send (no data; T1c will add a body parameter) ------ */
-
-static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags)
+/* Build T_DATA_IND M_PROTO + M_DATA(payload) and deliver UP to the
+ * stream head so the user's getmsg can return both. */
+static void reply_data_ind(queue_t *rq, mblk_t *payload)
 {
+	mblk_t *ind = allocb(sizeof(struct t_tcp_data_ind), 0);
+	if (!ind) {
+		freemsg(payload);
+		return;
+	}
+	ind->b_datap->db_type = M_PROTO;
+	struct t_tcp_data_ind *d = (struct t_tcp_data_ind *)ind->b_wptr;
+	d->prim    = T_TCP_DATA_IND;
+	d->_pad[0] = d->_pad[1] = d->_pad[2] = 0;
+	ind->b_wptr += sizeof(*d);
+	ind->b_cont  = payload;
+	putnext(rq, ind);
+}
+
+/* ---- Segment send ------------------------------------------------ */
+/*
+ * Build a TCP segment (header + optional payload), wrap in M_DATA
+ * with IP headroom reserved, and hand off to ip_send.  Payload, if
+ * any, is taken from `payload` -- we walk its b_cont chain copying
+ * bytes into the contiguous segment buffer (good enough at our
+ * scale; zero-copy chains would need ip_wput to handle them).
+ * Caller relinquishes ownership of `payload`.
+ *
+ * SYN and FIN each consume one sequence-number slot (RFC 793 3.2);
+ * data consumes its byte count.  All three advance snd_nxt before
+ * the segment goes out so the loopback recursion observes the
+ * post-send state.
+ */
+static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags,
+                            mblk_t *payload)
+{
+	unsigned plen = payload ? (unsigned)msgdsize(payload) : 0;
 	uint32_t src_ip = ip_route_src(s->remote_ip);
 	if (src_ip == 0) {
+		if (payload) freemsg(payload);
 		kprintf("tcp: no route to %u.%u.%u.%u\n",
 			(s->remote_ip >> 24) & 0xff,
 			(s->remote_ip >> 16) & 0xff,
@@ -237,8 +281,11 @@ static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags)
 		return -1;
 	}
 
-	mblk_t *mp = allocb(IP_HDR_LEN + TCP_HDR_LEN_MIN, 0);
-	if (!mp) return -1;
+	mblk_t *mp = allocb(IP_HDR_LEN + TCP_HDR_LEN_MIN + plen, 0);
+	if (!mp) {
+		if (payload) freemsg(payload);
+		return -1;
+	}
 	mp->b_rptr += IP_HDR_LEN;
 	mp->b_wptr  = mp->b_rptr;
 
@@ -249,17 +296,28 @@ static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags)
 	h->ack      = htonl32(s->rcv_nxt);
 	h->data_off = (TCP_HDR_LEN_MIN / 4) << 4;
 	h->flags    = flags;
-	h->window   = htons16(8192);	/* fixed; T1f adds dynamic window */
+	h->window   = htons16(8192);
 	h->checksum = 0;
 	h->urg_ptr  = 0;
 	mp->b_wptr += TCP_HDR_LEN_MIN;
 
-	uint16_t cs = tcp_checksum(src_ip, s->remote_ip, h, TCP_HDR_LEN_MIN);
+	if (payload) {
+		for (mblk_t *m = payload; m; m = m->b_cont) {
+			unsigned n = (unsigned)(m->b_wptr - m->b_rptr);
+			if (n == 0) continue;
+			kmemcpy(mp->b_wptr, m->b_rptr, n);
+			mp->b_wptr += n;
+		}
+		freemsg(payload);
+	}
+
+	unsigned seg_len = TCP_HDR_LEN_MIN + plen;
+	uint16_t cs = tcp_checksum(src_ip, s->remote_ip, h, seg_len);
 	h->checksum = htons16(cs);
 
-	/* SYN and FIN each consume one sequence-number slot. */
 	if (flags & TCP_FLAG_SYN) s->snd_nxt += 1;
 	if (flags & TCP_FLAG_FIN) s->snd_nxt += 1;
+	s->snd_nxt += plen;
 
 	return ip_send(s->remote_ip, IPPROTO_TCP, mp);
 }
@@ -330,7 +388,7 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 			s->rcv_nxt = seg_seq + 1;
 			s->snd_una = seg_ack;
 			s->state   = TCPS_ESTABLISHED;
-			(void)tcp_send_segment(s, TCP_FLAG_ACK);
+			(void)tcp_send_segment(s, TCP_FLAG_ACK, NULL);
 			reply_conn_con(q, src_ip, sport);
 		}
 		break;
@@ -348,7 +406,7 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 			s->rcv_nxt     = seg_seq + 1;
 			s->state       = TCPS_SYN_RECEIVED;
 			(void)tcp_send_segment(s,
-			        TCP_FLAG_SYN | TCP_FLAG_ACK);
+			        TCP_FLAG_SYN | TCP_FLAG_ACK, NULL);
 		}
 		break;
 
@@ -364,9 +422,42 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 		}
 		break;
 
-	case TCPS_ESTABLISHED:
-		/* T1c implements data and ack tracking. */
+	case TCPS_ESTABLISHED: {
+		/* Verify the segment belongs to this connection.  T1c
+		 * doesn't bother with ack-acceptability checks
+		 * (snd_una < ack <= snd_nxt) since we don't retransmit
+		 * yet; T1f's retransmit timer needs those. */
+		if (src_ip != s->remote_ip || sport != s->remote_port)
+			break;
+
+		/* Piggybacked ACK: advance snd_una if seg_ack is newer.
+		 * Compare via int32 subtraction so wraparound is handled
+		 * the canonical RFC 793 way. */
+		if (flags & TCP_FLAG_ACK) {
+			if ((int32_t)(seg_ack - s->snd_una) > 0)
+				s->snd_una = seg_ack;
+		}
+
+		/* Data payload: in-order only.  Out-of-order goes to the
+		 * reorder buffer in T1f.  RST and FIN come in T1e. */
+		unsigned data_len = len - hl;
+		if (data_len > 0 && seg_seq == s->rcv_nxt) {
+			mblk_t *data = allocb(data_len, 0);
+			if (data) {
+				kmemcpy(data->b_wptr,
+				        body->b_rptr + hl, data_len);
+				data->b_wptr += data_len;
+				/* Advance rcv_nxt BEFORE the ACK send so
+				 * lo0's synchronous loopback sees the
+				 * post-receive state.  (Same trap T1b
+				 * hit; see the file header.) */
+				s->rcv_nxt += data_len;
+				(void)tcp_send_segment(s, TCP_FLAG_ACK, NULL);
+				reply_data_ind(q, data);
+			}
+		}
 		break;
+	}
 
 	default:
 		break;
@@ -430,8 +521,22 @@ static int handle_conn_req(queue_t *q, struct tcp_tcb *s,
 	s->snd_una     = s->snd_iss;
 	s->snd_nxt     = s->snd_iss;
 	s->state       = TCPS_SYN_SENT;
-	(void)tcp_send_segment(s, TCP_FLAG_SYN);
+	(void)tcp_send_segment(s, TCP_FLAG_SYN, NULL);
 	return 0;
+}
+
+static int handle_data_req(queue_t *q, struct tcp_tcb *s, mblk_t *payload)
+{
+	if (s->state != TCPS_ESTABLISHED) {
+		if (payload) freemsg(payload);
+		reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_PROTOERR);
+		return -1;
+	}
+	if (!payload || msgdsize(payload) == 0) {
+		if (payload) freemsg(payload);
+		return 0;	/* zero-byte data: nothing to send */
+	}
+	return tcp_send_segment(s, TCP_FLAG_ACK | TCP_FLAG_PSH, payload);
 }
 
 static int tcp_wq_putp(queue_t *q, mblk_t *mp)
@@ -454,21 +559,29 @@ static int tcp_wq_putp(queue_t *q, mblk_t *mp)
 	       >= (int)sizeof(struct t_tcp_bind_req)) {
 		rc = handle_bind_req(q, s,
 		                     (const struct t_tcp_bind_req *)mp->b_rptr);
+		freemsg(mp);
 	} else if (prim == T_TCP_CONN_REQ
 	    && (mp->b_wptr - mp->b_rptr)
 	       >= (int)sizeof(struct t_tcp_conn_req)) {
 		rc = handle_conn_req(q, s,
 		                     (const struct t_tcp_conn_req *)mp->b_rptr);
+		freemsg(mp);
+	} else if (prim == T_TCP_DATA_REQ) {
+		mblk_t *payload = mp->b_cont;
+		mp->b_cont = NULL;
+		freemsg(mp);
+		rc = handle_data_req(q, s, payload);
 	} else if (prim == T_TCP_CONN_RES
-	        || prim == T_TCP_DATA_REQ
 	        || prim == T_TCP_ORDREL_REQ
 	        || prim == T_TCP_DISCON_REQ) {
 		/* Primitives that exist in the ABI but aren't wired up
 		 * yet at this phase. */
 		reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_NOTSUP);
+		freemsg(mp);
 		rc = 0;
+	} else {
+		freemsg(mp);
 	}
-	freemsg(mp);
 	return rc;
 }
 
@@ -595,6 +708,48 @@ static int drain_for_prim(struct stdata *sd, uint8_t want_prim)
 	return -1;
 }
 
+/* Drain T_DATA_IND and verify its M_DATA payload matches `expect`. */
+static int drain_data_ind(struct stdata *sd, const char *expect,
+                          unsigned elen)
+{
+	for (int i = 0; i < 64; i++) {
+		mblk_t *mp = getq(sd->sd_rq);
+		if (!mp) { kthread_yield(); continue; }
+		uint8_t prim = (mp->b_wptr - mp->b_rptr) >= 1
+		             ? mp->b_rptr[0] : 0;
+		if (prim != T_TCP_DATA_IND || !mp->b_cont) {
+			freemsg(mp);
+			continue;
+		}
+		mblk_t *body = mp->b_cont;
+		int ok = ((body->b_wptr - body->b_rptr) == (int)elen)
+		      && kmemcmp(body->b_rptr, expect, elen) == 0;
+		freemsg(mp);
+		return ok ? 0 : -1;
+	}
+	return -1;
+}
+
+static int send_data_req(struct stdata *sd, const char *buf, unsigned blen)
+{
+	mblk_t *ctl = allocb(sizeof(struct t_tcp_data_req), 0);
+	if (!ctl) return -1;
+	ctl->b_datap->db_type = M_PROTO;
+	struct t_tcp_data_req *r = (struct t_tcp_data_req *)ctl->b_wptr;
+	r->prim    = T_TCP_DATA_REQ;
+	r->_pad[0] = r->_pad[1] = r->_pad[2] = 0;
+	ctl->b_wptr += sizeof(*r);
+
+	mblk_t *data = allocb(blen, 0);
+	if (!data) { freemsg(ctl); return -1; }
+	kmemcpy(data->b_wptr, buf, blen);
+	data->b_wptr += blen;
+	ctl->b_cont = data;
+
+	putnext(sd->sd_wq, ctl);
+	return 0;
+}
+
 static int send_bind_req(struct stdata *sd, uint16_t port)
 {
 	mblk_t *mp = allocb(sizeof(struct t_tcp_bind_req), 0);
@@ -642,6 +797,17 @@ int tcp_selftest_run(void)
 	/* Both sides should reach ESTABLISHED and fire T_TCP_CONN_CON. */
 	if (drain_for_prim(C, T_TCP_CONN_CON) < 0) goto out;
 	if (drain_for_prim(L, T_TCP_CONN_CON) < 0) goto out;
+
+	/* T1c: bidirectional data exchange. */
+	static const char msg_c2l[] = "hello-from-client";
+	static const char msg_l2c[] = "and-from-listener";
+
+	if (send_data_req(C, msg_c2l, sizeof(msg_c2l) - 1) < 0) goto out;
+	if (drain_data_ind(L, msg_c2l, sizeof(msg_c2l) - 1) < 0) goto out;
+
+	if (send_data_req(L, msg_l2c, sizeof(msg_l2c) - 1) < 0) goto out;
+	if (drain_data_ind(C, msg_l2c, sizeof(msg_l2c) - 1) < 0) goto out;
+
 	rc = 0;
 
 out:
