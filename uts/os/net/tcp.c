@@ -242,6 +242,22 @@ static void reply_conn_con(queue_t *rq, uint32_t dst_ip, uint16_t dst_port)
 	putnext(rq, mp);
 }
 
+/* Build T_ORDREL_IND ("peer has done its half of the close; you
+ * can read remaining buffered bytes but no more will arrive") and
+ * deliver UP. */
+static void reply_ordrel_ind(queue_t *rq)
+{
+	mblk_t *mp = allocb(sizeof(struct t_tcp_ordrel_ind), 0);
+	if (!mp) return;
+	mp->b_datap->db_type = M_PROTO;
+	struct t_tcp_ordrel_ind *o =
+	    (struct t_tcp_ordrel_ind *)mp->b_wptr;
+	o->prim    = T_TCP_ORDREL_IND;
+	o->_pad[0] = o->_pad[1] = o->_pad[2] = 0;
+	mp->b_wptr += sizeof(*o);
+	putnext(rq, mp);
+}
+
 /* Build T_CONN_IND ("an inbound connection is pending; send
  * T_CONN_RES to accept it") and deliver UP.  Carries the peer's
  * (src_ip, src_port) so the listener's user can inspect before
@@ -454,13 +470,21 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 		}
 		break;
 
-	case TCPS_ESTABLISHED: {
-		/* Verify the segment belongs to this connection.  T1c
-		 * doesn't bother with ack-acceptability checks
-		 * (snd_una < ack <= snd_nxt) since we don't retransmit
-		 * yet; T1f's retransmit timer needs those. */
+	case TCPS_ESTABLISHED:
+	case TCPS_FIN_WAIT_1:
+	case TCPS_FIN_WAIT_2:
+	case TCPS_CLOSE_WAIT:
+	case TCPS_LAST_ACK: {
+		/* Verify the segment belongs to this connection. */
 		if (src_ip != s->remote_ip || sport != s->remote_port)
 			break;
+
+		/* RST in any post-handshake state aborts the connection. */
+		if (flags & TCP_FLAG_RST) {
+			s->state = TCPS_CLOSED;
+			reply_discon_ind(q, TCP_DISCON_REASON_RESET);
+			break;
+		}
 
 		/* Piggybacked ACK: advance snd_una if seg_ack is newer.
 		 * Compare via int32 subtraction so wraparound is handled
@@ -468,25 +492,66 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 		if (flags & TCP_FLAG_ACK) {
 			if ((int32_t)(seg_ack - s->snd_una) > 0)
 				s->snd_una = seg_ack;
+			/* State-machine effects of the ACK depend on the
+			 * current state. */
+			if (s->state == TCPS_FIN_WAIT_1
+			 && s->snd_una == s->snd_nxt) {
+				/* Our FIN got ACK'd; peer hasn't FIN'd yet. */
+				s->state = TCPS_FIN_WAIT_2;
+			} else if (s->state == TCPS_LAST_ACK
+			        && s->snd_una == s->snd_nxt) {
+				/* Our FIN (sent in response to peer's FIN)
+				 * is now ACK'd.  Connection fully closed. */
+				s->state = TCPS_CLOSED;
+			}
 		}
 
-		/* Data payload: in-order only.  Out-of-order goes to the
-		 * reorder buffer in T1f.  RST and FIN come in T1e. */
+		/* In-order data delivery -- accept payload up through
+		 * CLOSE_WAIT (peer can still send before we FIN), drop
+		 * it after we've FIN'd. */
 		unsigned data_len = len - hl;
-		if (data_len > 0 && seg_seq == s->rcv_nxt) {
+		if (data_len > 0 && seg_seq == s->rcv_nxt
+		    && (s->state == TCPS_ESTABLISHED
+		     || s->state == TCPS_CLOSE_WAIT)) {
 			mblk_t *data = allocb(data_len, 0);
 			if (data) {
 				kmemcpy(data->b_wptr,
 				        body->b_rptr + hl, data_len);
 				data->b_wptr += data_len;
-				/* Advance rcv_nxt BEFORE the ACK send so
-				 * lo0's synchronous loopback sees the
-				 * post-receive state.  (Same trap T1b
-				 * hit; see the file header.) */
+				/* State-update before ACK send -- lo0 sync
+				 * trap from T1b. */
 				s->rcv_nxt += data_len;
 				(void)tcp_send_segment(s, TCP_FLAG_ACK, NULL);
 				reply_data_ind(q, data);
 			}
+		}
+
+		/* FIN: consumes one sequence slot and triggers half-close
+		 * on our side.  Only honour if it's the next byte we
+		 * expect (post-data is fine). */
+		if ((flags & TCP_FLAG_FIN) && seg_seq + data_len == s->rcv_nxt) {
+			s->rcv_nxt += 1;
+			/* state-update before send (lo0 sync) */
+			enum tcp_state prev = s->state;
+			if (prev == TCPS_ESTABLISHED)
+				s->state = TCPS_CLOSE_WAIT;
+			else if (prev == TCPS_FIN_WAIT_1
+			      || prev == TCPS_FIN_WAIT_2)
+				/* T1e simplification: skip TIME_WAIT and
+				 * jump straight to CLOSED.  No 2*MSL wait
+				 * means the same 5-tuple can be reused
+				 * immediately; not a practical issue at
+				 * our scale. */
+				s->state = TCPS_CLOSED;
+			(void)tcp_send_segment(s, TCP_FLAG_ACK, NULL);
+			/* T_ORDREL_IND fires on every FIN we accept,
+			 * regardless of our state.  Even if we already
+			 * issued T_ORDREL_REQ ourselves (FIN_WAIT_*), the
+			 * user benefits from the "peer is done sending"
+			 * signal -- it means the connection is fully
+			 * closed, no need to wait further. */
+			(void)prev;
+			reply_ordrel_ind(q);
 		}
 		break;
 	}
@@ -514,6 +579,19 @@ static int tcp_qclose(queue_t *rq)
 {
 	struct tcp_tcb *s = rq->q_ptr;
 	if (!s) return 0;
+	/* User closed an active connection without going through the
+	 * graceful close (T_ORDREL_REQ) dance.  Send a RST as a
+	 * failsafe so the peer sees the connection die instead of
+	 * having to time out.  Skip if we're already CLOSED. */
+	if (s->state == TCPS_ESTABLISHED
+	 || s->state == TCPS_FIN_WAIT_1
+	 || s->state == TCPS_FIN_WAIT_2
+	 || s->state == TCPS_CLOSE_WAIT
+	 || s->state == TCPS_LAST_ACK
+	 || s->state == TCPS_SYN_SENT
+	 || s->state == TCPS_SYN_RECEIVED) {
+		(void)tcp_send_segment(s, TCP_FLAG_RST, NULL);
+	}
 	if (s->bound) {
 		uint32_t key = tcp_bind_key(s->local_port, 0);
 		send_ip_bind(rq, IP_T_UNBIND_REQ, key);
@@ -587,6 +665,53 @@ static int handle_conn_res(queue_t *q, struct tcp_tcb *s)
 	return 0;
 }
 
+static int handle_ordrel_req(queue_t *q, struct tcp_tcb *s)
+{
+	(void)q;
+	if (s->state == TCPS_ESTABLISHED) {
+		/* Graceful close, active side.  Send FIN, FIN_WAIT_1. */
+		s->state = TCPS_FIN_WAIT_1;
+		(void)tcp_send_segment(s, TCP_FLAG_ACK | TCP_FLAG_FIN, NULL);
+		return 0;
+	}
+	if (s->state == TCPS_CLOSE_WAIT) {
+		/* Peer already FIN'd us; respond with our FIN -> LAST_ACK. */
+		s->state = TCPS_LAST_ACK;
+		(void)tcp_send_segment(s, TCP_FLAG_ACK | TCP_FLAG_FIN, NULL);
+		return 0;
+	}
+	reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_PROTOERR);
+	return 0;
+}
+
+static int handle_discon_req(queue_t *q, struct tcp_tcb *s)
+{
+	(void)q;
+	/* Abortive close: RST, then CLOSED.  Valid from any non-CLOSED
+	 * post-handshake state, plus from SYN_SENT / SYN_RECEIVED /
+	 * LISTEN-with-pending-incoming (the user's "reject" hook). */
+	if (s->state == TCPS_CLOSED) return 0;
+	if (s->state == TCPS_SYN_SENT
+	 || s->state == TCPS_SYN_RECEIVED
+	 || s->state == TCPS_ESTABLISHED
+	 || s->state == TCPS_FIN_WAIT_1
+	 || s->state == TCPS_FIN_WAIT_2
+	 || s->state == TCPS_CLOSE_WAIT
+	 || s->state == TCPS_LAST_ACK) {
+		s->state = TCPS_CLOSED;
+		(void)tcp_send_segment(s, TCP_FLAG_RST, NULL);
+		return 0;
+	}
+	if (s->state == TCPS_LISTEN && s->listen_syn_pending) {
+		/* Reject the pending SYN with RST.  Stay in LISTEN. */
+		s->listen_syn_pending = 0;
+		(void)tcp_send_segment(s, TCP_FLAG_RST, NULL);
+		s->remote_ip = 0;
+		s->remote_port = 0;
+	}
+	return 0;
+}
+
 static int handle_data_req(queue_t *q, struct tcp_tcb *s, mblk_t *payload)
 {
 	if (s->state != TCPS_ESTABLISHED) {
@@ -639,13 +764,12 @@ static int tcp_wq_putp(queue_t *q, mblk_t *mp)
 	} else if (prim == T_TCP_CONN_RES) {
 		rc = handle_conn_res(q, s);
 		freemsg(mp);
-	} else if (prim == T_TCP_ORDREL_REQ
-	        || prim == T_TCP_DISCON_REQ) {
-		/* Primitives that exist in the ABI but aren't wired up
-		 * yet at this phase. */
-		reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_NOTSUP);
+	} else if (prim == T_TCP_ORDREL_REQ) {
+		rc = handle_ordrel_req(q, s);
 		freemsg(mp);
-		rc = 0;
+	} else if (prim == T_TCP_DISCON_REQ) {
+		rc = handle_discon_req(q, s);
+		freemsg(mp);
 	} else {
 		freemsg(mp);
 	}
@@ -905,6 +1029,34 @@ int tcp_selftest_run(void)
 
 	if (send_data_req(L, msg_l2c, sizeof(msg_l2c) - 1) < 0) goto out;
 	if (drain_data_ind(C, msg_l2c, sizeof(msg_l2c) - 1) < 0) goto out;
+
+	/* T1e graceful close: C sends FIN, L receives T_ORDREL_IND,
+	 * L sends its own FIN, C receives T_ORDREL_IND.  Both reach
+	 * CLOSED via FIN_WAIT_2 / LAST_ACK transitions. */
+	{
+		mblk_t *mp = allocb(sizeof(struct t_tcp_ordrel_req), 0);
+		if (!mp) goto out;
+		mp->b_datap->db_type = M_PROTO;
+		struct t_tcp_ordrel_req *r =
+		    (struct t_tcp_ordrel_req *)mp->b_wptr;
+		r->prim    = T_TCP_ORDREL_REQ;
+		r->_pad[0] = r->_pad[1] = r->_pad[2] = 0;
+		mp->b_wptr += sizeof(*r);
+		putnext(C->sd_wq, mp);
+	}
+	if (drain_for_prim(L, T_TCP_ORDREL_IND) < 0) goto out;
+	{
+		mblk_t *mp = allocb(sizeof(struct t_tcp_ordrel_req), 0);
+		if (!mp) goto out;
+		mp->b_datap->db_type = M_PROTO;
+		struct t_tcp_ordrel_req *r =
+		    (struct t_tcp_ordrel_req *)mp->b_wptr;
+		r->prim    = T_TCP_ORDREL_REQ;
+		r->_pad[0] = r->_pad[1] = r->_pad[2] = 0;
+		mp->b_wptr += sizeof(*r);
+		putnext(L->sd_wq, mp);
+	}
+	if (drain_for_prim(C, T_TCP_ORDREL_IND) < 0) goto out;
 
 	rc = 0;
 

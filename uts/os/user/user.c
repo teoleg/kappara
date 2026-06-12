@@ -668,32 +668,12 @@ extern char hello_blob_end[];
 
 extern char ps_blob_start[];
 extern char ps_blob_end[];
-extern char sigtest_blob_start[];
-extern char sigtest_blob_end[];
-extern char masktest_blob_start[];
-extern char masktest_blob_end[];
-extern char waittest_blob_start[];
-extern char waittest_blob_end[];
-extern char segvtest_blob_start[];
-extern char segvtest_blob_end[];
-extern char pipe_blob_start[];
-extern char pipe_blob_end[];
-extern char pipework_blob_start[];
-extern char pipework_blob_end[];
-extern char malloctest_blob_start[];
-extern char malloctest_blob_end[];
-extern char forktest_blob_start[];
-extern char forktest_blob_end[];
 extern char ping_blob_start[];
 extern char ping_blob_end[];
 extern char ifconfig_blob_start[];
 extern char ifconfig_blob_end[];
-extern char udptest_blob_start[];
-extern char udptest_blob_end[];
-extern char pktfilttest_blob_start[];
-extern char pktfilttest_blob_end[];
-extern char tcptest_blob_start[];
-extern char tcptest_blob_end[];
+extern char test_blob_start[];
+extern char test_blob_end[];
 
 static struct blob_priv hello_priv;
 
@@ -760,20 +740,10 @@ void exec_space_init(void)
 #define PAY(name_str, sym_start, sym_end) \
 	{ name_str, (sym_start), (uint32_t)((sym_end) - (sym_start)) }
 	const struct kfs_payload usrbin_payloads[] = {
-		PAY("ps",         ps_blob_start,         ps_blob_end),
-		PAY("sigtest",    sigtest_blob_start,    sigtest_blob_end),
-		PAY("masktest",   masktest_blob_start,   masktest_blob_end),
-		PAY("waittest",   waittest_blob_start,   waittest_blob_end),
-		PAY("segvtest",   segvtest_blob_start,   segvtest_blob_end),
-		PAY("pipe",       pipe_blob_start,       pipe_blob_end),
-		PAY("pipework",   pipework_blob_start,   pipework_blob_end),
-		PAY("malloctest", malloctest_blob_start, malloctest_blob_end),
-		PAY("forktest",   forktest_blob_start,   forktest_blob_end),
-		PAY("ping",       ping_blob_start,       ping_blob_end),
-		PAY("ifconfig",   ifconfig_blob_start,   ifconfig_blob_end),
-		PAY("udptest",    udptest_blob_start,    udptest_blob_end),
-		PAY("pktfilttest", pktfilttest_blob_start, pktfilttest_blob_end),
-		PAY("tcptest",    tcptest_blob_start,    tcptest_blob_end),
+		PAY("ps",       ps_blob_start,       ps_blob_end),
+		PAY("ping",     ping_blob_start,     ping_blob_end),
+		PAY("ifconfig", ifconfig_blob_start, ifconfig_blob_end),
+		PAY("test",     test_blob_start,     test_blob_end),
 	};
 #undef PAY
 	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);
