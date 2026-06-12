@@ -389,9 +389,8 @@ static void cmd_help(void)
 		"  ping [ip] [count]      ICMP echo via /dev/icmp (default 127.0.0.1)\r\n"
 		"  ifconfig               dump /proc/netif (interface list)\r\n"
 		"  <name>                 unknown commands look up /usr/bin/<name>\r\n"
-		"                         (ps, sigtest, masktest, waittest, segvtest,\r\n"
-		"                          pipe, pipework, malloctest, forktest,\r\n"
-		"                          udptest, pktfilttest, tcptest)\r\n");
+		"                         (ps, ping, ifconfig,\r\n"
+		"                          test <name>|all  -- all selftests in one ELF)\r\n");
 }
 
 static void cmd_pid(void)

@@ -95,7 +95,120 @@ struct tcp_tcb {
 	 * For T1d single-listener-one-conn there's only one pending
 	 * slot; T1d.5 grows this into a real accept queue. */
 	int        listen_syn_pending;
+
+	/* T1f retransmit + RTT.  RTO is in 10ms ticks (sched_tick is
+	 * at 100Hz).  pending_flags is what we'll re-send on RTO --
+	 * SYN, SYN|ACK, or ACK|FIN; data retransmit needs a send queue
+	 * which T1g adds.  rto_expires=0 means timer inactive.
+	 *
+	 * RTT estimate (RFC 6298): srtt + 4*rttvar gives RTO, clamped
+	 * to [TCP_RTO_MIN, TCP_RTO_MAX].  send_tick records when the
+	 * pending segment went out so the ACK can compute the round-
+	 * trip.  Updated only for non-retransmitted samples (Karn's
+	 * algorithm). */
+	uint32_t   rto_expires;
+	uint32_t   rto_ticks;
+	uint32_t   send_tick;
+	uint8_t    pending_flags;
+	uint8_t    retransmit_count;
+	int        rtt_valid;	/* srtt/rttvar primed */
+	uint32_t   srtt_ticks;
+	uint32_t   rttvar_ticks;
+
+	/* T1g send queue.  snd_buf holds unACK'd outbound bytes;
+	 * snd_buf_seq is the seq number of the first byte in the
+	 * buffer.  Each T_DATA_REQ appends, each ACK trims from the
+	 * front.  Caps at 8 KB -- T_DATA_REQ above that returns
+	 * DISCON_IND with reason=PROTOERR (no flow control yet). */
+	mblk_t    *snd_buf;
+	uint32_t   snd_buf_seq;
+
+	/* Queue pointers stashed for the timer kthread (which doesn't
+	 * have a queue parameter).  upper_rq = where to deliver
+	 * T_DISCON_IND when we give up retransmitting. */
+	queue_t   *upper_rq;
 };
+
+#define TCP_RTO_MIN	100	/* 1.0 s in 10ms ticks (RFC 6298) */
+#define TCP_RTO_MAX	6000	/* 60.0 s                       */
+#define TCP_RTO_INITIAL	100	/* 1.0 s before first RTT sample */
+#define TCP_MAX_RETRANSMITS	5
+#define TCP_SND_BUF_MAX	8192
+
+/* ---- Tick + TCB registry --------------------------------------- */
+
+#define TCP_MAX_TCBS	32
+
+static struct tcp_tcb *tcp_tcb_table[TCP_MAX_TCBS];
+static volatile uint32_t tcp_tick_counter;
+
+/* Called from sched_tick at 100Hz.  Cheap counter bump; the
+ * retransmit kthread polls this and does the actual work. */
+void tcp_tick(void)
+{
+	tcp_tick_counter++;
+}
+
+static void tcp_tcb_register(struct tcp_tcb *s)
+{
+	for (int i = 0; i < TCP_MAX_TCBS; i++) {
+		if (!tcp_tcb_table[i]) {
+			tcp_tcb_table[i] = s;
+			return;
+		}
+	}
+}
+
+static void tcp_tcb_unregister(struct tcp_tcb *s)
+{
+	for (int i = 0; i < TCP_MAX_TCBS; i++) {
+		if (tcp_tcb_table[i] == s) {
+			tcp_tcb_table[i] = NULL;
+			return;
+		}
+	}
+}
+
+/* Arm / cancel the retransmit timer.  Arming records `pending_flags`
+ * so the kthread knows what to re-send.  Cancelling sets
+ * rto_expires=0; called when an ACK covers our outstanding seq. */
+static void tcp_arm_rto(struct tcp_tcb *s, uint8_t flags)
+{
+	if (s->rto_ticks == 0) s->rto_ticks = TCP_RTO_INITIAL;
+	s->rto_expires      = tcp_tick_counter + s->rto_ticks;
+	s->send_tick        = tcp_tick_counter;
+	s->pending_flags    = flags;
+	s->retransmit_count = 0;
+}
+
+static void tcp_cancel_rto(struct tcp_tcb *s)
+{
+	s->rto_expires = 0;
+}
+
+/* RFC 6298 RTT estimator.  Karn's algorithm: don't sample on
+ * retransmits (sample[retransmit_count==0] is safe). */
+static void tcp_update_rtt(struct tcp_tcb *s, uint32_t sample_ticks)
+{
+	if (!s->rtt_valid) {
+		s->srtt_ticks   = sample_ticks;
+		s->rttvar_ticks = sample_ticks / 2;
+		s->rtt_valid    = 1;
+	} else {
+		uint32_t srtt = s->srtt_ticks;
+		uint32_t var  = s->rttvar_ticks;
+		int32_t  d    = (int32_t)sample_ticks - (int32_t)srtt;
+		uint32_t ad   = d < 0 ? (uint32_t)-d : (uint32_t)d;
+		var  = (3 * var + ad) >> 2;	/* var = 0.75*var + 0.25*|err| */
+		srtt = (7 * srtt + sample_ticks) >> 3;	/* srtt = 7/8 + 1/8 */
+		s->srtt_ticks   = srtt;
+		s->rttvar_ticks = var;
+	}
+	uint32_t rto = s->srtt_ticks + 4 * s->rttvar_ticks;
+	if (rto < TCP_RTO_MIN) rto = TCP_RTO_MIN;
+	if (rto > TCP_RTO_MAX) rto = TCP_RTO_MAX;
+	s->rto_ticks = rto;
+}
 
 /* Global ISS counter.  Real TCP picks ISS via a clock-keyed random
  * function (RFC 6528) to avoid sequence-number prediction.  We just
@@ -242,6 +355,22 @@ static void reply_conn_con(queue_t *rq, uint32_t dst_ip, uint16_t dst_port)
 	putnext(rq, mp);
 }
 
+/* Build T_ORDREL_IND ("peer has done its half of the close; you
+ * can read remaining buffered bytes but no more will arrive") and
+ * deliver UP. */
+static void reply_ordrel_ind(queue_t *rq)
+{
+	mblk_t *mp = allocb(sizeof(struct t_tcp_ordrel_ind), 0);
+	if (!mp) return;
+	mp->b_datap->db_type = M_PROTO;
+	struct t_tcp_ordrel_ind *o =
+	    (struct t_tcp_ordrel_ind *)mp->b_wptr;
+	o->prim    = T_TCP_ORDREL_IND;
+	o->_pad[0] = o->_pad[1] = o->_pad[2] = 0;
+	mp->b_wptr += sizeof(*o);
+	putnext(rq, mp);
+}
+
 /* Build T_CONN_IND ("an inbound connection is pending; send
  * T_CONN_RES to accept it") and deliver UP.  Carries the peer's
  * (src_ip, src_port) so the listener's user can inspect before
@@ -346,6 +475,14 @@ static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags,
 	if (flags & TCP_FLAG_FIN) s->snd_nxt += 1;
 	s->snd_nxt += plen;
 
+	/* Arm RTO for segments that consume sequence-number space
+	 * (SYN and FIN) -- those are the segments that need to make it
+	 * through for the connection to progress.  Pure ACKs and data
+	 * (no FIN) don't get retransmitted at T1f; T1g's send queue
+	 * adds data retransmit. */
+	if (flags & (TCP_FLAG_SYN | TCP_FLAG_FIN))
+		tcp_arm_rto(s, flags);
+
 	return ip_send(s->remote_ip, IPPROTO_TCP, mp);
 }
 
@@ -411,6 +548,11 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 		 && seg_ack == s->snd_nxt
 		 && src_ip == s->remote_ip
 		 && sport  == s->remote_port) {
+			/* SYN got ACK'd: cancel RTO, sample RTT, learn IRS. */
+			if (s->retransmit_count == 0)
+				tcp_update_rtt(s,
+				    tcp_tick_counter - s->send_tick);
+			tcp_cancel_rto(s);
 			s->rcv_irs = seg_seq;
 			s->rcv_nxt = seg_seq + 1;
 			s->snd_una = seg_ack;
@@ -448,45 +590,121 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 		 && seg_ack == s->snd_nxt
 		 && src_ip == s->remote_ip
 		 && sport  == s->remote_port) {
+			if (s->retransmit_count == 0)
+				tcp_update_rtt(s,
+				    tcp_tick_counter - s->send_tick);
+			tcp_cancel_rto(s);
 			s->snd_una = seg_ack;
 			s->state   = TCPS_ESTABLISHED;
 			reply_conn_con(q, src_ip, sport);
 		}
 		break;
 
-	case TCPS_ESTABLISHED: {
-		/* Verify the segment belongs to this connection.  T1c
-		 * doesn't bother with ack-acceptability checks
-		 * (snd_una < ack <= snd_nxt) since we don't retransmit
-		 * yet; T1f's retransmit timer needs those. */
+	case TCPS_ESTABLISHED:
+	case TCPS_FIN_WAIT_1:
+	case TCPS_FIN_WAIT_2:
+	case TCPS_CLOSE_WAIT:
+	case TCPS_LAST_ACK: {
+		/* Verify the segment belongs to this connection. */
 		if (src_ip != s->remote_ip || sport != s->remote_port)
 			break;
+
+		/* RST in any post-handshake state aborts the connection. */
+		if (flags & TCP_FLAG_RST) {
+			s->state = TCPS_CLOSED;
+			reply_discon_ind(q, TCP_DISCON_REASON_RESET);
+			break;
+		}
 
 		/* Piggybacked ACK: advance snd_una if seg_ack is newer.
 		 * Compare via int32 subtraction so wraparound is handled
 		 * the canonical RFC 793 way. */
 		if (flags & TCP_FLAG_ACK) {
-			if ((int32_t)(seg_ack - s->snd_una) > 0)
+			if ((int32_t)(seg_ack - s->snd_una) > 0) {
+				uint32_t acked = seg_ack - s->snd_una;
 				s->snd_una = seg_ack;
+				/* T1g: trim ACK'd bytes from snd_buf. */
+				if (s->snd_buf) {
+					unsigned buf_len = (unsigned)
+					    (s->snd_buf->b_wptr - s->snd_buf->b_rptr);
+					if (acked >= buf_len) {
+						freemsg(s->snd_buf);
+						s->snd_buf     = NULL;
+						s->snd_buf_seq = 0;
+					} else {
+						s->snd_buf->b_rptr += acked;
+						s->snd_buf_seq += acked;
+					}
+				}
+			}
+			/* State-machine effects of the ACK depend on the
+			 * current state. */
+			if (s->state == TCPS_FIN_WAIT_1
+			 && s->snd_una == s->snd_nxt) {
+				/* Our FIN got ACK'd; peer hasn't FIN'd yet. */
+				if (s->retransmit_count == 0)
+					tcp_update_rtt(s,
+					    tcp_tick_counter - s->send_tick);
+				tcp_cancel_rto(s);
+				s->state = TCPS_FIN_WAIT_2;
+			} else if (s->state == TCPS_LAST_ACK
+			        && s->snd_una == s->snd_nxt) {
+				/* Our FIN (sent in response to peer's FIN)
+				 * is now ACK'd.  Connection fully closed. */
+				if (s->retransmit_count == 0)
+					tcp_update_rtt(s,
+					    tcp_tick_counter - s->send_tick);
+				tcp_cancel_rto(s);
+				s->state = TCPS_CLOSED;
+			}
 		}
 
-		/* Data payload: in-order only.  Out-of-order goes to the
-		 * reorder buffer in T1f.  RST and FIN come in T1e. */
+		/* In-order data delivery -- accept payload up through
+		 * CLOSE_WAIT (peer can still send before we FIN), drop
+		 * it after we've FIN'd. */
 		unsigned data_len = len - hl;
-		if (data_len > 0 && seg_seq == s->rcv_nxt) {
+		if (data_len > 0 && seg_seq == s->rcv_nxt
+		    && (s->state == TCPS_ESTABLISHED
+		     || s->state == TCPS_CLOSE_WAIT)) {
 			mblk_t *data = allocb(data_len, 0);
 			if (data) {
 				kmemcpy(data->b_wptr,
 				        body->b_rptr + hl, data_len);
 				data->b_wptr += data_len;
-				/* Advance rcv_nxt BEFORE the ACK send so
-				 * lo0's synchronous loopback sees the
-				 * post-receive state.  (Same trap T1b
-				 * hit; see the file header.) */
+				/* State-update before ACK send -- lo0 sync
+				 * trap from T1b. */
 				s->rcv_nxt += data_len;
 				(void)tcp_send_segment(s, TCP_FLAG_ACK, NULL);
 				reply_data_ind(q, data);
 			}
+		}
+
+		/* FIN: consumes one sequence slot and triggers half-close
+		 * on our side.  Only honour if it's the next byte we
+		 * expect (post-data is fine). */
+		if ((flags & TCP_FLAG_FIN) && seg_seq + data_len == s->rcv_nxt) {
+			s->rcv_nxt += 1;
+			/* state-update before send (lo0 sync) */
+			enum tcp_state prev = s->state;
+			if (prev == TCPS_ESTABLISHED)
+				s->state = TCPS_CLOSE_WAIT;
+			else if (prev == TCPS_FIN_WAIT_1
+			      || prev == TCPS_FIN_WAIT_2)
+				/* T1e simplification: skip TIME_WAIT and
+				 * jump straight to CLOSED.  No 2*MSL wait
+				 * means the same 5-tuple can be reused
+				 * immediately; not a practical issue at
+				 * our scale. */
+				s->state = TCPS_CLOSED;
+			(void)tcp_send_segment(s, TCP_FLAG_ACK, NULL);
+			/* T_ORDREL_IND fires on every FIN we accept,
+			 * regardless of our state.  Even if we already
+			 * issued T_ORDREL_REQ ourselves (FIN_WAIT_*), the
+			 * user benefits from the "peer is done sending"
+			 * signal -- it means the connection is fully
+			 * closed, no need to wait further. */
+			(void)prev;
+			reply_ordrel_ind(q);
 		}
 		break;
 	}
@@ -504,9 +722,12 @@ static int tcp_qopen(queue_t *rq)
 	struct tcp_tcb *s = kmalloc(sizeof(*s));
 	if (!s) return -1;
 	kmemset(s, 0, sizeof(*s));
-	s->state = TCPS_CLOSED;
+	s->state    = TCPS_CLOSED;
+	s->upper_rq = rq;	/* T1f retransmit kthread delivers
+				 * T_DISCON_IND here on give-up */
 	rq->q_ptr     = s;
 	WR(rq)->q_ptr = s;
+	tcp_tcb_register(s);
 	return 0;
 }
 
@@ -514,10 +735,25 @@ static int tcp_qclose(queue_t *rq)
 {
 	struct tcp_tcb *s = rq->q_ptr;
 	if (!s) return 0;
+	/* User closed an active connection without going through the
+	 * graceful close (T_ORDREL_REQ) dance.  Send a RST as a
+	 * failsafe so the peer sees the connection die instead of
+	 * having to time out.  Skip if we're already CLOSED. */
+	if (s->state == TCPS_ESTABLISHED
+	 || s->state == TCPS_FIN_WAIT_1
+	 || s->state == TCPS_FIN_WAIT_2
+	 || s->state == TCPS_CLOSE_WAIT
+	 || s->state == TCPS_LAST_ACK
+	 || s->state == TCPS_SYN_SENT
+	 || s->state == TCPS_SYN_RECEIVED) {
+		(void)tcp_send_segment(s, TCP_FLAG_RST, NULL);
+	}
 	if (s->bound) {
 		uint32_t key = tcp_bind_key(s->local_port, 0);
 		send_ip_bind(rq, IP_T_UNBIND_REQ, key);
 	}
+	if (s->snd_buf) freemsg(s->snd_buf);
+	tcp_tcb_unregister(s);
 	rq->q_ptr     = NULL;
 	WR(rq)->q_ptr = NULL;
 	kfree(s);
@@ -587,6 +823,53 @@ static int handle_conn_res(queue_t *q, struct tcp_tcb *s)
 	return 0;
 }
 
+static int handle_ordrel_req(queue_t *q, struct tcp_tcb *s)
+{
+	(void)q;
+	if (s->state == TCPS_ESTABLISHED) {
+		/* Graceful close, active side.  Send FIN, FIN_WAIT_1. */
+		s->state = TCPS_FIN_WAIT_1;
+		(void)tcp_send_segment(s, TCP_FLAG_ACK | TCP_FLAG_FIN, NULL);
+		return 0;
+	}
+	if (s->state == TCPS_CLOSE_WAIT) {
+		/* Peer already FIN'd us; respond with our FIN -> LAST_ACK. */
+		s->state = TCPS_LAST_ACK;
+		(void)tcp_send_segment(s, TCP_FLAG_ACK | TCP_FLAG_FIN, NULL);
+		return 0;
+	}
+	reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_PROTOERR);
+	return 0;
+}
+
+static int handle_discon_req(queue_t *q, struct tcp_tcb *s)
+{
+	(void)q;
+	/* Abortive close: RST, then CLOSED.  Valid from any non-CLOSED
+	 * post-handshake state, plus from SYN_SENT / SYN_RECEIVED /
+	 * LISTEN-with-pending-incoming (the user's "reject" hook). */
+	if (s->state == TCPS_CLOSED) return 0;
+	if (s->state == TCPS_SYN_SENT
+	 || s->state == TCPS_SYN_RECEIVED
+	 || s->state == TCPS_ESTABLISHED
+	 || s->state == TCPS_FIN_WAIT_1
+	 || s->state == TCPS_FIN_WAIT_2
+	 || s->state == TCPS_CLOSE_WAIT
+	 || s->state == TCPS_LAST_ACK) {
+		s->state = TCPS_CLOSED;
+		(void)tcp_send_segment(s, TCP_FLAG_RST, NULL);
+		return 0;
+	}
+	if (s->state == TCPS_LISTEN && s->listen_syn_pending) {
+		/* Reject the pending SYN with RST.  Stay in LISTEN. */
+		s->listen_syn_pending = 0;
+		(void)tcp_send_segment(s, TCP_FLAG_RST, NULL);
+		s->remote_ip = 0;
+		s->remote_port = 0;
+	}
+	return 0;
+}
+
 static int handle_data_req(queue_t *q, struct tcp_tcb *s, mblk_t *payload)
 {
 	if (s->state != TCPS_ESTABLISHED) {
@@ -598,7 +881,45 @@ static int handle_data_req(queue_t *q, struct tcp_tcb *s, mblk_t *payload)
 		if (payload) freemsg(payload);
 		return 0;	/* zero-byte data: nothing to send */
 	}
-	return tcp_send_segment(s, TCP_FLAG_ACK | TCP_FLAG_PSH, payload);
+	unsigned plen = (unsigned)msgdsize(payload);
+	unsigned old  = s->snd_buf
+	             ? (unsigned)(s->snd_buf->b_wptr - s->snd_buf->b_rptr) : 0;
+	if (old + plen > TCP_SND_BUF_MAX) {
+		freemsg(payload);
+		reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_PROTOERR);
+		return -1;
+	}
+
+	/* Append to snd_buf so retransmits can pull the unACK'd bytes
+	 * out of it.  Single-mblk model keeps the trim logic simple
+	 * (advance b_rptr on ACK). */
+	mblk_t *new_buf = allocb(old + plen, 0);
+	if (!new_buf) { freemsg(payload); return -1; }
+	if (old) {
+		kmemcpy(new_buf->b_wptr, s->snd_buf->b_rptr, old);
+		new_buf->b_wptr += old;
+	}
+	for (mblk_t *m = payload; m; m = m->b_cont) {
+		unsigned n = (unsigned)(m->b_wptr - m->b_rptr);
+		if (n == 0) continue;
+		kmemcpy(new_buf->b_wptr, m->b_rptr, n);
+		new_buf->b_wptr += n;
+	}
+
+	if (!s->snd_buf) s->snd_buf_seq = s->snd_nxt;
+	if (s->snd_buf) freemsg(s->snd_buf);
+	s->snd_buf = new_buf;
+
+	/* Send a copy of just the new bytes.  tcp_send_segment copies +
+	 * frees; the canonical retransmit-source bytes live in snd_buf. */
+	mblk_t *send_copy = allocb(plen, 0);
+	if (send_copy) {
+		kmemcpy(send_copy->b_wptr,
+		        new_buf->b_rptr + old, plen);
+		send_copy->b_wptr += plen;
+	}
+	freemsg(payload);
+	return tcp_send_segment(s, TCP_FLAG_ACK | TCP_FLAG_PSH, send_copy);
 }
 
 static int tcp_wq_putp(queue_t *q, mblk_t *mp)
@@ -639,13 +960,12 @@ static int tcp_wq_putp(queue_t *q, mblk_t *mp)
 	} else if (prim == T_TCP_CONN_RES) {
 		rc = handle_conn_res(q, s);
 		freemsg(mp);
-	} else if (prim == T_TCP_ORDREL_REQ
-	        || prim == T_TCP_DISCON_REQ) {
-		/* Primitives that exist in the ABI but aren't wired up
-		 * yet at this phase. */
-		reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_NOTSUP);
+	} else if (prim == T_TCP_ORDREL_REQ) {
+		rc = handle_ordrel_req(q, s);
 		freemsg(mp);
-		rc = 0;
+	} else if (prim == T_TCP_DISCON_REQ) {
+		rc = handle_discon_req(q, s);
+		freemsg(mp);
 	} else {
 		freemsg(mp);
 	}
@@ -738,10 +1058,109 @@ struct streamtab tcp_streamtab = {
 	.st_wrinit = &tcp_winit,
 };
 
+/* ---- Retransmit kthread (T1f) ---------------------------------- */
+/*
+ * Polls tcp_tick_counter (incremented at 100Hz from sched_tick).
+ * For each TCB with an armed timer whose expiry has passed:
+ *   - If retransmit count maxed out, abort (RST + DISCON_IND).
+ *   - Else exponential-backoff RTO, re-send the pending SYN/FIN.
+ */
+static void tcp_retransmit_main(void *arg)
+{
+	(void)arg;
+	uint32_t last_seen = 0;
+	for (;;) {
+		kthread_yield();
+		uint32_t now = tcp_tick_counter;
+		if (now == last_seen) continue;
+		last_seen = now;
+
+		for (int i = 0; i < TCP_MAX_TCBS; i++) {
+			struct tcp_tcb *s = tcp_tcb_table[i];
+			if (!s || s->rto_expires == 0)         continue;
+			if ((int32_t)(now - s->rto_expires) < 0) continue;
+
+			if (s->retransmit_count >= TCP_MAX_RETRANSMITS) {
+				/* Give up.  Abort with RST + tell user. */
+				uint8_t f = s->pending_flags;
+				(void)f;
+				s->state       = TCPS_CLOSED;
+				s->rto_expires = 0;
+				if (s->upper_rq)
+					reply_discon_ind(s->upper_rq,
+					    TCP_DISCON_REASON_TIMEOUT);
+				continue;
+			}
+
+			/* Back off, re-send, re-arm.  Don't sample RTT
+			 * (Karn): retransmit_count > 0 suppresses
+			 * sampling in all ACK paths above. */
+			uint8_t saved_count = s->retransmit_count + 1;
+			s->rto_ticks <<= 1;
+			if (s->rto_ticks > TCP_RTO_MAX) s->rto_ticks = TCP_RTO_MAX;
+			/* snd_nxt was already advanced when we first sent
+			 * the SYN/FIN.  tcp_send_segment will advance it
+			 * AGAIN if we just pass the flags as-is, so rewind
+			 * before retransmitting. */
+			uint8_t f = s->pending_flags;
+			if (f & TCP_FLAG_SYN) s->snd_nxt -= 1;
+			if (f & TCP_FLAG_FIN) s->snd_nxt -= 1;
+			(void)tcp_send_segment(s, f, NULL);
+			/* tcp_send_segment -> tcp_arm_rto reset
+			 * retransmit_count to 0 and rto_expires.  Restore
+			 * our count and override expiry with the doubled
+			 * timeout. */
+			s->retransmit_count = saved_count;
+			s->rto_expires      = now + s->rto_ticks;
+		}
+	}
+}
+
 void tcp_module_init(void)
 {
 	streams_register("tcp", &tcp_streamtab);
 	cdev_register(CDEV_MAJ_TCP, "tcp", &ip_streamtab);
+}
+
+/* /proc/tcp walker.  cb returns the per-connection row info to the
+ * caller; we don't lock the table -- connections coming and going
+ * during a /proc read is OK, snapshot semantics are loose. */
+static const char *tcp_state_names[] = {
+	"CLOSED", "BOUND", "LISTEN", "SYN_SENT", "SYN_RECEIVED",
+	"ESTABLISHED", "FIN_WAIT_1", "FIN_WAIT_2", "CLOSE_WAIT", "LAST_ACK",
+};
+
+void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),
+                      void *arg)
+{
+	for (int i = 0; i < TCP_MAX_TCBS; i++) {
+		struct tcp_tcb *s = tcp_tcb_table[i];
+		if (!s) continue;
+		struct tcp_tcb_view v = {
+			.state_name  = (s->state < (int)(sizeof(tcp_state_names)
+			                / sizeof(tcp_state_names[0])))
+			               ? tcp_state_names[s->state]
+			               : "?",
+			.local_port  = s->local_port,
+			.remote_ip   = s->remote_ip,
+			.remote_port = s->remote_port,
+			.snd_buf_len = s->snd_buf
+			    ? (uint32_t)(s->snd_buf->b_wptr - s->snd_buf->b_rptr)
+			    : 0,
+			.rto_ms      = s->rto_ticks * 10,
+			.srtt_ms     = s->srtt_ticks * 10,
+		};
+		cb(&v, arg);
+	}
+}
+
+/* Late init: spawn the retransmit kthread.  Called from main.c
+ * AFTER sched_init (kthread_create derefs curthread under the
+ * hood; tcp_module_init runs from streams_head_init which is
+ * pre-sched). */
+void tcp_init_late(void)
+{
+	kthread_create("tcp_rtx", tcp_retransmit_main, NULL);
 }
 
 /* ---- In-kernel selftest ------------------------------------------ */
@@ -905,6 +1324,34 @@ int tcp_selftest_run(void)
 
 	if (send_data_req(L, msg_l2c, sizeof(msg_l2c) - 1) < 0) goto out;
 	if (drain_data_ind(C, msg_l2c, sizeof(msg_l2c) - 1) < 0) goto out;
+
+	/* T1e graceful close: C sends FIN, L receives T_ORDREL_IND,
+	 * L sends its own FIN, C receives T_ORDREL_IND.  Both reach
+	 * CLOSED via FIN_WAIT_2 / LAST_ACK transitions. */
+	{
+		mblk_t *mp = allocb(sizeof(struct t_tcp_ordrel_req), 0);
+		if (!mp) goto out;
+		mp->b_datap->db_type = M_PROTO;
+		struct t_tcp_ordrel_req *r =
+		    (struct t_tcp_ordrel_req *)mp->b_wptr;
+		r->prim    = T_TCP_ORDREL_REQ;
+		r->_pad[0] = r->_pad[1] = r->_pad[2] = 0;
+		mp->b_wptr += sizeof(*r);
+		putnext(C->sd_wq, mp);
+	}
+	if (drain_for_prim(L, T_TCP_ORDREL_IND) < 0) goto out;
+	{
+		mblk_t *mp = allocb(sizeof(struct t_tcp_ordrel_req), 0);
+		if (!mp) goto out;
+		mp->b_datap->db_type = M_PROTO;
+		struct t_tcp_ordrel_req *r =
+		    (struct t_tcp_ordrel_req *)mp->b_wptr;
+		r->prim    = T_TCP_ORDREL_REQ;
+		r->_pad[0] = r->_pad[1] = r->_pad[2] = 0;
+		mp->b_wptr += sizeof(*r);
+		putnext(L->sd_wq, mp);
+	}
+	if (drain_for_prim(C, T_TCP_ORDREL_IND) < 0) goto out;
 
 	rc = 0;
 

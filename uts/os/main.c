@@ -478,6 +478,8 @@ void kmain(void)
 		kprintf("tcp: SELFTEST FAIL\n");
 	else
 		kprintf("tcp: selftest PASS\n");
+	tcp_init_late();	/* spawn retransmit kthread now that
+				 * sched is ready */
 	/* Bring up SLIP on the mini-UART after IP is ready -- slip_init
 	 * needs ip_attach_stream to I_LINK the slip0 stream underneath. */
 	slip_init();

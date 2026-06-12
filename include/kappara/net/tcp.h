@@ -203,6 +203,22 @@ struct t_tcp_discon_ind {
 /* Streamtab + boot-time registry hookup. */
 extern struct streamtab tcp_streamtab;
 void tcp_module_init(void);
+void tcp_init_late(void);
+
+/* Per-TCB snapshot exposed by /proc/tcp.  Strings/integers only --
+ * no kernel pointers, no mblks.  Used by cmd/netstats. */
+struct tcp_tcb_view {
+	const char *state_name;
+	uint16_t    local_port;
+	uint32_t    remote_ip;	/* host byte order; 0 if unconnected */
+	uint16_t    remote_port;
+	uint32_t    snd_buf_len;
+	uint32_t    rto_ms;	/* current RTO in milliseconds */
+	uint32_t    srtt_ms;	/* smoothed RTT in milliseconds */
+};
+
+void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),
+                      void *arg);
 
 /* Self-test: opens a tcp stream in-kernel, sends T_BIND_REQ, checks
  * for T_BIND_ACK.  Other primitives get added to the selftest as

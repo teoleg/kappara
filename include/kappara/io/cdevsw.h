@@ -70,6 +70,7 @@ typedef uint32_t dev_t;
 #define CDEV_MAJ_UDP		18	/* /dev/udp -- UDP TPI device     */
 #define CDEV_MAJ_TCP		19	/* /dev/tcp -- TCP TPI device     */
 #define CDEV_MAJ_PROC_SLIP	20	/* /proc/slip -- slip0 byte/frame counters */
+#define CDEV_MAJ_PROC_TCP	21	/* /proc/tcp  -- TCP connection table */
 
 #define CDEV_MAX		32
 
