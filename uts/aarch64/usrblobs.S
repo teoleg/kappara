@@ -45,14 +45,6 @@ segvtest_blob_start:
 	.incbin "build/cmd/segvtest.elf"
 segvtest_blob_end:
 
-	.section ".rodata.crash_blob","a",%progbits
-	.balign 8
-	.global crash_blob_start
-	.global crash_blob_end
-crash_blob_start:
-	.incbin "build/cmd/crash.elf"
-crash_blob_end:
-
 	.section ".rodata.pipe_blob","a",%progbits
 	.balign 8
 	.global pipe_blob_start
@@ -116,3 +108,11 @@ udptest_blob_end:
 pktfilttest_blob_start:
 	.incbin "build/cmd/pktfilttest.elf"
 pktfilttest_blob_end:
+
+	.section ".rodata.tcptest_blob","a",%progbits
+	.balign 8
+	.global tcptest_blob_start
+	.global tcptest_blob_end
+tcptest_blob_start:
+	.incbin "build/cmd/tcptest.elf"
+tcptest_blob_end:

@@ -676,8 +676,6 @@ extern char waittest_blob_start[];
 extern char waittest_blob_end[];
 extern char segvtest_blob_start[];
 extern char segvtest_blob_end[];
-extern char crash_blob_start[];
-extern char crash_blob_end[];
 extern char pipe_blob_start[];
 extern char pipe_blob_end[];
 extern char pipework_blob_start[];
@@ -694,6 +692,8 @@ extern char udptest_blob_start[];
 extern char udptest_blob_end[];
 extern char pktfilttest_blob_start[];
 extern char pktfilttest_blob_end[];
+extern char tcptest_blob_start[];
+extern char tcptest_blob_end[];
 
 static struct blob_priv hello_priv;
 
@@ -765,7 +765,6 @@ void exec_space_init(void)
 		PAY("masktest",   masktest_blob_start,   masktest_blob_end),
 		PAY("waittest",   waittest_blob_start,   waittest_blob_end),
 		PAY("segvtest",   segvtest_blob_start,   segvtest_blob_end),
-		PAY("crash",      crash_blob_start,      crash_blob_end),
 		PAY("pipe",       pipe_blob_start,       pipe_blob_end),
 		PAY("pipework",   pipework_blob_start,   pipework_blob_end),
 		PAY("malloctest", malloctest_blob_start, malloctest_blob_end),
@@ -774,6 +773,7 @@ void exec_space_init(void)
 		PAY("ifconfig",   ifconfig_blob_start,   ifconfig_blob_end),
 		PAY("udptest",    udptest_blob_start,    udptest_blob_end),
 		PAY("pktfilttest", pktfilttest_blob_start, pktfilttest_blob_end),
+		PAY("tcptest",    tcptest_blob_start,    tcptest_blob_end),
 	};
 #undef PAY
 	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);
