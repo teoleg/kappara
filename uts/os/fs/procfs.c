@@ -31,6 +31,7 @@
 #include "kappara/core/ftrace.h"
 #include "kappara/core/kmem.h"
 #include "kappara/net/netif.h"
+#include "kappara/net/slip.h"
 #include "kappara/core/pmm.h"
 #include "kappara/core/printk.h"
 #include "kappara/fs/proc.h"
@@ -330,6 +331,38 @@ static int proc_netif_qopen(queue_t *q)
 	return 0;
 }
 
+/* ---- /proc/slip ---------------------------------------------------- */
+/*
+ * Per-line counters for the slip0 stream.  rx_bytes is what the mini-
+ * UART rx kthread has pulled off the wire (regardless of framing);
+ * frame counters come from the slip module's own state.
+ */
+
+static struct procbuf slip_pb;
+
+static int proc_slip_qopen(queue_t *q)
+{
+	pb_reset(&slip_pb);
+	pb_str(&slip_pb, "iface:  slip0  (mini-UART at 0x3F215040)\n");
+	pb_str(&slip_pb, "rx_bytes_total:  ");
+	pb_pad_dec(&slip_pb, slip_rx_byte_count(), 8); pb_putc(&slip_pb, '\n');
+	struct slip_state_view sv;
+	if (slip_get_stats(&sv) == 0) {
+		pb_str(&slip_pb, "rx_frames:       ");
+		pb_pad_dec(&slip_pb, sv.rx_frames,   8); pb_putc(&slip_pb, '\n');
+		pb_str(&slip_pb, "rx_runts:        ");
+		pb_pad_dec(&slip_pb, sv.rx_runts,    8); pb_putc(&slip_pb, '\n');
+		pb_str(&slip_pb, "rx_overflow:     ");
+		pb_pad_dec(&slip_pb, sv.rx_overflow, 8); pb_putc(&slip_pb, '\n');
+		pb_str(&slip_pb, "tx_frames:       ");
+		pb_pad_dec(&slip_pb, sv.tx_frames,   8); pb_putc(&slip_pb, '\n');
+	} else {
+		pb_str(&slip_pb, "(slip not initialised)\n");
+	}
+	pb_flush_to_q(&slip_pb, q);
+	return 0;
+}
+
 /* ---- Read-side put: the head queues data; we never see reverse traffic. */
 
 static int proc_rq_putp(queue_t *q, mblk_t *mp)
@@ -374,6 +407,7 @@ PROC_DRIVER(slab,   proc_slab_qopen);
 PROC_DRIVER(stream, proc_stream_qopen);
 PROC_DRIVER(cpu,    proc_cpu_qopen);
 PROC_DRIVER(netif,  proc_netif_qopen);
+PROC_DRIVER(procslip, proc_slip_qopen);
 
 /* ---- /proc/ftrace --------------------------------------------------- */
 
@@ -452,6 +486,7 @@ void proc_init(void)
 	cdev_register(CDEV_MAJ_PROC_FTRACE, "proc-ftrace", &ftrace_streamtab);
 	cdev_register(CDEV_MAJ_PROC_CPU,    "proc-cpu",    &cpu_streamtab);
 	cdev_register(CDEV_MAJ_PROC_NETIF,  "proc-netif",  &netif_streamtab);
+	cdev_register(CDEV_MAJ_PROC_SLIP,   "proc-slip",   &procslip_streamtab);
 
 	struct dentry *proc = vfs_mkdir(vfs_root(), "proc");
 	vfs_mknod_chrdev(proc, "ps",       MKDEV(CDEV_MAJ_PROC_PS,     0));
@@ -461,4 +496,5 @@ void proc_init(void)
 	vfs_mknod_chrdev(proc, "ftrace",   MKDEV(CDEV_MAJ_PROC_FTRACE, 0));
 	vfs_mknod_chrdev(proc, "cpuload",  MKDEV(CDEV_MAJ_PROC_CPU,    0));
 	vfs_mknod_chrdev(proc, "netif",    MKDEV(CDEV_MAJ_PROC_NETIF,  0));
+	vfs_mknod_chrdev(proc, "slip",     MKDEV(CDEV_MAJ_PROC_SLIP,   0));
 }

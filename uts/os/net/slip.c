@@ -305,6 +305,8 @@ void slip_module_init(void)
 /* ---- rx kthread ------------------------------------------------- */
 
 static queue_t *slip_rx_drv_rq;	/* miniuart driver's rq; set by slip_init */
+static uint32_t slip_rx_bytes_total;	/* every byte we've pulled off the wire */
+static int      slip_announced_first;	/* one-time "uart rx is alive" print */
 
 static void slip_rx_main(void *arg)
 {
@@ -321,6 +323,14 @@ static void slip_rx_main(void *arg)
 			kthread_yield();
 			continue;
 		}
+		slip_rx_bytes_total += n;
+		if (!slip_announced_first) {
+			slip_announced_first = 1;
+			kprintf("slip: first %u bytes on mini-UART:", n);
+			for (unsigned i = 0; i < n && i < 16; i++)
+				kprintf(" %02x", buf[i]);
+			kprintf("\n");
+		}
 		mblk_t *mp = allocb(n, 0);
 		if (mp) {
 			kmemcpy(mp->b_wptr, buf, n);
@@ -329,6 +339,34 @@ static void slip_rx_main(void *arg)
 		}
 	}
 }
+
+/* Reach into the slip module's per-instance state from outside the
+ * stream stack -- /proc/slip uses these to dump counters.  The state
+ * is the q_ptr we set in slip_qopen, captured from the kernel-built
+ * stream's drv_rq->q_next on the read side. */
+static struct stdata *slip_stream_sd;	/* set by slip_init */
+
+uint32_t slip_rx_byte_count(void)
+{
+	return slip_rx_bytes_total;
+}
+
+int slip_get_stats(struct slip_state_view *out)
+{
+	if (!slip_stream_sd) return -1;
+	/* drv_rq->q_next on the read side is the slip module's rq, whose
+	 * q_ptr is the slip_state.  Mirrors the layout do_ipush sets up. */
+	queue_t *slip_rq = slip_stream_sd->sd_drv_rq
+	                 ? slip_stream_sd->sd_drv_rq->q_next : NULL;
+	if (!slip_rq || !slip_rq->q_ptr) return -1;
+	struct slip_state *s = (struct slip_state *)slip_rq->q_ptr;
+	out->rx_frames   = s->rx_frames;
+	out->rx_runts    = s->rx_runts;
+	out->rx_overflow = s->rx_overflow;
+	out->tx_frames   = s->tx_frames;
+	return 0;
+}
+
 
 /* ---- slip0 netif identity --------------------------------------- */
 
@@ -361,6 +399,7 @@ void slip_init(void)
 
 	/* Stash the driver's rq for the rx kthread to deliver into. */
 	slip_rx_drv_rq = sd->sd_drv_rq;
+	slip_stream_sd = sd;
 
 	netif_register(&slip0_nif);
 
