@@ -42,6 +42,13 @@ static int tcp_bind(int fd, uint16_t port, uint16_t *out_port)
 	return 0;
 }
 
+static int tcp_listen(int fd)
+{
+	struct t_tcp_listen_req req = { .prim = T_TCP_LISTEN_REQ };
+	struct strbuf ctl = { .maxlen = 0, .len = sizeof(req), .buf = &req };
+	return putmsg(fd, &ctl, NULL, 0);
+}
+
 static int tcp_connect(int fd, uint32_t dst_ip, uint16_t dst_port)
 {
 	struct t_tcp_conn_req req = {
@@ -53,13 +60,26 @@ static int tcp_connect(int fd, uint32_t dst_ip, uint16_t dst_port)
 	return putmsg(fd, &ctl, NULL, 0);
 }
 
-static int await_conn_con(int fd)
+static int tcp_accept(int fd)
 {
-	struct t_tcp_conn_con con;
-	struct strbuf cin = { .maxlen = sizeof(con), .len = 0, .buf = &con };
+	struct t_tcp_conn_res res = { .prim = T_TCP_CONN_RES };
+	struct strbuf ctl = { .maxlen = 0, .len = sizeof(res), .buf = &res };
+	return putmsg(fd, &ctl, NULL, 0);
+}
+
+static int await_prim(int fd, uint8_t want_prim)
+{
+	uint8_t buf[64];
+	struct strbuf cin = { .maxlen = sizeof(buf), .len = 0, .buf = buf };
 	int flags = 0;
 	if (getmsg(fd, &cin, NULL, &flags) < 0) return -1;
-	return (con.prim == T_TCP_CONN_CON) ? 0 : -1;
+	if (cin.len < 1 || buf[0] != want_prim) return -1;
+	return 0;
+}
+
+static int await_conn_con(int fd)
+{
+	return await_prim(fd, T_TCP_CONN_CON);
 }
 
 static int tcp_send(int fd, const void *buf, unsigned len)
@@ -106,8 +126,33 @@ int main(int argc, char **argv)
 	printf("tcptest: L=port %u, C=port %u\n",
 	       (unsigned)lport, (unsigned)cport);
 
+	/* L: explicit T_LISTEN_REQ.  Without it, BOUND silently drops
+	 * inbound SYNs.  T1d split this from the implicit-listener
+	 * behavior the earlier phases had. */
+	if (tcp_listen(L) < 0) {
+		puts("tcptest: T_LISTEN_REQ failed");
+		close(L); close(C); return 1;
+	}
+
+	/* C: T_CONN_REQ -- sends SYN.  L will receive it, fire
+	 * T_CONN_IND, and wait for the listener to send T_CONN_RES
+	 * before issuing SYN-ACK. */
 	if (tcp_connect(C, 0x7f000001u, lport) < 0) {
 		puts("tcptest: T_CONN_REQ failed");
+		close(L); close(C); return 1;
+	}
+
+	/* L: drain T_CONN_IND notification of the pending connection. */
+	if (await_prim(L, T_TCP_CONN_IND) < 0) {
+		puts("tcptest: L never got T_CONN_IND");
+		close(L); close(C); return 1;
+	}
+
+	/* L: T_CONN_RES -- accept.  This sends SYN-ACK, which C processes
+	 * inline, ACKs, transitions to ESTABLISHED + T_CONN_CON.  That ACK
+	 * transitions L to ESTABLISHED + T_CONN_CON. */
+	if (tcp_accept(L) < 0) {
+		puts("tcptest: T_CONN_RES failed");
 		close(L); close(C); return 1;
 	}
 	if (await_conn_con(C) < 0) {

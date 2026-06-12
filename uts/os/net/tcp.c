@@ -87,6 +87,14 @@ struct tcp_tcb {
 	uint32_t   snd_iss;	/* our initial seq           */
 	uint32_t   rcv_nxt;	/* next seq we expect to recv */
 	uint32_t   rcv_irs;	/* peer's initial seq        */
+
+	/* T1d listener state.  LISTEN + SYN sets listen_syn_pending=1
+	 * and stores peer info; the SYN-ACK only goes out once the user
+	 * sends T_CONN_RES (real TPI semantics where the user gets to
+	 * inspect / accept / reject the incoming connection request).
+	 * For T1d single-listener-one-conn there's only one pending
+	 * slot; T1d.5 grows this into a real accept queue. */
+	int        listen_syn_pending;
 };
 
 /* Global ISS counter.  Real TCP picks ISS via a clock-keyed random
@@ -231,6 +239,25 @@ static void reply_conn_con(queue_t *rq, uint32_t dst_ip, uint16_t dst_port)
 	c->dst_port = dst_port;
 	c->_pad2    = 0;
 	mp->b_wptr += sizeof(*c);
+	putnext(rq, mp);
+}
+
+/* Build T_CONN_IND ("an inbound connection is pending; send
+ * T_CONN_RES to accept it") and deliver UP.  Carries the peer's
+ * (src_ip, src_port) so the listener's user can inspect before
+ * accepting. */
+static void reply_conn_ind(queue_t *rq, uint32_t src_ip, uint16_t src_port)
+{
+	mblk_t *mp = allocb(sizeof(struct t_tcp_conn_ind), 0);
+	if (!mp) return;
+	mp->b_datap->db_type = M_PROTO;
+	struct t_tcp_conn_ind *i = (struct t_tcp_conn_ind *)mp->b_wptr;
+	i->prim     = T_TCP_CONN_IND;
+	i->_pad[0]  = i->_pad[1] = i->_pad[2] = 0;
+	i->src_ip   = src_ip;
+	i->src_port = src_port;
+	i->_pad2    = 0;
+	mp->b_wptr += sizeof(*i);
 	putnext(rq, mp);
 }
 
@@ -394,19 +421,24 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 		break;
 
 	case TCPS_BOUND:
-		/* Acting as implicit listener.  Accept first SYN, learn
-		 * remote, send SYN-ACK. */
-		if (flags & TCP_FLAG_SYN) {
-			s->remote_ip   = src_ip;
-			s->remote_port = sport;
-			s->snd_iss     = alloc_iss();
-			s->snd_una     = s->snd_iss;
-			s->snd_nxt     = s->snd_iss;
-			s->rcv_irs     = seg_seq;
-			s->rcv_nxt     = seg_seq + 1;
-			s->state       = TCPS_SYN_RECEIVED;
-			(void)tcp_send_segment(s,
-			        TCP_FLAG_SYN | TCP_FLAG_ACK, NULL);
+		/* T1d: a bound-but-not-listening socket silently drops
+		 * SYNs.  User must explicitly T_LISTEN_REQ to accept
+		 * incoming connections. */
+		break;
+
+	case TCPS_LISTEN:
+		/* T1d: record peer + seq numbers, fire T_CONN_IND, but do
+		 * NOT send SYN-ACK yet.  The user must send T_CONN_RES to
+		 * accept (or T_DISCON_REQ to refuse, in T1e).  Single-slot
+		 * pending model: a second SYN while one is already pending
+		 * is dropped.  T1d.5's accept queue will replace this. */
+		if ((flags & TCP_FLAG_SYN) && !s->listen_syn_pending) {
+			s->remote_ip          = src_ip;
+			s->remote_port        = sport;
+			s->rcv_irs            = seg_seq;
+			s->rcv_nxt            = seg_seq + 1;
+			s->listen_syn_pending = 1;
+			reply_conn_ind(q, src_ip, sport);
 		}
 		break;
 
@@ -525,6 +557,36 @@ static int handle_conn_req(queue_t *q, struct tcp_tcb *s,
 	return 0;
 }
 
+static int handle_listen_req(queue_t *q, struct tcp_tcb *s)
+{
+	(void)q;
+	if (s->state != TCPS_BOUND) {
+		reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_PROTOERR);
+		return 0;
+	}
+	s->state = TCPS_LISTEN;
+	return 0;
+}
+
+static int handle_conn_res(queue_t *q, struct tcp_tcb *s)
+{
+	if (s->state != TCPS_LISTEN || !s->listen_syn_pending) {
+		reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_PROTOERR);
+		return 0;
+	}
+	/* User has accepted the pending SYN.  Send SYN-ACK now and
+	 * transition to SYN_RECEIVED.  The eventual ACK transitions
+	 * us to ESTABLISHED + T_CONN_CON via the existing
+	 * SYN_RECEIVED case in tcp_input_segment. */
+	s->snd_iss            = alloc_iss();
+	s->snd_una            = s->snd_iss;
+	s->snd_nxt            = s->snd_iss;
+	s->listen_syn_pending = 0;
+	s->state              = TCPS_SYN_RECEIVED;
+	(void)tcp_send_segment(s, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL);
+	return 0;
+}
+
 static int handle_data_req(queue_t *q, struct tcp_tcb *s, mblk_t *payload)
 {
 	if (s->state != TCPS_ESTABLISHED) {
@@ -571,8 +633,13 @@ static int tcp_wq_putp(queue_t *q, mblk_t *mp)
 		mp->b_cont = NULL;
 		freemsg(mp);
 		rc = handle_data_req(q, s, payload);
-	} else if (prim == T_TCP_CONN_RES
-	        || prim == T_TCP_ORDREL_REQ
+	} else if (prim == T_TCP_LISTEN_REQ) {
+		rc = handle_listen_req(q, s);
+		freemsg(mp);
+	} else if (prim == T_TCP_CONN_RES) {
+		rc = handle_conn_res(q, s);
+		freemsg(mp);
+	} else if (prim == T_TCP_ORDREL_REQ
 	        || prim == T_TCP_DISCON_REQ) {
 		/* Primitives that exist in the ABI but aren't wired up
 		 * yet at this phase. */
@@ -779,7 +846,21 @@ int tcp_selftest_run(void)
 	if (send_bind_req(L, 12345) < 0) goto out;
 	if (send_bind_req(C, 0) < 0)     goto out;
 
-	/* Client: T_TCP_CONN_REQ to 127.0.0.1:12345. */
+	/* L: T_TCP_LISTEN_REQ to start accepting SYNs. */
+	{
+		mblk_t *mp = allocb(sizeof(struct t_tcp_listen_req), 0);
+		if (!mp) goto out;
+		mp->b_datap->db_type = M_PROTO;
+		struct t_tcp_listen_req *r =
+		    (struct t_tcp_listen_req *)mp->b_wptr;
+		r->prim    = T_TCP_LISTEN_REQ;
+		r->_pad[0] = r->_pad[1] = r->_pad[2] = 0;
+		mp->b_wptr += sizeof(*r);
+		putnext(L->sd_wq, mp);
+	}
+
+	/* Client: T_TCP_CONN_REQ to 127.0.0.1:12345.  This sends SYN.
+	 * L will receive it, fire T_CONN_IND, and wait for T_CONN_RES. */
 	{
 		mblk_t *mp = allocb(sizeof(struct t_tcp_conn_req), 0);
 		if (!mp) goto out;
@@ -794,7 +875,24 @@ int tcp_selftest_run(void)
 		putnext(C->sd_wq, mp);
 	}
 
-	/* Both sides should reach ESTABLISHED and fire T_TCP_CONN_CON. */
+	/* L should now see T_CONN_IND for the pending connection. */
+	if (drain_for_prim(L, T_TCP_CONN_IND) < 0) goto out;
+
+	/* L: T_TCP_CONN_RES to accept.  This sends SYN-ACK which C
+	 * processes inline, ACKs, transitions to ESTABLISHED + T_CONN_CON,
+	 * and that ACK transitions L to ESTABLISHED + T_CONN_CON. */
+	{
+		mblk_t *mp = allocb(sizeof(struct t_tcp_conn_res), 0);
+		if (!mp) goto out;
+		mp->b_datap->db_type = M_PROTO;
+		struct t_tcp_conn_res *r =
+		    (struct t_tcp_conn_res *)mp->b_wptr;
+		r->prim    = T_TCP_CONN_RES;
+		r->_pad[0] = r->_pad[1] = r->_pad[2] = 0;
+		mp->b_wptr += sizeof(*r);
+		putnext(L->sd_wq, mp);
+	}
+
 	if (drain_for_prim(C, T_TCP_CONN_CON) < 0) goto out;
 	if (drain_for_prim(L, T_TCP_CONN_CON) < 0) goto out;
 
