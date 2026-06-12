@@ -1,5 +1,5 @@
 /*
- * cmd/netstats -- network state inspector.
+ * cmd/netstat -- network state inspector.
  *
  * Concatenates the per-subsystem /proc snapshots (netif, slip, tcp)
  * into one human-readable dump.  Same role as netstat / ss on real
@@ -14,7 +14,7 @@ static void cat(const char *path)
 {
 	int fd = open(path, 0);
 	if (fd < 0) {
-		printf("netstats: cannot open %s\n", path);
+		printf("netstat: cannot open %s\n", path);
 		return;
 	}
 	char buf[1024];

@@ -33,13 +33,13 @@ ifconfig_blob_start:
 	.incbin "build/cmd/ifconfig.elf"
 ifconfig_blob_end:
 
-	.section ".rodata.netstats_blob","a",%progbits
+	.section ".rodata.netstat_blob","a",%progbits
 	.balign 8
-	.global netstats_blob_start
-	.global netstats_blob_end
-netstats_blob_start:
-	.incbin "build/cmd/netstats.elf"
-netstats_blob_end:
+	.global netstat_blob_start
+	.global netstat_blob_end
+netstat_blob_start:
+	.incbin "build/cmd/netstat.elf"
+netstat_blob_end:
 
 	.section ".rodata.test_blob","a",%progbits
 	.balign 8

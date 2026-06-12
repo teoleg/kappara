@@ -672,8 +672,8 @@ extern char ping_blob_start[];
 extern char ping_blob_end[];
 extern char ifconfig_blob_start[];
 extern char ifconfig_blob_end[];
-extern char netstats_blob_start[];
-extern char netstats_blob_end[];
+extern char netstat_blob_start[];
+extern char netstat_blob_end[];
 extern char test_blob_start[];
 extern char test_blob_end[];
 
@@ -745,7 +745,7 @@ void exec_space_init(void)
 		PAY("ps",       ps_blob_start,       ps_blob_end),
 		PAY("ping",     ping_blob_start,     ping_blob_end),
 		PAY("ifconfig", ifconfig_blob_start, ifconfig_blob_end),
-		PAY("netstats", netstats_blob_start, netstats_blob_end),
+		PAY("netstat", netstat_blob_start, netstat_blob_end),
 		PAY("test",     test_blob_start,     test_blob_end),
 	};
 #undef PAY
