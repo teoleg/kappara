@@ -95,7 +95,111 @@ struct tcp_tcb {
 	 * For T1d single-listener-one-conn there's only one pending
 	 * slot; T1d.5 grows this into a real accept queue. */
 	int        listen_syn_pending;
+
+	/* T1f retransmit + RTT.  RTO is in 10ms ticks (sched_tick is
+	 * at 100Hz).  pending_flags is what we'll re-send on RTO --
+	 * SYN, SYN|ACK, or ACK|FIN; data retransmit needs a send queue
+	 * which T1g adds.  rto_expires=0 means timer inactive.
+	 *
+	 * RTT estimate (RFC 6298): srtt + 4*rttvar gives RTO, clamped
+	 * to [TCP_RTO_MIN, TCP_RTO_MAX].  send_tick records when the
+	 * pending segment went out so the ACK can compute the round-
+	 * trip.  Updated only for non-retransmitted samples (Karn's
+	 * algorithm). */
+	uint32_t   rto_expires;
+	uint32_t   rto_ticks;
+	uint32_t   send_tick;
+	uint8_t    pending_flags;
+	uint8_t    retransmit_count;
+	int        rtt_valid;	/* srtt/rttvar primed */
+	uint32_t   srtt_ticks;
+	uint32_t   rttvar_ticks;
+
+	/* Queue pointers stashed for the timer kthread (which doesn't
+	 * have a queue parameter).  upper_rq = where to deliver
+	 * T_DISCON_IND when we give up retransmitting. */
+	queue_t   *upper_rq;
 };
+
+#define TCP_RTO_MIN	100	/* 1.0 s in 10ms ticks (RFC 6298) */
+#define TCP_RTO_MAX	6000	/* 60.0 s                       */
+#define TCP_RTO_INITIAL	100	/* 1.0 s before first RTT sample */
+#define TCP_MAX_RETRANSMITS	5
+
+/* ---- Tick + TCB registry --------------------------------------- */
+
+#define TCP_MAX_TCBS	32
+
+static struct tcp_tcb *tcp_tcb_table[TCP_MAX_TCBS];
+static volatile uint32_t tcp_tick_counter;
+
+/* Called from sched_tick at 100Hz.  Cheap counter bump; the
+ * retransmit kthread polls this and does the actual work. */
+void tcp_tick(void)
+{
+	tcp_tick_counter++;
+}
+
+static void tcp_tcb_register(struct tcp_tcb *s)
+{
+	for (int i = 0; i < TCP_MAX_TCBS; i++) {
+		if (!tcp_tcb_table[i]) {
+			tcp_tcb_table[i] = s;
+			return;
+		}
+	}
+}
+
+static void tcp_tcb_unregister(struct tcp_tcb *s)
+{
+	for (int i = 0; i < TCP_MAX_TCBS; i++) {
+		if (tcp_tcb_table[i] == s) {
+			tcp_tcb_table[i] = NULL;
+			return;
+		}
+	}
+}
+
+/* Arm / cancel the retransmit timer.  Arming records `pending_flags`
+ * so the kthread knows what to re-send.  Cancelling sets
+ * rto_expires=0; called when an ACK covers our outstanding seq. */
+static void tcp_arm_rto(struct tcp_tcb *s, uint8_t flags)
+{
+	if (s->rto_ticks == 0) s->rto_ticks = TCP_RTO_INITIAL;
+	s->rto_expires      = tcp_tick_counter + s->rto_ticks;
+	s->send_tick        = tcp_tick_counter;
+	s->pending_flags    = flags;
+	s->retransmit_count = 0;
+}
+
+static void tcp_cancel_rto(struct tcp_tcb *s)
+{
+	s->rto_expires = 0;
+}
+
+/* RFC 6298 RTT estimator.  Karn's algorithm: don't sample on
+ * retransmits (sample[retransmit_count==0] is safe). */
+static void tcp_update_rtt(struct tcp_tcb *s, uint32_t sample_ticks)
+{
+	if (!s->rtt_valid) {
+		s->srtt_ticks   = sample_ticks;
+		s->rttvar_ticks = sample_ticks / 2;
+		s->rtt_valid    = 1;
+	} else {
+		uint32_t srtt = s->srtt_ticks;
+		uint32_t var  = s->rttvar_ticks;
+		int32_t  d    = (int32_t)sample_ticks - (int32_t)srtt;
+		uint32_t ad   = d < 0 ? (uint32_t)-d : (uint32_t)d;
+		var  = (3 * var + ad) >> 2;	/* var = 0.75*var + 0.25*|err| */
+		srtt = (7 * srtt + sample_ticks) >> 3;	/* srtt = 7/8 + 1/8 */
+		s->srtt_ticks   = srtt;
+		s->rttvar_ticks = var;
+	}
+	uint32_t rto = s->srtt_ticks + 4 * s->rttvar_ticks;
+	if (rto < TCP_RTO_MIN) rto = TCP_RTO_MIN;
+	if (rto > TCP_RTO_MAX) rto = TCP_RTO_MAX;
+	s->rto_ticks = rto;
+}
 
 /* Global ISS counter.  Real TCP picks ISS via a clock-keyed random
  * function (RFC 6528) to avoid sequence-number prediction.  We just
@@ -362,6 +466,14 @@ static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags,
 	if (flags & TCP_FLAG_FIN) s->snd_nxt += 1;
 	s->snd_nxt += plen;
 
+	/* Arm RTO for segments that consume sequence-number space
+	 * (SYN and FIN) -- those are the segments that need to make it
+	 * through for the connection to progress.  Pure ACKs and data
+	 * (no FIN) don't get retransmitted at T1f; T1g's send queue
+	 * adds data retransmit. */
+	if (flags & (TCP_FLAG_SYN | TCP_FLAG_FIN))
+		tcp_arm_rto(s, flags);
+
 	return ip_send(s->remote_ip, IPPROTO_TCP, mp);
 }
 
@@ -427,6 +539,11 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 		 && seg_ack == s->snd_nxt
 		 && src_ip == s->remote_ip
 		 && sport  == s->remote_port) {
+			/* SYN got ACK'd: cancel RTO, sample RTT, learn IRS. */
+			if (s->retransmit_count == 0)
+				tcp_update_rtt(s,
+				    tcp_tick_counter - s->send_tick);
+			tcp_cancel_rto(s);
 			s->rcv_irs = seg_seq;
 			s->rcv_nxt = seg_seq + 1;
 			s->snd_una = seg_ack;
@@ -464,6 +581,10 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 		 && seg_ack == s->snd_nxt
 		 && src_ip == s->remote_ip
 		 && sport  == s->remote_port) {
+			if (s->retransmit_count == 0)
+				tcp_update_rtt(s,
+				    tcp_tick_counter - s->send_tick);
+			tcp_cancel_rto(s);
 			s->snd_una = seg_ack;
 			s->state   = TCPS_ESTABLISHED;
 			reply_conn_con(q, src_ip, sport);
@@ -497,11 +618,19 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 			if (s->state == TCPS_FIN_WAIT_1
 			 && s->snd_una == s->snd_nxt) {
 				/* Our FIN got ACK'd; peer hasn't FIN'd yet. */
+				if (s->retransmit_count == 0)
+					tcp_update_rtt(s,
+					    tcp_tick_counter - s->send_tick);
+				tcp_cancel_rto(s);
 				s->state = TCPS_FIN_WAIT_2;
 			} else if (s->state == TCPS_LAST_ACK
 			        && s->snd_una == s->snd_nxt) {
 				/* Our FIN (sent in response to peer's FIN)
 				 * is now ACK'd.  Connection fully closed. */
+				if (s->retransmit_count == 0)
+					tcp_update_rtt(s,
+					    tcp_tick_counter - s->send_tick);
+				tcp_cancel_rto(s);
 				s->state = TCPS_CLOSED;
 			}
 		}
@@ -569,9 +698,12 @@ static int tcp_qopen(queue_t *rq)
 	struct tcp_tcb *s = kmalloc(sizeof(*s));
 	if (!s) return -1;
 	kmemset(s, 0, sizeof(*s));
-	s->state = TCPS_CLOSED;
+	s->state    = TCPS_CLOSED;
+	s->upper_rq = rq;	/* T1f retransmit kthread delivers
+				 * T_DISCON_IND here on give-up */
 	rq->q_ptr     = s;
 	WR(rq)->q_ptr = s;
+	tcp_tcb_register(s);
 	return 0;
 }
 
@@ -596,6 +728,7 @@ static int tcp_qclose(queue_t *rq)
 		uint32_t key = tcp_bind_key(s->local_port, 0);
 		send_ip_bind(rq, IP_T_UNBIND_REQ, key);
 	}
+	tcp_tcb_unregister(s);
 	rq->q_ptr     = NULL;
 	WR(rq)->q_ptr = NULL;
 	kfree(s);
@@ -862,10 +995,77 @@ struct streamtab tcp_streamtab = {
 	.st_wrinit = &tcp_winit,
 };
 
+/* ---- Retransmit kthread (T1f) ---------------------------------- */
+/*
+ * Polls tcp_tick_counter (incremented at 100Hz from sched_tick).
+ * For each TCB with an armed timer whose expiry has passed:
+ *   - If retransmit count maxed out, abort (RST + DISCON_IND).
+ *   - Else exponential-backoff RTO, re-send the pending SYN/FIN.
+ */
+static void tcp_retransmit_main(void *arg)
+{
+	(void)arg;
+	uint32_t last_seen = 0;
+	for (;;) {
+		kthread_yield();
+		uint32_t now = tcp_tick_counter;
+		if (now == last_seen) continue;
+		last_seen = now;
+
+		for (int i = 0; i < TCP_MAX_TCBS; i++) {
+			struct tcp_tcb *s = tcp_tcb_table[i];
+			if (!s || s->rto_expires == 0)         continue;
+			if ((int32_t)(now - s->rto_expires) < 0) continue;
+
+			if (s->retransmit_count >= TCP_MAX_RETRANSMITS) {
+				/* Give up.  Abort with RST + tell user. */
+				uint8_t f = s->pending_flags;
+				(void)f;
+				s->state       = TCPS_CLOSED;
+				s->rto_expires = 0;
+				if (s->upper_rq)
+					reply_discon_ind(s->upper_rq,
+					    TCP_DISCON_REASON_TIMEOUT);
+				continue;
+			}
+
+			/* Back off, re-send, re-arm.  Don't sample RTT
+			 * (Karn): retransmit_count > 0 suppresses
+			 * sampling in all ACK paths above. */
+			uint8_t saved_count = s->retransmit_count + 1;
+			s->rto_ticks <<= 1;
+			if (s->rto_ticks > TCP_RTO_MAX) s->rto_ticks = TCP_RTO_MAX;
+			/* snd_nxt was already advanced when we first sent
+			 * the SYN/FIN.  tcp_send_segment will advance it
+			 * AGAIN if we just pass the flags as-is, so rewind
+			 * before retransmitting. */
+			uint8_t f = s->pending_flags;
+			if (f & TCP_FLAG_SYN) s->snd_nxt -= 1;
+			if (f & TCP_FLAG_FIN) s->snd_nxt -= 1;
+			(void)tcp_send_segment(s, f, NULL);
+			/* tcp_send_segment -> tcp_arm_rto reset
+			 * retransmit_count to 0 and rto_expires.  Restore
+			 * our count and override expiry with the doubled
+			 * timeout. */
+			s->retransmit_count = saved_count;
+			s->rto_expires      = now + s->rto_ticks;
+		}
+	}
+}
+
 void tcp_module_init(void)
 {
 	streams_register("tcp", &tcp_streamtab);
 	cdev_register(CDEV_MAJ_TCP, "tcp", &ip_streamtab);
+}
+
+/* Late init: spawn the retransmit kthread.  Called from main.c
+ * AFTER sched_init (kthread_create derefs curthread under the
+ * hood; tcp_module_init runs from streams_head_init which is
+ * pre-sched). */
+void tcp_init_late(void)
+{
+	kthread_create("tcp_rtx", tcp_retransmit_main, NULL);
 }
 
 /* ---- In-kernel selftest ------------------------------------------ */

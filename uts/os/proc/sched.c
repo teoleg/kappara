@@ -1140,6 +1140,11 @@ void sched_tick(void)
 	 * therefore runs uninterrupted until it voluntarily blocks --
 	 * which is what SYS class is for. */
 	streams_run();
+	/* TCP tick: bump a counter the tcp_retransmit_main kthread
+	 * polls for RTO expiry.  Cheap (one increment per tick); the
+	 * actual retransmit work runs in thread context. */
+	extern void tcp_tick(void);
+	tcp_tick();
 	struct kthread *cur = curthread;
 	if (!cur)
 		return;

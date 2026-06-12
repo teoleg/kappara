@@ -203,6 +203,7 @@ struct t_tcp_discon_ind {
 /* Streamtab + boot-time registry hookup. */
 extern struct streamtab tcp_streamtab;
 void tcp_module_init(void);
+void tcp_init_late(void);
 
 /* Self-test: opens a tcp stream in-kernel, sends T_BIND_REQ, checks
  * for T_BIND_ACK.  Other primitives get added to the selftest as

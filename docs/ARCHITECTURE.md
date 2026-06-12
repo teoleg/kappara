@@ -768,7 +768,7 @@ TPI primitives (locked in across phases; see
 | T1c   | ✓ done | T_DATA_REQ / T_DATA_IND (in-order seq/ack; no retransmit yet)    |
 | T1d   | ✓ done | T_LISTEN_REQ + T_CONN_IND/T_CONN_RES (deferred SYN-ACK on accept)|
 | T1e   |        | T_ORDREL_REQ / T_ORDREL_IND (FIN handshake) + T_DISCON_REQ/IND   |
-| T1f   |        | retransmit timer + RTT estimation                                |
+| T1f   | ✓ done | retransmit timer + RTT estimation (SYN/FIN; data is T1g)         |
 | T1g   |        | cmd/tcptest end-to-end                                           |
 
 T1b currently uses a simplified single-connection listener: a TCB in
