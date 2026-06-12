@@ -56,4 +56,16 @@ int  slip_selftest_run(void);
  * find it.  Called from streams_head_init. */
 void slip_module_init(void);
 
+/* Snapshot of slip counters for /proc/slip introspection.  Returns
+ * total raw bytes the rx kthread has pulled off the mini-UART, plus
+ * the frame-level counters maintained by the slip module itself. */
+struct slip_state_view {
+	uint32_t   rx_frames;
+	uint32_t   rx_runts;
+	uint32_t   rx_overflow;
+	uint32_t   tx_frames;
+};
+uint32_t slip_rx_byte_count(void);
+int      slip_get_stats(struct slip_state_view *out);
+
 #endif

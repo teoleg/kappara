@@ -149,6 +149,24 @@ struct t_tcp_conn_ind {
 	uint16_t _pad2;
 };
 
+/* Empty payload -- T1d's listener model accepts the one pending
+ * connection per LISTEN socket (no seq token needed).  T1d.5's
+ * multi-accept will carry a seq + accept_fd field here. */
+struct t_tcp_conn_res {
+	uint8_t  prim;
+	uint8_t  _pad[3];
+};
+
+/* T_TCP_LISTEN_REQ: explicit BOUND -> LISTEN transition.  Without
+ * it a bound TCB silently drops inbound SYNs.  T1d split this from
+ * the T1b/T1c implicit-listener hack where BOUND auto-accepted. */
+struct t_tcp_listen_req {
+	uint8_t  prim;
+	uint8_t  _pad[3];
+};
+
+#define T_TCP_LISTEN_REQ	0x1d
+
 struct t_tcp_data_req {
 	uint8_t  prim;
 	uint8_t  _pad[3];
