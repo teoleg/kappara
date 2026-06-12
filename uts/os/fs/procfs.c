@@ -32,6 +32,7 @@
 #include "kappara/core/kmem.h"
 #include "kappara/net/netif.h"
 #include "kappara/net/slip.h"
+#include "kappara/net/tcp.h"
 #include "kappara/core/pmm.h"
 #include "kappara/core/printk.h"
 #include "kappara/fs/proc.h"
@@ -331,6 +332,47 @@ static int proc_netif_qopen(queue_t *q)
 	return 0;
 }
 
+/* ---- /proc/tcp ---------------------------------------------------- */
+/*
+ * One row per registered TCB.  Columns: state, local port, peer
+ * addr:port, send-buf length, srtt and current RTO (both ms).
+ */
+
+static struct procbuf tcp_pb;
+
+static void tcp_one_row(const struct tcp_tcb_view *v, void *arg)
+{
+	struct procbuf *b = arg;
+	pb_pad_str(b, v->state_name, 14);
+	pb_pad_dec(b, v->local_port, 6);
+	pb_str(b, "  ");
+	if (v->remote_ip) {
+		pb_pad_dec(b, (v->remote_ip >> 24) & 0xff, 0); pb_putc(b, '.');
+		pb_pad_dec(b, (v->remote_ip >> 16) & 0xff, 0); pb_putc(b, '.');
+		pb_pad_dec(b, (v->remote_ip >>  8) & 0xff, 0); pb_putc(b, '.');
+		pb_pad_dec(b,  v->remote_ip        & 0xff, 0); pb_putc(b, ':');
+		pb_pad_dec(b, v->remote_port, 0);
+	} else {
+		pb_str(b, "-");
+	}
+	pb_str(b, "  sbuf=");
+	pb_pad_dec(b, v->snd_buf_len, 0);
+	pb_str(b, "  srtt=");
+	pb_pad_dec(b, v->srtt_ms, 0);
+	pb_str(b, "ms rto=");
+	pb_pad_dec(b, v->rto_ms, 0);
+	pb_str(b, "ms\n");
+}
+
+static int proc_tcp_qopen(queue_t *q)
+{
+	pb_reset(&tcp_pb);
+	pb_str(&tcp_pb, "STATE         LPORT  PEER             EXTRAS\n");
+	tcp_for_each_tcb(tcp_one_row, &tcp_pb);
+	pb_flush_to_q(&tcp_pb, q);
+	return 0;
+}
+
 /* ---- /proc/slip ---------------------------------------------------- */
 /*
  * Per-line counters for the slip0 stream.  rx_bytes is what the mini-
@@ -408,6 +450,7 @@ PROC_DRIVER(stream, proc_stream_qopen);
 PROC_DRIVER(cpu,    proc_cpu_qopen);
 PROC_DRIVER(netif,  proc_netif_qopen);
 PROC_DRIVER(procslip, proc_slip_qopen);
+PROC_DRIVER(proctcp,  proc_tcp_qopen);
 
 /* ---- /proc/ftrace --------------------------------------------------- */
 
@@ -487,6 +530,7 @@ void proc_init(void)
 	cdev_register(CDEV_MAJ_PROC_CPU,    "proc-cpu",    &cpu_streamtab);
 	cdev_register(CDEV_MAJ_PROC_NETIF,  "proc-netif",  &netif_streamtab);
 	cdev_register(CDEV_MAJ_PROC_SLIP,   "proc-slip",   &procslip_streamtab);
+	cdev_register(CDEV_MAJ_PROC_TCP,    "proc-tcp",    &proctcp_streamtab);
 
 	struct dentry *proc = vfs_mkdir(vfs_root(), "proc");
 	vfs_mknod_chrdev(proc, "ps",       MKDEV(CDEV_MAJ_PROC_PS,     0));
@@ -497,4 +541,5 @@ void proc_init(void)
 	vfs_mknod_chrdev(proc, "cpuload",  MKDEV(CDEV_MAJ_PROC_CPU,    0));
 	vfs_mknod_chrdev(proc, "netif",    MKDEV(CDEV_MAJ_PROC_NETIF,  0));
 	vfs_mknod_chrdev(proc, "slip",     MKDEV(CDEV_MAJ_PROC_SLIP,   0));
+	vfs_mknod_chrdev(proc, "tcp",      MKDEV(CDEV_MAJ_PROC_TCP,    0));
 }

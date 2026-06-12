@@ -115,6 +115,14 @@ struct tcp_tcb {
 	uint32_t   srtt_ticks;
 	uint32_t   rttvar_ticks;
 
+	/* T1g send queue.  snd_buf holds unACK'd outbound bytes;
+	 * snd_buf_seq is the seq number of the first byte in the
+	 * buffer.  Each T_DATA_REQ appends, each ACK trims from the
+	 * front.  Caps at 8 KB -- T_DATA_REQ above that returns
+	 * DISCON_IND with reason=PROTOERR (no flow control yet). */
+	mblk_t    *snd_buf;
+	uint32_t   snd_buf_seq;
+
 	/* Queue pointers stashed for the timer kthread (which doesn't
 	 * have a queue parameter).  upper_rq = where to deliver
 	 * T_DISCON_IND when we give up retransmitting. */
@@ -125,6 +133,7 @@ struct tcp_tcb {
 #define TCP_RTO_MAX	6000	/* 60.0 s                       */
 #define TCP_RTO_INITIAL	100	/* 1.0 s before first RTT sample */
 #define TCP_MAX_RETRANSMITS	5
+#define TCP_SND_BUF_MAX	8192
 
 /* ---- Tick + TCB registry --------------------------------------- */
 
@@ -611,8 +620,23 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 		 * Compare via int32 subtraction so wraparound is handled
 		 * the canonical RFC 793 way. */
 		if (flags & TCP_FLAG_ACK) {
-			if ((int32_t)(seg_ack - s->snd_una) > 0)
+			if ((int32_t)(seg_ack - s->snd_una) > 0) {
+				uint32_t acked = seg_ack - s->snd_una;
 				s->snd_una = seg_ack;
+				/* T1g: trim ACK'd bytes from snd_buf. */
+				if (s->snd_buf) {
+					unsigned buf_len = (unsigned)
+					    (s->snd_buf->b_wptr - s->snd_buf->b_rptr);
+					if (acked >= buf_len) {
+						freemsg(s->snd_buf);
+						s->snd_buf     = NULL;
+						s->snd_buf_seq = 0;
+					} else {
+						s->snd_buf->b_rptr += acked;
+						s->snd_buf_seq += acked;
+					}
+				}
+			}
 			/* State-machine effects of the ACK depend on the
 			 * current state. */
 			if (s->state == TCPS_FIN_WAIT_1
@@ -728,6 +752,7 @@ static int tcp_qclose(queue_t *rq)
 		uint32_t key = tcp_bind_key(s->local_port, 0);
 		send_ip_bind(rq, IP_T_UNBIND_REQ, key);
 	}
+	if (s->snd_buf) freemsg(s->snd_buf);
 	tcp_tcb_unregister(s);
 	rq->q_ptr     = NULL;
 	WR(rq)->q_ptr = NULL;
@@ -856,7 +881,45 @@ static int handle_data_req(queue_t *q, struct tcp_tcb *s, mblk_t *payload)
 		if (payload) freemsg(payload);
 		return 0;	/* zero-byte data: nothing to send */
 	}
-	return tcp_send_segment(s, TCP_FLAG_ACK | TCP_FLAG_PSH, payload);
+	unsigned plen = (unsigned)msgdsize(payload);
+	unsigned old  = s->snd_buf
+	             ? (unsigned)(s->snd_buf->b_wptr - s->snd_buf->b_rptr) : 0;
+	if (old + plen > TCP_SND_BUF_MAX) {
+		freemsg(payload);
+		reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_PROTOERR);
+		return -1;
+	}
+
+	/* Append to snd_buf so retransmits can pull the unACK'd bytes
+	 * out of it.  Single-mblk model keeps the trim logic simple
+	 * (advance b_rptr on ACK). */
+	mblk_t *new_buf = allocb(old + plen, 0);
+	if (!new_buf) { freemsg(payload); return -1; }
+	if (old) {
+		kmemcpy(new_buf->b_wptr, s->snd_buf->b_rptr, old);
+		new_buf->b_wptr += old;
+	}
+	for (mblk_t *m = payload; m; m = m->b_cont) {
+		unsigned n = (unsigned)(m->b_wptr - m->b_rptr);
+		if (n == 0) continue;
+		kmemcpy(new_buf->b_wptr, m->b_rptr, n);
+		new_buf->b_wptr += n;
+	}
+
+	if (!s->snd_buf) s->snd_buf_seq = s->snd_nxt;
+	if (s->snd_buf) freemsg(s->snd_buf);
+	s->snd_buf = new_buf;
+
+	/* Send a copy of just the new bytes.  tcp_send_segment copies +
+	 * frees; the canonical retransmit-source bytes live in snd_buf. */
+	mblk_t *send_copy = allocb(plen, 0);
+	if (send_copy) {
+		kmemcpy(send_copy->b_wptr,
+		        new_buf->b_rptr + old, plen);
+		send_copy->b_wptr += plen;
+	}
+	freemsg(payload);
+	return tcp_send_segment(s, TCP_FLAG_ACK | TCP_FLAG_PSH, send_copy);
 }
 
 static int tcp_wq_putp(queue_t *q, mblk_t *mp)
@@ -1057,6 +1120,38 @@ void tcp_module_init(void)
 {
 	streams_register("tcp", &tcp_streamtab);
 	cdev_register(CDEV_MAJ_TCP, "tcp", &ip_streamtab);
+}
+
+/* /proc/tcp walker.  cb returns the per-connection row info to the
+ * caller; we don't lock the table -- connections coming and going
+ * during a /proc read is OK, snapshot semantics are loose. */
+static const char *tcp_state_names[] = {
+	"CLOSED", "BOUND", "LISTEN", "SYN_SENT", "SYN_RECEIVED",
+	"ESTABLISHED", "FIN_WAIT_1", "FIN_WAIT_2", "CLOSE_WAIT", "LAST_ACK",
+};
+
+void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),
+                      void *arg)
+{
+	for (int i = 0; i < TCP_MAX_TCBS; i++) {
+		struct tcp_tcb *s = tcp_tcb_table[i];
+		if (!s) continue;
+		struct tcp_tcb_view v = {
+			.state_name  = (s->state < (int)(sizeof(tcp_state_names)
+			                / sizeof(tcp_state_names[0])))
+			               ? tcp_state_names[s->state]
+			               : "?",
+			.local_port  = s->local_port,
+			.remote_ip   = s->remote_ip,
+			.remote_port = s->remote_port,
+			.snd_buf_len = s->snd_buf
+			    ? (uint32_t)(s->snd_buf->b_wptr - s->snd_buf->b_rptr)
+			    : 0,
+			.rto_ms      = s->rto_ticks * 10,
+			.srtt_ms     = s->srtt_ticks * 10,
+		};
+		cb(&v, arg);
+	}
 }
 
 /* Late init: spawn the retransmit kthread.  Called from main.c
