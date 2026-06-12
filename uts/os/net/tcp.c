@@ -422,6 +422,58 @@ static void reply_data_ind(queue_t *rq, mblk_t *payload)
  * the segment goes out so the loopback recursion observes the
  * post-send state.
  */
+/* Pure emit: build a segment with the given seq + flags + body and
+ * push it through ip_send.  No state mutation -- snd_nxt is NOT
+ * advanced, RTO is NOT armed.  Used by both the regular send wrapper
+ * (which does state updates around it) and the retransmit kthread
+ * (which re-sends snd_buf bytes with seq = snd_buf_seq). */
+static int tcp_emit_segment(struct tcp_tcb *s, uint32_t seq, uint8_t flags,
+                            const void *body, unsigned blen)
+{
+	uint32_t src_ip = ip_route_src(s->remote_ip);
+	if (src_ip == 0) {
+		kprintf("tcp: no route to %u.%u.%u.%u\n",
+			(s->remote_ip >> 24) & 0xff,
+			(s->remote_ip >> 16) & 0xff,
+			(s->remote_ip >>  8) & 0xff,
+			 s->remote_ip        & 0xff);
+		return -1;
+	}
+
+	mblk_t *mp = allocb(IP_HDR_LEN + TCP_HDR_LEN_MIN + blen, 0);
+	if (!mp) return -1;
+	mp->b_rptr += IP_HDR_LEN;
+	mp->b_wptr  = mp->b_rptr;
+
+	struct tcp_hdr *h = (struct tcp_hdr *)mp->b_wptr;
+	h->src_port = htons16(s->local_port);
+	h->dst_port = htons16(s->remote_port);
+	h->seq      = htonl32(seq);
+	h->ack      = htonl32(s->rcv_nxt);
+	h->data_off = (TCP_HDR_LEN_MIN / 4) << 4;
+	h->flags    = flags;
+	h->window   = htons16(8192);
+	h->checksum = 0;
+	h->urg_ptr  = 0;
+	mp->b_wptr += TCP_HDR_LEN_MIN;
+
+	if (blen > 0 && body) {
+		kmemcpy(mp->b_wptr, body, blen);
+		mp->b_wptr += blen;
+	}
+
+	unsigned seg_len = TCP_HDR_LEN_MIN + blen;
+	uint16_t cs = tcp_checksum(src_ip, s->remote_ip, h, seg_len);
+	h->checksum = htons16(cs);
+
+	return ip_send(s->remote_ip, IPPROTO_TCP, mp);
+}
+
+/* Regular send wrapper: build segment from mblk payload + advance
+ * snd_nxt + arm RTO when the segment carries SYN, FIN, or data.
+ * Frees the payload mblk (canonical bytes for data live in snd_buf;
+ * the caller passes a fresh copy of just the bytes being newly
+ * sent). */
 static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags,
                             mblk_t *payload)
 {
@@ -475,12 +527,10 @@ static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags,
 	if (flags & TCP_FLAG_FIN) s->snd_nxt += 1;
 	s->snd_nxt += plen;
 
-	/* Arm RTO for segments that consume sequence-number space
-	 * (SYN and FIN) -- those are the segments that need to make it
-	 * through for the connection to progress.  Pure ACKs and data
-	 * (no FIN) don't get retransmitted at T1f; T1g's send queue
-	 * adds data retransmit. */
-	if (flags & (TCP_FLAG_SYN | TCP_FLAG_FIN))
+	/* Arm RTO whenever the segment occupies sequence space: SYN, FIN,
+	 * or data.  Pure ACKs don't need retransmit -- if the peer didn't
+	 * see our ACK, they'll re-send their data and we'll re-ACK. */
+	if ((flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) || plen > 0)
 		tcp_arm_rto(s, flags);
 
 	return ip_send(s->remote_ip, IPPROTO_TCP, mp);
@@ -623,7 +673,10 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 			if ((int32_t)(seg_ack - s->snd_una) > 0) {
 				uint32_t acked = seg_ack - s->snd_una;
 				s->snd_una = seg_ack;
-				/* T1g: trim ACK'd bytes from snd_buf. */
+				/* T1g: trim ACK'd bytes from snd_buf.
+				 * Cancel RTO when fully drained; reset on
+				 * partial ACK so the next byte gets its
+				 * own retransmit budget. */
 				if (s->snd_buf) {
 					unsigned buf_len = (unsigned)
 					    (s->snd_buf->b_wptr - s->snd_buf->b_rptr);
@@ -631,9 +684,21 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 						freemsg(s->snd_buf);
 						s->snd_buf     = NULL;
 						s->snd_buf_seq = 0;
+						if (s->retransmit_count == 0)
+							tcp_update_rtt(s,
+							    tcp_tick_counter
+							    - s->send_tick);
+						tcp_cancel_rto(s);
 					} else {
 						s->snd_buf->b_rptr += acked;
 						s->snd_buf_seq += acked;
+						/* Partial ACK: reset RTO so
+						 * the remaining bytes get a
+						 * fresh timer. */
+						s->rto_expires = tcp_tick_counter
+						               + s->rto_ticks;
+						s->send_tick = tcp_tick_counter;
+						s->retransmit_count = 0;
 					}
 				}
 			}
@@ -1092,24 +1157,35 @@ static void tcp_retransmit_main(void *arg)
 				continue;
 			}
 
-			/* Back off, re-send, re-arm.  Don't sample RTT
-			 * (Karn): retransmit_count > 0 suppresses
-			 * sampling in all ACK paths above. */
+			/* Back off, re-send, re-arm.  Don't sample RTT on
+			 * the eventual ACK (Karn): retransmit_count > 0
+			 * suppresses sampling in all ACK paths. */
 			uint8_t saved_count = s->retransmit_count + 1;
 			s->rto_ticks <<= 1;
 			if (s->rto_ticks > TCP_RTO_MAX) s->rto_ticks = TCP_RTO_MAX;
-			/* snd_nxt was already advanced when we first sent
-			 * the SYN/FIN.  tcp_send_segment will advance it
-			 * AGAIN if we just pass the flags as-is, so rewind
-			 * before retransmitting. */
-			uint8_t f = s->pending_flags;
-			if (f & TCP_FLAG_SYN) s->snd_nxt -= 1;
-			if (f & TCP_FLAG_FIN) s->snd_nxt -= 1;
-			(void)tcp_send_segment(s, f, NULL);
-			/* tcp_send_segment -> tcp_arm_rto reset
-			 * retransmit_count to 0 and rto_expires.  Restore
-			 * our count and override expiry with the doubled
-			 * timeout. */
+
+			/* Data retransmit takes priority: if snd_buf has
+			 * unACK'd bytes, re-send them at snd_buf_seq.
+			 * tcp_emit_segment doesn't touch snd_nxt, so the
+			 * regular bookkeeping is unchanged. */
+			if (s->snd_buf
+			    && s->snd_buf->b_wptr > s->snd_buf->b_rptr) {
+				unsigned plen = (unsigned)
+				    (s->snd_buf->b_wptr - s->snd_buf->b_rptr);
+				(void)tcp_emit_segment(s, s->snd_buf_seq,
+				    TCP_FLAG_ACK | TCP_FLAG_PSH,
+				    s->snd_buf->b_rptr, plen);
+			} else if (s->pending_flags
+			    & (TCP_FLAG_SYN | TCP_FLAG_FIN)) {
+				/* SYN/FIN retransmit -- the segment
+				 * already consumed a slot of seq space
+				 * when first sent, so re-emit at the same
+				 * seq.  Use snd_una which is the oldest
+				 * unACK'd byte (== the SYN/FIN seq). */
+				(void)tcp_emit_segment(s, s->snd_una,
+				    s->pending_flags, NULL, 0);
+			}
+
 			s->retransmit_count = saved_count;
 			s->rto_expires      = now + s->rto_ticks;
 		}
