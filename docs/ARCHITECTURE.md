@@ -772,6 +772,7 @@ TPI primitives (locked in across phases; see
 | T1f   | ✓ done | retransmit timer + RTT estimation (SYN/FIN; data is T1g)         |
 | T1g   | ✓ done | cmd/test `tcp` and `tcpmulti` subcommands end-to-end             |
 | T1h   | ✓ done | real receive-window advertisement; cap data_req by peer's wnd   |
+| T1i   | ✓ done | TIME_WAIT + CLOSING (RFC 793 full graph); 2*MSL via tcp_tick    |
 
 T1h flow control: outbound segments advertise
 `TCP_RCV_WND_MAX - upstream_q_count` instead of a hardcoded constant,
@@ -785,6 +786,50 @@ snd_wnd)`.  No queueing of "deferred" sends yet -- a `T_DATA_REQ`
 that doesn't fit returns `T_DISCON_IND{PROTOERR}` and the user
 re-tries after an ACK opens the window.  `/proc/tcp` shows both as
 `swnd=N rwnd=M`.
+
+T1i state machine completion -- the RFC 793 close graph is now
+fully wired:
+
+```
+   ESTABLISHED ---(user T_ORDREL_REQ; send FIN)--> FIN_WAIT_1
+       |                                              |
+       |                                  +-----------+-----------+
+       |                                  |                       |
+       |                              peer ACK              peer FIN (no ACK)
+       |                                  v                       v
+       |                              FIN_WAIT_2              CLOSING
+       |                                  |                       |
+       |                              peer FIN                peer ACK
+       |                                  v                       v
+   CLOSE_WAIT ---(user T_ORDREL_REQ)--> LAST_ACK            TIME_WAIT
+       |                                  |                       |
+       |                              peer ACK              2*MSL expires
+       |                                  v                       v
+       |                                CLOSED                  CLOSED
+       v
+   (user T_ORDREL_REQ)
+```
+
+CLOSING is the simultaneous-close midpoint -- our FIN crossed the
+peer's FIN in flight; we move there from FIN_WAIT_1 when a peer FIN
+arrives before the ACK for our own FIN.  When the trailing ACK
+finally lands, we transition to TIME_WAIT.
+
+TIME_WAIT is the 2*MSL sweep -- the active closer absorbs any
+retransmitted FIN from the peer (in case our final ACK was lost) and
+holds the 5-tuple out of reuse so stray late packets can't fool a
+new connection.  2*MSL is `TCP_TIME_WAIT_TICKS` (1 s, since
+everything is local; bump for non-loopback peers).  The retransmit
+kthread drives the clock: at each tick it checks every TCB with
+`state == TIME_WAIT` and flips to CLOSED on expiry.  TIME_WAIT also
+ignores spurious RTO arms; the only thing in flight is potential
+peer-FIN-retransmits, which we re-ACK without resetting the 2*MSL
+deadline.
+
+`tcp_qclose` skips the parting RST for CLOSING / TIME_WAIT / CLOSED
+since both sides already FIN'd.  LAST_ACK still sends RST if the
+user closes before our final ACK lands -- otherwise the peer's
+unACK'd FIN would retransmit into the void.
 
 T1d.5 multi-accept: the listener stays in LISTEN across accepts.  Each
 inbound SYN gets queued in an 8-slot backlog ring on the listener's

@@ -57,22 +57,39 @@ mounted at `/usr/bin`.  Typing their name without `exec` works because
 the shell's PATH fallback automatically tries `/usr/bin/<name>` for any
 unrecognised command.  Source lives in `cmd/`.
 
-| Program       | What it does                                                  |
-|---------------|---------------------------------------------------------------|
-| `ps`          | Read and display `/proc/ps` (thread list with TID/state/name).|
-| `sigtest`     | Install a SIGTERM handler, signal self, verify delivery (smoke test for `sigaction`/`sendsig`/`sigreturn`). |
-| `masktest`    | `sigprocmask` + `sigsuspend` round-trip: block SIGTERM, queue it, atomically unblock-and-wait. |
-| `waittest`    | Spawn a short-lived worker thread via `sys_spawn`, `sys_wait` for it. |
-| `segvtest`    | Spawn a worker that installs a SIGSEGV handler then deref NULL — proves one-shot handler delivery. |
-| `crash`       | Dereference NULL directly — no spawn.  The exec thread takes the EL0 data-abort fault, gets SIGSEGV'd, and exits. |
-| `pipe`        | Create a pipe, write a message, read it back in the same thread. |
-| `pipework`    | Spawn a writer thread and a reader thread connected by a pipe; demonstrates blocking-read EOF detection. |
-| `malloctest`  | Exercise libc `malloc`/`free`/`calloc`/`realloc` end-to-end; smoke test for `SYS_brk` and the sbrk-backed allocator. |
-| `forktest`    | R5 smoke test: parent forks, child mutates a global, exits with status 42; parent waits and verifies the mutation didn't leak across the address-space boundary. |
-| `ping [ip] [count]` | Send ICMP echo requests via `/dev/icmp` (STREAMS cdev).  Default target `127.0.0.1`, default count 4.  Prints `PONG from A.B.C.D: seq=N rtt=Xms` per reply.  Works over loopback only for now (no SLIP/Ethernet yet). |
-| `udptest`     | TPI smoke test for `/dev/udp`: binds port 12345 via `putmsg(T_BIND_REQ)`, sends a 9-byte payload to 127.0.0.1:12345 via `putmsg(T_UNITDATA_REQ)`, reads it back via `getmsg(T_UNITDATA_IND)`, verifies the payload round-tripped intact. |
-| `pktfilttest` | Composability proof: opens `/dev/udp`, baseline-sends a datagram, then `ioctl(I_PUSH, "pktfilter")` slots a kernel filter module between the stream head and UDP at runtime.  Configures the filter to drop dst_port=12345, sends another datagram (silently dropped), queries the filter's drop counter via `PF_T_STATS_REQ`, then `ioctl(I_POP)` removes the filter and re-sends to confirm traffic flows again. |
-| `ifconfig`    | Dump `/proc/netif` (one row per registered netif: name, flags, MTU, IP, netmask).  Read-only — all netifs are statically registered at boot. |
+| Program             | What it does                                            |
+|---------------------|---------------------------------------------------------|
+| `ps`                | Read and display `/proc/ps` (thread list with TID/state/name). |
+| `ping [ip] [count]` | Send ICMP echo requests via `/dev/icmp`.  Default target `127.0.0.1`, count 4. |
+| `ifconfig`          | Dump `/proc/netif` (one row per registered netif).      |
+| `netstat`           | Dump `/proc/netif` + `/proc/slip` + `/proc/tcp`.        |
+| `test <name>`       | Run one selftest (see subcommand list below).  `test all` runs every test, `test` with no args prints the list. |
+
+The five `/usr/bin` programs cap at `KFS_DIRENTS=14`; adding a new
+top-level ELF burns a kernel-image slab plus a kfs slot, so new
+selftests go into `cmd/test.c` as another entry in the registry,
+not a new ELF.
+
+`test` subcommands (the registry lives in `cmd/test.c`):
+
+| Subcommand     | What it does                                                |
+|----------------|-------------------------------------------------------------|
+| `fork`         | parent forks; child mutates a global, exits with status 42; parent waits and verifies the mutation didn't leak across the address-space boundary. |
+| `wait`         | spawn a short-lived worker thread via `sys_spawn`, `sys_wait` for it. |
+| `sig`          | install a SIGTERM handler, signal self, verify delivery (smoke test for `sigaction`/`sendsig`/`sigreturn`). |
+| `mask`         | `sigprocmask` + `sigsuspend` round-trip: block SIGTERM, queue it, atomically unblock-and-wait. |
+| `segv`         | spawn a worker that installs a SIGSEGV handler then deref NULL -- proves one-shot handler delivery. |
+| `pipe`         | create a pipe, write a message, read it back in the same thread. |
+| `pipework`     | spawn writer + reader threads connected by a pipe; demonstrates blocking-read EOF detection. |
+| `malloc`       | exercise libc `malloc`/`free`/`calloc`/`realloc` end-to-end. |
+| `udp`          | TPI smoke test for `/dev/udp`: bind, send, recv, verify payload round-trip. |
+| `pktfilt`      | composability proof: open `/dev/udp`, `I_PUSH` the pktfilter module at runtime, configure it to drop one dst port, verify the drop counter, `I_POP` it, verify traffic flows again. |
+| `tcp`          | TPI smoke test for `/dev/tcp`: 3-fd flow (listener / client / responder), 3-way handshake, bidirectional data, graceful close. |
+| `tcpmulti`     | multi-accept proof: two clients connect to one listener, listener stays in LISTEN, both accepted onto separate responder fds, cross-traffic verified. |
+
+The `crash` shell builtin is unchanged: `crash` from the shell prompt
+derefs NULL directly and the EL0 fault path SIGSEGVs the calling
+thread.  See `docs/ARCHITECTURE.md` for the trap dispatch.
 
 Exec-space programs can call `sys_spawn` to create sub-threads.  The
 kernel allocates their stacks from `exec_stack_storage` starting at
@@ -101,13 +118,6 @@ These all act on a single "current" fd kept in the shell, set by `open`.
 | `push <module>`            | `ioctl(I_PUSH, "module")` — push a module on the stream.    |
 | `pop`                      | `ioctl(I_POP)`.                                             |
 
-## Pipes / IPC
-
-| Command                    | What it does                                                |
-|----------------------------|-------------------------------------------------------------|
-| `pipe`                     | sys_pipe demo: write then read in the same shell thread.    |
-| `pipework`                 | `sys_pipe` + two spawned workers connected through it (blocking read + EOF). |
-
 ## Examples
 
 A small session that exercises most of it:
@@ -115,26 +125,28 @@ A small session that exercises most of it:
 ```
 kappara:/# ls
 usr
+etc
 bin
 proc
 dev
 kappara:/# ll /usr/bin
-reg    10144 malloctest
-reg    12136 pipework
-reg    11768 pipe
-reg    11472 crash
-reg    11832 segvtest
-reg    11872 waittest
-reg    11968 masktest
-reg    11824 sigtest
-reg    11584 ps
-kappara:/# malloctest
-malloctest: PASS
-kappara:/# cat /proc/ps
-  TID  STATE   NAME
-    0  READY   main
-    1  READY   uart_rx
-    2  RUN     user-init
+reg   17920 test
+reg    9456 netstat
+reg    9712 ifconfig
+reg   10144 ping
+reg    9456 ps
+kappara:/# test malloc
+malloc: PASS
+kappara:/# test tcp
+tcp: PASS
+kappara:/# netstat
+NAME    FLAGS  MTU     IP              NETMASK
+lo0     UP      1500  127.0.0.1       255.0.0.0
+slip0   UP       296  192.168.10.2    255.255.255.252
+iface:  slip0  (mini-UART at 0x3F215040)
+rx_bytes_total:         0
+...
+STATE         LPORT  PEER             EXTRAS
 ```
 
 ## `kc` — Norton Commander-style file manager

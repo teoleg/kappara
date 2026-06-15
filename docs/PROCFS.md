@@ -212,6 +212,23 @@ RTT, current RTO.  Listener TCBs with queued pending SYNs append
 `backlog=N` -- the depth of the multi-accept ring
 (`TCP_LISTEN_BACKLOG`, currently 8).
 
+State names match the RFC 793 graph:
+
+| State          | Meaning                                              |
+|----------------|------------------------------------------------------|
+| `CLOSED`       | TCB allocated, nothing bound yet                     |
+| `BOUND`        | `T_BIND_REQ` succeeded, no `T_LISTEN_REQ` yet        |
+| `LISTEN`       | accepting inbound SYNs into the backlog ring         |
+| `SYN_SENT`     | active opener; sent SYN, waiting for SYN-ACK         |
+| `SYN_RECEIVED` | passive opener; sent SYN-ACK, waiting for ACK        |
+| `ESTABLISHED`  | both sides have agreed on ISS+1; data flows          |
+| `FIN_WAIT_1`   | sent our FIN; awaiting ACK and/or peer FIN           |
+| `FIN_WAIT_2`   | our FIN ACK'd; awaiting peer's FIN                   |
+| `CLOSE_WAIT`   | peer FIN'd us; user hasn't sent `T_ORDREL_REQ` yet   |
+| `CLOSING`      | simultaneous close; our FIN crossed peer's FIN       |
+| `LAST_ACK`     | passive-closer sent FIN; awaiting peer's final ACK   |
+| `TIME_WAIT`    | active-closer 2*MSL sweep; absorbs FIN retransmits   |
+
 ```
 kappara:/# cat /proc/tcp
 STATE         LPORT  PEER             EXTRAS

@@ -71,6 +71,8 @@ enum tcp_state {
 	TCPS_FIN_WAIT_2    = 7,
 	TCPS_CLOSE_WAIT    = 8,
 	TCPS_LAST_ACK      = 9,
+	TCPS_CLOSING       = 10,	/* T1i: simultaneous close */
+	TCPS_TIME_WAIT     = 11,	/* T1i: active-closer 2*MSL wait */
 };
 
 struct tcp_tcb {
@@ -143,6 +145,12 @@ struct tcp_tcb {
 	 * connection).  handle_data_req honours it: we never let more
 	 * than min(TCP_SND_BUF_MAX, snd_wnd) bytes be outstanding. */
 	uint16_t   snd_wnd;
+
+	/* T1i TIME_WAIT 2*MSL deadline (in 10ms ticks).  Set when we
+	 * enter TIME_WAIT; the retransmit kthread polls and transitions
+	 * to CLOSED once tcp_tick_counter passes this.  0 when not in
+	 * TIME_WAIT. */
+	uint32_t   time_wait_expires;
 };
 
 #define TCP_RTO_MIN	100	/* 1.0 s in 10ms ticks (RFC 6298) */
@@ -151,6 +159,12 @@ struct tcp_tcb {
 #define TCP_MAX_RETRANSMITS	5
 #define TCP_SND_BUF_MAX	8192
 #define TCP_RCV_WND_MAX	8192	/* max bytes we advertise as receive window */
+/* T1i 2*MSL.  RFC 793 picks 2 minutes; real Solaris defaults to 60s.
+ * For kappara everything is local (lo0 or a short SLIP wire), so 1
+ * second is plenty to absorb peer FIN retransmits without making
+ * tests wait forever for TIME_WAIT->CLOSED.  Bump if you ever wire
+ * up a network where stray segments can actually loiter. */
+#define TCP_TIME_WAIT_TICKS	100	/* 1.0 s */
 
 /* ---- Tick + TCB registry --------------------------------------- */
 
@@ -248,6 +262,17 @@ static void tcp_arm_rto(struct tcp_tcb *s, uint8_t flags)
 static void tcp_cancel_rto(struct tcp_tcb *s)
 {
 	s->rto_expires = 0;
+}
+
+/* T1i: transition into TIME_WAIT.  Arms the 2*MSL deadline; the
+ * retransmit kthread polls it and flips to CLOSED on expiry.  Cancels
+ * any pending RTO -- we're done sending, just absorbing any FIN
+ * retransmits the peer might send. */
+static void tcp_enter_time_wait(struct tcp_tcb *s)
+{
+	s->state             = TCPS_TIME_WAIT;
+	s->time_wait_expires = tcp_tick_counter + TCP_TIME_WAIT_TICKS;
+	tcp_cancel_rto(s);
 }
 
 /* RFC 6298 RTT estimator.  Karn's algorithm: don't sample on
@@ -820,6 +845,17 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 					    tcp_tick_counter - s->send_tick);
 				tcp_cancel_rto(s);
 				s->state = TCPS_FIN_WAIT_2;
+			} else if (s->state == TCPS_CLOSING
+			        && s->snd_una == s->snd_nxt) {
+				/* Simultaneous close: we'd entered CLOSING
+				 * when our FIN crossed peer's FIN in flight,
+				 * still waiting for our FIN to be ACK'd.
+				 * Now it is -- go to TIME_WAIT for the 2*MSL
+				 * sweep. */
+				if (s->retransmit_count == 0)
+					tcp_update_rtt(s,
+					    tcp_tick_counter - s->send_tick);
+				tcp_enter_time_wait(s);
 			} else if (s->state == TCPS_LAST_ACK
 			        && s->snd_una == s->snd_nxt) {
 				/* Our FIN (sent in response to peer's FIN)
@@ -861,18 +897,25 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 		 * expect (post-data is fine). */
 		if ((flags & TCP_FLAG_FIN) && seg_seq + data_len == s->rcv_nxt) {
 			s->rcv_nxt += 1;
-			/* state-update before send (lo0 sync) */
+			/* T1i: state-update before send (lo0 sync).  RFC 793
+			 * full graph:
+			 *   ESTABLISHED + FIN              -> CLOSE_WAIT
+			 *   FIN_WAIT_1  + FIN  (our FIN ACK'd above)
+			 *                                  -> TIME_WAIT
+			 *   FIN_WAIT_1  + FIN  (our FIN still in flight)
+			 *                                  -> CLOSING
+			 *   FIN_WAIT_2  + FIN              -> TIME_WAIT
+			 * The ACK path above already turned FIN_WAIT_1 into
+			 * FIN_WAIT_2 if the segment ACK'd our FIN, so by the
+			 * time we get here state==FIN_WAIT_1 means our FIN
+			 * is still unACK'd -> CLOSING. */
 			enum tcp_state prev = s->state;
 			if (prev == TCPS_ESTABLISHED)
 				s->state = TCPS_CLOSE_WAIT;
-			else if (prev == TCPS_FIN_WAIT_1
-			      || prev == TCPS_FIN_WAIT_2)
-				/* T1e simplification: skip TIME_WAIT and
-				 * jump straight to CLOSED.  No 2*MSL wait
-				 * means the same 5-tuple can be reused
-				 * immediately; not a practical issue at
-				 * our scale. */
-				s->state = TCPS_CLOSED;
+			else if (prev == TCPS_FIN_WAIT_1)
+				s->state = TCPS_CLOSING;
+			else if (prev == TCPS_FIN_WAIT_2)
+				tcp_enter_time_wait(s);
 			(void)tcp_send_segment(s, TCP_FLAG_ACK, NULL);
 			/* T_ORDREL_IND fires on every FIN we accept,
 			 * regardless of our state.  Even if we already
@@ -880,11 +923,24 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 			 * user benefits from the "peer is done sending"
 			 * signal -- it means the connection is fully
 			 * closed, no need to wait further. */
-			(void)prev;
 			reply_ordrel_ind(q);
 		}
 		break;
 	}
+
+	case TCPS_TIME_WAIT:
+		/* 2*MSL sweep.  Peer may retransmit their FIN if our final
+		 * ACK was lost -- re-send the ACK so they tear down too.
+		 * The retransmitted FIN's seq is one before our rcv_nxt
+		 * (we advanced past it when we first accepted it).  The
+		 * 2*MSL clock is NOT reset here: a flood of retransmits
+		 * would extend TIME_WAIT indefinitely otherwise. */
+		if ((flags & TCP_FLAG_FIN)
+		    && src_ip == s->remote_ip && sport == s->remote_port
+		    && seg_seq + 1 == s->rcv_nxt) {
+			(void)tcp_send_segment(s, TCP_FLAG_ACK, NULL);
+		}
+		break;
 
 	default:
 		break;
@@ -916,6 +972,11 @@ static int tcp_qclose(queue_t *rq)
 	 * graceful close (T_ORDREL_REQ) dance.  Send a RST as a
 	 * failsafe so the peer sees the connection die instead of
 	 * having to time out.  Skip if we're already CLOSED. */
+	/* T1i: CLOSING and TIME_WAIT are graceful-close states -- both
+	 * sides have already FIN'd, no need for a parting RST.  LAST_ACK
+	 * is also a graceful state but we still RST if the user closes
+	 * the fd before our final ACK lands (peer would otherwise
+	 * retransmit FIN into the void). */
 	if (s->state == TCPS_ESTABLISHED
 	 || s->state == TCPS_FIN_WAIT_1
 	 || s->state == TCPS_FIN_WAIT_2
@@ -1316,7 +1377,19 @@ static void tcp_retransmit_main(void *arg)
 
 		for (int i = 0; i < TCP_MAX_TCBS; i++) {
 			struct tcp_tcb *s = tcp_tcb_table[i];
-			if (!s || s->rto_expires == 0)         continue;
+			if (!s) continue;
+			/* T1i: 2*MSL clock for TIME_WAIT.  Drive it from
+			 * the same poll loop as RTO -- both fire off
+			 * tcp_tick_counter ticks.  Done with this slot
+			 * after the transition; nothing more to retransmit. */
+			if (s->state == TCPS_TIME_WAIT) {
+				if ((int32_t)(now - s->time_wait_expires) >= 0) {
+					s->state             = TCPS_CLOSED;
+					s->time_wait_expires = 0;
+				}
+				continue;
+			}
+			if (s->rto_expires == 0)               continue;
 			if ((int32_t)(now - s->rto_expires) < 0) continue;
 
 			if (s->retransmit_count >= TCP_MAX_RETRANSMITS) {
@@ -1378,6 +1451,7 @@ void tcp_module_init(void)
 static const char *tcp_state_names[] = {
 	"CLOSED", "BOUND", "LISTEN", "SYN_SENT", "SYN_RECEIVED",
 	"ESTABLISHED", "FIN_WAIT_1", "FIN_WAIT_2", "CLOSE_WAIT", "LAST_ACK",
+	"CLOSING", "TIME_WAIT",
 };
 
 void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),
