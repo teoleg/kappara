@@ -137,6 +137,12 @@ struct tcp_tcb {
 	 * have a queue parameter).  upper_rq = where to deliver
 	 * T_DISCON_IND when we give up retransmitting. */
 	queue_t   *upper_rq;
+
+	/* Peer's last advertised receive window, in bytes.  Updated on
+	 * every inbound segment (including the SYN that opens the
+	 * connection).  handle_data_req honours it: we never let more
+	 * than min(TCP_SND_BUF_MAX, snd_wnd) bytes be outstanding. */
+	uint16_t   snd_wnd;
 };
 
 #define TCP_RTO_MIN	100	/* 1.0 s in 10ms ticks (RFC 6298) */
@@ -144,6 +150,7 @@ struct tcp_tcb {
 #define TCP_RTO_INITIAL	100	/* 1.0 s before first RTT sample */
 #define TCP_MAX_RETRANSMITS	5
 #define TCP_SND_BUF_MAX	8192
+#define TCP_RCV_WND_MAX	8192	/* max bytes we advertise as receive window */
 
 /* ---- Tick + TCB registry --------------------------------------- */
 
@@ -479,6 +486,21 @@ static void reply_data_ind(queue_t *rq, mblk_t *payload)
  * the segment goes out so the loopback recursion observes the
  * post-send state.
  */
+/* Compute the receive window we should advertise: TCP_RCV_WND_MAX
+ * minus whatever bytes are still queued upstream of us (head's
+ * sd_rq), since those are bytes the user hasn't read yet.  When the
+ * user drains the head, the window naturally re-opens on our next
+ * outbound segment.  upper_rq is the TCP module's read queue;
+ * upper_rq->q_next is the head's sd_rq (TCP sits at the top of the
+ * pushed stack). */
+static uint16_t tcp_rcv_window(const struct tcp_tcb *s)
+{
+	queue_t *uq = s->upper_rq ? s->upper_rq->q_next : NULL;
+	size_t used = uq ? uq->q_count : 0;
+	if (used >= TCP_RCV_WND_MAX) return 0;
+	return (uint16_t)(TCP_RCV_WND_MAX - used);
+}
+
 /* Pure emit: build a segment with the given seq + flags + body and
  * push it through ip_send.  No state mutation -- snd_nxt is NOT
  * advanced, RTO is NOT armed.  Used by both the regular send wrapper
@@ -509,7 +531,7 @@ static int tcp_emit_segment(struct tcp_tcb *s, uint32_t seq, uint8_t flags,
 	h->ack      = htonl32(s->rcv_nxt);
 	h->data_off = (TCP_HDR_LEN_MIN / 4) << 4;
 	h->flags    = flags;
-	h->window   = htons16(8192);
+	h->window   = htons16(tcp_rcv_window(s));
 	h->checksum = 0;
 	h->urg_ptr  = 0;
 	mp->b_wptr += TCP_HDR_LEN_MIN;
@@ -561,7 +583,7 @@ static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags,
 	h->ack      = htonl32(s->rcv_nxt);
 	h->data_off = (TCP_HDR_LEN_MIN / 4) << 4;
 	h->flags    = flags;
-	h->window   = htons16(8192);
+	h->window   = htons16(tcp_rcv_window(s));
 	h->checksum = 0;
 	h->urg_ptr  = 0;
 	mp->b_wptr += TCP_HDR_LEN_MIN;
@@ -656,6 +678,14 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 		s = child;
 		if (child->upper_rq) q = child->upper_rq;
 	}
+
+	/* Track the peer's advertised receive window on every segment
+	 * destined for this TCB.  handle_data_req honours it as the
+	 * upper bound on outstanding bytes.  Skip on LISTEN (the
+	 * listener never sends data; the child reads the window from
+	 * the ACK that completes its handshake). */
+	if (s->state != TCPS_LISTEN)
+		s->snd_wnd = ntohs16(h->window);
 
 	switch (s->state) {
 	case TCPS_SYN_SENT:
@@ -815,10 +845,14 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 				        body->b_rptr + hl, data_len);
 				data->b_wptr += data_len;
 				/* State-update before ACK send -- lo0 sync
-				 * trap from T1b. */
+				 * trap from T1b.  Deliver T_DATA_IND
+				 * upstream FIRST so the ACK's advertised
+				 * window already accounts for the just-
+				 * queued bytes; otherwise the peer reads a
+				 * stale (too-large) window. */
 				s->rcv_nxt += data_len;
-				(void)tcp_send_segment(s, TCP_FLAG_ACK, NULL);
 				reply_data_ind(q, data);
+				(void)tcp_send_segment(s, TCP_FLAG_ACK, NULL);
 			}
 		}
 
@@ -1079,7 +1113,14 @@ static int handle_data_req(queue_t *q, struct tcp_tcb *s, mblk_t *payload)
 	unsigned plen = (unsigned)msgdsize(payload);
 	unsigned old  = s->snd_buf
 	             ? (unsigned)(s->snd_buf->b_wptr - s->snd_buf->b_rptr) : 0;
-	if (old + plen > TCP_SND_BUF_MAX) {
+	/* Cap outstanding bytes by both our own buffer ceiling and the
+	 * peer's advertised receive window.  No queueing of "deferred"
+	 * sends yet -- if it doesn't fit right now, the user gets
+	 * PROTOERR and re-tries after the window opens (an ACK will
+	 * trim snd_buf and grow the headroom). */
+	unsigned cap = TCP_SND_BUF_MAX;
+	if (s->snd_wnd < cap) cap = s->snd_wnd;
+	if (old + plen > cap) {
 		freemsg(payload);
 		reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_PROTOERR);
 		return -1;
@@ -1359,6 +1400,8 @@ void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),
 			.rto_ms      = s->rto_ticks * 10,
 			.srtt_ms     = s->srtt_ticks * 10,
 			.backlog_depth = s->pending_count,
+			.snd_wnd     = s->snd_wnd,
+			.rcv_wnd     = tcp_rcv_window(s),
 		};
 		cb(&v, arg);
 	}

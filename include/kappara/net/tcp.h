@@ -225,6 +225,8 @@ struct tcp_tcb_view {
 	uint32_t    rto_ms;	/* current RTO in milliseconds */
 	uint32_t    srtt_ms;	/* smoothed RTT in milliseconds */
 	uint16_t    backlog_depth;	/* LISTEN only: pending-SYN count */
+	uint16_t    snd_wnd;	/* peer's last advertised receive window */
+	uint16_t    rcv_wnd;	/* what we'd advertise right now    */
 };
 
 void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),

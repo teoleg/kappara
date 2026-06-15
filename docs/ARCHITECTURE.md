@@ -771,6 +771,20 @@ TPI primitives (locked in across phases; see
 | T1e   | ✓ done | T_ORDREL_REQ / T_ORDREL_IND (FIN handshake) + T_DISCON_REQ/IND   |
 | T1f   | ✓ done | retransmit timer + RTT estimation (SYN/FIN; data is T1g)         |
 | T1g   | ✓ done | cmd/test `tcp` and `tcpmulti` subcommands end-to-end             |
+| T1h   | ✓ done | real receive-window advertisement; cap data_req by peer's wnd   |
+
+T1h flow control: outbound segments advertise
+`TCP_RCV_WND_MAX - upstream_q_count` instead of a hardcoded constant,
+so the peer throttles when the user is slow draining the stream
+head's read queue.  `T_DATA_IND` is now delivered upward BEFORE the
+ACK goes out so the advertised window already reflects the
+just-queued bytes (otherwise the peer reads a stale, too-large
+window).  Inbound segments update `s->snd_wnd` from the wire; the
+write-side cap in `handle_data_req` is `min(TCP_SND_BUF_MAX,
+snd_wnd)`.  No queueing of "deferred" sends yet -- a `T_DATA_REQ`
+that doesn't fit returns `T_DISCON_IND{PROTOERR}` and the user
+re-tries after an ACK opens the window.  `/proc/tcp` shows both as
+`swnd=N rwnd=M`.
 
 T1d.5 multi-accept: the listener stays in LISTEN across accepts.  Each
 inbound SYN gets queued in an 8-slot backlog ring on the listener's

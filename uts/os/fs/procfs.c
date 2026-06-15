@@ -357,6 +357,10 @@ static void tcp_one_row(const struct tcp_tcb_view *v, void *arg)
 	}
 	pb_str(b, "  sbuf=");
 	pb_pad_dec(b, v->snd_buf_len, 0);
+	pb_str(b, "  swnd=");
+	pb_pad_dec(b, v->snd_wnd, 0);
+	pb_str(b, " rwnd=");
+	pb_pad_dec(b, v->rcv_wnd, 0);
 	pb_str(b, "  srtt=");
 	pb_pad_dec(b, v->srtt_ms, 0);
 	pb_str(b, "ms rto=");
