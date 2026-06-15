@@ -149,12 +149,21 @@ struct t_tcp_conn_ind {
 	uint16_t _pad2;
 };
 
-/* Empty payload -- T1d's listener model accepts the one pending
- * connection per LISTEN socket (no seq token needed).  T1d.5's
- * multi-accept will carry a seq + accept_fd field here. */
+/* T1d.5 multi-accept: T_CONN_RES carries the file descriptor of a
+ * fresh /dev/tcp endpoint that will receive the accepted connection.
+ * The listener stays in LISTEN; the kernel pops the head pending
+ * SYN from the listener's backlog, populates that responding endpoint
+ * with the connection state, and sends SYN-ACK from it.  T_CONN_CON
+ * fires on the responding fd (not the listener).
+ *
+ * The responding endpoint must be a freshly-opened /dev/tcp in CLOSED
+ * state (no bind / connect / listen yet).  Sharing local_port with the
+ * listener is implicit -- the child filters segments by 4-tuple and
+ * is routed to via fan-out from the listener's TCB. */
 struct t_tcp_conn_res {
 	uint8_t  prim;
 	uint8_t  _pad[3];
+	int32_t  responding_fd;
 };
 
 /* T_TCP_LISTEN_REQ: explicit BOUND -> LISTEN transition.  Without
@@ -215,6 +224,7 @@ struct tcp_tcb_view {
 	uint32_t    snd_buf_len;
 	uint32_t    rto_ms;	/* current RTO in milliseconds */
 	uint32_t    srtt_ms;	/* smoothed RTT in milliseconds */
+	uint16_t    backlog_depth;	/* LISTEN only: pending-SYN count */
 };
 
 void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),

@@ -361,7 +361,14 @@ static void tcp_one_row(const struct tcp_tcb_view *v, void *arg)
 	pb_pad_dec(b, v->srtt_ms, 0);
 	pb_str(b, "ms rto=");
 	pb_pad_dec(b, v->rto_ms, 0);
-	pb_str(b, "ms\n");
+	pb_str(b, "ms");
+	/* Listener backlog -- only shown when non-zero (any TCB whose
+	 * state isn't LISTEN has backlog_depth == 0). */
+	if (v->backlog_depth) {
+		pb_str(b, " backlog=");
+		pb_pad_dec(b, v->backlog_depth, 0);
+	}
+	pb_putc(b, '\n');
 }
 
 static int proc_tcp_qopen(queue_t *q)

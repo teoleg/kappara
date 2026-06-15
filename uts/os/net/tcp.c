@@ -48,6 +48,7 @@
 #include "kappara/core/kmem.h"
 #include "kappara/core/printk.h"
 #include "kappara/core/string.h"
+#include "kappara/fs/vfs.h"
 #include "kappara/io/cdevsw.h"
 #include "kappara/io/stream_head.h"
 #include "kappara/io/streams.h"
@@ -56,6 +57,8 @@
 #include "kappara/proc/sched.h"
 
 /* ---- Per-connection state (TCB) ---------------------------------- */
+
+#define TCP_LISTEN_BACKLOG	8	/* pending-SYN ring depth on a LISTEN */
 
 enum tcp_state {
 	TCPS_CLOSED        = 0,
@@ -88,13 +91,20 @@ struct tcp_tcb {
 	uint32_t   rcv_nxt;	/* next seq we expect to recv */
 	uint32_t   rcv_irs;	/* peer's initial seq        */
 
-	/* T1d listener state.  LISTEN + SYN sets listen_syn_pending=1
-	 * and stores peer info; the SYN-ACK only goes out once the user
-	 * sends T_CONN_RES (real TPI semantics where the user gets to
-	 * inspect / accept / reject the incoming connection request).
-	 * For T1d single-listener-one-conn there's only one pending
-	 * slot; T1d.5 grows this into a real accept queue. */
-	int        listen_syn_pending;
+	/* T1d.5 multi-accept backlog.  Each arriving SYN on a LISTEN
+	 * TCB enqueues here + fires T_CONN_IND; each T_CONN_RES pops
+	 * the head, moves it into the user-supplied responding fd's
+	 * TCB, and sends SYN-ACK from THAT TCB.  The listener stays in
+	 * LISTEN; child TCBs filter inbound segments by 4-tuple and
+	 * receive them via the listener's fan-out (see
+	 * tcp_input_segment's LISTEN case). */
+	struct {
+		uint32_t remote_ip;
+		uint16_t remote_port;
+		uint32_t irs;	/* peer's initial seq */
+	}          pending_q[TCP_LISTEN_BACKLOG];
+	uint8_t    pending_head;
+	uint8_t    pending_count;
 
 	/* T1f retransmit + RTT.  RTO is in 10ms ticks (sched_tick is
 	 * at 100Hz).  pending_flags is what we'll re-send on RTO --
@@ -167,6 +177,53 @@ static void tcp_tcb_unregister(struct tcp_tcb *s)
 			return;
 		}
 	}
+}
+
+/* Find a child TCB matching the 4-tuple (lport, rip, rport).  Used by
+ * the listener's fan-out: when a non-SYN segment lands on the LISTEN
+ * TCB (because IP multicasts to every TCP upper), we redirect it to
+ * the child that owns the connection. */
+static struct tcp_tcb *tcp_find_child(uint16_t lport,
+                                      uint32_t rip, uint16_t rport)
+{
+	for (int i = 0; i < TCP_MAX_TCBS; i++) {
+		struct tcp_tcb *s = tcp_tcb_table[i];
+		if (!s) continue;
+		if (s->state == TCPS_CLOSED
+		 || s->state == TCPS_BOUND
+		 || s->state == TCPS_LISTEN
+		 || s->state == TCPS_SYN_SENT) continue;
+		if (s->local_port == lport
+		 && s->remote_ip  == rip
+		 && s->remote_port == rport)
+			return s;
+	}
+	return NULL;
+}
+
+/* Resolve a user-passed file descriptor to its TCP TCB.  Used by
+ * T_CONN_RES to attach the accepted connection to a fresh /dev/tcp
+ * endpoint the user opened separately.  Returns NULL on any
+ * mismatch -- bad fd, non-TCP fd, or fd points at a TCB that isn't
+ * in our table.
+ *
+ * The TCB lives behind the topmost pushed module's q_ptr, which is
+ * sd_wq->q_next (sd_wq itself is the stream HEAD's queue; the pushed
+ * tcp module hangs off head.q_next per do_ipush). */
+static struct tcp_tcb *tcp_tcb_from_fd(int fd)
+{
+	if (fd < 0 || fd >= KT_FD_MAX) return NULL;
+	struct kthread *t = curthread;
+	if (!t) return NULL;
+	struct file *f = t->fdt[fd];
+	if (!f) return NULL;
+	struct stdata *sd = (struct stdata *)f->f_private;
+	if (!sd || !sd->sd_wq || !sd->sd_wq->q_next) return NULL;
+	struct tcp_tcb *s = sd->sd_wq->q_next->q_ptr;
+	if (!s) return NULL;
+	for (int i = 0; i < TCP_MAX_TCBS; i++)
+		if (tcp_tcb_table[i] == s) return s;
+	return NULL;
 }
 
 /* Arm / cancel the retransmit timer.  Arming records `pending_flags`
@@ -583,6 +640,23 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 		return;
 	}
 
+	/* T1d.5 multi-accept fan-out.  IP delivers all proto=TCP
+	 * segments to every bound upper, but only the listener TCB is
+	 * bound at IP level -- children share its bind and are
+	 * discoverable in tcp_tcb_table by their 4-tuple.  If a
+	 * non-SYN segment arrives on a LISTEN TCB, redirect it to the
+	 * matching child (whose state/queue handle the real work). */
+	if (s->state == TCPS_LISTEN && !(flags & TCP_FLAG_SYN)) {
+		struct tcp_tcb *child =
+		    tcp_find_child(s->local_port, src_ip, sport);
+		if (!child) {
+			freemsg(body);
+			return;
+		}
+		s = child;
+		if (child->upper_rq) q = child->upper_rq;
+	}
+
 	switch (s->state) {
 	case TCPS_SYN_SENT:
 		/* Expecting SYN+ACK (passive simultaneous-open simplified).
@@ -619,17 +693,21 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 		break;
 
 	case TCPS_LISTEN:
-		/* T1d: record peer + seq numbers, fire T_CONN_IND, but do
-		 * NOT send SYN-ACK yet.  The user must send T_CONN_RES to
-		 * accept (or T_DISCON_REQ to refuse, in T1e).  Single-slot
-		 * pending model: a second SYN while one is already pending
-		 * is dropped.  T1d.5's accept queue will replace this. */
-		if ((flags & TCP_FLAG_SYN) && !s->listen_syn_pending) {
-			s->remote_ip          = src_ip;
-			s->remote_port        = sport;
-			s->rcv_irs            = seg_seq;
-			s->rcv_nxt            = seg_seq + 1;
-			s->listen_syn_pending = 1;
+		/* T1d.5: append the SYN to the backlog ring + fire
+		 * T_CONN_IND.  User sends T_CONN_RES (with a fresh fd in
+		 * `responding_fd`) to accept; that pops the head pending
+		 * entry into the new TCB and sends SYN-ACK from there.
+		 * The listener stays in LISTEN, so concurrent inbound
+		 * connections each get their own slot until the ring is
+		 * full (then we silently drop -- peer will retransmit). */
+		if (flags & TCP_FLAG_SYN) {
+			if (s->pending_count >= TCP_LISTEN_BACKLOG) break;
+			int slot = (s->pending_head + s->pending_count)
+			           % TCP_LISTEN_BACKLOG;
+			s->pending_q[slot].remote_ip   = src_ip;
+			s->pending_q[slot].remote_port = sport;
+			s->pending_q[slot].irs         = seg_seq;
+			s->pending_count++;
 			reply_conn_ind(q, src_ip, sport);
 		}
 		break;
@@ -813,6 +891,19 @@ static int tcp_qclose(queue_t *rq)
 	 || s->state == TCPS_SYN_RECEIVED) {
 		(void)tcp_send_segment(s, TCP_FLAG_RST, NULL);
 	}
+	/* Listener close with queued SYNs: send RST to each peer so
+	 * they don't time out waiting for SYN-ACK.  Same shape as
+	 * T_DISCON_REQ-on-LISTEN above. */
+	if (s->state == TCPS_LISTEN && s->pending_count > 0) {
+		while (s->pending_count > 0) {
+			int h = s->pending_head;
+			s->remote_ip   = s->pending_q[h].remote_ip;
+			s->remote_port = s->pending_q[h].remote_port;
+			(void)tcp_send_segment(s, TCP_FLAG_RST, NULL);
+			s->pending_head = (h + 1) % TCP_LISTEN_BACKLOG;
+			s->pending_count--;
+		}
+	}
 	if (s->bound) {
 		uint32_t key = tcp_bind_key(s->local_port, 0);
 		send_ip_bind(rq, IP_T_UNBIND_REQ, key);
@@ -869,22 +960,52 @@ static int handle_listen_req(queue_t *q, struct tcp_tcb *s)
 	return 0;
 }
 
-static int handle_conn_res(queue_t *q, struct tcp_tcb *s)
+/* Core accept: pop the listener's head pending SYN onto the given
+ * child TCB and send SYN-ACK from it.  Caller is responsible for
+ * validating that `s` is a listener with at least one queued SYN and
+ * `child` is a fresh TCB in CLOSED state.  Used by both the syscall
+ * path (handle_conn_res) and the in-kernel selftest. */
+static int tcp_accept_into(struct tcp_tcb *s, struct tcp_tcb *child)
 {
-	if (s->state != TCPS_LISTEN || !s->listen_syn_pending) {
+	int head = s->pending_head;
+	uint32_t rip   = s->pending_q[head].remote_ip;
+	uint16_t rport = s->pending_q[head].remote_port;
+	uint32_t irs   = s->pending_q[head].irs;
+	s->pending_head = (head + 1) % TCP_LISTEN_BACKLOG;
+	s->pending_count--;
+
+	child->local_port  = s->local_port;
+	child->remote_ip   = rip;
+	child->remote_port = rport;
+	child->rcv_irs     = irs;
+	child->rcv_nxt     = irs + 1;
+	child->snd_iss     = alloc_iss();
+	child->snd_una     = child->snd_iss;
+	child->snd_nxt     = child->snd_iss;
+	child->state       = TCPS_SYN_RECEIVED;
+
+	return tcp_send_segment(child, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL);
+}
+
+static int handle_conn_res(queue_t *q, struct tcp_tcb *s,
+                           const struct t_tcp_conn_res *req)
+{
+	if (s->state != TCPS_LISTEN || s->pending_count == 0) {
 		reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_PROTOERR);
 		return 0;
 	}
-	/* User has accepted the pending SYN.  Send SYN-ACK now and
-	 * transition to SYN_RECEIVED.  The eventual ACK transitions
-	 * us to ESTABLISHED + T_CONN_CON via the existing
-	 * SYN_RECEIVED case in tcp_input_segment. */
-	s->snd_iss            = alloc_iss();
-	s->snd_una            = s->snd_iss;
-	s->snd_nxt            = s->snd_iss;
-	s->listen_syn_pending = 0;
-	s->state              = TCPS_SYN_RECEIVED;
-	(void)tcp_send_segment(s, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL);
+	/* Resolve the user-supplied responding fd.  Must be a fresh
+	 * /dev/tcp endpoint (still in CLOSED state, never bound or
+	 * connected), and must not be the listener itself.  The child
+	 * borrows the listener's local_port and stays un-bound at IP
+	 * level -- inbound segments reach it via the listener's
+	 * fan-out in tcp_input_segment. */
+	struct tcp_tcb *child = tcp_tcb_from_fd(req->responding_fd);
+	if (!child || child == s || child->state != TCPS_CLOSED) {
+		reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_PROTOERR);
+		return 0;
+	}
+	(void)tcp_accept_into(s, child);
 	return 0;
 }
 
@@ -925,11 +1046,20 @@ static int handle_discon_req(queue_t *q, struct tcp_tcb *s)
 		(void)tcp_send_segment(s, TCP_FLAG_RST, NULL);
 		return 0;
 	}
-	if (s->state == TCPS_LISTEN && s->listen_syn_pending) {
-		/* Reject the pending SYN with RST.  Stay in LISTEN. */
-		s->listen_syn_pending = 0;
-		(void)tcp_send_segment(s, TCP_FLAG_RST, NULL);
-		s->remote_ip = 0;
+	if (s->state == TCPS_LISTEN && s->pending_count > 0) {
+		/* Reject every pending SYN with RST.  Stay in LISTEN.
+		 * RFC 793: when the user aborts an arrived connection
+		 * request, the SYN gets an RST so the peer's SYN_SENT
+		 * tears down promptly instead of timing out. */
+		while (s->pending_count > 0) {
+			int h = s->pending_head;
+			s->remote_ip   = s->pending_q[h].remote_ip;
+			s->remote_port = s->pending_q[h].remote_port;
+			(void)tcp_send_segment(s, TCP_FLAG_RST, NULL);
+			s->pending_head = (h + 1) % TCP_LISTEN_BACKLOG;
+			s->pending_count--;
+		}
+		s->remote_ip   = 0;
 		s->remote_port = 0;
 	}
 	return 0;
@@ -1022,8 +1152,11 @@ static int tcp_wq_putp(queue_t *q, mblk_t *mp)
 	} else if (prim == T_TCP_LISTEN_REQ) {
 		rc = handle_listen_req(q, s);
 		freemsg(mp);
-	} else if (prim == T_TCP_CONN_RES) {
-		rc = handle_conn_res(q, s);
+	} else if (prim == T_TCP_CONN_RES
+	    && (mp->b_wptr - mp->b_rptr)
+	       >= (int)sizeof(struct t_tcp_conn_res)) {
+		rc = handle_conn_res(q, s,
+		                     (const struct t_tcp_conn_res *)mp->b_rptr);
 		freemsg(mp);
 	} else if (prim == T_TCP_ORDREL_REQ) {
 		rc = handle_ordrel_req(q, s);
@@ -1225,6 +1358,7 @@ void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),
 			    : 0,
 			.rto_ms      = s->rto_ticks * 10,
 			.srtt_ms     = s->srtt_ticks * 10,
+			.backlog_depth = s->pending_count,
 		};
 		cb(&v, arg);
 	}
@@ -1328,16 +1462,21 @@ static int send_bind_req(struct stdata *sd, uint16_t port)
 
 int tcp_selftest_run(void)
 {
-	struct stdata *L = NULL, *C = NULL;
+	struct stdata *L = NULL, *C = NULL, *R = NULL;
 	int rc = -1;
 
 	L = stream_build_kernel(&ip_streamtab, "tcp_listen", 0);
 	C = stream_build_kernel(&ip_streamtab, "tcp_client", 0);
-	if (!L || !C) goto out;
+	R = stream_build_kernel(&ip_streamtab, "tcp_respond", 0);
+	if (!L || !C || !R) goto out;
 	if (stream_push_kernel(L, "tcp") < 0) goto out;
 	if (stream_push_kernel(C, "tcp") < 0) goto out;
+	if (stream_push_kernel(R, "tcp") < 0) goto out;
 
-	/* Bind both. */
+	/* Bind L (listener) and C (client).  R stays unbound -- accept
+	 * grafts the connection state onto it without going through IP
+	 * bind, since R receives inbound segments via the listener's
+	 * fan-out. */
 	if (send_bind_req(L, 12345) < 0) goto out;
 	if (send_bind_req(C, 0) < 0)     goto out;
 
@@ -1373,37 +1512,34 @@ int tcp_selftest_run(void)
 	/* L should now see T_CONN_IND for the pending connection. */
 	if (drain_for_prim(L, T_TCP_CONN_IND) < 0) goto out;
 
-	/* L: T_TCP_CONN_RES to accept.  This sends SYN-ACK which C
-	 * processes inline, ACKs, transitions to ESTABLISHED + T_CONN_CON,
-	 * and that ACK transitions L to ESTABLISHED + T_CONN_CON. */
+	/* Accept: graft the pending SYN onto R's TCB.  The syscall path
+	 * (handle_conn_res) does this by resolving an fd; from kernel
+	 * context we hop straight to the helper since L's and R's TCBs
+	 * sit behind their respective sd_wq->q_ptr. */
 	{
-		mblk_t *mp = allocb(sizeof(struct t_tcp_conn_res), 0);
-		if (!mp) goto out;
-		mp->b_datap->db_type = M_PROTO;
-		struct t_tcp_conn_res *r =
-		    (struct t_tcp_conn_res *)mp->b_wptr;
-		r->prim    = T_TCP_CONN_RES;
-		r->_pad[0] = r->_pad[1] = r->_pad[2] = 0;
-		mp->b_wptr += sizeof(*r);
-		putnext(L->sd_wq, mp);
+		struct tcp_tcb *L_tcb = L->sd_wq->q_next->q_ptr;
+		struct tcp_tcb *R_tcb = R->sd_wq->q_next->q_ptr;
+		if (!L_tcb || !R_tcb) goto out;
+		if (tcp_accept_into(L_tcb, R_tcb) < 0) goto out;
 	}
 
+	/* T_CONN_CON now fires on C (active side) and R (responder).
+	 * L stays in LISTEN -- this is the key T1d.5 invariant. */
 	if (drain_for_prim(C, T_TCP_CONN_CON) < 0) goto out;
-	if (drain_for_prim(L, T_TCP_CONN_CON) < 0) goto out;
+	if (drain_for_prim(R, T_TCP_CONN_CON) < 0) goto out;
 
-	/* T1c: bidirectional data exchange. */
-	static const char msg_c2l[] = "hello-from-client";
-	static const char msg_l2c[] = "and-from-listener";
+	/* T1c: bidirectional data exchange.  Data flows on the accepted
+	 * connection (R), not the listener. */
+	static const char msg_c2r[] = "hello-from-client";
+	static const char msg_r2c[] = "and-from-responder";
 
-	if (send_data_req(C, msg_c2l, sizeof(msg_c2l) - 1) < 0) goto out;
-	if (drain_data_ind(L, msg_c2l, sizeof(msg_c2l) - 1) < 0) goto out;
+	if (send_data_req(C, msg_c2r, sizeof(msg_c2r) - 1) < 0) goto out;
+	if (drain_data_ind(R, msg_c2r, sizeof(msg_c2r) - 1) < 0) goto out;
 
-	if (send_data_req(L, msg_l2c, sizeof(msg_l2c) - 1) < 0) goto out;
-	if (drain_data_ind(C, msg_l2c, sizeof(msg_l2c) - 1) < 0) goto out;
+	if (send_data_req(R, msg_r2c, sizeof(msg_r2c) - 1) < 0) goto out;
+	if (drain_data_ind(C, msg_r2c, sizeof(msg_r2c) - 1) < 0) goto out;
 
-	/* T1e graceful close: C sends FIN, L receives T_ORDREL_IND,
-	 * L sends its own FIN, C receives T_ORDREL_IND.  Both reach
-	 * CLOSED via FIN_WAIT_2 / LAST_ACK transitions. */
+	/* T1e graceful close on the accepted connection. */
 	{
 		mblk_t *mp = allocb(sizeof(struct t_tcp_ordrel_req), 0);
 		if (!mp) goto out;
@@ -1415,7 +1551,7 @@ int tcp_selftest_run(void)
 		mp->b_wptr += sizeof(*r);
 		putnext(C->sd_wq, mp);
 	}
-	if (drain_for_prim(L, T_TCP_ORDREL_IND) < 0) goto out;
+	if (drain_for_prim(R, T_TCP_ORDREL_IND) < 0) goto out;
 	{
 		mblk_t *mp = allocb(sizeof(struct t_tcp_ordrel_req), 0);
 		if (!mp) goto out;
@@ -1425,7 +1561,7 @@ int tcp_selftest_run(void)
 		r->prim    = T_TCP_ORDREL_REQ;
 		r->_pad[0] = r->_pad[1] = r->_pad[2] = 0;
 		mp->b_wptr += sizeof(*r);
-		putnext(L->sd_wq, mp);
+		putnext(R->sd_wq, mp);
 	}
 	if (drain_for_prim(C, T_TCP_ORDREL_IND) < 0) goto out;
 
@@ -1434,5 +1570,6 @@ int tcp_selftest_run(void)
 out:
 	if (L) stream_destroy_kernel(L);
 	if (C) stream_destroy_kernel(C);
+	if (R) stream_destroy_kernel(R);
 	return rc;
 }

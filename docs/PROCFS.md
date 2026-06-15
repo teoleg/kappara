@@ -202,6 +202,30 @@ Ethernet drivers land with runtime-configurable IP/MTU, write-side
 ioctls (or a `/dev/dlpi`-shaped control stream) become the place to
 add mutation.
 
+### /proc/tcp
+
+One row per registered TCP TCB (`tcp_for_each_tcb` walk).  Columns:
+state, local port, peer (ip:port or `-` for unconnected), send-buffer
+length, smoothed RTT, current RTO.  Listener TCBs with queued pending
+SYNs append `backlog=N` -- the depth of the multi-accept ring
+(`TCP_LISTEN_BACKLOG`, currently 8).
+
+```
+kappara:/# cat /proc/tcp
+STATE         LPORT  PEER             EXTRAS
+LISTEN         24680  -                sbuf=0  srtt=0ms rto=0ms backlog=2
+SYN_RECEIVED   24680  127.0.0.1:49157  sbuf=0  srtt=10ms rto=40ms
+ESTABLISHED    49152  127.0.0.1:24680  sbuf=0  srtt=10ms rto=40ms
+```
+
+The user-facing tool is `cmd/netstat`, which concatenates
+`/proc/netif`, `/proc/slip`, and `/proc/tcp`.
+
+### /proc/slip
+
+Per-line counters for `slip0`: total UART bytes received, plus SLIP
+framing counters (rx_frames, rx_runts, rx_overflow, tx_frames).
+
 ## How to add a new /proc entry
 
 Three steps:

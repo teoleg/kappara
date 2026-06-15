@@ -767,15 +767,26 @@ TPI primitives (locked in across phases; see
 | T1b   | ✓ done | T_CONN_REQ / T_CONN_CON + 3-way handshake (active + passive)     |
 | T1c   | ✓ done | T_DATA_REQ / T_DATA_IND (in-order seq/ack; no retransmit yet)    |
 | T1d   | ✓ done | T_LISTEN_REQ + T_CONN_IND/T_CONN_RES (deferred SYN-ACK on accept)|
-| T1e   |        | T_ORDREL_REQ / T_ORDREL_IND (FIN handshake) + T_DISCON_REQ/IND   |
+| T1d.5 | ✓ done | multi-accept backlog; T_CONN_RES carries a responding fd        |
+| T1e   | ✓ done | T_ORDREL_REQ / T_ORDREL_IND (FIN handshake) + T_DISCON_REQ/IND   |
 | T1f   | ✓ done | retransmit timer + RTT estimation (SYN/FIN; data is T1g)         |
-| T1g   |        | cmd/tcptest end-to-end                                           |
+| T1g   | ✓ done | cmd/test `tcp` and `tcpmulti` subcommands end-to-end             |
 
-T1b currently uses a simplified single-connection listener: a TCB in
-BOUND state accepts the first SYN inline, transitions to
-SYN_RECEIVED, and morphs into the established connection on ACK.
-T1d will split this properly into a LISTEN state with an accept
-queue producing child TCBs per inbound connection.
+T1d.5 multi-accept: the listener stays in LISTEN across accepts.  Each
+inbound SYN gets queued in an 8-slot backlog ring on the listener's
+TCB and fires a `T_CONN_IND` carrying the peer's (ip, port).  The user
+opens a fresh `/dev/tcp` for each connection and passes its fd in
+`T_CONN_RES.responding_fd`; the kernel pops the head pending SYN,
+grafts its state onto that responder's TCB, and sends SYN-ACK from
+it.  Children share the listener's local port without a separate IP
+bind -- IP multicasts every TCP segment to all bound uppers, the
+listener's tcp_input fan-out catches non-SYN segments destined for a
+child by 4-tuple match (`tcp_find_child`) and redirects.
+
+Backlog overflow drops the SYN silently; the peer's SYN_SENT will
+retransmit until either room frees up or the peer gives up.  Backlog
+depth surfaces in `/proc/tcp` as `backlog=N` for any LISTEN row whose
+ring is non-empty.
 
 Critical lo0 detail: state transitions are updated BEFORE the
 synchronous `tcp_send_segment` call, not after.  lo0's tx loops
