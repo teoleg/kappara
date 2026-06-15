@@ -773,6 +773,7 @@ TPI primitives (locked in across phases; see
 | T1g   | ✓ done | cmd/test `tcp` and `tcpmulti` subcommands end-to-end             |
 | T1h   | ✓ done | real receive-window advertisement; cap data_req by peer's wnd   |
 | T1i   | ✓ done | TIME_WAIT + CLOSING (RFC 793 full graph); 2*MSL via tcp_tick    |
+| T1j   | ✓ done | RFC 5681 cwnd: slow start, CA, RTO-driven MD; MSS segmentation  |
 
 T1h flow control: outbound segments advertise
 `TCP_RCV_WND_MAX - upstream_q_count` instead of a hardcoded constant,
@@ -830,6 +831,50 @@ deadline.
 since both sides already FIN'd.  LAST_ACK still sends RST if the
 user closes before our final ACK lands -- otherwise the peer's
 unACK'd FIN would retransmit into the void.
+
+T1j congestion control (RFC 5681).  Three new TCB fields drive the
+shape:
+
+- `mss` -- segment size cap.  No SYN-option negotiation yet, so fixed
+  at 536 (RFC 879 conservative default).  Bump this once we wire MSS
+  into the SYN options.
+- `cwnd` -- congestion window in bytes.  Starts at `IW = 2*MSS`
+  (RFC 5681 sec 3.1 for MSS <= 1095).  Caps in-flight bytes
+  alongside `snd_wnd`.
+- `ssthresh` -- slow-start threshold.  Starts at 65535 (effectively
+  unlimited) so we stay in slow start until the first loss event.
+
+`handle_data_req` no longer sends the user's payload as a single
+segment.  Instead it appends to `snd_buf` and calls
+`tcp_try_send_pending`, which loops MSS-sized chunks out the wire
+until cwnd or snd_wnd run out.  snd_buf may hold more bytes than
+snd_nxt has sent: the segmenter walks from `snd_buf_seq +
+(snd_nxt - snd_buf_seq)` forward.
+
+Every ACK that advances snd_una calls `tcp_cwnd_on_ack`:
+
+- Below ssthresh, `cwnd += MSS` per ACK -> cwnd doubles per RTT
+  (slow start).
+- At or above ssthresh, `cwnd += MSS*MSS/cwnd` (rounded) per ACK
+  -> ~ +1 MSS per RTT (congestion avoidance).
+
+After the cwnd update the trim path calls `tcp_try_send_pending`
+again so the freed cwnd room ships any bytes queued behind it.  The
+helper is reentrancy-guarded (`s->in_send`) because lo0's
+synchronous loopback drives ACK -> trim -> try_send chains back
+into us inside a single emit call; the outer loop picks up after
+the recursion unwinds.
+
+On RTO expiry the kthread calls `tcp_cwnd_on_rto` BEFORE re-sending:
+`ssthresh = max(flight/2, 2*MSS)`, `cwnd = MSS`.  Slow start ramps
+us back up once the first retransmit lands and gets ACK'd.  The
+retransmit itself is also capped at one MSS now (was the whole
+snd_buf).
+
+Fast retransmit / fast recovery are NOT wired yet -- duplicate-ACK
+detection plus the `cwnd = ssthresh + 3*MSS` inflation are the
+next step.  Until then, packet loss waits for the RTO before we
+notice.
 
 T1d.5 multi-accept: the listener stays in LISTEN across accepts.  Each
 inbound SYN gets queued in an 8-slot backlog ring on the listener's

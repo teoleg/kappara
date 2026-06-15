@@ -646,6 +646,99 @@ fail:
 	return 1;
 }
 
+/* ---- tcp bulk transfer: exercises cwnd slow-start segmentation ---- */
+/* The standard `test tcp` round-trips 4 bytes, well under one MSS, so
+ * congestion control never kicks in.  This one ships 2000 bytes
+ * (capped under the largest kmalloc size cache of 2048) which
+ * still forces ~4 MSS-sized segments + ACK feedback to grow cwnd
+ * from IW=2*MSS up through slow start.  Verifies bytes arrive in
+ * order and intact. */
+#define TCPBIG_LEN	2000
+
+static int test_tcpbig(void)
+{
+	int L = -1, C = -1, R = -1;
+	L = open("/dev/tcp", 2);
+	C = open("/dev/tcp", 2);
+	R = open("/dev/tcp", 2);
+	if (L < 0 || C < 0 || R < 0) { puts("tcpbig: FAIL open"); goto fail; }
+
+	uint16_t lport = 0;
+	if (tcp_bind_(L, 25000, &lport) < 0 || tcp_bind_(C, 0, NULL) < 0) {
+		puts("tcpbig: FAIL bind"); goto fail;
+	}
+	struct t_tcp_listen_req lreq = { .prim = T_TCP_LISTEN_REQ };
+	if (tcp_put_prim(L, &lreq, sizeof(lreq)) < 0) {
+		puts("tcpbig: FAIL listen"); goto fail;
+	}
+	struct t_tcp_conn_req creq = {
+		.prim = T_TCP_CONN_REQ, .dst_ip = 0x7f000001u, .dst_port = lport,
+	};
+	if (tcp_put_prim(C, &creq, sizeof(creq)) < 0
+	 || tcp_await_prim(L, T_TCP_CONN_IND) < 0) {
+		puts("tcpbig: FAIL CONN_IND"); goto fail;
+	}
+	struct t_tcp_conn_res cres = {
+		.prim = T_TCP_CONN_RES, .responding_fd = R,
+	};
+	if (tcp_put_prim(L, &cres, sizeof(cres)) < 0
+	 || tcp_await_prim(C, T_TCP_CONN_CON) < 0
+	 || tcp_await_prim(R, T_TCP_CONN_CON) < 0) {
+		puts("tcpbig: FAIL handshake"); goto fail;
+	}
+
+	/* Fill a buffer with a verifiable pattern. */
+	static char src[TCPBIG_LEN];
+	for (int i = 0; i < TCPBIG_LEN; i++)
+		src[i] = (char)(i & 0xff);
+
+	struct t_tcp_data_req dreq = { .prim = T_TCP_DATA_REQ };
+	struct strbuf dctl = { .maxlen = 0, .len = sizeof(dreq), .buf = &dreq };
+	struct strbuf ddat = { .maxlen = 0, .len = TCPBIG_LEN, .buf = src };
+	if (putmsg(C, &dctl, &ddat, 0) < 0) {
+		puts("tcpbig: FAIL send"); goto fail;
+	}
+
+	/* Drain T_DATA_INDs off R until we've collected TCPBIG_LEN
+	 * bytes.  cwnd-driven segmentation means R gets several
+	 * smaller indications instead of one big one. */
+	static char rcv[TCPBIG_LEN];
+	int got = 0;
+	while (got < TCPBIG_LEN) {
+		uint8_t ctlbuf[16];
+		struct strbuf rcin = { .maxlen = sizeof(ctlbuf), .len = 0, .buf = ctlbuf };
+		struct strbuf rdin = { .maxlen = TCPBIG_LEN - got, .len = 0,
+		                       .buf = rcv + got };
+		int flags = 0;
+		if (getmsg(R, &rcin, &rdin, &flags) < 0
+		    || ctlbuf[0] != T_TCP_DATA_IND
+		    || rdin.len <= 0) {
+			puts("tcpbig: FAIL recv"); goto fail;
+		}
+		got += rdin.len;
+	}
+	if (memcmp(src, rcv, TCPBIG_LEN) != 0) {
+		puts("tcpbig: FAIL data mismatch"); goto fail;
+	}
+
+	struct t_tcp_ordrel_req oreq = { .prim = T_TCP_ORDREL_REQ };
+	if (tcp_put_prim(C, &oreq, sizeof(oreq)) < 0
+	 || tcp_await_prim(R, T_TCP_ORDREL_IND) < 0
+	 || tcp_put_prim(R, &oreq, sizeof(oreq)) < 0
+	 || tcp_await_prim(C, T_TCP_ORDREL_IND) < 0) {
+		puts("tcpbig: FAIL ordrel"); goto fail;
+	}
+
+	close(L); close(C); close(R);
+	printf("tcpbig: PASS (%d bytes)\n", TCPBIG_LEN);
+	return 0;
+fail:
+	if (L >= 0) close(L);
+	if (C >= 0) close(C);
+	if (R >= 0) close(R);
+	return 1;
+}
+
 /* ---- registry --------------------------------------------------- */
 
 struct test_entry { const char *name; int (*fn)(void); };
@@ -663,6 +756,7 @@ static const struct test_entry tests[] = {
 	{ "pktfilt",  test_pktfilt },
 	{ "tcp",      test_tcp },
 	{ "tcpmulti", test_tcpmulti },
+	{ "tcpbig",   test_tcpbig },
 };
 
 #define N_TESTS (sizeof(tests) / sizeof(tests[0]))

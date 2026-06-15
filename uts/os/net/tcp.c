@@ -151,6 +151,24 @@ struct tcp_tcb {
 	 * to CLOSED once tcp_tick_counter passes this.  0 when not in
 	 * TIME_WAIT. */
 	uint32_t   time_wait_expires;
+
+	/* T1j RFC 5681 congestion control.  cwnd caps in-flight bytes
+	 * (alongside snd_wnd).  Below ssthresh we're in slow start
+	 * (cwnd += mss per ACK); above we do congestion avoidance
+	 * (cwnd += mss*mss/cwnd per ACK).  On RTO we halve ssthresh
+	 * and reset cwnd to mss.  Segmentation happens in
+	 * tcp_try_send_pending: snd_buf may hold more bytes than
+	 * snd_nxt has sent so far, and we shovel out MSS-sized
+	 * chunks as ACKs open both windows. */
+	uint32_t   cwnd;
+	uint32_t   ssthresh;
+	uint16_t   mss;
+	uint8_t    in_send;	/* re-entry guard for tcp_try_send_pending --
+				 * lo0's synchronous loopback can drive
+				 * an ACK -> trim -> try_send chain back
+				 * into us inside an emit call.  The outer
+				 * loop picks up the freed cwnd room after
+				 * the recursion unwinds. */
 };
 
 #define TCP_RTO_MIN	100	/* 1.0 s in 10ms ticks (RFC 6298) */
@@ -165,6 +183,13 @@ struct tcp_tcb {
  * tests wait forever for TIME_WAIT->CLOSED.  Bump if you ever wire
  * up a network where stray segments can actually loiter. */
 #define TCP_TIME_WAIT_TICKS	100	/* 1.0 s */
+/* T1j congestion control (RFC 5681).  No MSS option negotiation yet,
+ * so MSS is fixed at 536 (RFC 879 conservative default).  IW = 2*MSS
+ * per RFC 5681 sec 3.1 for MSS <= 1095.  Initial ssthresh is large
+ * enough that we stay in slow start until the first loss event. */
+#define TCP_MSS_DEFAULT		536
+#define TCP_INITIAL_CWND	(2 * TCP_MSS_DEFAULT)
+#define TCP_INITIAL_SSTHRESH	65535
 
 /* ---- Tick + TCB registry --------------------------------------- */
 
@@ -640,6 +665,84 @@ static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags,
 	return ip_send(s->remote_ip, IPPROTO_TCP, mp);
 }
 
+/* ---- Congestion control + segmentation -------------------------- */
+
+/* RFC 5681 cwnd update on every ACK that advances snd_una.  Slow
+ * start below ssthresh (cwnd += MSS per ACK -> doubles per RTT),
+ * congestion avoidance above (cwnd += MSS*MSS/cwnd per ACK -> +1 MSS
+ * per RTT).  The CA form is rounded to avoid losing fractional MSS
+ * over long flows. */
+static void tcp_cwnd_on_ack(struct tcp_tcb *s, uint32_t acked)
+{
+	(void)acked;	/* RFC 5681 increments per ACK, not per byte */
+	if (s->cwnd < s->ssthresh) {
+		s->cwnd += s->mss;
+	} else {
+		uint32_t incr = ((uint32_t)s->mss * s->mss + s->cwnd / 2)
+		              / s->cwnd;
+		if (incr == 0) incr = 1;
+		s->cwnd += incr;
+	}
+}
+
+/* RFC 5681 sec 3.1: RTO-driven multiplicative decrease. */
+static void tcp_cwnd_on_rto(struct tcp_tcb *s)
+{
+	uint32_t flight = s->snd_nxt - s->snd_una;
+	uint32_t half   = flight / 2;
+	if (half < 2u * s->mss) half = 2u * s->mss;
+	s->ssthresh = half;
+	s->cwnd     = s->mss;
+}
+
+/* Try to ship snd_buf bytes that are queued past snd_nxt, in
+ * MSS-sized chunks, until cwnd or snd_wnd run out.  Called from
+ * handle_data_req (after appending) and the ACK trim path (after
+ * inflight shrinks / cwnd grows).
+ *
+ * Re-entry: the very first emit triggers lo0's synchronous loopback
+ * -> peer ACK -> our ACK path -> tcp_try_send_pending again.  We
+ * guard with s->in_send so the recursive call is a no-op; the outer
+ * loop sees the freed cwnd room once the recursion unwinds. */
+static void tcp_try_send_pending(struct tcp_tcb *s)
+{
+	if (s->in_send) return;
+	if (s->state != TCPS_ESTABLISHED
+	 && s->state != TCPS_CLOSE_WAIT) return;
+	s->in_send = 1;
+	for (;;) {
+		if (!s->snd_buf) break;
+		uint32_t buf_used = (uint32_t)
+		    (s->snd_buf->b_wptr - s->snd_buf->b_rptr);
+		uint32_t sent     = s->snd_nxt - s->snd_buf_seq;
+		if (sent >= buf_used) break;	/* nothing new to send */
+		uint32_t unsent = buf_used - sent;
+
+		uint32_t inflight = s->snd_nxt - s->snd_una;
+		uint32_t cwnd_room = s->cwnd > inflight
+		                     ? (s->cwnd - inflight) : 0;
+		uint32_t wnd_room  = s->snd_wnd > inflight
+		                     ? ((uint32_t)s->snd_wnd - inflight) : 0;
+		uint32_t room = cwnd_room < wnd_room ? cwnd_room : wnd_room;
+		if (room == 0) break;
+
+		uint32_t chunk = unsent < room ? unsent : room;
+		if (chunk > s->mss) chunk = s->mss;
+		const unsigned char *p = s->snd_buf->b_rptr + sent;
+
+		if (tcp_emit_segment(s, s->snd_nxt,
+		    TCP_FLAG_ACK | TCP_FLAG_PSH, p, chunk) < 0)
+			break;
+		s->snd_nxt += chunk;
+		/* Arm RTO if not already running (first segment of a
+		 * fresh send burst).  ACKs that fully drain snd_buf
+		 * cancel it. */
+		if (s->rto_expires == 0)
+			tcp_arm_rto(s, TCP_FLAG_ACK | TCP_FLAG_PSH);
+	}
+	s->in_send = 0;
+}
+
 /* ---- Inbound segment processing --------------------------------- */
 
 static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
@@ -806,13 +909,18 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 			if ((int32_t)(seg_ack - s->snd_una) > 0) {
 				uint32_t acked = seg_ack - s->snd_una;
 				s->snd_una = seg_ack;
+				/* T1j: cwnd update on every ACK that
+				 * advances snd_una -- slow start /
+				 * congestion avoidance per RFC 5681. */
+				tcp_cwnd_on_ack(s, acked);
 				/* T1g: trim ACK'd bytes from snd_buf.
-				 * Cancel RTO when fully drained; reset on
-				 * partial ACK so the next byte gets its
-				 * own retransmit budget. */
+				 * Cancel RTO when fully drained AND there
+				 * are no unsent bytes left; otherwise reset
+				 * so the remaining data has its own RTO. */
 				if (s->snd_buf) {
 					unsigned buf_len = (unsigned)
 					    (s->snd_buf->b_wptr - s->snd_buf->b_rptr);
+					unsigned sent_left = s->snd_nxt - s->snd_buf_seq;
 					if (acked >= buf_len) {
 						freemsg(s->snd_buf);
 						s->snd_buf     = NULL;
@@ -825,15 +933,29 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 					} else {
 						s->snd_buf->b_rptr += acked;
 						s->snd_buf_seq += acked;
-						/* Partial ACK: reset RTO so
-						 * the remaining bytes get a
-						 * fresh timer. */
-						s->rto_expires = tcp_tick_counter
-						               + s->rto_ticks;
-						s->send_tick = tcp_tick_counter;
-						s->retransmit_count = 0;
+						sent_left -= acked;
+						if (sent_left > 0) {
+							/* Partial ACK on
+							 * still-in-flight data:
+							 * reset RTO for the
+							 * remaining bytes. */
+							s->rto_expires = tcp_tick_counter
+							               + s->rto_ticks;
+							s->send_tick = tcp_tick_counter;
+							s->retransmit_count = 0;
+						} else {
+							/* All sent bytes ACK'd
+							 * but more queued waiting
+							 * for cwnd to open --
+							 * try_send below picks
+							 * them up. */
+							tcp_cancel_rto(s);
+						}
 					}
 				}
+				/* Newly opened cwnd/snd_wnd: ship any bytes
+				 * that were queued waiting for room. */
+				tcp_try_send_pending(s);
 			}
 			/* State-machine effects of the ACK depend on the
 			 * current state. */
@@ -958,6 +1080,10 @@ static int tcp_qopen(queue_t *rq)
 	s->state    = TCPS_CLOSED;
 	s->upper_rq = rq;	/* T1f retransmit kthread delivers
 				 * T_DISCON_IND here on give-up */
+	/* T1j: initialise congestion control state per RFC 5681. */
+	s->mss      = TCP_MSS_DEFAULT;
+	s->cwnd     = TCP_INITIAL_CWND;
+	s->ssthresh = TCP_INITIAL_SSTHRESH;
 	rq->q_ptr     = s;
 	WR(rq)->q_ptr = s;
 	tcp_tcb_register(s);
@@ -1078,6 +1204,12 @@ static int tcp_accept_into(struct tcp_tcb *s, struct tcp_tcb *child)
 	child->snd_una     = child->snd_iss;
 	child->snd_nxt     = child->snd_iss;
 	child->state       = TCPS_SYN_RECEIVED;
+	/* T1j: each accepted connection gets a fresh slow-start window.
+	 * tcp_qopen already pre-set these for child but the listener
+	 * may have evolved its own cwnd; reset to be safe. */
+	child->mss      = TCP_MSS_DEFAULT;
+	child->cwnd     = TCP_INITIAL_CWND;
+	child->ssthresh = TCP_INITIAL_SSTHRESH;
 
 	return tcp_send_segment(child, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL);
 }
@@ -1174,22 +1306,23 @@ static int handle_data_req(queue_t *q, struct tcp_tcb *s, mblk_t *payload)
 	unsigned plen = (unsigned)msgdsize(payload);
 	unsigned old  = s->snd_buf
 	             ? (unsigned)(s->snd_buf->b_wptr - s->snd_buf->b_rptr) : 0;
-	/* Cap outstanding bytes by both our own buffer ceiling and the
-	 * peer's advertised receive window.  No queueing of "deferred"
-	 * sends yet -- if it doesn't fit right now, the user gets
-	 * PROTOERR and re-tries after the window opens (an ACK will
-	 * trim snd_buf and grow the headroom). */
-	unsigned cap = TCP_SND_BUF_MAX;
-	if (s->snd_wnd < cap) cap = s->snd_wnd;
-	if (old + plen > cap) {
+	/* T1j: cap by snd_buf ceiling only.  Flow control by cwnd and
+	 * snd_wnd happens inside tcp_try_send_pending -- bytes queue
+	 * here even when there's no immediate room on the wire, and
+	 * shovel out as ACKs open both windows. */
+	if (old + plen > TCP_SND_BUF_MAX) {
 		freemsg(payload);
 		reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_PROTOERR);
 		return -1;
 	}
 
-	/* Append to snd_buf so retransmits can pull the unACK'd bytes
-	 * out of it.  Single-mblk model keeps the trim logic simple
-	 * (advance b_rptr on ACK). */
+	/* Append to snd_buf.  T1j: bytes are queued here in their
+	 * entirety, but only MSS-sized chunks go out on the wire per
+	 * tcp_try_send_pending; cwnd and snd_wnd govern how many of
+	 * those chunks fit before we have to wait for an ACK to free
+	 * room.  Single-mblk model keeps trim logic simple (advance
+	 * b_rptr on ACK trims, snd_nxt - snd_buf_seq tracks how much
+	 * is already on the wire). */
 	mblk_t *new_buf = allocb(old + plen, 0);
 	if (!new_buf) { freemsg(payload); return -1; }
 	if (old) {
@@ -1206,17 +1339,10 @@ static int handle_data_req(queue_t *q, struct tcp_tcb *s, mblk_t *payload)
 	if (!s->snd_buf) s->snd_buf_seq = s->snd_nxt;
 	if (s->snd_buf) freemsg(s->snd_buf);
 	s->snd_buf = new_buf;
-
-	/* Send a copy of just the new bytes.  tcp_send_segment copies +
-	 * frees; the canonical retransmit-source bytes live in snd_buf. */
-	mblk_t *send_copy = allocb(plen, 0);
-	if (send_copy) {
-		kmemcpy(send_copy->b_wptr,
-		        new_buf->b_rptr + old, plen);
-		send_copy->b_wptr += plen;
-	}
 	freemsg(payload);
-	return tcp_send_segment(s, TCP_FLAG_ACK | TCP_FLAG_PSH, send_copy);
+
+	tcp_try_send_pending(s);
+	return 0;
 }
 
 static int tcp_wq_putp(queue_t *q, mblk_t *mp)
@@ -1406,19 +1532,27 @@ static void tcp_retransmit_main(void *arg)
 
 			/* Back off, re-send, re-arm.  Don't sample RTT on
 			 * the eventual ACK (Karn): retransmit_count > 0
-			 * suppresses sampling in all ACK paths. */
+			 * suppresses sampling in all ACK paths.
+			 *
+			 * T1j: on the FIRST retransmit (count 0 -> 1) treat
+			 * the loss as a congestion event: halve ssthresh
+			 * and reset cwnd to one MSS.  Slow start ramps us
+			 * back up after the ACK lands. */
+			if (s->retransmit_count == 0)
+				tcp_cwnd_on_rto(s);
 			uint8_t saved_count = s->retransmit_count + 1;
 			s->rto_ticks <<= 1;
 			if (s->rto_ticks > TCP_RTO_MAX) s->rto_ticks = TCP_RTO_MAX;
 
 			/* Data retransmit takes priority: if snd_buf has
-			 * unACK'd bytes, re-send them at snd_buf_seq.
-			 * tcp_emit_segment doesn't touch snd_nxt, so the
-			 * regular bookkeeping is unchanged. */
+			 * unACK'd bytes, re-send up to one MSS from the
+			 * front at snd_buf_seq.  tcp_emit_segment doesn't
+			 * touch snd_nxt, so the bookkeeping is unchanged. */
 			if (s->snd_buf
 			    && s->snd_buf->b_wptr > s->snd_buf->b_rptr) {
 				unsigned plen = (unsigned)
 				    (s->snd_buf->b_wptr - s->snd_buf->b_rptr);
+				if (plen > s->mss) plen = s->mss;
 				(void)tcp_emit_segment(s, s->snd_buf_seq,
 				    TCP_FLAG_ACK | TCP_FLAG_PSH,
 				    s->snd_buf->b_rptr, plen);
@@ -1476,6 +1610,8 @@ void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),
 			.backlog_depth = s->pending_count,
 			.snd_wnd     = s->snd_wnd,
 			.rcv_wnd     = tcp_rcv_window(s),
+			.cwnd        = s->cwnd,
+			.ssthresh    = s->ssthresh,
 		};
 		cb(&v, arg);
 	}

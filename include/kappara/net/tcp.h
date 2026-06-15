@@ -227,6 +227,8 @@ struct tcp_tcb_view {
 	uint16_t    backlog_depth;	/* LISTEN only: pending-SYN count */
 	uint16_t    snd_wnd;	/* peer's last advertised receive window */
 	uint16_t    rcv_wnd;	/* what we'd advertise right now    */
+	uint32_t    cwnd;	/* T1j: congestion window in bytes  */
+	uint32_t    ssthresh;	/* T1j: slow-start threshold        */
 };
 
 void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),

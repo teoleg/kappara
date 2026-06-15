@@ -207,10 +207,11 @@ add mutation.
 One row per registered TCP TCB (`tcp_for_each_tcb` walk).  Columns:
 state, local port, peer (ip:port or `-` for unconnected), send-buffer
 length, send window (`swnd`, peer's last advertised receive window),
-receive window (`rwnd`, what we'd advertise right now), smoothed
-RTT, current RTO.  Listener TCBs with queued pending SYNs append
-`backlog=N` -- the depth of the multi-accept ring
-(`TCP_LISTEN_BACKLOG`, currently 8).
+receive window (`rwnd`, what we'd advertise right now), congestion
+window (`cwnd`, RFC 5681 in-flight cap), slow-start threshold
+(`ssthresh`), smoothed RTT, current RTO.  Listener TCBs with queued
+pending SYNs append `backlog=N` -- the depth of the multi-accept
+ring (`TCP_LISTEN_BACKLOG`, currently 8).
 
 State names match the RFC 793 graph:
 
@@ -232,8 +233,8 @@ State names match the RFC 793 graph:
 ```
 kappara:/# cat /proc/tcp
 STATE         LPORT  PEER             EXTRAS
-LISTEN         24680  -                sbuf=0  swnd=0 rwnd=8192  srtt=0ms rto=0ms backlog=2
-ESTABLISHED    49152  127.0.0.1:24680  sbuf=0  swnd=8192 rwnd=8192  srtt=10ms rto=40ms
+LISTEN         24680  -                sbuf=0  swnd=0 rwnd=8192  cwnd=1072 ssthresh=65535  srtt=0ms rto=0ms backlog=2
+ESTABLISHED    49152  127.0.0.1:24680  sbuf=0  swnd=8192 rwnd=8192  cwnd=2680 ssthresh=65535  srtt=10ms rto=40ms
 ```
 
 The user-facing tool is `cmd/netstat`, which concatenates

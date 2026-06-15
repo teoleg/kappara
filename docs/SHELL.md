@@ -86,6 +86,7 @@ not a new ELF.
 | `pktfilt`      | composability proof: open `/dev/udp`, `I_PUSH` the pktfilter module at runtime, configure it to drop one dst port, verify the drop counter, `I_POP` it, verify traffic flows again. |
 | `tcp`          | TPI smoke test for `/dev/tcp`: 3-fd flow (listener / client / responder), 3-way handshake, bidirectional data, graceful close. |
 | `tcpmulti`     | multi-accept proof: two clients connect to one listener, listener stays in LISTEN, both accepted onto separate responder fds, cross-traffic verified. |
+| `tcpbig`       | RFC 5681 slow-start proof: ship 2000 bytes from C to R (well over IW=2*MSS), drain on the receiver until everything arrives intact.  Exercises MSS segmentation + cwnd growth across multiple RTTs. |
 
 The `crash` shell builtin is unchanged: `crash` from the shell prompt
 derefs NULL directly and the EL0 fault path SIGSEGVs the calling
