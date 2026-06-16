@@ -66,6 +66,24 @@ typedef struct msgb mblk_t;
 
 #define TCP_HDR_LEN_MIN	20	/* no options */
 
+/* T1l: SYN-only option negotiation.  Three kinds we care about
+ * (RFC 793 + RFC 1122): END=0 terminates the list, NOP=1 is a
+ * single-byte padder, MSS=2 is a 4-byte (kind, len, mss_hi, mss_lo)
+ * tuple.  We currently emit only MSS on SYN/SYN-ACK; subsequent
+ * segments carry no options. */
+#define TCP_OPT_END	0
+#define TCP_OPT_NOP	1
+#define TCP_OPT_MSS	2
+#define TCP_OPT_MSS_LEN	4
+
+/* T1m: window scale (RFC 7323 sec 2).  Shift value 0..14; values >14
+ * MUST be clamped per the RFC.  Negotiated on SYN/SYN-ACK only;
+ * applies to every subsequent segment's 16-bit window field. */
+#define TCP_OPT_WSCALE		3
+#define TCP_OPT_WSCALE_LEN	3
+#define TCP_WSCALE_MAX		14
+#define TCP_LOCAL_WSCALE	0	/* our advertised window <= 16 bits */
+
 /* On-wire TCP header (RFC 793).  All big-endian. */
 struct tcp_hdr {
 	uint16_t src_port;
@@ -149,12 +167,21 @@ struct t_tcp_conn_ind {
 	uint16_t _pad2;
 };
 
-/* Empty payload -- T1d's listener model accepts the one pending
- * connection per LISTEN socket (no seq token needed).  T1d.5's
- * multi-accept will carry a seq + accept_fd field here. */
+/* T1d.5 multi-accept: T_CONN_RES carries the file descriptor of a
+ * fresh /dev/tcp endpoint that will receive the accepted connection.
+ * The listener stays in LISTEN; the kernel pops the head pending
+ * SYN from the listener's backlog, populates that responding endpoint
+ * with the connection state, and sends SYN-ACK from it.  T_CONN_CON
+ * fires on the responding fd (not the listener).
+ *
+ * The responding endpoint must be a freshly-opened /dev/tcp in CLOSED
+ * state (no bind / connect / listen yet).  Sharing local_port with the
+ * listener is implicit -- the child filters segments by 4-tuple and
+ * is routed to via fan-out from the listener's TCB. */
 struct t_tcp_conn_res {
 	uint8_t  prim;
 	uint8_t  _pad[3];
+	int32_t  responding_fd;
 };
 
 /* T_TCP_LISTEN_REQ: explicit BOUND -> LISTEN transition.  Without
@@ -215,6 +242,14 @@ struct tcp_tcb_view {
 	uint32_t    snd_buf_len;
 	uint32_t    rto_ms;	/* current RTO in milliseconds */
 	uint32_t    srtt_ms;	/* smoothed RTT in milliseconds */
+	uint16_t    backlog_depth;	/* LISTEN only: pending-SYN count */
+	uint32_t    snd_wnd;	/* peer's last advertised receive window (scaled) */
+	uint16_t    rcv_wnd;	/* what we'd advertise right now    */
+	uint32_t    cwnd;	/* T1j: congestion window in bytes  */
+	uint32_t    ssthresh;	/* T1j: slow-start threshold        */
+	uint8_t     dup_acks;	/* T1k: current consecutive-dup-ACK count */
+	uint8_t     snd_wnd_shift;	/* T1m: peer's WS shift (0 = no scaling) */
+	uint8_t     ws_active;		/* T1m: WS negotiation succeeded */
 };
 
 void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),
@@ -224,5 +259,12 @@ void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),
  * for T_BIND_ACK.  Other primitives get added to the selftest as
  * subsequent phases fill them in.  Returns 0 on PASS, -1 on FAIL. */
 int  tcp_selftest_run(void);
+
+/* Kernel-mode accept: graft a pending SYN on `listener_sd` onto
+ * a freshly built `responder_sd` (both must have tcp pushed).
+ * Replaces the TPI T_CONN_RES fd-resolution path for in-kernel
+ * servers like telnetd. */
+struct stdata;
+int  tcp_kaccept(struct stdata *listener_sd, struct stdata *responder_sd);
 
 #endif

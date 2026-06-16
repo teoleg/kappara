@@ -446,7 +446,8 @@ static int test_tcp(void)
 {
 	int L = open("/dev/tcp", 2);
 	int C = open("/dev/tcp", 2);
-	if (L < 0 || C < 0) { puts("tcp: FAIL open"); goto fail_close; }
+	int R = open("/dev/tcp", 2);
+	if (L < 0 || C < 0 || R < 0) { puts("tcp: FAIL open"); goto fail_close; }
 
 	uint16_t lport = 0;
 	if (tcp_bind_(L, 23456, &lport) < 0
@@ -470,41 +471,44 @@ static int test_tcp(void)
 		puts("tcp: FAIL CONN_IND"); goto fail_close;
 	}
 
-	struct t_tcp_conn_res cres = { .prim = T_TCP_CONN_RES };
+	/* Accept onto R (the responding endpoint).  L stays in LISTEN. */
+	struct t_tcp_conn_res cres = {
+		.prim = T_TCP_CONN_RES, .responding_fd = R,
+	};
 	if (tcp_put_prim(L, &cres, sizeof(cres)) < 0) {
 		puts("tcp: FAIL accept"); goto fail_close;
 	}
 	if (tcp_await_prim(C, T_TCP_CONN_CON) < 0
-	    || tcp_await_prim(L, T_TCP_CONN_CON) < 0) {
+	    || tcp_await_prim(R, T_TCP_CONN_CON) < 0) {
 		puts("tcp: FAIL CONN_CON"); goto fail_close;
 	}
 
 	/* Data round-trip both ways. */
-	static const char c2l[] = "ping";
-	static const char l2c[] = "pong";
+	static const char c2r[] = "ping";
+	static const char r2c[] = "pong";
 	struct t_tcp_data_req dreq = { .prim = T_TCP_DATA_REQ };
 	struct strbuf dctl = { .maxlen = 0, .len = sizeof(dreq), .buf = &dreq };
-	struct strbuf c2ldat = { .maxlen = 0, .len = sizeof(c2l) - 1,
-	                         .buf = (void *)c2l };
-	if (putmsg(C, &dctl, &c2ldat, 0) < 0) {
-		puts("tcp: FAIL C->L send"); goto fail_close;
+	struct strbuf c2rdat = { .maxlen = 0, .len = sizeof(c2r) - 1,
+	                         .buf = (void *)c2r };
+	if (putmsg(C, &dctl, &c2rdat, 0) < 0) {
+		puts("tcp: FAIL C->R send"); goto fail_close;
 	}
 	{
 		uint8_t ctlbuf[16]; char db[32];
 		struct strbuf rcin = { .maxlen = sizeof(ctlbuf), .len = 0, .buf = ctlbuf };
 		struct strbuf rdin = { .maxlen = sizeof(db), .len = 0, .buf = db };
 		int flags = 0;
-		if (getmsg(L, &rcin, &rdin, &flags) < 0
+		if (getmsg(R, &rcin, &rdin, &flags) < 0
 		    || ctlbuf[0] != T_TCP_DATA_IND
-		    || rdin.len != (int)(sizeof(c2l) - 1)
-		    || memcmp(db, c2l, sizeof(c2l) - 1) != 0) {
-			puts("tcp: FAIL C->L recv"); goto fail_close;
+		    || rdin.len != (int)(sizeof(c2r) - 1)
+		    || memcmp(db, c2r, sizeof(c2r) - 1) != 0) {
+			puts("tcp: FAIL C->R recv"); goto fail_close;
 		}
 	}
-	struct strbuf l2cdat = { .maxlen = 0, .len = sizeof(l2c) - 1,
-	                         .buf = (void *)l2c };
-	if (putmsg(L, &dctl, &l2cdat, 0) < 0) {
-		puts("tcp: FAIL L->C send"); goto fail_close;
+	struct strbuf r2cdat = { .maxlen = 0, .len = sizeof(r2c) - 1,
+	                         .buf = (void *)r2c };
+	if (putmsg(R, &dctl, &r2cdat, 0) < 0) {
+		puts("tcp: FAIL R->C send"); goto fail_close;
 	}
 	{
 		uint8_t ctlbuf[16]; char db[32];
@@ -513,28 +517,225 @@ static int test_tcp(void)
 		int flags = 0;
 		if (getmsg(C, &rcin, &rdin, &flags) < 0
 		    || ctlbuf[0] != T_TCP_DATA_IND
-		    || rdin.len != (int)(sizeof(l2c) - 1)
-		    || memcmp(db, l2c, sizeof(l2c) - 1) != 0) {
-			puts("tcp: FAIL L->C recv"); goto fail_close;
+		    || rdin.len != (int)(sizeof(r2c) - 1)
+		    || memcmp(db, r2c, sizeof(r2c) - 1) != 0) {
+			puts("tcp: FAIL R->C recv"); goto fail_close;
 		}
 	}
 
-	/* Graceful close. */
+	/* Graceful close of the accepted connection. */
 	struct t_tcp_ordrel_req oreq = { .prim = T_TCP_ORDREL_REQ };
 	if (tcp_put_prim(C, &oreq, sizeof(oreq)) < 0
-	 || tcp_await_prim(L, T_TCP_ORDREL_IND) < 0
-	 || tcp_put_prim(L, &oreq, sizeof(oreq)) < 0
+	 || tcp_await_prim(R, T_TCP_ORDREL_IND) < 0
+	 || tcp_put_prim(R, &oreq, sizeof(oreq)) < 0
 	 || tcp_await_prim(C, T_TCP_ORDREL_IND) < 0) {
 		puts("tcp: FAIL ORDREL"); goto fail_close;
 	}
 
-	close(L); close(C);
+	close(L); close(C); close(R);
 	puts("tcp: PASS");
 	return 0;
 
 fail_close:
 	if (L >= 0) close(L);
 	if (C >= 0) close(C);
+	if (R >= 0) close(R);
+	return 1;
+}
+
+/* ---- tcp multi-accept: two concurrent clients onto one listener ---- */
+/* Proves the listener stays in LISTEN across accepts: C1's SYN arrives
+ * while C2's SYN is also in flight, both get queued, both get accepted
+ * onto fresh responder fds, and both round-trip independently. */
+static int test_tcpmulti(void)
+{
+	int L = -1, C1 = -1, C2 = -1, R1 = -1, R2 = -1;
+	L  = open("/dev/tcp", 2);
+	C1 = open("/dev/tcp", 2);
+	C2 = open("/dev/tcp", 2);
+	R1 = open("/dev/tcp", 2);
+	R2 = open("/dev/tcp", 2);
+	if (L < 0 || C1 < 0 || C2 < 0 || R1 < 0 || R2 < 0) {
+		puts("tcpmulti: FAIL open"); goto fail;
+	}
+
+	uint16_t lport = 0;
+	if (tcp_bind_(L, 24680, &lport) < 0
+	 || tcp_bind_(C1, 0, NULL) < 0
+	 || tcp_bind_(C2, 0, NULL) < 0) {
+		puts("tcpmulti: FAIL bind"); goto fail;
+	}
+
+	struct t_tcp_listen_req lreq = { .prim = T_TCP_LISTEN_REQ };
+	if (tcp_put_prim(L, &lreq, sizeof(lreq)) < 0) {
+		puts("tcpmulti: FAIL listen"); goto fail;
+	}
+
+	/* Both clients connect.  Lo0 is synchronous so each SYN runs to
+	 * completion (queued at L) before the next connect call begins. */
+	struct t_tcp_conn_req creq = {
+		.prim = T_TCP_CONN_REQ, .dst_ip = 0x7f000001u, .dst_port = lport,
+	};
+	if (tcp_put_prim(C1, &creq, sizeof(creq)) < 0
+	 || tcp_put_prim(C2, &creq, sizeof(creq)) < 0) {
+		puts("tcpmulti: FAIL connect"); goto fail;
+	}
+
+	/* L sees TWO CONN_INDs and is still in LISTEN. */
+	if (tcp_await_prim(L, T_TCP_CONN_IND) < 0
+	 || tcp_await_prim(L, T_TCP_CONN_IND) < 0) {
+		puts("tcpmulti: FAIL CONN_IND x2"); goto fail;
+	}
+
+	/* Accept each onto its own responder. */
+	struct t_tcp_conn_res cres1 = {
+		.prim = T_TCP_CONN_RES, .responding_fd = R1,
+	};
+	struct t_tcp_conn_res cres2 = {
+		.prim = T_TCP_CONN_RES, .responding_fd = R2,
+	};
+	if (tcp_put_prim(L, &cres1, sizeof(cres1)) < 0
+	 || tcp_put_prim(L, &cres2, sizeof(cres2)) < 0) {
+		puts("tcpmulti: FAIL CONN_RES x2"); goto fail;
+	}
+
+	/* Each client + each responder sees its own CONN_CON.  The
+	 * pairing depends on FIFO order in the pending queue -- the
+	 * first SYN's accept lands on the first responder. */
+	if (tcp_await_prim(C1, T_TCP_CONN_CON) < 0
+	 || tcp_await_prim(C2, T_TCP_CONN_CON) < 0
+	 || tcp_await_prim(R1, T_TCP_CONN_CON) < 0
+	 || tcp_await_prim(R2, T_TCP_CONN_CON) < 0) {
+		puts("tcpmulti: FAIL CONN_CON x4"); goto fail;
+	}
+
+	/* Cross-traffic on both connections to make sure the segments
+	 * route to the right responder (not interleaved). */
+	struct t_tcp_data_req dreq = { .prim = T_TCP_DATA_REQ };
+	struct strbuf dctl = { .maxlen = 0, .len = sizeof(dreq), .buf = &dreq };
+	static const char m1[] = "AAA";
+	static const char m2[] = "BBB";
+	struct strbuf d1 = { .maxlen = 0, .len = sizeof(m1) - 1, .buf = (void*)m1 };
+	struct strbuf d2 = { .maxlen = 0, .len = sizeof(m2) - 1, .buf = (void*)m2 };
+	if (putmsg(C1, &dctl, &d1, 0) < 0 || putmsg(C2, &dctl, &d2, 0) < 0) {
+		puts("tcpmulti: FAIL data send"); goto fail;
+	}
+	for (int i = 0; i < 2; i++) {
+		uint8_t ctlbuf[16]; char db[8];
+		struct strbuf rcin = { .maxlen = sizeof(ctlbuf), .len = 0, .buf = ctlbuf };
+		struct strbuf rdin = { .maxlen = sizeof(db), .len = 0, .buf = db };
+		int flags = 0;
+		int fd = i ? R2 : R1;
+		const char *want = i ? m2 : m1;
+		if (getmsg(fd, &rcin, &rdin, &flags) < 0
+		    || ctlbuf[0] != T_TCP_DATA_IND
+		    || rdin.len != 3 || memcmp(db, want, 3) != 0) {
+			puts("tcpmulti: FAIL data recv"); goto fail;
+		}
+	}
+
+	close(L); close(C1); close(C2); close(R1); close(R2);
+	puts("tcpmulti: PASS");
+	return 0;
+fail:
+	if (L  >= 0) close(L);
+	if (C1 >= 0) close(C1);
+	if (C2 >= 0) close(C2);
+	if (R1 >= 0) close(R1);
+	if (R2 >= 0) close(R2);
+	return 1;
+}
+
+/* ---- tcp bulk transfer: exercises cwnd slow-start segmentation ---- */
+/* The standard `test tcp` round-trips 4 bytes, well under one MSS, so
+ * congestion control never kicks in.  This one ships 2000 bytes
+ * (capped under the largest kmalloc size cache of 2048) which
+ * still forces ~4 MSS-sized segments + ACK feedback to grow cwnd
+ * from IW=2*MSS up through slow start.  Verifies bytes arrive in
+ * order and intact. */
+#define TCPBIG_LEN	2000
+
+static int test_tcpbig(void)
+{
+	int L = -1, C = -1, R = -1;
+	L = open("/dev/tcp", 2);
+	C = open("/dev/tcp", 2);
+	R = open("/dev/tcp", 2);
+	if (L < 0 || C < 0 || R < 0) { puts("tcpbig: FAIL open"); goto fail; }
+
+	uint16_t lport = 0;
+	if (tcp_bind_(L, 25000, &lport) < 0 || tcp_bind_(C, 0, NULL) < 0) {
+		puts("tcpbig: FAIL bind"); goto fail;
+	}
+	struct t_tcp_listen_req lreq = { .prim = T_TCP_LISTEN_REQ };
+	if (tcp_put_prim(L, &lreq, sizeof(lreq)) < 0) {
+		puts("tcpbig: FAIL listen"); goto fail;
+	}
+	struct t_tcp_conn_req creq = {
+		.prim = T_TCP_CONN_REQ, .dst_ip = 0x7f000001u, .dst_port = lport,
+	};
+	if (tcp_put_prim(C, &creq, sizeof(creq)) < 0
+	 || tcp_await_prim(L, T_TCP_CONN_IND) < 0) {
+		puts("tcpbig: FAIL CONN_IND"); goto fail;
+	}
+	struct t_tcp_conn_res cres = {
+		.prim = T_TCP_CONN_RES, .responding_fd = R,
+	};
+	if (tcp_put_prim(L, &cres, sizeof(cres)) < 0
+	 || tcp_await_prim(C, T_TCP_CONN_CON) < 0
+	 || tcp_await_prim(R, T_TCP_CONN_CON) < 0) {
+		puts("tcpbig: FAIL handshake"); goto fail;
+	}
+
+	/* Fill a buffer with a verifiable pattern. */
+	static char src[TCPBIG_LEN];
+	for (int i = 0; i < TCPBIG_LEN; i++)
+		src[i] = (char)(i & 0xff);
+
+	struct t_tcp_data_req dreq = { .prim = T_TCP_DATA_REQ };
+	struct strbuf dctl = { .maxlen = 0, .len = sizeof(dreq), .buf = &dreq };
+	struct strbuf ddat = { .maxlen = 0, .len = TCPBIG_LEN, .buf = src };
+	if (putmsg(C, &dctl, &ddat, 0) < 0) {
+		puts("tcpbig: FAIL send"); goto fail;
+	}
+
+	/* Drain T_DATA_INDs off R until we've collected TCPBIG_LEN
+	 * bytes.  cwnd-driven segmentation means R gets several
+	 * smaller indications instead of one big one. */
+	static char rcv[TCPBIG_LEN];
+	int got = 0;
+	while (got < TCPBIG_LEN) {
+		uint8_t ctlbuf[16];
+		struct strbuf rcin = { .maxlen = sizeof(ctlbuf), .len = 0, .buf = ctlbuf };
+		struct strbuf rdin = { .maxlen = TCPBIG_LEN - got, .len = 0,
+		                       .buf = rcv + got };
+		int flags = 0;
+		if (getmsg(R, &rcin, &rdin, &flags) < 0
+		    || ctlbuf[0] != T_TCP_DATA_IND
+		    || rdin.len <= 0) {
+			puts("tcpbig: FAIL recv"); goto fail;
+		}
+		got += rdin.len;
+	}
+	if (memcmp(src, rcv, TCPBIG_LEN) != 0) {
+		puts("tcpbig: FAIL data mismatch"); goto fail;
+	}
+
+	struct t_tcp_ordrel_req oreq = { .prim = T_TCP_ORDREL_REQ };
+	if (tcp_put_prim(C, &oreq, sizeof(oreq)) < 0
+	 || tcp_await_prim(R, T_TCP_ORDREL_IND) < 0
+	 || tcp_put_prim(R, &oreq, sizeof(oreq)) < 0
+	 || tcp_await_prim(C, T_TCP_ORDREL_IND) < 0) {
+		puts("tcpbig: FAIL ordrel"); goto fail;
+	}
+
+	close(L); close(C); close(R);
+	printf("tcpbig: PASS (%d bytes)\n", TCPBIG_LEN);
+	return 0;
+fail:
+	if (L >= 0) close(L);
+	if (C >= 0) close(C);
+	if (R >= 0) close(R);
 	return 1;
 }
 
@@ -554,6 +755,8 @@ static const struct test_entry tests[] = {
 	{ "udp",      test_udp },
 	{ "pktfilt",  test_pktfilt },
 	{ "tcp",      test_tcp },
+	{ "tcpmulti", test_tcpmulti },
+	{ "tcpbig",   test_tcpbig },
 };
 
 #define N_TESTS (sizeof(tests) / sizeof(tests[0]))

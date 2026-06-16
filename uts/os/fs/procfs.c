@@ -357,11 +357,39 @@ static void tcp_one_row(const struct tcp_tcb_view *v, void *arg)
 	}
 	pb_str(b, "  sbuf=");
 	pb_pad_dec(b, v->snd_buf_len, 0);
+	pb_str(b, "  swnd=");
+	pb_pad_dec(b, v->snd_wnd, 0);
+	pb_str(b, " rwnd=");
+	pb_pad_dec(b, v->rcv_wnd, 0);
+	pb_str(b, "  cwnd=");
+	pb_pad_dec(b, v->cwnd, 0);
+	pb_str(b, " ssthresh=");
+	pb_pad_dec(b, v->ssthresh, 0);
 	pb_str(b, "  srtt=");
 	pb_pad_dec(b, v->srtt_ms, 0);
 	pb_str(b, "ms rto=");
 	pb_pad_dec(b, v->rto_ms, 0);
-	pb_str(b, "ms\n");
+	pb_str(b, "ms");
+	/* Listener backlog -- only shown when non-zero (any TCB whose
+	 * state isn't LISTEN has backlog_depth == 0). */
+	if (v->backlog_depth) {
+		pb_str(b, " backlog=");
+		pb_pad_dec(b, v->backlog_depth, 0);
+	}
+	/* Dup-ACK counter -- non-zero only when we're partway through a
+	 * fast-recovery cycle. */
+	if (v->dup_acks) {
+		pb_str(b, " dupacks=");
+		pb_pad_dec(b, v->dup_acks, 0);
+	}
+	/* Window scaling: only show when negotiated.  Format
+	 * "wscale=N" means peer's scaling factor (we always
+	 * advertise 0 in TCP_LOCAL_WSCALE). */
+	if (v->ws_active) {
+		pb_str(b, " wscale=");
+		pb_pad_dec(b, v->snd_wnd_shift, 0);
+	}
+	pb_putc(b, '\n');
 }
 
 static int proc_tcp_qopen(queue_t *q)

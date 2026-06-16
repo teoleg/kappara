@@ -1,17 +1,24 @@
 # kappara
 
 A small SVR4-flavored Unix-like operating system for AArch64 (Raspberry Pi 3
-on QEMU today, eventually real Pi 4 hardware).  All four cores boot —
-core 0 runs the kernel + scheduler, cores 1-3 are released into a tiny
-"hello + idle" entry through the standard ARM spin-table at PA 0xE0/E8/F0.
-Real per-CPU scheduling is the next big step.
+on QEMU today, eventually real Pi 4 hardware).  All four cores boot and
+run an SVR4-style per-CPU dispatcher — each core has its own dispq, idle
+thread, and `cpu_thread`; cross-CPU steal works.
 
-The kernel uses SVR4 STREAMS for character I/O — pipes, console, /dev/loop,
-/dev/klog, /proc/* — with module push/pop, queues, and message blocks all
-matching the AT&T conventions (mblk_t / qinit / streamtab).  Modules are
-discovered via cdevsw[major].  Inode lifecycle follows vnode v_count and
-vop_inactive.  Signals are reliable (DEC/BSD-style: persistent handlers,
-sigmask).  Numbering is POSIX (SIGTERM=15, SIGKILL=9, etc.).
+The kernel uses SVR4 STREAMS for all character I/O — pipes, ttys, /dev/loop,
+/dev/klog, /proc/*, the network stack — with module push/pop, queues, and
+message blocks matching the AT&T conventions (mblk_t / qinit / streamtab).
+Modules are discovered via `cdevsw[major]`.  Inode lifecycle follows vnode
+`v_count` and `vop_inactive`.  Signals are reliable (DEC/BSD-style:
+persistent handlers, sigmask, sigaction).  Numbering is POSIX (SIGTERM=15,
+SIGKILL=9, ...).
+
+Networking is a STREAMS multiplexor: `/dev/ip` is the mux, ICMP / UDP / TCP
+are pushable modules above it, lo0 / slip0 are stream drivers underneath.
+TCP is the RFC 793 full state graph (LISTEN through TIME_WAIT) with a
+multi-accept backlog, RFC 6298 RTT estimation, exponential-backoff
+retransmit, and real receive-window advertisement driven by STREAMS
+backpressure.  See `docs/ARCHITECTURE.md` for the TCP phase table.
 
 No soup for you.
 
@@ -61,26 +68,30 @@ To quit:
 | `uts/aarch64/framebuffer.c`   | VC mailbox framebuffer + drawing primitives                       |
 | `uts/aarch64/fbcon.c`         | Framebuffer text console (kprintf-tee off by default)             |
 | `uts/aarch64/kallsyms_stub.S` | Pass-1 placeholder for the symbol-table link                      |
-| `uts/os/pmm.c`                 | 4 KB-page freelist allocator                                      |
-| `uts/os/kmem.c`                | Slab allocator + `kmalloc` size caches                            |
-| `uts/os/sched.c`               | Round-robin scheduler, wait queues, reap path                     |
-| `uts/os/signal.c`              | DEC/BSD reliable signals (fatal defaults today)                   |
-| `uts/os/streams.c`             | mblk_t / dblk_t / queue_t / putq / getq                           |
-| `uts/os/stream_head.c`         | Stream head, drivers (loop/null/console/klog/fbcon), pipes        |
-| `uts/os/cdevsw.c`              | SVR4 character-device switch keyed by major number                |
-| `uts/os/vfs.c`                 | In-memory dentry/inode tree, fd table, vnode v_count              |
-| `uts/os/kfs.c`                 | "kappara filesystem" — superblock + bitmap + dirent table         |
-| `uts/os/ramdisk.c`             | Block device backing kfs                                          |
-| `uts/os/proc.c`                | `/proc/{ps,meminfo,slabinfo,streams,ftrace}`                      |
-| `uts/os/ftrace.c`              | Per-CPU function tracer (`make TRACE=1`)                          |
-| `uts/os/syscall.c`             | Syscall table + dispatcher                                        |
-| `uts/os/kallsyms.c`            | Symbol-name lookup, frame-pointer backtrace                       |
-| `uts/os/user.c`                | EL0 setup, `sys_spawn` / `sys_exit`, per-thread user stacks       |
+| `uts/os/core/pmm.c`            | 4 KB-page freelist allocator (spinlocked for SMP)                 |
+| `uts/os/core/kmem.c`           | Slab allocator + `kmalloc` size caches (lock order: kmem → pmm)   |
+| `uts/os/proc/sched.c`          | Per-CPU dispatcher, wait queues, reap path                        |
+| `uts/os/proc/signal.c`         | DEC/BSD reliable signals (sigaction, sigsuspend, sigprocmask)     |
+| `uts/os/io/streams.c`          | mblk_t / dblk_t / queue_t / putq / getq / service procs           |
+| `uts/os/io/stream_head.c`      | Stream head, drivers (loop/null/console/klog/fbcon), pipes        |
+| `uts/os/io/cdevsw.c`           | SVR4 character-device switch keyed by major number                |
+| `uts/os/io/tty.c`              | tty / ldterm line discipline                                      |
+| `uts/os/fs/vfs.c`              | In-memory dentry/inode tree, fd table, vnode v_count              |
+| `uts/os/fs/kfs.c`              | "kappara filesystem" — superblock + bitmap + dirent table         |
+| `uts/os/fs/ramdisk.c`          | Block device backing kfs                                          |
+| `uts/os/fs/procfs.c`           | `/proc/{ps,meminfo,slabinfo,streams,ftrace,netif,slip,tcp,cpuload}` |
+| `uts/os/net/ipv4.c`            | IP multiplexor (`/dev/ip`), per-proto fan-out                     |
+| `uts/os/net/{icmp,udp,tcp}.c`  | Pushable TPI modules above IP                                     |
+| `uts/os/net/{lo,slip}.c`       | Stream drivers underneath IP (loopback, mini-UART SLIP)           |
+| `uts/os/core/ftrace.c`         | Per-CPU function tracer (`make TRACE=1`)                          |
+| `uts/os/proc/syscall.c`        | Syscall table + dispatcher                                        |
+| `uts/os/core/kallsyms.c`       | Symbol-name lookup, frame-pointer backtrace                       |
+| `uts/os/user/user.c`           | EL0 setup, `sys_execve`, per-thread user stacks                   |
 | `uts/os/main.c`                | `kmain` orchestration                                             |
-| `user/init.c`                  | Userspace shell (ksh) — runs at EL0 as PID 2                      |
+| `user/init.c`                  | Userspace shell (ksh) — runs at EL0                               |
 | `user/syscall.h`               | User-side syscall numbers + inline asm wrappers                   |
-| `cmd/`                         | `/usr/bin` programs (ps, sigtest, waittest, …) — ELF64, linked against libc |
-| `lib/libc/`                    | Freestanding libc: crt0, printf, malloc, FILE*, string, io         |
+| `cmd/`                         | `/usr/bin` programs: `ps`, `ping`, `ifconfig`, `netstat`, `test`  |
+| `lib/libc/`                    | Freestanding libc: crt0, printf, malloc, FILE*, string, io        |
 | `tools/gen_kallsyms.sh`        | nm + awk producing the symbol-table .S after pass-1 link          |
 | `docs/`                        | Reference documentation                                            |
 

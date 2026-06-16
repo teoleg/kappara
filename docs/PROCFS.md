@@ -202,6 +202,53 @@ Ethernet drivers land with runtime-configurable IP/MTU, write-side
 ioctls (or a `/dev/dlpi`-shaped control stream) become the place to
 add mutation.
 
+### /proc/tcp
+
+One row per registered TCP TCB (`tcp_for_each_tcb` walk).  Columns:
+state, local port, peer (ip:port or `-` for unconnected), send-buffer
+length, send window (`swnd`, peer's last advertised receive window),
+receive window (`rwnd`, what we'd advertise right now), congestion
+window (`cwnd`, RFC 5681 in-flight cap), slow-start threshold
+(`ssthresh`), smoothed RTT, current RTO.  Listener TCBs with queued
+pending SYNs append `backlog=N` -- the depth of the multi-accept
+ring (`TCP_LISTEN_BACKLOG`, currently 8).  TCBs partway through fast
+recovery append `dupacks=N` -- the running count of consecutive
+duplicate ACKs (resets to 0 on the first new ACK).  When RFC 7323
+window scaling is negotiated, the row appends `wscale=N` -- peer's
+shift factor (`s->snd_wnd_shift`); we always advertise 0.
+
+State names match the RFC 793 graph:
+
+| State          | Meaning                                              |
+|----------------|------------------------------------------------------|
+| `CLOSED`       | TCB allocated, nothing bound yet                     |
+| `BOUND`        | `T_BIND_REQ` succeeded, no `T_LISTEN_REQ` yet        |
+| `LISTEN`       | accepting inbound SYNs into the backlog ring         |
+| `SYN_SENT`     | active opener; sent SYN, waiting for SYN-ACK         |
+| `SYN_RECEIVED` | passive opener; sent SYN-ACK, waiting for ACK        |
+| `ESTABLISHED`  | both sides have agreed on ISS+1; data flows          |
+| `FIN_WAIT_1`   | sent our FIN; awaiting ACK and/or peer FIN           |
+| `FIN_WAIT_2`   | our FIN ACK'd; awaiting peer's FIN                   |
+| `CLOSE_WAIT`   | peer FIN'd us; user hasn't sent `T_ORDREL_REQ` yet   |
+| `CLOSING`      | simultaneous close; our FIN crossed peer's FIN       |
+| `LAST_ACK`     | passive-closer sent FIN; awaiting peer's final ACK   |
+| `TIME_WAIT`    | active-closer 2*MSL sweep; absorbs FIN retransmits   |
+
+```
+kappara:/# cat /proc/tcp
+STATE         LPORT  PEER             EXTRAS
+LISTEN         24680  -                sbuf=0  swnd=0 rwnd=8192  cwnd=1072 ssthresh=65535  srtt=0ms rto=0ms backlog=2
+ESTABLISHED    49152  127.0.0.1:24680  sbuf=0  swnd=8192 rwnd=8192  cwnd=2680 ssthresh=65535  srtt=10ms rto=40ms
+```
+
+The user-facing tool is `cmd/netstat`, which concatenates
+`/proc/netif`, `/proc/slip`, and `/proc/tcp`.
+
+### /proc/slip
+
+Per-line counters for `slip0`: total UART bytes received, plus SLIP
+framing counters (rx_frames, rx_runts, rx_overflow, tx_frames).
+
 ## How to add a new /proc entry
 
 Three steps:

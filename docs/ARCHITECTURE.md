@@ -767,15 +767,209 @@ TPI primitives (locked in across phases; see
 | T1b   | ✓ done | T_CONN_REQ / T_CONN_CON + 3-way handshake (active + passive)     |
 | T1c   | ✓ done | T_DATA_REQ / T_DATA_IND (in-order seq/ack; no retransmit yet)    |
 | T1d   | ✓ done | T_LISTEN_REQ + T_CONN_IND/T_CONN_RES (deferred SYN-ACK on accept)|
-| T1e   |        | T_ORDREL_REQ / T_ORDREL_IND (FIN handshake) + T_DISCON_REQ/IND   |
+| T1d.5 | ✓ done | multi-accept backlog; T_CONN_RES carries a responding fd        |
+| T1e   | ✓ done | T_ORDREL_REQ / T_ORDREL_IND (FIN handshake) + T_DISCON_REQ/IND   |
 | T1f   | ✓ done | retransmit timer + RTT estimation (SYN/FIN; data is T1g)         |
-| T1g   |        | cmd/tcptest end-to-end                                           |
+| T1g   | ✓ done | cmd/test `tcp` and `tcpmulti` subcommands end-to-end             |
+| T1h   | ✓ done | real receive-window advertisement; cap data_req by peer's wnd   |
+| T1i   | ✓ done | TIME_WAIT + CLOSING (RFC 793 full graph); 2*MSL via tcp_tick    |
+| T1j   | ✓ done | RFC 5681 cwnd: slow start, CA, RTO-driven MD; MSS segmentation  |
+| T1k   | ✓ done | RFC 5681 fast retransmit + fast recovery (3-dup-ACK trigger)    |
+| T1l   | ✓ done | MSS option negotiation on SYN/SYN-ACK; mss tracks per-route MTU |
+| T1m   | ✓ done | RFC 7323 window scale option; symmetric "echo to enable" semantics |
 
-T1b currently uses a simplified single-connection listener: a TCB in
-BOUND state accepts the first SYN inline, transitions to
-SYN_RECEIVED, and morphs into the established connection on ACK.
-T1d will split this properly into a LISTEN state with an accept
-queue producing child TCBs per inbound connection.
+T1h flow control: outbound segments advertise
+`TCP_RCV_WND_MAX - upstream_q_count` instead of a hardcoded constant,
+so the peer throttles when the user is slow draining the stream
+head's read queue.  `T_DATA_IND` is now delivered upward BEFORE the
+ACK goes out so the advertised window already reflects the
+just-queued bytes (otherwise the peer reads a stale, too-large
+window).  Inbound segments update `s->snd_wnd` from the wire; the
+write-side cap in `handle_data_req` is `min(TCP_SND_BUF_MAX,
+snd_wnd)`.  No queueing of "deferred" sends yet -- a `T_DATA_REQ`
+that doesn't fit returns `T_DISCON_IND{PROTOERR}` and the user
+re-tries after an ACK opens the window.  `/proc/tcp` shows both as
+`swnd=N rwnd=M`.
+
+T1i state machine completion -- the RFC 793 close graph is now
+fully wired:
+
+```
+   ESTABLISHED ---(user T_ORDREL_REQ; send FIN)--> FIN_WAIT_1
+       |                                              |
+       |                                  +-----------+-----------+
+       |                                  |                       |
+       |                              peer ACK              peer FIN (no ACK)
+       |                                  v                       v
+       |                              FIN_WAIT_2              CLOSING
+       |                                  |                       |
+       |                              peer FIN                peer ACK
+       |                                  v                       v
+   CLOSE_WAIT ---(user T_ORDREL_REQ)--> LAST_ACK            TIME_WAIT
+       |                                  |                       |
+       |                              peer ACK              2*MSL expires
+       |                                  v                       v
+       |                                CLOSED                  CLOSED
+       v
+   (user T_ORDREL_REQ)
+```
+
+CLOSING is the simultaneous-close midpoint -- our FIN crossed the
+peer's FIN in flight; we move there from FIN_WAIT_1 when a peer FIN
+arrives before the ACK for our own FIN.  When the trailing ACK
+finally lands, we transition to TIME_WAIT.
+
+TIME_WAIT is the 2*MSL sweep -- the active closer absorbs any
+retransmitted FIN from the peer (in case our final ACK was lost) and
+holds the 5-tuple out of reuse so stray late packets can't fool a
+new connection.  2*MSL is `TCP_TIME_WAIT_TICKS` (1 s, since
+everything is local; bump for non-loopback peers).  The retransmit
+kthread drives the clock: at each tick it checks every TCB with
+`state == TIME_WAIT` and flips to CLOSED on expiry.  TIME_WAIT also
+ignores spurious RTO arms; the only thing in flight is potential
+peer-FIN-retransmits, which we re-ACK without resetting the 2*MSL
+deadline.
+
+`tcp_qclose` skips the parting RST for CLOSING / TIME_WAIT / CLOSED
+since both sides already FIN'd.  LAST_ACK still sends RST if the
+user closes before our final ACK lands -- otherwise the peer's
+unACK'd FIN would retransmit into the void.
+
+T1j congestion control (RFC 5681).  Three new TCB fields drive the
+shape:
+
+- `mss` -- segment size cap.  No SYN-option negotiation yet, so fixed
+  at 536 (RFC 879 conservative default).  Bump this once we wire MSS
+  into the SYN options.
+- `cwnd` -- congestion window in bytes.  Starts at `IW = 2*MSS`
+  (RFC 5681 sec 3.1 for MSS <= 1095).  Caps in-flight bytes
+  alongside `snd_wnd`.
+- `ssthresh` -- slow-start threshold.  Starts at 65535 (effectively
+  unlimited) so we stay in slow start until the first loss event.
+
+`handle_data_req` no longer sends the user's payload as a single
+segment.  Instead it appends to `snd_buf` and calls
+`tcp_try_send_pending`, which loops MSS-sized chunks out the wire
+until cwnd or snd_wnd run out.  snd_buf may hold more bytes than
+snd_nxt has sent: the segmenter walks from `snd_buf_seq +
+(snd_nxt - snd_buf_seq)` forward.
+
+Every ACK that advances snd_una calls `tcp_cwnd_on_ack`:
+
+- Below ssthresh, `cwnd += MSS` per ACK -> cwnd doubles per RTT
+  (slow start).
+- At or above ssthresh, `cwnd += MSS*MSS/cwnd` (rounded) per ACK
+  -> ~ +1 MSS per RTT (congestion avoidance).
+
+After the cwnd update the trim path calls `tcp_try_send_pending`
+again so the freed cwnd room ships any bytes queued behind it.  The
+helper is reentrancy-guarded (`s->in_send`) because lo0's
+synchronous loopback drives ACK -> trim -> try_send chains back
+into us inside a single emit call; the outer loop picks up after
+the recursion unwinds.
+
+On RTO expiry the kthread calls `tcp_cwnd_on_rto` BEFORE re-sending:
+`ssthresh = max(flight/2, 2*MSS)`, `cwnd = MSS`.  Slow start ramps
+us back up once the first retransmit lands and gets ACK'd.  The
+retransmit itself is also capped at one MSS now (was the whole
+snd_buf).
+
+T1k fast retransmit + fast recovery (RFC 5681 sec 3.2).  A
+duplicate ACK -- `seg_ack == snd_una`, no payload, no SYN/FIN,
+outstanding data on our side -- bumps `dup_ack_count`.  On the
+third dup ACK we treat the head-of-snd_buf segment as confirmed
+lost without waiting for the RTO:
+
+- `ssthresh = max(flightsize/2, 2*MSS)`
+- `cwnd = ssthresh + 3*MSS` -- the "3" accounts for the three
+  segments that left the network (each dup ACK signals one).
+- Retransmit `snd_buf[0]` up to one MSS.
+
+Each additional dup ACK while in fast recovery inflates cwnd by
+one MSS so we keep pushing fresh segments into the pipe.  A new
+ACK (advancing `snd_una`) exits fast recovery: `cwnd = ssthresh`
+(deflation), `dup_ack_count = 0`.
+
+Triggering fast retransmit deterministically needs an injected
+loss; the existing pktfilter module operates on TPI primitives
+above the TCP module, not on built TCP segments, so it can't help
+here.  Adding a segment-drop hook at lo0 (or a TCB-keyed "drop
+next N" knob in tcp.c) is what an integration test would look
+like.  The code is exercised through the inverse path: no test
+hits it, but happy-path tests still pass with the new branches in
+place.
+
+T1l MSS option negotiation (RFC 793 + RFC 1122).  Before this MSS
+was hardcoded to 536, so segmentation ignored the actual link
+capacity (lo0 carries 1500-byte frames; SLIP carries 296).  Now
+every outbound SYN/SYN-ACK carries the standard 4-byte MSS option
+(`kind=2, len=4, mss_hi, mss_lo`); the advertised value is
+`netif_route(remote_ip)->mtu - IP_HDR_LEN - TCP_HDR_LEN_MIN`.
+
+On the receive side `tcp_parse_mss` walks the TLV stream between
+the fixed header and the data, looking for kind=2.  Unknown
+options are skipped via their length byte; END/NOP are handled
+inline.
+
+The effective MSS for a connection is
+`min(local_mss(outgoing_route), peer_advertised_mss)`, clamped
+to RFC 879's 536 floor in case both endpoints under-advertise.
+For an active opener the negotiation happens in the SYN_SENT
+handler when the SYN-ACK arrives.  For a passive opener the
+peer's MSS is stashed in `pending_q[].peer_mss` at SYN time, and
+`tcp_accept_into` consumes it when the user `T_CONN_RES`s.  The
+helper also resets `cwnd = 2 * mss` (RFC 5681 IW) so a
+1460-byte MSS doesn't keep the old 1072-byte initial window.
+
+T1m window scale (RFC 7323 sec 2).  Adds the 3-byte WSCALE option
+(`kind=3, len=3, shift`) alongside MSS on SYN segments.  Total
+SYN option block is now 8 bytes when WS is active: `02 04 hi lo
+01 03 03 shift` -- MSS then NOP then WSCALE, 4-aligned for the
+data_off field.
+
+Symmetric "echo to enable" semantics per the RFC:
+
+- Active opener always sets `ws_active = 1` at `handle_conn_req`
+  time and emits the option in its SYN.  If the peer's SYN-ACK
+  comes back without WS, we clear `ws_active` so subsequent
+  segments don't ship the option.
+- Passive opener stashes peer's WS shift in
+  `pending_q[].peer_wscale` at SYN-receive time.
+  `tcp_accept_into` sets `child->ws_active = pending.has_wscale`
+  before sending the SYN-ACK, so we only echo WS if peer offered.
+
+We advertise shift = 0 (`TCP_LOCAL_WSCALE`) since
+`TCP_RCV_WND_MAX = 8192` fits in 16 bits.  The shift exists in
+the wire to let a peer with huge buffers scale ITS advertised
+window past 64 KB; we record their shift in `snd_wnd_shift` and
+apply it on every post-handshake segment: `s->snd_wnd = (h->window
+<< snd_wnd_shift)`.  `snd_wnd` widened from `uint16_t` to
+`uint32_t` to hold the scaled product.
+
+Once we have buffers larger than 64 KB on our side, bump
+`TCP_LOCAL_WSCALE` and `TCP_RCV_WND_MAX`; the receive path is
+already plumbed to advertise an unscaled value while the peer
+applies whatever shift they observed.
+
+Options beyond MSS + WSCALE (SACK, timestamps / PAWS) are still
+TODO.  When they land they share `tcp_parse_syn_options`'s
+walker and the SYN-emit path's option-write block.
+
+T1d.5 multi-accept: the listener stays in LISTEN across accepts.  Each
+inbound SYN gets queued in an 8-slot backlog ring on the listener's
+TCB and fires a `T_CONN_IND` carrying the peer's (ip, port).  The user
+opens a fresh `/dev/tcp` for each connection and passes its fd in
+`T_CONN_RES.responding_fd`; the kernel pops the head pending SYN,
+grafts its state onto that responder's TCB, and sends SYN-ACK from
+it.  Children share the listener's local port without a separate IP
+bind -- IP multicasts every TCP segment to all bound uppers, the
+listener's tcp_input fan-out catches non-SYN segments destined for a
+child by 4-tuple match (`tcp_find_child`) and redirects.
+
+Backlog overflow drops the SYN silently; the peer's SYN_SENT will
+retransmit until either room frees up or the peer gives up.  Backlog
+depth surfaces in `/proc/tcp` as `backlog=N` for any LISTEN row whose
+ring is non-empty.
 
 Critical lo0 detail: state transitions are updated BEFORE the
 synchronous `tcp_send_segment` call, not after.  lo0's tx loops
