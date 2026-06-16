@@ -33,6 +33,8 @@
 
 #if defined(PLATFORM_PI4)
 #  include "platform/pi4.h"
+#elif defined(PLATFORM_VIRT)
+#  include "platform/virt.h"
 #else
 #  include "platform/pi3.h"
 #endif

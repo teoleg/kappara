@@ -71,8 +71,31 @@ ifeq ($(ARCH),aarch64)
     KERNEL        := $(BUILD)/kernel8.img
     QEMU          := qemu-system-aarch64
     QEMU_ARGS     := -M raspi3b -serial mon:stdio -serial null -display none
+else ifeq ($(ARCH),virt)
+    # QEMU `virt` machine (generic aarch64).  Reuses the aarch64
+    # toolchain + shared PL011 driver via PLAT_PL011_BASE; brings its
+    # own boot.S (no spin-table, single-core today) and linker.ld
+    # (RAM at 0x40000000, kernel at 0x40080000).
+    #
+    # Phase 1 (this commit): ARCH=virt builds a kernel that prints a
+    # PL011 splash and halts.  Phase 2 brings the full kernel up by
+    # stubbing the Pi-only drivers (framebuffer, mailbox, mini-UART,
+    # BCM2836 IPI block); phases 3-5 add virtio-net + a telnet server.
+    CROSS         ?= aarch64-linux-gnu-
+    ARCH_CFLAGS   := -mcpu=cortex-a72 -mgeneral-regs-only \
+                     -Iuts/aarch64 -DPLATFORM_VIRT
+    LINKER_LD     := uts/virt/linker.ld
+    ARCH_OBJS     := \
+        $(BUILD)/uts/virt/boot.o \
+        $(BUILD)/uts/aarch64/uart.o
+    KERNEL_OBJS   := \
+        $(BUILD)/uts/virt/main.o
+    ELF           := $(BUILD)/kernel.elf
+    KERNEL        := $(BUILD)/kernel.img
+    QEMU          := qemu-system-aarch64
+    QEMU_ARGS     := -M virt -cpu cortex-a72 -nographic
 else
-    $(error Unknown ARCH=$(ARCH); use ARCH=aarch64)
+    $(error Unknown ARCH=$(ARCH); use ARCH=aarch64 or ARCH=virt)
 endif
 
 CC      := $(CROSS)gcc
