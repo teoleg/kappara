@@ -43,6 +43,8 @@
 #include "kappara/core/printk.h"
 #include "kappara/core/string.h"
 #include "kappara/io/streams.h"
+#include "kappara/io/stream_head.h"
+#include "kappara/net/ip.h"
 #include "kappara/net/netif.h"
 #include "kappara/proc/sched.h"
 #include "platform.h"
@@ -95,6 +97,46 @@ struct virtio_net_hdr {
 } __attribute__((packed));
 
 #define VNET_HDR_LEN	sizeof(struct virtio_net_hdr)
+
+/* ---- Ethernet + ARP --------------------------------------------- */
+
+struct ether_hdr {
+	uint8_t  dst[6];
+	uint8_t  src[6];
+	uint16_t ethertype;	/* network byte order */
+} __attribute__((packed));
+
+#define ETH_HDR_LEN	14
+#define ETHERTYPE_IPV4	0x0800
+#define ETHERTYPE_ARP	0x0806
+
+struct arp_pkt {
+	uint16_t hw_type;	/* 1 = Ethernet */
+	uint16_t proto_type;	/* 0x0800 IPv4 */
+	uint8_t  hw_len;	/* 6 */
+	uint8_t  proto_len;	/* 4 */
+	uint16_t opcode;	/* 1 = request, 2 = reply */
+	uint8_t  sender_mac[6];
+	uint8_t  sender_ip[4];
+	uint8_t  target_mac[6];
+	uint8_t  target_ip[4];
+} __attribute__((packed));
+
+#define ARP_REQUEST	1
+#define ARP_REPLY	2
+
+/* eth0's IPv4 config matches QEMU's default user-mode (slirp) NAT
+ * subnet: 10.0.2.0/24 with host=10.0.2.2 (gateway), dns=10.0.2.3,
+ * DHCP-assigned guest = 10.0.2.15.  We skip DHCP for now and just
+ * use the well-known guest address. */
+#define ETH0_IP		0x0a00020fu	/* 10.0.2.15 */
+#define ETH0_NETMASK	0xffffff00u	/* /24 */
+#define ETH0_GATEWAY	0x0a000202u	/* 10.0.2.2 */
+
+/* ARP cache: just the gateway entry for now.  Resolved lazily via
+ * the first ARP request we send out. */
+static uint8_t arp_gw_mac[6];
+static int     arp_gw_have;
 
 /* ---- Virtqueue rings ------------------------------------------- */
 
@@ -243,8 +285,8 @@ static int tx_prepare(void)
 }
 
 /* TX: build a 2-desc chain (header + payload), kick.  Caller passes
- * a flat buffer + length for now -- mblk wrapping comes when the
- * netif's streamtab gets wired in the next commit. */
+ * a flat buffer + length already containing the full Ethernet frame
+ * (Ethernet header + payload). */
 int virtio_net_tx_bytes(const void *buf, unsigned len)
 {
 	if (!g_eth0.ready || len == 0 || len > PAGE_SIZE) return -1;
@@ -278,9 +320,117 @@ int virtio_net_tx_bytes(const void *buf, unsigned len)
 	return 0;
 }
 
-/* IRQ entry: drain used rings.  RX bytes are reported (count only)
- * here; once IP wiring lands they'll be marshalled into mblks and
- * fed to the IP mux via the netif's streamtab. */
+/* ---- ARP + Ethernet helpers ------------------------------------ */
+
+static void put_be16(uint8_t *p, uint16_t v)
+{
+	p[0] = (uint8_t)(v >> 8);
+	p[1] = (uint8_t)(v & 0xff);
+}
+static uint16_t get_be16(const uint8_t *p)
+{
+	return ((uint16_t)p[0] << 8) | p[1];
+}
+
+/* Build an ARP frame in `frame` and TX it.  out_op = ARP_REQUEST or
+ * ARP_REPLY; out_dst_mac may be broadcast for requests, the requester
+ * for replies; sender/target_ip are host-byte-order. */
+static void arp_send(int out_op, const uint8_t out_dst_mac[6],
+                     uint32_t sender_ip, uint32_t target_ip,
+                     const uint8_t target_mac[6])
+{
+	uint8_t frame[ETH_HDR_LEN + sizeof(struct arp_pkt)];
+	struct ether_hdr *eh = (struct ether_hdr *)frame;
+	kmemcpy(eh->dst, out_dst_mac, 6);
+	kmemcpy(eh->src, g_eth0.mac, 6);
+	eh->ethertype = (uint16_t)((ETHERTYPE_ARP & 0xff) << 8
+	                         | ((ETHERTYPE_ARP >> 8) & 0xff));
+
+	struct arp_pkt *a = (struct arp_pkt *)(frame + ETH_HDR_LEN);
+	put_be16((uint8_t *)&a->hw_type,    1);
+	put_be16((uint8_t *)&a->proto_type, ETHERTYPE_IPV4);
+	a->hw_len    = 6;
+	a->proto_len = 4;
+	put_be16((uint8_t *)&a->opcode, (uint16_t)out_op);
+	kmemcpy(a->sender_mac, g_eth0.mac, 6);
+	a->sender_ip[0] = (sender_ip >> 24) & 0xff;
+	a->sender_ip[1] = (sender_ip >> 16) & 0xff;
+	a->sender_ip[2] = (sender_ip >>  8) & 0xff;
+	a->sender_ip[3] = (sender_ip      ) & 0xff;
+	if (target_mac)
+		kmemcpy(a->target_mac, target_mac, 6);
+	else
+		kmemset(a->target_mac, 0, 6);
+	a->target_ip[0] = (target_ip >> 24) & 0xff;
+	a->target_ip[1] = (target_ip >> 16) & 0xff;
+	a->target_ip[2] = (target_ip >>  8) & 0xff;
+	a->target_ip[3] = (target_ip      ) & 0xff;
+
+	virtio_net_tx_bytes(frame, sizeof(frame));
+}
+
+static void arp_send_request(uint32_t target_ip)
+{
+	static const uint8_t bcast[6] = { 0xff,0xff,0xff,0xff,0xff,0xff };
+	arp_send(ARP_REQUEST, bcast, ETH0_IP, target_ip, 0);
+}
+
+/* Forward declaration: queue_t to attach to RX delivery path. */
+static struct stdata *eth0_sd;
+
+static void rx_dispatch(const uint8_t *frame, unsigned len)
+{
+	if (len < ETH_HDR_LEN) return;
+	const struct ether_hdr *eh = (const struct ether_hdr *)frame;
+	uint16_t et = (uint16_t)(((eh->ethertype & 0xff) << 8)
+	                         | ((eh->ethertype >> 8) & 0xff));
+
+	if (et == ETHERTYPE_ARP && len >= ETH_HDR_LEN + sizeof(struct arp_pkt)) {
+		const struct arp_pkt *a =
+		    (const struct arp_pkt *)(frame + ETH_HDR_LEN);
+		uint16_t op = get_be16((const uint8_t *)&a->opcode);
+		uint32_t sip = ((uint32_t)a->sender_ip[0] << 24)
+		             | ((uint32_t)a->sender_ip[1] << 16)
+		             | ((uint32_t)a->sender_ip[2] <<  8)
+		             | ((uint32_t)a->sender_ip[3]      );
+		uint32_t tip = ((uint32_t)a->target_ip[0] << 24)
+		             | ((uint32_t)a->target_ip[1] << 16)
+		             | ((uint32_t)a->target_ip[2] <<  8)
+		             | ((uint32_t)a->target_ip[3]      );
+		if (op == ARP_REQUEST && tip == ETH0_IP) {
+			arp_send(ARP_REPLY, a->sender_mac, ETH0_IP,
+			         sip, a->sender_mac);
+		} else if (op == ARP_REPLY && sip == ETH0_GATEWAY) {
+			kmemcpy(arp_gw_mac, a->sender_mac, 6);
+			arp_gw_have = 1;
+			kprintf("eth0: gw %02x:%02x:%02x:%02x:%02x:%02x\n",
+			        arp_gw_mac[0], arp_gw_mac[1], arp_gw_mac[2],
+			        arp_gw_mac[3], arp_gw_mac[4], arp_gw_mac[5]);
+		}
+		return;
+	}
+
+	if (et == ETHERTYPE_IPV4 && eth0_sd && eth0_sd->sd_rq) {
+		/* Strip Ethernet header, send the IP datagram up to the
+		 * IP mux via the netif stream's read side. */
+		unsigned plen = len - ETH_HDR_LEN;
+		mblk_t *mp = allocb(plen, 0);
+		if (mp) {
+			kmemcpy(mp->b_wptr, frame + ETH_HDR_LEN, plen);
+			mp->b_wptr += plen;
+			mp->b_datap->db_type = M_DATA;
+			/* Put up the stream's read-side chain so ip_rput
+			 * sees it. */
+			queue_t *rq = eth0_sd->sd_drv_rq;
+			if (rq && rq->q_next)
+				putnext(rq, mp);
+			else
+				freemsg(mp);
+		}
+	}
+}
+
+/* IRQ entry: drain used rings. */
 void virtio_net_irq(void)
 {
 	if (!g_eth0.ready) return;
@@ -296,10 +446,122 @@ void virtio_net_irq(void)
 		unsigned slot = (unsigned)e.id;
 		unsigned len  = (unsigned)e.len;
 		g_eth0.rx.last_used++;
-		(void)len;
+		if (len > VNET_HDR_LEN && len <= PAGE_SIZE) {
+			rx_dispatch((uint8_t *)g_eth0.rx_bufs[slot]
+			            + VNET_HDR_LEN,
+			            len - VNET_HDR_LEN);
+		}
 		rx_post(slot);
 	}
 	mw32(VMMIO_QNOTIFY, RXQ);
+}
+
+/* ---- eth0 streamtab + ip_attach_stream -------------------------- */
+/*
+ * Write side: IP wput sends an mblk containing a raw IP datagram.
+ * We prepend an Ethernet header (dst = cached gateway MAC, src = our
+ * MAC, ethertype = IPv4) and TX through virtio.
+ */
+static int eth0_wq_putp(queue_t *q, mblk_t *mp)
+{
+	(void)q;
+	if (!mp) return 0;
+	if (mp->b_datap->db_type != M_DATA) { freemsg(mp); return 0; }
+
+	unsigned plen = (unsigned)msgdsize(mp);
+	if (plen == 0 || plen > PAGE_SIZE - ETH_HDR_LEN) {
+		freemsg(mp);
+		return -1;
+	}
+
+	if (!arp_gw_have) {
+		/* Trigger ARP and drop this packet -- the next packet
+		 * after the reply lands will succeed. */
+		arp_send_request(ETH0_GATEWAY);
+		freemsg(mp);
+		return 0;
+	}
+
+	uint8_t buf[ETH_HDR_LEN + 1500];
+	struct ether_hdr *eh = (struct ether_hdr *)buf;
+	kmemcpy(eh->dst, arp_gw_mac, 6);
+	kmemcpy(eh->src, g_eth0.mac, 6);
+	eh->ethertype = (uint16_t)((ETHERTYPE_IPV4 & 0xff) << 8
+	                         | ((ETHERTYPE_IPV4 >> 8) & 0xff));
+
+	unsigned char *p = buf + ETH_HDR_LEN;
+	for (mblk_t *m = mp; m; m = m->b_cont) {
+		unsigned n = (unsigned)(m->b_wptr - m->b_rptr);
+		if (n == 0) continue;
+		kmemcpy(p, m->b_rptr, n);
+		p += n;
+	}
+	freemsg(mp);
+
+	virtio_net_tx_bytes(buf, ETH_HDR_LEN + plen);
+	return 0;
+}
+
+static int eth0_rq_putp(queue_t *q, mblk_t *mp)
+{
+	return putnext(q, mp);
+}
+
+static int eth0_qopen(queue_t *rq)
+{
+	(void)rq;
+	return 0;
+}
+
+static struct module_info eth0_minfo = {
+	.mi_idnum  = 2000,
+	.mi_idname = "eth0",
+	.mi_minpsz = 0,
+	.mi_maxpsz = 1500,
+	.mi_hiwat  = 16384,
+	.mi_lowat  = 8192,
+};
+
+static struct qinit eth0_rinit = {
+	.qi_putp  = eth0_rq_putp,
+	.qi_qopen = eth0_qopen,
+	.qi_minfo = &eth0_minfo,
+};
+static struct qinit eth0_winit = {
+	.qi_putp  = eth0_wq_putp,
+	.qi_minfo = &eth0_minfo,
+};
+struct streamtab eth0_streamtab = {
+	.st_rdinit = &eth0_rinit,
+	.st_wrinit = &eth0_winit,
+};
+
+static struct netif eth0_nif;
+
+static void wire_eth0_into_ip(void)
+{
+	struct stdata *sd =
+	    stream_build_kernel(&eth0_streamtab, "eth0_drv", 0);
+	if (!sd) {
+		kprintf("eth0: stream_build_kernel failed\n");
+		return;
+	}
+	eth0_sd = sd;
+
+	eth0_nif.name     = "eth0";
+	eth0_nif.ip       = ETH0_IP;
+	eth0_nif.netmask  = ETH0_NETMASK;
+	eth0_nif.mtu      = 1500;
+	eth0_nif.streamtab = NULL;	/* using pre-built sd via attach */
+	eth0_nif.tx       = NULL;
+	netif_register(&eth0_nif);
+
+	long muxid = ip_attach_stream(sd, &eth0_nif);
+	if (muxid <= 0) {
+		kprintf("eth0: ip_attach_stream failed rc=%ld\n", muxid);
+		return;
+	}
+	kprintf("eth0: linked under IP muxid=%ld\n", muxid);
 }
 
 static int try_init_net(unsigned slot)
@@ -354,6 +616,7 @@ static int try_init_net(unsigned slot)
 		g_eth0.mac[3], g_eth0.mac[4], g_eth0.mac[5]);
 
 	g_eth0.ready = 1;
+	wire_eth0_into_ip();
 	return 0;
 }
 
