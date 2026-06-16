@@ -55,14 +55,48 @@ static int put_prim(struct stdata *sd, const void *body, unsigned blen)
 	return 0;
 }
 
+/* Pull the next mblk off sd_rq, blocking on sd_readwait when the
+ * queue is empty.  Same shape stream_read uses (sq_lock around the
+ * getq + sleep_on window so wakers can't slip in).  Returns NULL
+ * only if the stream EOF'd. */
+static mblk_t *wait_next_mblk(struct stdata *sd)
+{
+	unsigned long flags =
+	    spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+	for (;;) {
+		mblk_t *mp = getq(sd->sd_rq);
+		if (mp) {
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
+			                        flags);
+			return mp;
+		}
+		if (sd->sd_flags & SD_EOF) {
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
+			                        flags);
+			return 0;
+		}
+		kthread_sleep_on_locked(&sd->sd_readwait, flags);
+		flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+	}
+}
+
 static int wait_prim(struct stdata *sd, uint8_t want, void *out, unsigned cap)
 {
-	for (int i = 0; i < 4096; i++) {
-		mblk_t *mp = getq(sd->sd_rq);
-		if (!mp) { kthread_yield(); continue; }
+	for (;;) {
+		mblk_t *mp = wait_next_mblk(sd);
+		if (!mp) return -1;
 		uint8_t prim = (mp->b_wptr - mp->b_rptr) >= 1
 		             ? mp->b_rptr[0] : 0;
-		if (prim != want) { freemsg(mp); continue; }
+		if (prim != want) {
+			/* Discon arrived before the expected primitive --
+			 * connection died, bail. */
+			if (prim == T_TCP_DISCON_IND) {
+				freemsg(mp);
+				return -1;
+			}
+			freemsg(mp);
+			continue;
+		}
 		if (out && cap) {
 			unsigned n = (unsigned)(mp->b_wptr - mp->b_rptr);
 			if (n > cap) n = cap;
@@ -71,16 +105,15 @@ static int wait_prim(struct stdata *sd, uint8_t want, void *out, unsigned cap)
 		freemsg(mp);
 		return 0;
 	}
-	return -1;
 }
 
 /* Block waiting for a T_TCP_DATA_IND, copy its M_DATA payload into
- * the caller's buffer.  Returns bytes received (>0) or -1 on close. */
+ * the caller's buffer.  Returns bytes received (>0), -1 on close. */
 static int wait_data(struct stdata *sd, char *buf, unsigned cap)
 {
-	for (int i = 0; i < 8000; i++) {
-		mblk_t *mp = getq(sd->sd_rq);
-		if (!mp) { kthread_yield(); continue; }
+	for (;;) {
+		mblk_t *mp = wait_next_mblk(sd);
+		if (!mp) return -1;
 		uint8_t prim = (mp->b_wptr - mp->b_rptr) >= 1
 		             ? mp->b_rptr[0] : 0;
 		if (prim == T_TCP_DATA_IND && mp->b_cont) {
@@ -97,7 +130,6 @@ static int wait_data(struct stdata *sd, char *buf, unsigned cap)
 		}
 		freemsg(mp);
 	}
-	return -1;
 }
 
 static int send_data(struct stdata *sd, const char *buf, unsigned blen)
@@ -321,7 +353,10 @@ static void telnetd_main(void *arg)
 
 		/* Drain T_CONN_CON on R, then run the per-connection
 		 * session.  Graceful close ends the session. */
-		(void)wait_prim(R, T_TCP_CONN_CON, 0, 0);
+		if (wait_prim(R, T_TCP_CONN_CON, 0, 0) < 0) {
+			stream_destroy_kernel(R);
+			continue;
+		}
 		telnet_session(R);
 
 		struct t_tcp_ordrel_req oq = { .prim = T_TCP_ORDREL_REQ };
