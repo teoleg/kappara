@@ -213,7 +213,9 @@ window (`cwnd`, RFC 5681 in-flight cap), slow-start threshold
 pending SYNs append `backlog=N` -- the depth of the multi-accept
 ring (`TCP_LISTEN_BACKLOG`, currently 8).  TCBs partway through fast
 recovery append `dupacks=N` -- the running count of consecutive
-duplicate ACKs (resets to 0 on the first new ACK).
+duplicate ACKs (resets to 0 on the first new ACK).  When RFC 7323
+window scaling is negotiated, the row appends `wscale=N` -- peer's
+shift factor (`s->snd_wnd_shift`); we always advertise 0.
 
 State names match the RFC 793 graph:
 

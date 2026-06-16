@@ -382,6 +382,13 @@ static void tcp_one_row(const struct tcp_tcb_view *v, void *arg)
 		pb_str(b, " dupacks=");
 		pb_pad_dec(b, v->dup_acks, 0);
 	}
+	/* Window scaling: only show when negotiated.  Format
+	 * "wscale=N" means peer's scaling factor (we always
+	 * advertise 0 in TCP_LOCAL_WSCALE). */
+	if (v->ws_active) {
+		pb_str(b, " wscale=");
+		pb_pad_dec(b, v->snd_wnd_shift, 0);
+	}
 	pb_putc(b, '\n');
 }
 

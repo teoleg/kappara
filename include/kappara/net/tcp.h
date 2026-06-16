@@ -76,6 +76,14 @@ typedef struct msgb mblk_t;
 #define TCP_OPT_MSS	2
 #define TCP_OPT_MSS_LEN	4
 
+/* T1m: window scale (RFC 7323 sec 2).  Shift value 0..14; values >14
+ * MUST be clamped per the RFC.  Negotiated on SYN/SYN-ACK only;
+ * applies to every subsequent segment's 16-bit window field. */
+#define TCP_OPT_WSCALE		3
+#define TCP_OPT_WSCALE_LEN	3
+#define TCP_WSCALE_MAX		14
+#define TCP_LOCAL_WSCALE	0	/* our advertised window <= 16 bits */
+
 /* On-wire TCP header (RFC 793).  All big-endian. */
 struct tcp_hdr {
 	uint16_t src_port;
@@ -235,11 +243,13 @@ struct tcp_tcb_view {
 	uint32_t    rto_ms;	/* current RTO in milliseconds */
 	uint32_t    srtt_ms;	/* smoothed RTT in milliseconds */
 	uint16_t    backlog_depth;	/* LISTEN only: pending-SYN count */
-	uint16_t    snd_wnd;	/* peer's last advertised receive window */
+	uint32_t    snd_wnd;	/* peer's last advertised receive window (scaled) */
 	uint16_t    rcv_wnd;	/* what we'd advertise right now    */
 	uint32_t    cwnd;	/* T1j: congestion window in bytes  */
 	uint32_t    ssthresh;	/* T1j: slow-start threshold        */
 	uint8_t     dup_acks;	/* T1k: current consecutive-dup-ACK count */
+	uint8_t     snd_wnd_shift;	/* T1m: peer's WS shift (0 = no scaling) */
+	uint8_t     ws_active;		/* T1m: WS negotiation succeeded */
 };
 
 void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),

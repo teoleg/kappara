@@ -106,6 +106,9 @@ struct tcp_tcb {
 		uint16_t remote_port;
 		uint16_t peer_mss;	/* T1l: stashed from SYN option, 0 if absent */
 		uint32_t irs;	/* peer's initial seq */
+		uint8_t  peer_wscale;	/* T1m: WS option value if has_wscale */
+		uint8_t  has_wscale;
+		uint16_t _pad;
 	}          pending_q[TCP_LISTEN_BACKLOG];
 	uint8_t    pending_head;
 	uint8_t    pending_count;
@@ -145,8 +148,12 @@ struct tcp_tcb {
 	/* Peer's last advertised receive window, in bytes.  Updated on
 	 * every inbound segment (including the SYN that opens the
 	 * connection).  handle_data_req honours it: we never let more
-	 * than min(TCP_SND_BUF_MAX, snd_wnd) bytes be outstanding. */
-	uint16_t   snd_wnd;
+	 * than min(TCP_SND_BUF_MAX, snd_wnd) bytes be outstanding.
+	 * T1m: this is the SCALED value (h->window << snd_wnd_shift),
+	 * which is why it's 32 bits -- 0xffff << 14 = 1 GiB. */
+	uint32_t   snd_wnd;
+	uint8_t    snd_wnd_shift;	/* peer's WS option value */
+	uint8_t    ws_active;		/* both ends agreed to use WS */
 
 	/* T1i TIME_WAIT 2*MSL deadline (in 10ms ticks).  Set when we
 	 * enter TIME_WAIT; the retransmit kthread polls and transitions
@@ -564,13 +571,26 @@ static uint16_t tcp_local_mss(uint32_t dst_ip)
 	return (uint16_t)mss;
 }
 
-/* Parse a SYN segment's options for the MSS field.  Returns 0 if the
- * option is missing or malformed -- caller treats that as "peer
- * didn't advertise" and uses RFC 879's 536.  Walks kind/length TLVs;
- * NOP is single-byte, END terminates, anything else uses the length
- * byte to skip past unknown options. */
-static uint16_t tcp_parse_mss(const uint8_t *opts, unsigned olen)
+/* Parsed SYN options the rest of the input path cares about.
+ * Holds enough to drive T1l (MSS) and T1m (window scale)
+ * negotiation; growth to PAWS / SACK options would extend this
+ * struct rather than re-walk. */
+struct tcp_syn_options {
+	uint16_t mss;		/* 0 = absent or malformed */
+	uint8_t  wscale;	/* 0..14, clamped */
+	uint8_t  has_wscale;
+};
+
+/* Walk the options block of a SYN-bearing segment.  END (kind=0)
+ * terminates; NOP (kind=1) is a 1-byte padder; anything else uses
+ * the length byte to skip past unknown options.  Caller takes
+ * "absent" as "peer didn't advertise" and falls back to defaults. */
+static void tcp_parse_syn_options(const uint8_t *opts, unsigned olen,
+                                  struct tcp_syn_options *o)
 {
+	o->mss        = 0;
+	o->wscale     = 0;
+	o->has_wscale = 0;
 	unsigned i = 0;
 	while (i < olen) {
 		uint8_t kind = opts[i];
@@ -580,11 +600,16 @@ static uint16_t tcp_parse_mss(const uint8_t *opts, unsigned olen)
 		uint8_t len = opts[i + 1];
 		if (len < 2 || i + len > olen) break;
 		if (kind == TCP_OPT_MSS && len == TCP_OPT_MSS_LEN) {
-			return ((uint16_t)opts[i + 2] << 8) | opts[i + 3];
+			o->mss = ((uint16_t)opts[i + 2] << 8) | opts[i + 3];
+		} else if (kind == TCP_OPT_WSCALE
+		        && len == TCP_OPT_WSCALE_LEN) {
+			uint8_t shift = opts[i + 2];
+			if (shift > TCP_WSCALE_MAX) shift = TCP_WSCALE_MAX;
+			o->wscale     = shift;
+			o->has_wscale = 1;
 		}
 		i += len;
 	}
-	return 0;
 }
 
 /* Negotiate effective MSS once both ends have spoken: min of the
@@ -636,9 +661,15 @@ static int tcp_emit_segment(struct tcp_tcb *s, uint32_t seq, uint8_t flags,
 		return -1;
 	}
 
-	/* T1l: SYN-bearing segments carry the MSS option; everything
-	 * else is plain. */
-	unsigned opt_len = (flags & TCP_FLAG_SYN) ? TCP_OPT_MSS_LEN : 0;
+	/* T1l/T1m: SYN-bearing segments carry the MSS option; if
+	 * window scaling was negotiated, append NOP + WSCALE for a
+	 * total of 8 option bytes (4-aligned).  Everything else is
+	 * plain (no options). */
+	unsigned opt_len = 0;
+	if (flags & TCP_FLAG_SYN) {
+		opt_len = TCP_OPT_MSS_LEN;
+		if (s->ws_active) opt_len += 4;	/* NOP + WSCALE TLV */
+	}
 
 	mblk_t *mp = allocb(IP_HDR_LEN + TCP_HDR_LEN_MIN + opt_len + blen, 0);
 	if (!mp) return -1;
@@ -659,11 +690,20 @@ static int tcp_emit_segment(struct tcp_tcb *s, uint32_t seq, uint8_t flags,
 
 	if (opt_len) {
 		uint16_t mss_val = tcp_local_mss(s->remote_ip);
-		mp->b_wptr[0] = TCP_OPT_MSS;
-		mp->b_wptr[1] = TCP_OPT_MSS_LEN;
-		mp->b_wptr[2] = (mss_val >> 8) & 0xff;
-		mp->b_wptr[3] =  mss_val       & 0xff;
-		mp->b_wptr   += TCP_OPT_MSS_LEN;
+		uint8_t *o = mp->b_wptr;
+		o[0] = TCP_OPT_MSS;
+		o[1] = TCP_OPT_MSS_LEN;
+		o[2] = (mss_val >> 8) & 0xff;
+		o[3] =  mss_val       & 0xff;
+		o += TCP_OPT_MSS_LEN;
+		if (s->ws_active) {
+			o[0] = TCP_OPT_NOP;
+			o[1] = TCP_OPT_WSCALE;
+			o[2] = TCP_OPT_WSCALE_LEN;
+			o[3] = TCP_LOCAL_WSCALE;
+			o += 4;
+		}
+		mp->b_wptr += opt_len;
 	}
 
 	if (blen > 0 && body) {
@@ -698,8 +738,12 @@ static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags,
 		return -1;
 	}
 
-	/* T1l: SYN-bearing segments carry the MSS option. */
-	unsigned opt_len = (flags & TCP_FLAG_SYN) ? TCP_OPT_MSS_LEN : 0;
+	/* T1l/T1m: SYN-bearing segments carry MSS (+ WSCALE if active). */
+	unsigned opt_len = 0;
+	if (flags & TCP_FLAG_SYN) {
+		opt_len = TCP_OPT_MSS_LEN;
+		if (s->ws_active) opt_len += 4;
+	}
 
 	mblk_t *mp = allocb(IP_HDR_LEN + TCP_HDR_LEN_MIN + opt_len + plen, 0);
 	if (!mp) {
@@ -723,11 +767,20 @@ static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags,
 
 	if (opt_len) {
 		uint16_t mss_val = tcp_local_mss(s->remote_ip);
-		mp->b_wptr[0] = TCP_OPT_MSS;
-		mp->b_wptr[1] = TCP_OPT_MSS_LEN;
-		mp->b_wptr[2] = (mss_val >> 8) & 0xff;
-		mp->b_wptr[3] =  mss_val       & 0xff;
-		mp->b_wptr   += TCP_OPT_MSS_LEN;
+		uint8_t *o = mp->b_wptr;
+		o[0] = TCP_OPT_MSS;
+		o[1] = TCP_OPT_MSS_LEN;
+		o[2] = (mss_val >> 8) & 0xff;
+		o[3] =  mss_val       & 0xff;
+		o += TCP_OPT_MSS_LEN;
+		if (s->ws_active) {
+			o[0] = TCP_OPT_NOP;
+			o[1] = TCP_OPT_WSCALE;
+			o[2] = TCP_OPT_WSCALE_LEN;
+			o[3] = TCP_LOCAL_WSCALE;
+			o += 4;
+		}
+		mp->b_wptr += opt_len;
 	}
 
 	if (payload) {
@@ -903,9 +956,16 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 	 * destined for this TCB.  handle_data_req honours it as the
 	 * upper bound on outstanding bytes.  Skip on LISTEN (the
 	 * listener never sends data; the child reads the window from
-	 * the ACK that completes its handshake). */
-	if (s->state != TCPS_LISTEN)
-		s->snd_wnd = ntohs16(h->window);
+	 * the ACK that completes its handshake).  T1m: scale by the
+	 * peer's WS shift -- on a SYN there's no scaling yet
+	 * (snd_wnd_shift = 0 for the initial SYN-ACK), but every
+	 * post-handshake segment is interpreted scaled. */
+	if (s->state != TCPS_LISTEN) {
+		uint32_t w = (uint32_t)ntohs16(h->window);
+		if (!(flags & TCP_FLAG_SYN))
+			w <<= s->snd_wnd_shift;
+		s->snd_wnd = w;
+	}
 
 	switch (s->state) {
 	case TCPS_SYN_SENT:
@@ -927,13 +987,28 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 				tcp_update_rtt(s,
 				    tcp_tick_counter - s->send_tick);
 			tcp_cancel_rto(s);
-			/* T1l: parse peer's SYN-ACK options for MSS. */
-			uint16_t peer_mss = (hl > TCP_HDR_LEN_MIN)
-			    ? tcp_parse_mss(
-			        body->b_rptr + TCP_HDR_LEN_MIN,
-			        hl - TCP_HDR_LEN_MIN)
-			    : 0;
-			tcp_negotiate_mss(s, peer_mss);
+			/* T1l/T1m: parse peer's SYN-ACK options.  WSCALE
+			 * stays in effect only if peer echoed it; we'd
+			 * already offered ws_active=1 at handle_conn_req
+			 * time but if peer's SYN-ACK is silent we MUST
+			 * clear (RFC 7323 sec 2.2). */
+			struct tcp_syn_options sopts;
+			if (hl > TCP_HDR_LEN_MIN) {
+				tcp_parse_syn_options(
+				    body->b_rptr + TCP_HDR_LEN_MIN,
+				    hl - TCP_HDR_LEN_MIN, &sopts);
+			} else {
+				sopts.mss = 0;
+				sopts.wscale = 0;
+				sopts.has_wscale = 0;
+			}
+			tcp_negotiate_mss(s, sopts.mss);
+			if (sopts.has_wscale) {
+				s->snd_wnd_shift = sopts.wscale;
+			} else {
+				s->snd_wnd_shift = 0;
+				s->ws_active     = 0;
+			}
 			s->rcv_irs = seg_seq;
 			s->rcv_nxt = seg_seq + 1;
 			s->snd_una = seg_ack;
@@ -964,13 +1039,22 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 			s->pending_q[slot].remote_ip   = src_ip;
 			s->pending_q[slot].remote_port = sport;
 			s->pending_q[slot].irs         = seg_seq;
-			/* T1l: stash peer's MSS so tcp_accept_into can
-			 * finish the negotiation when the user accepts. */
-			s->pending_q[slot].peer_mss    = (hl > TCP_HDR_LEN_MIN)
-			    ? tcp_parse_mss(
-			        body->b_rptr + TCP_HDR_LEN_MIN,
-			        hl - TCP_HDR_LEN_MIN)
-			    : 0;
+			/* T1l/T1m: stash peer's MSS + WSCALE so
+			 * tcp_accept_into can finish negotiation when
+			 * the user accepts.  Defaults if no options. */
+			struct tcp_syn_options sopts;
+			if (hl > TCP_HDR_LEN_MIN) {
+				tcp_parse_syn_options(
+				    body->b_rptr + TCP_HDR_LEN_MIN,
+				    hl - TCP_HDR_LEN_MIN, &sopts);
+			} else {
+				sopts.mss = 0;
+				sopts.wscale = 0;
+				sopts.has_wscale = 0;
+			}
+			s->pending_q[slot].peer_mss    = sopts.mss;
+			s->pending_q[slot].peer_wscale = sopts.wscale;
+			s->pending_q[slot].has_wscale  = sopts.has_wscale;
 			s->pending_count++;
 			reply_conn_ind(q, src_ip, sport);
 		}
@@ -1323,6 +1407,9 @@ static int handle_conn_req(queue_t *q, struct tcp_tcb *s,
 	s->snd_una     = s->snd_iss;
 	s->snd_nxt     = s->snd_iss;
 	s->state       = TCPS_SYN_SENT;
+	/* T1m: offer window scaling in our SYN.  If peer's SYN-ACK
+	 * is silent we'll clear ws_active in the SYN_SENT handler. */
+	s->ws_active   = 1;
 	(void)tcp_send_segment(s, TCP_FLAG_SYN, NULL);
 	return 0;
 }
@@ -1346,10 +1433,12 @@ static int handle_listen_req(queue_t *q, struct tcp_tcb *s)
 static int tcp_accept_into(struct tcp_tcb *s, struct tcp_tcb *child)
 {
 	int head = s->pending_head;
-	uint32_t rip      = s->pending_q[head].remote_ip;
-	uint16_t rport    = s->pending_q[head].remote_port;
-	uint32_t irs      = s->pending_q[head].irs;
-	uint16_t peer_mss = s->pending_q[head].peer_mss;
+	uint32_t rip        = s->pending_q[head].remote_ip;
+	uint16_t rport      = s->pending_q[head].remote_port;
+	uint32_t irs        = s->pending_q[head].irs;
+	uint16_t peer_mss   = s->pending_q[head].peer_mss;
+	uint8_t  peer_ws    = s->pending_q[head].peer_wscale;
+	uint8_t  has_ws     = s->pending_q[head].has_wscale;
 	s->pending_head = (head + 1) % TCP_LISTEN_BACKLOG;
 	s->pending_count--;
 
@@ -1371,6 +1460,16 @@ static int tcp_accept_into(struct tcp_tcb *s, struct tcp_tcb *child)
 	 * local_mss route lookup) and peer's advertised value is in
 	 * hand from the pending-SYN stash. */
 	tcp_negotiate_mss(child, peer_mss);
+	/* T1m: window scaling is symmetric -- emit our WS only if
+	 * peer offered theirs.  When active, snd_wnd_shift governs how
+	 * we interpret peer's window field on every later segment. */
+	if (has_ws) {
+		child->ws_active     = 1;
+		child->snd_wnd_shift = peer_ws;
+	} else {
+		child->ws_active     = 0;
+		child->snd_wnd_shift = 0;
+	}
 
 	return tcp_send_segment(child, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL);
 }
@@ -1774,6 +1873,8 @@ void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),
 			.cwnd        = s->cwnd,
 			.ssthresh    = s->ssthresh,
 			.dup_acks    = s->dup_ack_count,
+			.snd_wnd_shift = s->snd_wnd_shift,
+			.ws_active     = s->ws_active,
 		};
 		cb(&v, arg);
 	}

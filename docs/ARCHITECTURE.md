@@ -776,6 +776,7 @@ TPI primitives (locked in across phases; see
 | T1j   | ✓ done | RFC 5681 cwnd: slow start, CA, RTO-driven MD; MSS segmentation  |
 | T1k   | ✓ done | RFC 5681 fast retransmit + fast recovery (3-dup-ACK trigger)    |
 | T1l   | ✓ done | MSS option negotiation on SYN/SYN-ACK; mss tracks per-route MTU |
+| T1m   | ✓ done | RFC 7323 window scale option; symmetric "echo to enable" semantics |
 
 T1h flow control: outbound segments advertise
 `TCP_RCV_WND_MAX - upstream_q_count` instead of a hardcoded constant,
@@ -920,9 +921,39 @@ peer's MSS is stashed in `pending_q[].peer_mss` at SYN time, and
 helper also resets `cwnd = 2 * mss` (RFC 5681 IW) so a
 1460-byte MSS doesn't keep the old 1072-byte initial window.
 
-Options beyond MSS (window scale, SACK, timestamps) are still
-TODO.  When they land they share `tcp_parse_mss`'s walker
-pattern and the SYN-emit path's option-write block.
+T1m window scale (RFC 7323 sec 2).  Adds the 3-byte WSCALE option
+(`kind=3, len=3, shift`) alongside MSS on SYN segments.  Total
+SYN option block is now 8 bytes when WS is active: `02 04 hi lo
+01 03 03 shift` -- MSS then NOP then WSCALE, 4-aligned for the
+data_off field.
+
+Symmetric "echo to enable" semantics per the RFC:
+
+- Active opener always sets `ws_active = 1` at `handle_conn_req`
+  time and emits the option in its SYN.  If the peer's SYN-ACK
+  comes back without WS, we clear `ws_active` so subsequent
+  segments don't ship the option.
+- Passive opener stashes peer's WS shift in
+  `pending_q[].peer_wscale` at SYN-receive time.
+  `tcp_accept_into` sets `child->ws_active = pending.has_wscale`
+  before sending the SYN-ACK, so we only echo WS if peer offered.
+
+We advertise shift = 0 (`TCP_LOCAL_WSCALE`) since
+`TCP_RCV_WND_MAX = 8192` fits in 16 bits.  The shift exists in
+the wire to let a peer with huge buffers scale ITS advertised
+window past 64 KB; we record their shift in `snd_wnd_shift` and
+apply it on every post-handshake segment: `s->snd_wnd = (h->window
+<< snd_wnd_shift)`.  `snd_wnd` widened from `uint16_t` to
+`uint32_t` to hold the scaled product.
+
+Once we have buffers larger than 64 KB on our side, bump
+`TCP_LOCAL_WSCALE` and `TCP_RCV_WND_MAX`; the receive path is
+already plumbed to advertise an unscaled value while the peer
+applies whatever shift they observed.
+
+Options beyond MSS + WSCALE (SACK, timestamps / PAWS) are still
+TODO.  When they land they share `tcp_parse_syn_options`'s
+walker and the SYN-emit path's option-write block.
 
 T1d.5 multi-accept: the listener stays in LISTEN across accepts.  Each
 inbound SYN gets queued in an 8-slot backlog ring on the listener's
