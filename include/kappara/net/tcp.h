@@ -229,6 +229,7 @@ struct tcp_tcb_view {
 	uint16_t    rcv_wnd;	/* what we'd advertise right now    */
 	uint32_t    cwnd;	/* T1j: congestion window in bytes  */
 	uint32_t    ssthresh;	/* T1j: slow-start threshold        */
+	uint8_t     dup_acks;	/* T1k: current consecutive-dup-ACK count */
 };
 
 void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),

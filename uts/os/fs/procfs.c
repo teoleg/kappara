@@ -376,6 +376,12 @@ static void tcp_one_row(const struct tcp_tcb_view *v, void *arg)
 		pb_str(b, " backlog=");
 		pb_pad_dec(b, v->backlog_depth, 0);
 	}
+	/* Dup-ACK counter -- non-zero only when we're partway through a
+	 * fast-recovery cycle. */
+	if (v->dup_acks) {
+		pb_str(b, " dupacks=");
+		pb_pad_dec(b, v->dup_acks, 0);
+	}
 	pb_putc(b, '\n');
 }
 

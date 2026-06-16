@@ -169,6 +169,14 @@ struct tcp_tcb {
 				 * into us inside an emit call.  The outer
 				 * loop picks up the freed cwnd room after
 				 * the recursion unwinds. */
+	/* T1k fast retransmit / fast recovery (RFC 5681 sec 3.2).
+	 * Counter of duplicate ACKs received in a row.  At 3 we treat
+	 * the head-of-snd_buf segment as lost: shrink ssthresh, inflate
+	 * cwnd by 3*MSS (each dup ACK signals a segment that LEFT the
+	 * network), retransmit.  Each further dup grows cwnd by MSS so
+	 * we can keep the pipe full.  Any new ACK exits fast recovery
+	 * via cwnd = ssthresh (deflation). */
+	uint8_t    dup_ack_count;
 };
 
 #define TCP_RTO_MIN	100	/* 1.0 s in 10ms ticks (RFC 6298) */
@@ -902,6 +910,10 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 			break;
 		}
 
+		/* Hoist data_len computation -- dup-ACK detection below
+		 * needs to know if this segment is data-bearing. */
+		unsigned data_len = len - hl;
+
 		/* Piggybacked ACK: advance snd_una if seg_ack is newer.
 		 * Compare via int32 subtraction so wraparound is handled
 		 * the canonical RFC 793 way. */
@@ -909,6 +921,13 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 			if ((int32_t)(seg_ack - s->snd_una) > 0) {
 				uint32_t acked = seg_ack - s->snd_una;
 				s->snd_una = seg_ack;
+				/* T1k: a new ACK exits fast recovery.
+				 * Deflate cwnd back to ssthresh (the
+				 * pre-loss working point) before the
+				 * cwnd_on_ack growth step nudges it up. */
+				if (s->dup_ack_count >= 3)
+					s->cwnd = s->ssthresh;
+				s->dup_ack_count = 0;
 				/* T1j: cwnd update on every ACK that
 				 * advances snd_una -- slow start /
 				 * congestion avoidance per RFC 5681. */
@@ -956,6 +975,46 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 				/* Newly opened cwnd/snd_wnd: ship any bytes
 				 * that were queued waiting for room. */
 				tcp_try_send_pending(s);
+			} else if (seg_ack == s->snd_una
+			        && data_len == 0
+			        && !(flags & (TCP_FLAG_SYN | TCP_FLAG_FIN))
+			        && s->snd_buf
+			        && s->snd_nxt != s->snd_una) {
+				/* T1k duplicate ACK (RFC 5681 sec 3.2).
+				 * Peer is telling us they're still waiting
+				 * for the byte at snd_una -- something
+				 * after it arrived, advanced their rcv
+				 * out-of-order, but the head segment
+				 * itself is missing.  Count them; at 3
+				 * we treat it as a confirmed loss
+				 * signal and fast-retransmit. */
+				s->dup_ack_count++;
+				if (s->dup_ack_count == 3) {
+					uint32_t flight = s->snd_nxt - s->snd_una;
+					uint32_t half   = flight / 2;
+					if (half < 2u * s->mss) half = 2u * s->mss;
+					s->ssthresh = half;
+					/* Inflate by 3*MSS: each of the 3 dup
+					 * ACKs signals one segment that left
+					 * the network. */
+					s->cwnd = s->ssthresh + 3u * s->mss;
+					/* Retransmit the head of snd_buf at
+					 * snd_buf_seq.  Capped at MSS like the
+					 * RTO retransmit path. */
+					unsigned plen = (unsigned)
+					    (s->snd_buf->b_wptr - s->snd_buf->b_rptr);
+					if (plen > s->mss) plen = s->mss;
+					(void)tcp_emit_segment(s, s->snd_buf_seq,
+					    TCP_FLAG_ACK | TCP_FLAG_PSH,
+					    s->snd_buf->b_rptr, plen);
+				} else if (s->dup_ack_count > 3) {
+					/* Each additional dup ACK inflates
+					 * cwnd by one MSS -- another segment
+					 * has reached the peer.  Try to send
+					 * new data into the freed window. */
+					s->cwnd += s->mss;
+					tcp_try_send_pending(s);
+				}
 			}
 			/* State-machine effects of the ACK depend on the
 			 * current state. */
@@ -992,8 +1051,8 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 
 		/* In-order data delivery -- accept payload up through
 		 * CLOSE_WAIT (peer can still send before we FIN), drop
-		 * it after we've FIN'd. */
-		unsigned data_len = len - hl;
+		 * it after we've FIN'd.  data_len was hoisted to the
+		 * top of the case for dup-ACK detection. */
 		if (data_len > 0 && seg_seq == s->rcv_nxt
 		    && (s->state == TCPS_ESTABLISHED
 		     || s->state == TCPS_CLOSE_WAIT)) {
@@ -1612,6 +1671,7 @@ void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),
 			.rcv_wnd     = tcp_rcv_window(s),
 			.cwnd        = s->cwnd,
 			.ssthresh    = s->ssthresh,
+			.dup_acks    = s->dup_ack_count,
 		};
 		cb(&v, arg);
 	}

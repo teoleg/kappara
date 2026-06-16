@@ -774,6 +774,7 @@ TPI primitives (locked in across phases; see
 | T1h   | ✓ done | real receive-window advertisement; cap data_req by peer's wnd   |
 | T1i   | ✓ done | TIME_WAIT + CLOSING (RFC 793 full graph); 2*MSL via tcp_tick    |
 | T1j   | ✓ done | RFC 5681 cwnd: slow start, CA, RTO-driven MD; MSS segmentation  |
+| T1k   | ✓ done | RFC 5681 fast retransmit + fast recovery (3-dup-ACK trigger)    |
 
 T1h flow control: outbound segments advertise
 `TCP_RCV_WND_MAX - upstream_q_count` instead of a hardcoded constant,
@@ -871,10 +872,30 @@ us back up once the first retransmit lands and gets ACK'd.  The
 retransmit itself is also capped at one MSS now (was the whole
 snd_buf).
 
-Fast retransmit / fast recovery are NOT wired yet -- duplicate-ACK
-detection plus the `cwnd = ssthresh + 3*MSS` inflation are the
-next step.  Until then, packet loss waits for the RTO before we
-notice.
+T1k fast retransmit + fast recovery (RFC 5681 sec 3.2).  A
+duplicate ACK -- `seg_ack == snd_una`, no payload, no SYN/FIN,
+outstanding data on our side -- bumps `dup_ack_count`.  On the
+third dup ACK we treat the head-of-snd_buf segment as confirmed
+lost without waiting for the RTO:
+
+- `ssthresh = max(flightsize/2, 2*MSS)`
+- `cwnd = ssthresh + 3*MSS` -- the "3" accounts for the three
+  segments that left the network (each dup ACK signals one).
+- Retransmit `snd_buf[0]` up to one MSS.
+
+Each additional dup ACK while in fast recovery inflates cwnd by
+one MSS so we keep pushing fresh segments into the pipe.  A new
+ACK (advancing `snd_una`) exits fast recovery: `cwnd = ssthresh`
+(deflation), `dup_ack_count = 0`.
+
+Triggering fast retransmit deterministically needs an injected
+loss; the existing pktfilter module operates on TPI primitives
+above the TCP module, not on built TCP segments, so it can't help
+here.  Adding a segment-drop hook at lo0 (or a TCB-keyed "drop
+next N" knob in tcp.c) is what an integration test would look
+like.  The code is exercised through the inverse path: no test
+hits it, but happy-path tests still pass with the new branches in
+place.
 
 T1d.5 multi-accept: the listener stays in LISTEN across accepts.  Each
 inbound SYN gets queued in an 8-slot backlog ring on the listener's

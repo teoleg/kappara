@@ -211,7 +211,9 @@ receive window (`rwnd`, what we'd advertise right now), congestion
 window (`cwnd`, RFC 5681 in-flight cap), slow-start threshold
 (`ssthresh`), smoothed RTT, current RTO.  Listener TCBs with queued
 pending SYNs append `backlog=N` -- the depth of the multi-accept
-ring (`TCP_LISTEN_BACKLOG`, currently 8).
+ring (`TCP_LISTEN_BACKLOG`, currently 8).  TCBs partway through fast
+recovery append `dupacks=N` -- the running count of consecutive
+duplicate ACKs (resets to 0 on the first new ACK).
 
 State names match the RFC 793 graph:
 
