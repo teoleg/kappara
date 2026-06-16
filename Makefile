@@ -106,6 +106,7 @@ else ifeq ($(ARCH),virt)
         $(BUILD)/uts/virt/mailbox.o \
         $(BUILD)/uts/virt/miniuart.o \
         $(BUILD)/uts/virt/slip-stubs.o \
+        $(BUILD)/uts/virt/virtio_net.o \
         $(BUILD)/uts/aarch64/userblob.o \
         $(BUILD)/uts/aarch64/helloblob.o \
         $(BUILD)/uts/aarch64/usrblobs.o
@@ -150,7 +151,10 @@ else ifeq ($(ARCH),virt)
     ELF           := $(BUILD)/kernel.elf
     KERNEL        := $(BUILD)/kernel.img
     QEMU          := qemu-system-aarch64
-    QEMU_ARGS     := -M virt,gic-version=3 -cpu cortex-a72 -nographic -m 256
+    QEMU_ARGS     := -M virt,gic-version=3 -cpu cortex-a72 -nographic -m 256 \
+                     -global virtio-mmio.force-legacy=false \
+                     -netdev user,id=n0 \
+                     -device virtio-net-device,netdev=n0
 else
     $(error Unknown ARCH=$(ARCH); use ARCH=aarch64 or ARCH=virt)
 endif

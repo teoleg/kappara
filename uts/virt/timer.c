@@ -20,6 +20,7 @@
 #include "kappara/arch/gic.h"
 #include "kappara/arch/ipi.h"
 #include "kappara/arch/timer.h"
+#include "kappara/arch/virtio_net.h"
 #include "kappara/core/printk.h"
 #include "kappara/proc/sched.h"
 #include "platform.h"
@@ -95,6 +96,14 @@ void irq_dispatch(void)
 	if (intid == PLAT_IPI_SGI) {
 		gic_eoi(iar);
 		ipi_handle();
+		return;
+	}
+	/* Virtio-mmio SPIs start at INTID 48 (SPI 16 + base 32) per
+	 * QEMU virt's machine description.  Fan out to the virtio-net
+	 * driver if it's plausibly its IRQ. */
+	if (intid >= 48 && intid <= 79) {
+		gic_eoi(iar);
+		virtio_net_irq();
 		return;
 	}
 	if (intid >= 1020) {

@@ -498,9 +498,15 @@ void kmain(void)
 #if !defined(PLATFORM_VIRT)
 	/* Bring up SLIP on the mini-UART after IP is ready -- slip_init
 	 * needs ip_attach_stream to I_LINK the slip0 stream underneath.
-	 * Virt has no mini-UART; it gets eth0 via virtio-net (phase 3)
-	 * instead, so we skip the SLIP path entirely. */
+	 * Virt has no mini-UART; it gets eth0 via virtio-net instead. */
 	slip_init();
+#else
+	/* Phase 2: probe virtio-mmio for a net device.  Phase 3 attaches
+	 * eth0 to the IP mux so packets actually route. */
+	{
+		extern void virtio_net_init(void);
+		virtio_net_init();
+	}
 #endif
 	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ on core 0 */
 
