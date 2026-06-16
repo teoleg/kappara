@@ -71,27 +71,36 @@ void timer_init(unsigned hz)
 		PLAT_TIMER_PPI);
 }
 
-static void timer_irq(void)
-{
-	write_cntp_tval(tick_cycles);
-	sched_tick();
-}
-
 void irq_dispatch(void)
 {
 	uint32_t iar   = gic_iar();
 	uint32_t intid = iar & 0x3ff;
 
+	/* T1: EOI BEFORE any potential yield.  GIC v3 keeps the
+	 * interrupt "active" until ICC_EOIR1_EL1 is written -- the
+	 * running priority stays at the IRQ's priority, which blocks
+	 * any equal- or lower-priority interrupt from preempting.
+	 * If we ran the handler (which yields) before EOI, the GIC
+	 * would never see another timer pending (RPR stuck high), the
+	 * scheduler couldn't be re-driven by the tick, and we'd hang
+	 * after the first IRQ.  raspi3b doesn't hit this because the
+	 * BCM2836 routing block has no EOI concept -- the timer's
+	 * CNTP_TVAL re-arm is what deasserts its level. */
 	if (intid == PLAT_TIMER_PPI) {
-		timer_irq();
-	} else if (intid == PLAT_IPI_SGI) {
+		write_cntp_tval(tick_cycles);
+		gic_eoi(iar);
+		sched_tick();
+		return;
+	}
+	if (intid == PLAT_IPI_SGI) {
+		gic_eoi(iar);
 		ipi_handle();
-	} else if (intid >= 1020) {
+		return;
+	}
+	if (intid >= 1020) {
 		/* spurious / no pending */
 		return;
-	} else {
-		kprintf("irq: unhandled intid=%u\n", intid);
 	}
-
 	gic_eoi(iar);
+	kprintf("irq: unhandled intid=%u\n", intid);
 }
