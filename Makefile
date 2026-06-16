@@ -150,7 +150,7 @@ else ifeq ($(ARCH),virt)
     ELF           := $(BUILD)/kernel.elf
     KERNEL        := $(BUILD)/kernel.img
     QEMU          := qemu-system-aarch64
-    QEMU_ARGS     := -M virt -cpu cortex-a72 -nographic
+    QEMU_ARGS     := -M virt,gic-version=3 -cpu cortex-a72 -nographic -m 256
 else
     $(error Unknown ARCH=$(ARCH); use ARCH=aarch64 or ARCH=virt)
 endif

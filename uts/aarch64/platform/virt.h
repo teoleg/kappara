@@ -41,10 +41,14 @@
 /* PL011 UART. */
 #define PLAT_PL011_BASE			0x09000000UL
 
-/* GIC v2.  We're not using a PLAT_LOCAL_PERIPH_BASE concept here --
- * the GIC distributor and CPU interface are separate windows. */
+/* GIC v3.  Cortex-A53/A72 are GIC v3-capable and reset with the
+ * system-register interface live; QEMU virt with the default
+ * gic-version=3 puts the distributor at the v2 address and the
+ * redistributors at 0x080A0000+0x20000*cpu.  The CPU interface
+ * itself isn't MMIO -- it's ICC_* system registers. */
 #define PLAT_GIC_DIST_BASE		0x08000000UL
-#define PLAT_GIC_CPUI_BASE		0x08010000UL
+#define PLAT_GIC_REDIST_BASE		0x080A0000UL
+#define PLAT_GIC_REDIST_STRIDE		0x20000UL
 
 /* Generic-timer IRQ.  The non-secure physical timer is PPI 30 (= INTID
  * 30) on every CPU; the GIC distributor exposes its enable + priority
