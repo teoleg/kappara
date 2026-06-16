@@ -501,11 +501,13 @@ void kmain(void)
 	 * Virt has no mini-UART; it gets eth0 via virtio-net instead. */
 	slip_init();
 #else
-	/* Phase 2: probe virtio-mmio for a net device.  Phase 3 attaches
-	 * eth0 to the IP mux so packets actually route. */
+	/* Phase 2-3: probe virtio-mmio and attach eth0 to IP.  Phase 5:
+	 * spawn the telnet listener kthread once TCP is alive. */
 	{
 		extern void virtio_net_init(void);
+		extern void telnetd_init(void);
 		virtio_net_init();
+		telnetd_init();
 	}
 #endif
 	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ on core 0 */

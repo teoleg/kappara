@@ -107,6 +107,7 @@ else ifeq ($(ARCH),virt)
         $(BUILD)/uts/virt/miniuart.o \
         $(BUILD)/uts/virt/slip-stubs.o \
         $(BUILD)/uts/virt/virtio_net.o \
+        $(BUILD)/uts/virt/telnetd.o \
         $(BUILD)/uts/aarch64/userblob.o \
         $(BUILD)/uts/aarch64/helloblob.o \
         $(BUILD)/uts/aarch64/usrblobs.o
@@ -153,7 +154,7 @@ else ifeq ($(ARCH),virt)
     QEMU          := qemu-system-aarch64
     QEMU_ARGS     := -M virt,gic-version=3 -cpu cortex-a72 -nographic -m 256 \
                      -global virtio-mmio.force-legacy=false \
-                     -netdev user,id=n0 \
+                     -netdev user,id=n0,hostfwd=tcp::2323-:23 \
                      -device virtio-net-device,netdev=n0
 else
     $(error Unknown ARCH=$(ARCH); use ARCH=aarch64 or ARCH=virt)

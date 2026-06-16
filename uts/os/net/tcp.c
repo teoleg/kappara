@@ -1976,6 +1976,26 @@ static int send_bind_req(struct stdata *sd, uint16_t port)
 	return drain_for_prim(sd, T_TCP_BIND_ACK);
 }
 
+/* Kernel-mode accept helper.  Telnetd (and any other in-kernel
+ * server) uses this to pair a freshly built responder stream with a
+ * pending SYN on the listener.  Both stdata pointers must have the
+ * TCP module pushed; we reach into sd_wq->q_next->q_ptr (which is
+ * the TCP TCB) and call the same tcp_accept_into() the user-fd
+ * T_CONN_RES path uses.  Returns 0 on success. */
+int tcp_kaccept(struct stdata *listener_sd, struct stdata *responder_sd)
+{
+	if (!listener_sd || !responder_sd
+	 || !listener_sd->sd_wq || !listener_sd->sd_wq->q_next
+	 || !responder_sd->sd_wq || !responder_sd->sd_wq->q_next)
+		return -1;
+	struct tcp_tcb *L = listener_sd->sd_wq->q_next->q_ptr;
+	struct tcp_tcb *R = responder_sd->sd_wq->q_next->q_ptr;
+	if (!L || !R) return -1;
+	if (L->state != TCPS_LISTEN || L->pending_count == 0) return -1;
+	if (R->state != TCPS_CLOSED) return -1;
+	return tcp_accept_into(L, R);
+}
+
 int tcp_selftest_run(void)
 {
 	struct stdata *L = NULL, *C = NULL, *R = NULL;

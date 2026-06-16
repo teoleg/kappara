@@ -260,4 +260,11 @@ void tcp_for_each_tcb(void (*cb)(const struct tcp_tcb_view *v, void *arg),
  * subsequent phases fill them in.  Returns 0 on PASS, -1 on FAIL. */
 int  tcp_selftest_run(void);
 
+/* Kernel-mode accept: graft a pending SYN on `listener_sd` onto
+ * a freshly built `responder_sd` (both must have tcp pushed).
+ * Replaces the TPI T_CONN_RES fd-resolution path for in-kernel
+ * servers like telnetd. */
+struct stdata;
+int  tcp_kaccept(struct stdata *listener_sd, struct stdata *responder_sd);
+
 #endif
