@@ -53,6 +53,7 @@
 #include "kappara/io/stream_head.h"
 #include "kappara/io/streams.h"
 #include "kappara/net/ip.h"
+#include "kappara/net/netif.h"
 #include "kappara/net/tcp.h"
 #include "kappara/proc/sched.h"
 
@@ -103,6 +104,7 @@ struct tcp_tcb {
 	struct {
 		uint32_t remote_ip;
 		uint16_t remote_port;
+		uint16_t peer_mss;	/* T1l: stashed from SYN option, 0 if absent */
 		uint32_t irs;	/* peer's initial seq */
 	}          pending_q[TCP_LISTEN_BACKLOG];
 	uint8_t    pending_head;
@@ -544,6 +546,63 @@ static void reply_data_ind(queue_t *rq, mblk_t *payload)
  * the segment goes out so the loopback recursion observes the
  * post-send state.
  */
+/* T1l: local MSS for a given destination = outgoing netif's MTU
+ * minus the IP + minimum-TCP overhead.  Falls back to RFC 879's
+ * conservative 536 when we don't know the route yet (e.g. before
+ * IP fan-out has linked any netif).  Header options on SYN occupy
+ * extra bytes on the SYN segment itself, but the MSS we advertise
+ * is the receive-side payload cap on POST-handshake segments
+ * (which carry no options), so MTU - IP - TCP_HDR_LEN_MIN is the
+ * right denominator. */
+static uint16_t tcp_local_mss(uint32_t dst_ip)
+{
+	struct netif *n = netif_route(dst_ip);
+	if (!n) return TCP_MSS_DEFAULT;
+	if (n->mtu <= IP_HDR_LEN + TCP_HDR_LEN_MIN) return TCP_MSS_DEFAULT;
+	uint32_t mss = (uint32_t)n->mtu - IP_HDR_LEN - TCP_HDR_LEN_MIN;
+	if (mss > 0xffffu) mss = 0xffffu;
+	return (uint16_t)mss;
+}
+
+/* Parse a SYN segment's options for the MSS field.  Returns 0 if the
+ * option is missing or malformed -- caller treats that as "peer
+ * didn't advertise" and uses RFC 879's 536.  Walks kind/length TLVs;
+ * NOP is single-byte, END terminates, anything else uses the length
+ * byte to skip past unknown options. */
+static uint16_t tcp_parse_mss(const uint8_t *opts, unsigned olen)
+{
+	unsigned i = 0;
+	while (i < olen) {
+		uint8_t kind = opts[i];
+		if (kind == TCP_OPT_END) break;
+		if (kind == TCP_OPT_NOP) { i++; continue; }
+		if (i + 1 >= olen) break;
+		uint8_t len = opts[i + 1];
+		if (len < 2 || i + len > olen) break;
+		if (kind == TCP_OPT_MSS && len == TCP_OPT_MSS_LEN) {
+			return ((uint16_t)opts[i + 2] << 8) | opts[i + 3];
+		}
+		i += len;
+	}
+	return 0;
+}
+
+/* Negotiate effective MSS once both ends have spoken: min of the
+ * peer's advertised value and what our outgoing netif can carry.
+ * Called once per connection at handshake completion; resizes the
+ * initial congestion window to 2 * negotiated MSS (RFC 5681 IW)
+ * since the prior value was based on TCP_MSS_DEFAULT, not the
+ * route's actual capacity. */
+static void tcp_negotiate_mss(struct tcp_tcb *s, uint16_t peer_mss)
+{
+	uint16_t local = tcp_local_mss(s->remote_ip);
+	uint16_t eff   = local;
+	if (peer_mss && peer_mss < eff) eff = peer_mss;
+	if (eff < TCP_MSS_DEFAULT) eff = TCP_MSS_DEFAULT;
+	s->mss  = eff;
+	s->cwnd = 2u * eff;
+}
+
 /* Compute the receive window we should advertise: TCP_RCV_WND_MAX
  * minus whatever bytes are still queued upstream of us (head's
  * sd_rq), since those are bytes the user hasn't read yet.  When the
@@ -577,7 +636,11 @@ static int tcp_emit_segment(struct tcp_tcb *s, uint32_t seq, uint8_t flags,
 		return -1;
 	}
 
-	mblk_t *mp = allocb(IP_HDR_LEN + TCP_HDR_LEN_MIN + blen, 0);
+	/* T1l: SYN-bearing segments carry the MSS option; everything
+	 * else is plain. */
+	unsigned opt_len = (flags & TCP_FLAG_SYN) ? TCP_OPT_MSS_LEN : 0;
+
+	mblk_t *mp = allocb(IP_HDR_LEN + TCP_HDR_LEN_MIN + opt_len + blen, 0);
 	if (!mp) return -1;
 	mp->b_rptr += IP_HDR_LEN;
 	mp->b_wptr  = mp->b_rptr;
@@ -587,19 +650,28 @@ static int tcp_emit_segment(struct tcp_tcb *s, uint32_t seq, uint8_t flags,
 	h->dst_port = htons16(s->remote_port);
 	h->seq      = htonl32(seq);
 	h->ack      = htonl32(s->rcv_nxt);
-	h->data_off = (TCP_HDR_LEN_MIN / 4) << 4;
+	h->data_off = ((TCP_HDR_LEN_MIN + opt_len) / 4) << 4;
 	h->flags    = flags;
 	h->window   = htons16(tcp_rcv_window(s));
 	h->checksum = 0;
 	h->urg_ptr  = 0;
 	mp->b_wptr += TCP_HDR_LEN_MIN;
 
+	if (opt_len) {
+		uint16_t mss_val = tcp_local_mss(s->remote_ip);
+		mp->b_wptr[0] = TCP_OPT_MSS;
+		mp->b_wptr[1] = TCP_OPT_MSS_LEN;
+		mp->b_wptr[2] = (mss_val >> 8) & 0xff;
+		mp->b_wptr[3] =  mss_val       & 0xff;
+		mp->b_wptr   += TCP_OPT_MSS_LEN;
+	}
+
 	if (blen > 0 && body) {
 		kmemcpy(mp->b_wptr, body, blen);
 		mp->b_wptr += blen;
 	}
 
-	unsigned seg_len = TCP_HDR_LEN_MIN + blen;
+	unsigned seg_len = TCP_HDR_LEN_MIN + opt_len + blen;
 	uint16_t cs = tcp_checksum(src_ip, s->remote_ip, h, seg_len);
 	h->checksum = htons16(cs);
 
@@ -626,7 +698,10 @@ static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags,
 		return -1;
 	}
 
-	mblk_t *mp = allocb(IP_HDR_LEN + TCP_HDR_LEN_MIN + plen, 0);
+	/* T1l: SYN-bearing segments carry the MSS option. */
+	unsigned opt_len = (flags & TCP_FLAG_SYN) ? TCP_OPT_MSS_LEN : 0;
+
+	mblk_t *mp = allocb(IP_HDR_LEN + TCP_HDR_LEN_MIN + opt_len + plen, 0);
 	if (!mp) {
 		if (payload) freemsg(payload);
 		return -1;
@@ -639,12 +714,21 @@ static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags,
 	h->dst_port = htons16(s->remote_port);
 	h->seq      = htonl32(s->snd_nxt);
 	h->ack      = htonl32(s->rcv_nxt);
-	h->data_off = (TCP_HDR_LEN_MIN / 4) << 4;
+	h->data_off = ((TCP_HDR_LEN_MIN + opt_len) / 4) << 4;
 	h->flags    = flags;
 	h->window   = htons16(tcp_rcv_window(s));
 	h->checksum = 0;
 	h->urg_ptr  = 0;
 	mp->b_wptr += TCP_HDR_LEN_MIN;
+
+	if (opt_len) {
+		uint16_t mss_val = tcp_local_mss(s->remote_ip);
+		mp->b_wptr[0] = TCP_OPT_MSS;
+		mp->b_wptr[1] = TCP_OPT_MSS_LEN;
+		mp->b_wptr[2] = (mss_val >> 8) & 0xff;
+		mp->b_wptr[3] =  mss_val       & 0xff;
+		mp->b_wptr   += TCP_OPT_MSS_LEN;
+	}
 
 	if (payload) {
 		for (mblk_t *m = payload; m; m = m->b_cont) {
@@ -656,7 +740,7 @@ static int tcp_send_segment(struct tcp_tcb *s, uint8_t flags,
 		freemsg(payload);
 	}
 
-	unsigned seg_len = TCP_HDR_LEN_MIN + plen;
+	unsigned seg_len = TCP_HDR_LEN_MIN + opt_len + plen;
 	uint16_t cs = tcp_checksum(src_ip, s->remote_ip, h, seg_len);
 	h->checksum = htons16(cs);
 
@@ -843,6 +927,13 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 				tcp_update_rtt(s,
 				    tcp_tick_counter - s->send_tick);
 			tcp_cancel_rto(s);
+			/* T1l: parse peer's SYN-ACK options for MSS. */
+			uint16_t peer_mss = (hl > TCP_HDR_LEN_MIN)
+			    ? tcp_parse_mss(
+			        body->b_rptr + TCP_HDR_LEN_MIN,
+			        hl - TCP_HDR_LEN_MIN)
+			    : 0;
+			tcp_negotiate_mss(s, peer_mss);
 			s->rcv_irs = seg_seq;
 			s->rcv_nxt = seg_seq + 1;
 			s->snd_una = seg_ack;
@@ -873,6 +964,13 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 			s->pending_q[slot].remote_ip   = src_ip;
 			s->pending_q[slot].remote_port = sport;
 			s->pending_q[slot].irs         = seg_seq;
+			/* T1l: stash peer's MSS so tcp_accept_into can
+			 * finish the negotiation when the user accepts. */
+			s->pending_q[slot].peer_mss    = (hl > TCP_HDR_LEN_MIN)
+			    ? tcp_parse_mss(
+			        body->b_rptr + TCP_HDR_LEN_MIN,
+			        hl - TCP_HDR_LEN_MIN)
+			    : 0;
 			s->pending_count++;
 			reply_conn_ind(q, src_ip, sport);
 		}
@@ -1248,9 +1346,10 @@ static int handle_listen_req(queue_t *q, struct tcp_tcb *s)
 static int tcp_accept_into(struct tcp_tcb *s, struct tcp_tcb *child)
 {
 	int head = s->pending_head;
-	uint32_t rip   = s->pending_q[head].remote_ip;
-	uint16_t rport = s->pending_q[head].remote_port;
-	uint32_t irs   = s->pending_q[head].irs;
+	uint32_t rip      = s->pending_q[head].remote_ip;
+	uint16_t rport    = s->pending_q[head].remote_port;
+	uint32_t irs      = s->pending_q[head].irs;
+	uint16_t peer_mss = s->pending_q[head].peer_mss;
 	s->pending_head = (head + 1) % TCP_LISTEN_BACKLOG;
 	s->pending_count--;
 
@@ -1266,9 +1365,12 @@ static int tcp_accept_into(struct tcp_tcb *s, struct tcp_tcb *child)
 	/* T1j: each accepted connection gets a fresh slow-start window.
 	 * tcp_qopen already pre-set these for child but the listener
 	 * may have evolved its own cwnd; reset to be safe. */
-	child->mss      = TCP_MSS_DEFAULT;
 	child->cwnd     = TCP_INITIAL_CWND;
 	child->ssthresh = TCP_INITIAL_SSTHRESH;
+	/* T1l: negotiate MSS now that remote_ip is set (drives the
+	 * local_mss route lookup) and peer's advertised value is in
+	 * hand from the pending-SYN stash. */
+	tcp_negotiate_mss(child, peer_mss);
 
 	return tcp_send_segment(child, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL);
 }

@@ -775,6 +775,7 @@ TPI primitives (locked in across phases; see
 | T1i   | ✓ done | TIME_WAIT + CLOSING (RFC 793 full graph); 2*MSL via tcp_tick    |
 | T1j   | ✓ done | RFC 5681 cwnd: slow start, CA, RTO-driven MD; MSS segmentation  |
 | T1k   | ✓ done | RFC 5681 fast retransmit + fast recovery (3-dup-ACK trigger)    |
+| T1l   | ✓ done | MSS option negotiation on SYN/SYN-ACK; mss tracks per-route MTU |
 
 T1h flow control: outbound segments advertise
 `TCP_RCV_WND_MAX - upstream_q_count` instead of a hardcoded constant,
@@ -896,6 +897,32 @@ next N" knob in tcp.c) is what an integration test would look
 like.  The code is exercised through the inverse path: no test
 hits it, but happy-path tests still pass with the new branches in
 place.
+
+T1l MSS option negotiation (RFC 793 + RFC 1122).  Before this MSS
+was hardcoded to 536, so segmentation ignored the actual link
+capacity (lo0 carries 1500-byte frames; SLIP carries 296).  Now
+every outbound SYN/SYN-ACK carries the standard 4-byte MSS option
+(`kind=2, len=4, mss_hi, mss_lo`); the advertised value is
+`netif_route(remote_ip)->mtu - IP_HDR_LEN - TCP_HDR_LEN_MIN`.
+
+On the receive side `tcp_parse_mss` walks the TLV stream between
+the fixed header and the data, looking for kind=2.  Unknown
+options are skipped via their length byte; END/NOP are handled
+inline.
+
+The effective MSS for a connection is
+`min(local_mss(outgoing_route), peer_advertised_mss)`, clamped
+to RFC 879's 536 floor in case both endpoints under-advertise.
+For an active opener the negotiation happens in the SYN_SENT
+handler when the SYN-ACK arrives.  For a passive opener the
+peer's MSS is stashed in `pending_q[].peer_mss` at SYN time, and
+`tcp_accept_into` consumes it when the user `T_CONN_RES`s.  The
+helper also resets `cwnd = 2 * mss` (RFC 5681 IW) so a
+1460-byte MSS doesn't keep the old 1072-byte initial window.
+
+Options beyond MSS (window scale, SACK, timestamps) are still
+TODO.  When they land they share `tcp_parse_mss`'s walker
+pattern and the SYN-emit path's option-write block.
 
 T1d.5 multi-accept: the listener stays in LISTEN across accepts.  Each
 inbound SYN gets queued in an 8-slot backlog ring on the listener's

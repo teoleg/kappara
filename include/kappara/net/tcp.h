@@ -66,6 +66,16 @@ typedef struct msgb mblk_t;
 
 #define TCP_HDR_LEN_MIN	20	/* no options */
 
+/* T1l: SYN-only option negotiation.  Three kinds we care about
+ * (RFC 793 + RFC 1122): END=0 terminates the list, NOP=1 is a
+ * single-byte padder, MSS=2 is a 4-byte (kind, len, mss_hi, mss_lo)
+ * tuple.  We currently emit only MSS on SYN/SYN-ACK; subsequent
+ * segments carry no options. */
+#define TCP_OPT_END	0
+#define TCP_OPT_NOP	1
+#define TCP_OPT_MSS	2
+#define TCP_OPT_MSS_LEN	4
+
 /* On-wire TCP header (RFC 793).  All big-endian. */
 struct tcp_hdr {
 	uint16_t src_port;
