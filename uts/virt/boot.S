@@ -73,8 +73,11 @@ _start:
 
 .Lfrom_el2:
 	/* Stack pointer for EL1.  Use sp_el1 so the eret lands with
-	 * the stack already valid -- no extra mov in the EL1 epilogue. */
-	adr	x0, stack_top
+	 * the stack already valid -- no extra mov in the EL1 epilogue.
+	 * adrp + add (not plain adr): the kernel + BSS can span >1 MB
+	 * now, putting stack_top out of adr's +/-1 MB reach. */
+	adrp	x0, stack_top
+	add	x0, x0, :lo12:stack_top
 	msr	sp_el1, x0
 
 	/* EL1/EL0 can read the physical and virtual counters. */
@@ -104,13 +107,17 @@ _start:
 .Lin_el1:
 	/* Stack already in sp_el1 (we eret'd from EL2); also load into
 	 * our current SP so plain C code uses the same memory. */
-	adr	x0, stack_top
+	adrp	x0, stack_top
+	add	x0, x0, :lo12:stack_top
 	mov	sp, x0
 
 	/* Zero the BSS.  __bss_start / __bss_end are linker-script
-	 * symbols (see uts/virt/linker.ld). */
-	adr	x0, __bss_start
-	adr	x1, __bss_end
+	 * symbols (see uts/virt/linker.ld).  adrp + add same as the
+	 * stack-pointer load above. */
+	adrp	x0, __bss_start
+	add	x0, x0, :lo12:__bss_start
+	adrp	x1, __bss_end
+	add	x1, x1, :lo12:__bss_end
 1:	cmp	x0, x1
 	b.eq	2f
 	str	xzr, [x0], #8

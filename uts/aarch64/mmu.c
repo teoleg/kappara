@@ -176,6 +176,18 @@ static void build_identity_map(void)
 	l0_table[0] = (uint64_t)(uintptr_t)l1_table | D_VALID | D_TABLE;
 	l1_table[0] = (uint64_t)(uintptr_t)l2_table | D_VALID | D_TABLE;
 
+#if defined(PLATFORM_VIRT)
+	/*
+	 * QEMU virt: RAM lives in the second 1 GB block at 0x40000000.
+	 * Map it as normal cacheable so the kernel + stack + heap that
+	 * the linker placed at 0x40080000+ are actually performant
+	 * (Device mapping for RAM would still work but every load/store
+	 * would bypass caches).
+	 */
+	l1_table[1] = 0x40000000UL |
+		      D_VALID | D_ATTRIDX(ATTR_NORMAL_IDX) |
+		      D_AP_RW_EL1 | D_SH_INNER | D_AF | D_UXN;
+#else
 	/*
 	 * L1[1]: identity-map VA 0x40000000..0x80000000 (1 GB block) as Device.
 	 * This covers the BCM2836 ARM-local peripheral window (timer routing,
@@ -185,6 +197,7 @@ static void build_identity_map(void)
 	l1_table[1] = PLAT_LOCAL_PERIPH_BASE |
 		      D_VALID | D_ATTRIDX(ATTR_DEVICE_IDX) |
 		      D_AP_RW_EL1 | D_SH_NONE | D_AF | D_PXN | D_UXN;
+#endif
 
 	for (int i = 0; i < ENTRIES_PER_TABLE; i++) {
 		uint64_t pa = (uint64_t)i << BLOCK_2M_SHIFT;

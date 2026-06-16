@@ -74,22 +74,79 @@ ifeq ($(ARCH),aarch64)
 else ifeq ($(ARCH),virt)
     # QEMU `virt` machine (generic aarch64).  Reuses the aarch64
     # toolchain + shared PL011 driver via PLAT_PL011_BASE; brings its
-    # own boot.S (no spin-table, single-core today) and linker.ld
-    # (RAM at 0x40000000, kernel at 0x40080000).
+    # own boot.S, GIC-based timer/ipi, and stubs for the Pi-only
+    # drivers (framebuffer, mailbox, mini-UART) so the same main.c
+    # boots through to the shell prompt.
     #
-    # Phase 1 (this commit): ARCH=virt builds a kernel that prints a
-    # PL011 splash and halts.  Phase 2 brings the full kernel up by
-    # stubbing the Pi-only drivers (framebuffer, mailbox, mini-UART,
-    # BCM2836 IPI block); phases 3-5 add virtio-net + a telnet server.
+    # Phase 2 (current): full kernel bring-up, single-core.  Boots to
+    # the same /usr/bin shell as raspi3b.
+    # Phase 3: virtio-mmio probe + virtio-net driver (eth0 netif).
+    # Phase 4: TCP integration vs Linux.
+    # Phase 5: telnet server + hostfwd for external access.
     CROSS         ?= aarch64-linux-gnu-
     ARCH_CFLAGS   := -mcpu=cortex-a72 -mgeneral-regs-only \
                      -Iuts/aarch64 -DPLATFORM_VIRT
     LINKER_LD     := uts/virt/linker.ld
+    USER_BUILD    := build/user
+    USER_BIN      := $(USER_BUILD)/init.bin
+    USERBLOB_EXTRA_DEP := $(USER_BIN)
     ARCH_OBJS     := \
         $(BUILD)/uts/virt/boot.o \
-        $(BUILD)/uts/aarch64/uart.o
+        $(BUILD)/uts/aarch64/uart.o \
+        $(BUILD)/uts/aarch64/vectors.o \
+        $(BUILD)/uts/aarch64/trap.o \
+        $(BUILD)/uts/aarch64/mmu.o \
+        $(BUILD)/uts/aarch64/switch.o \
+        $(BUILD)/uts/aarch64/thread.o \
+        $(BUILD)/uts/virt/timer.o \
+        $(BUILD)/uts/virt/ipi.o \
+        $(BUILD)/uts/virt/gic.o \
+        $(BUILD)/uts/virt/framebuffer.o \
+        $(BUILD)/uts/virt/fbcon.o \
+        $(BUILD)/uts/virt/mailbox.o \
+        $(BUILD)/uts/virt/miniuart.o \
+        $(BUILD)/uts/virt/slip-stubs.o \
+        $(BUILD)/uts/aarch64/userblob.o \
+        $(BUILD)/uts/aarch64/helloblob.o \
+        $(BUILD)/uts/aarch64/usrblobs.o
     KERNEL_OBJS   := \
-        $(BUILD)/uts/virt/main.o
+        $(BUILD)/uts/os/core/printk.o \
+        $(BUILD)/uts/os/core/pmm.o \
+        $(BUILD)/uts/os/core/string.o \
+        $(BUILD)/uts/os/core/kmem.o \
+        $(BUILD)/uts/os/core/klog.o \
+        $(BUILD)/uts/os/core/uaccess.o \
+        $(BUILD)/uts/os/core/kallsyms.o \
+        $(BUILD)/uts/os/core/ftrace.o \
+        $(BUILD)/uts/os/proc/process.o \
+        $(BUILD)/uts/os/proc/sched.o \
+        $(BUILD)/uts/os/proc/signal.o \
+        $(BUILD)/uts/os/proc/syscall.o \
+        $(BUILD)/uts/os/fs/vfs.o \
+        $(BUILD)/uts/os/fs/ramdisk.o \
+        $(BUILD)/uts/os/fs/kfs.o \
+        $(BUILD)/uts/os/fs/procfs.o \
+        $(BUILD)/uts/os/io/streams.o \
+        $(BUILD)/uts/os/io/cdevsw.o \
+        $(BUILD)/uts/os/io/bdevsw.o \
+        $(BUILD)/uts/os/io/buf.o \
+        $(BUILD)/uts/os/io/bram.o \
+        $(BUILD)/uts/os/io/stream_head.o \
+        $(BUILD)/uts/os/io/vt.o \
+        $(BUILD)/uts/os/io/ldterm.o \
+        $(BUILD)/uts/os/io/tty.o \
+        $(BUILD)/uts/os/net/netif.o \
+        $(BUILD)/uts/os/net/ipv4.o \
+        $(BUILD)/uts/os/net/icmp.o \
+        $(BUILD)/uts/os/net/udp.o \
+        $(BUILD)/uts/os/net/tcp.o \
+        $(BUILD)/uts/os/net/pktfilter.o \
+        $(BUILD)/uts/os/net/lo.o \
+        $(BUILD)/uts/os/user/user.o \
+        $(BUILD)/uts/os/main.o
+    KSYM_STUB_OBJ := $(BUILD)/uts/aarch64/kallsyms_stub.o
+    KSYM_OBJ      := $(BUILD)/uts/aarch64/kallsyms.o
+    KSYM_SRC      := $(BUILD)/uts/aarch64/kallsyms.S
     ELF           := $(BUILD)/kernel.elf
     KERNEL        := $(BUILD)/kernel.img
     QEMU          := qemu-system-aarch64
@@ -163,7 +220,7 @@ $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-ifeq ($(ARCH),aarch64)
+ifneq ($(filter $(ARCH),aarch64 virt),)
 
 # Two-pass link for kallsyms.  Pass 1 uses the stub (empty table) so
 # we have an ELF to nm; tools/gen_kallsyms.sh emits the populated
@@ -172,10 +229,10 @@ ifeq ($(ARCH),aarch64)
 # not shift any code/data addresses between passes -- the addresses
 # captured in pass 1 stay valid in pass 2.
 
-$(BUILD)/kernel8.tmp.elf: $(OBJS) $(KSYM_STUB_OBJ) $(LINKER_LD)
+$(BUILD)/kernel.tmp.elf: $(OBJS) $(KSYM_STUB_OBJ) $(LINKER_LD)
 	$(LD) $(LDFLAGS) -T $(LINKER_LD) -o $@ $(OBJS) $(KSYM_STUB_OBJ) $(LIBGCC)
 
-$(KSYM_SRC): $(BUILD)/kernel8.tmp.elf tools/gen_kallsyms.sh
+$(KSYM_SRC): $(BUILD)/kernel.tmp.elf tools/gen_kallsyms.sh
 	@mkdir -p $(dir $@)
 	./tools/gen_kallsyms.sh $(CROSS)nm $< > $@
 
@@ -236,7 +293,7 @@ stop:
 # link with user/linker.ld at VA 0x10000000, objcopy to a raw .bin,
 # then uts/aarch64/userblob.S incbin's the result into the kernel.
 
-ifeq ($(ARCH),aarch64)
+ifneq ($(filter $(ARCH),aarch64 virt),)
 
 USER_CC     := $(CROSS)gcc
 USER_LD     := $(CROSS)ld

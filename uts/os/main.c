@@ -250,6 +250,7 @@ extern void     secondary_start(void);	/* boot.S */
  *   5. Idle loop: yield (giving the scheduler a steal opportunity)
  *      then WFI when there is nothing to run
  */
+#if !defined(PLATFORM_VIRT)
 void secondary_main(unsigned cpu)
 {
 	mmu_enable_this_cpu();
@@ -264,7 +265,9 @@ void secondary_main(unsigned cpu)
 		__asm__ volatile ("wfi");
 	}
 }
+#endif
 
+#if !defined(PLATFORM_VIRT)
 static void smp_dc_cvac(void *p)
 {
 	uintptr_t a = (uintptr_t)p & ~63UL;
@@ -316,6 +319,7 @@ void smp_wake_secondary(unsigned cpu)
 
 	__asm__ volatile ("dsb sy; sev" ::: "memory");
 }
+#endif	/* !PLATFORM_VIRT */
 
 void kmain(void)
 {
@@ -366,15 +370,26 @@ void kmain(void)
 	 * The fix: split pmm enrolment around the four holes.  Lost RAM
 	 * is 8 MB (was 6 MB before heap window), which is fine on a 1 GB Pi.
 	 */
+	uintptr_t k_end = (uintptr_t)__kernel_end;
+#if defined(PLATFORM_VIRT)
+	/* virt: usable RAM lives entirely above kernel BSS (kernel is
+	 * loaded at 0x40080000, RAM ends at PLAT_RAM_END).  The Pi's
+	 * user/exec VA windows (0x10000000, 0x20000000) aren't part of
+	 * our backing RAM at all -- they get remapped to BSS-allocated
+	 * storage when user_init / exec_space_init runs, and the BSS
+	 * sits before k_end so pmm naturally skips it.  No holes to
+	 * carve. */
+	pmm_init(k_end, pmm_end);
+#else
 	#define USER_HOLE_BASE	0x10000000UL
 	#define USER_HOLE_END	0x10200000UL
 	#define EXEC_HOLE_BASE	0x20000000UL
 	#define EXEC_HOLE_END	0x20600000UL	/* covers exec+stack+heap windows */
-	uintptr_t k_end = (uintptr_t)__kernel_end;
 	pmm_init(k_end, k_end < USER_HOLE_BASE ? USER_HOLE_BASE : k_end);
 	pmm_add_range(USER_HOLE_END < k_end ? k_end : USER_HOLE_END,
 		      EXEC_HOLE_BASE);
 	pmm_add_range(EXEC_HOLE_END, pmm_end);
+#endif
 	kmem_init();
 
 	vfs_init();
@@ -480,9 +495,13 @@ void kmain(void)
 		kprintf("tcp: selftest PASS\n");
 	tcp_init_late();	/* spawn retransmit kthread now that
 				 * sched is ready */
+#if !defined(PLATFORM_VIRT)
 	/* Bring up SLIP on the mini-UART after IP is ready -- slip_init
-	 * needs ip_attach_stream to I_LINK the slip0 stream underneath. */
+	 * needs ip_attach_stream to I_LINK the slip0 stream underneath.
+	 * Virt has no mini-UART; it gets eth0 via virtio-net (phase 3)
+	 * instead, so we skip the SLIP path entirely. */
 	slip_init();
+#endif
 	ipi_init_this_cpu();	/* enable mailbox 0 -> IRQ on core 0 */
 
 	/* Smoke-test the kallsyms table by walking our own frame chain
@@ -502,12 +521,18 @@ void kmain(void)
 	 * runs the shell entirely in userspace from there on. */
 	user_spawn();
 
+#if !defined(PLATFORM_VIRT)
 	/* SMP foundation: wake cores 1..3 into a per-core "hello +
 	 * idle" entry.  They stay at EL2 with MMU off for now; the
 	 * actual EL drop + MMU setup + scheduler participation is the
-	 * follow-up.  This commit just proves we can light them up. */
+	 * follow-up.  This commit just proves we can light them up.
+	 *
+	 * On virt secondaries are PSCI-parked (no spin-table); wiring
+	 * a CPU_ON HVC from kernel context is a follow-up.  For phase
+	 * 2 we run single-core. */
 	for (unsigned cpu = 1; cpu < 4; cpu++)
 		smp_wake_secondary(cpu);
+#endif
 
 	__asm__ volatile ("msr daifclr, #2");
 
