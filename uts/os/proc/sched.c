@@ -396,7 +396,13 @@ static struct cpu *pick_push_target(struct cpu *caller)
 
 	/* Path 2: every CPU busy.  Hand the new thread to the
 	 * least-loaded CPU only if our own queue is non-trivial --
-	 * otherwise keep it local for cache locality. */
+	 * otherwise keep it local for cache locality.
+	 *
+	 * A peer is only a valid push target if it has been brought
+	 * up (sched_init or sched_secondary_init has run on it,
+	 * setting cpu_idle).  On virt + single-CPU boots, cpus[1..3]
+	 * are BSS-zero zombies; pushing there silently strands threads
+	 * because nothing on those CPUs ever runs. */
 	if (caller->cpu_nrunnable < 2)
 		return caller;
 
@@ -405,6 +411,7 @@ static struct cpu *pick_push_target(struct cpu *caller)
 	for (unsigned i = 0; i < KSCHED_NCPU; i++) {
 		struct cpu *v = &cpus[i];
 		if (v == caller) continue;
+		if (!v->cpu_idle) continue;	/* not brought up yet */
 		unsigned n = v->cpu_nrunnable;
 		if (n + 1 < best_n) {	/* strict: avoid bouncing on ties */
 			best   = v;
@@ -604,6 +611,7 @@ static struct kthread *try_steal(struct cpu *my_cpu)
 	for (unsigned i = 0; i < KSCHED_NCPU; i++) {
 		struct cpu *v = &cpus[i];
 		if (v == my_cpu)        continue;
+		if (!v->cpu_idle)       continue;  /* not brought up yet */
 		if (!v->cpu_qactmap)    continue;  /* racy but harmless */
 		int p = v->cpu_maxrunpri;          /* racy but harmless */
 		if (p > best_pri) {
