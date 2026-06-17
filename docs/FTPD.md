@@ -186,16 +186,35 @@ Verified on virt:
   reads the bytes back identical to host source.
 
 Carry-overs:
-- Throughput cliff: under ~5 KB transfers complete in tens of
-  ms (we see 4.6 MiB/s).  At ~6 KB and above the connection
-  stalls hard for >30 s and times out at the FTP client.  The
-  cliff sits suspiciously close to TCP_RCV_WND_MAX = 8192 and
-  smells like a window-update vs delayed-ACK interaction --
-  small enough to fit in the initial window, large enough that
-  drain latency closes the window before the kernel sends a
-  window-update.  Need to instrument tcp_rcv_window callers and
-  the drain side before deciding whether the fix lives in TCP
-  or in ftpd's loop.
+- Throughput cliff fixed.  Files up to 32 KB now upload at
+  4-8 MiB/s and download byte-identical at 2-3 MiB/s.  Real
+  ELFs uploaded over FTP run cleanly: `exec /home/foo` after
+  STOR'ing `build/cmd/ifconfig.elf` prints the eth0 / lo0 dump
+  as expected.  Four kernel bugs flushed by chasing the cliff:
+  - TCP had no "user drained" notification, so once the receive
+    queue filled to TCP_RCV_WND_MAX the window stayed closed
+    forever.  Added `struct stdata::sd_on_drain(sd, arg)`
+    invoked by `stream_read` / `stream_getmsg` after consuming
+    bytes; `tcp_qopen` wires it to `tcp_on_user_drain` which
+    fires a pure ACK so the peer learns the window re-opened.
+    `tcp_qclose` clears the hook before kfree-ing the TCB.
+  - `TCP_RCV_WND_MAX` (8 KB) and `TCP_SND_BUF_MAX` (8 KB) were
+    both too small for an FTP transfer.  Bumped to 65535 each
+    to match the uint16 wire-window cap when wscale=0.
+  - `data_accept` in ftpd was closing the PASV listener fd
+    right after `do_accept`, which dropped the IP-level bind
+    that the responder child shares with the listener for
+    fan-out.  Subsequent ACKs hit a port that's no longer bound
+    and IP dropped them, stalling the transfer at exactly the
+    first ~4 segments.  Split into `data_accept` + `data_done`
+    so the listener stays alive until after the data fd is
+    `do_close`'d.
+  - New `sd_on_drain`/`sd_on_drain_arg` fields in struct stdata
+    weren't initialised in `stream_build` / `pipe_end`; slab
+    returned recycled memory and `stream_read` then BLR'd
+    through a garbage function pointer (canonical CLAUDE.md
+    "slab returns recycled memory, not zero pages" trap).
+    Explicit NULL-init in both build paths.
 - `do_close` on the data channel during STOR does the polite
   ORDREL roundtrip; we could shortcut on the data fd since
   the file is already on disk, but leave it for now -- it's

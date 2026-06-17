@@ -825,6 +825,12 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name,
 	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
 	sd->sd_ioc_wq   = (struct wait_queue)WAIT_QUEUE_INIT;
 	sd->sd_ioc_response = NULL;
+	/* Slab returns recycled memory; zero the drain hook explicitly
+	 * so stream_read / stream_getmsg's optional callback isn't
+	 * called through a stale function pointer.  Modules whose
+	 * qopen needs the hook (today: tcp) set it themselves. */
+	sd->sd_on_drain     = NULL;
+	sd->sd_on_drain_arg = NULL;
 
 	/* Backref so sh_rq_putp can wake readers without a global
 	 * queue->stdata lookup.  The driver-side queues are not seen
@@ -1176,6 +1182,11 @@ static long stream_read(struct file *f, void *buf, size_t len)
 		/* Chain fully drained. */
 		freemsg(mp);
 	}
+	/* Tell the upstream module that we consumed bytes.  TCP uses
+	 * this to send a window-update ACK when the receive window
+	 * has materially re-opened. */
+	if (copied > 0 && sd->sd_on_drain)
+		sd->sd_on_drain(sd, sd->sd_on_drain_arg);
 	return (long)copied;
 }
 
@@ -1502,6 +1513,12 @@ static long stream_getmsg(struct file *f, struct strbuf *ctl,
 	} else {
 		freemsg(mp);
 	}
+	/* Tell the upstream module that we consumed bytes.  See the
+	 * matching stream_read hook for the canonical TCP use case. */
+	if ((data && data->len > 0) || (ctl && ctl->len > 0)) {
+		if (sd->sd_on_drain)
+			sd->sd_on_drain(sd, sd->sd_on_drain_arg);
+	}
 	return 0;
 }
 
@@ -1549,6 +1566,8 @@ static struct stdata *pipe_end(const char *name)
 	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
 	sd->sd_ioc_wq   = (struct wait_queue)WAIT_QUEUE_INIT;
 	sd->sd_ioc_response = NULL;
+	sd->sd_on_drain     = NULL;
+	sd->sd_on_drain_arg = NULL;
 	rq->q_ptr = sd;	/* so sh_rq_putp can wake readers */
 	wq->q_ptr = sd;
 	sd->sd_all_next = all_open_streams;

@@ -192,8 +192,22 @@ struct tcp_tcb {
 #define TCP_RTO_MAX	6000	/* 60.0 s                       */
 #define TCP_RTO_INITIAL	100	/* 1.0 s before first RTT sample */
 #define TCP_MAX_RETRANSMITS	5
-#define TCP_SND_BUF_MAX	8192
-#define TCP_RCV_WND_MAX	8192	/* max bytes we advertise as receive window */
+/* Outbound user-data buffer cap.  handle_data_req refuses a putmsg
+ * that would push (in-flight + queued) past this and aborts the
+ * connection with TCP_DISCON_REASON_PROTOERR.  Matching the receive
+ * window (TCP_RCV_WND_MAX = 65535) keeps a single FTP RETR's
+ * userland buffer from getting NAK'd: ftpd reads BUF_SZ chunks and
+ * dumps them into putmsg one after another, so any per-segment cap
+ * less than the file size truncates the download. */
+#define TCP_SND_BUF_MAX	65535
+/* Max bytes we advertise as receive window.  Caps at 65535 because
+ * TCP_LOCAL_WSCALE is 0 (we don't scale the wire window).  8 KB was
+ * what we shipped first; 8 KB plus an FTP STOR worth of data hits
+ * the receive window cliff hard.  64 KB matches what real BSD/Linux
+ * advertised before window scale became standard; combined with the
+ * drain-callback ACK in tcp_on_user_drain it pushes the FTP STOR
+ * cliff out past the kfs per-file cap. */
+#define TCP_RCV_WND_MAX	65535
 /* T1i 2*MSL.  RFC 793 picks 2 minutes; real Solaris defaults to 60s.
  * For kappara everything is local (lo0 or a short SLIP wire), so 1
  * second is plenty to absorb peer FIN retransmits without making
@@ -1329,6 +1343,19 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 
 /* ---- qopen / qclose ---------------------------------------------- */
 
+/* Stream-head drain callback: fires after the user has consumed
+ * bytes from sd_rq.  We send a pure ACK so the peer sees the
+ * freshly-reopened receive window.  Without this notification
+ * the sender stalls indefinitely once our queue fills to
+ * TCP_RCV_WND_MAX -- the canonical "FTP STOR cliff at ~5 KB" bug. */
+static void tcp_on_user_drain(struct stdata *sd, void *arg)
+{
+	(void)sd;
+	struct tcp_tcb *s = arg;
+	if (!s || s->state != TCPS_ESTABLISHED) return;
+	(void)tcp_send_segment(s, TCP_FLAG_ACK, NULL);
+}
+
 static int tcp_qopen(queue_t *rq)
 {
 	struct tcp_tcb *s = kmalloc(sizeof(*s));
@@ -1344,6 +1371,18 @@ static int tcp_qopen(queue_t *rq)
 	rq->q_ptr     = s;
 	WR(rq)->q_ptr = s;
 	tcp_tcb_register(s);
+
+	/* Wire the drain callback on the stream head so stream_read /
+	 * stream_getmsg can notify us when the user consumes bytes.
+	 * rq is TCP's read queue; rq->q_next is the head's sd_rq whose
+	 * q_ptr is the owning stdata (see sh_rq_putp). */
+	if (rq->q_next) {
+		struct stdata *sd = (struct stdata *)rq->q_next->q_ptr;
+		if (sd) {
+			sd->sd_on_drain     = tcp_on_user_drain;
+			sd->sd_on_drain_arg = s;
+		}
+	}
 	return 0;
 }
 
@@ -1385,6 +1424,15 @@ static int tcp_qclose(queue_t *rq)
 	if (s->bound) {
 		uint32_t key = tcp_bind_key(s->local_port, 0);
 		send_ip_bind(rq, IP_T_UNBIND_REQ, key);
+	}
+	/* Clear the drain hook before we kfree the tcb so the head
+	 * can't dereference us via sd_on_drain_arg after close. */
+	if (rq->q_next) {
+		struct stdata *sd = (struct stdata *)rq->q_next->q_ptr;
+		if (sd && sd->sd_on_drain_arg == s) {
+			sd->sd_on_drain     = NULL;
+			sd->sd_on_drain_arg = NULL;
+		}
 	}
 	if (s->snd_buf) freemsg(s->snd_buf);
 	tcp_tcb_unregister(s);

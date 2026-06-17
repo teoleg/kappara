@@ -371,15 +371,34 @@ static void cmd_pasv(struct session *s)
 }
 
 /* Accept the client's data connection (must follow a PASV that
- * stashed the listener fd).  Returns the data fd or -1; clears
- * the PASV state either way. */
+ * stashed the listener fd).  Returns the data fd or -1.
+ *
+ * We DON'T close the PASV listener here -- the listener owns the
+ * IP-level bind for the data port, and the responder child shares
+ * that bind for IP delivery.  Closing the listener immediately
+ * after accept tears down the IP routing entry; subsequent ACKs
+ * from the peer hit a port that's no longer bound and IP drops
+ * them, stalling the data channel at exactly 4 segments
+ * (whatever was in flight before the listener died).
+ *
+ * Callers must clear data_listener_fd by hand after the transfer
+ * completes (see cmd_retr / cmd_stor calling data_done). */
 static int data_accept(struct session *s)
 {
 	if (s->data_listener_fd < 0) return -1;
-	int dfd = do_accept(s->data_listener_fd);
-	close(s->data_listener_fd);
-	s->data_listener_fd = -1;
-	return dfd;
+	return do_accept(s->data_listener_fd);
+}
+
+/* Tear down the PASV listener after a transfer is done.  Called
+ * after we've graceful-closed the data fd; at this point the
+ * responder TCB is gone and no further packets are expected on
+ * the listener's port, so it's safe to close. */
+static void data_done(struct session *s)
+{
+	if (s->data_listener_fd >= 0) {
+		close(s->data_listener_fd);
+		s->data_listener_fd = -1;
+	}
 }
 
 /* ---- LIST ------------------------------------------------------ */
@@ -441,6 +460,7 @@ static void cmd_list(struct session *s, const char *arg)
 	}
 
 	do_close(dfd);
+	data_done(s);
 	reply(s->ctrl_fd, 226, "Transfer complete");
 }
 
@@ -479,6 +499,7 @@ static void cmd_retr(struct session *s, const char *arg)
 
 	close(ffd);
 	do_close(dfd);
+	data_done(s);
 	reply(s->ctrl_fd, 226, "Transfer complete");
 }
 
@@ -547,6 +568,7 @@ static void cmd_stor(struct session *s, const char *arg)
 
 	close(ffd);
 	close(dfd);	/* peer half-closed; their ORDREL ack already drained */
+	data_done(s);
 	reply(s->ctrl_fd, 226, "Transfer complete");
 }
 
