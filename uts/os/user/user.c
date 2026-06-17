@@ -678,6 +678,8 @@ extern char test_blob_start[];
 extern char test_blob_end[];
 extern char tcpconnect_blob_start[];
 extern char tcpconnect_blob_end[];
+extern char ftpd_blob_start[];
+extern char ftpd_blob_end[];
 
 static struct blob_priv hello_priv;
 
@@ -750,6 +752,7 @@ void exec_space_init(void)
 		PAY("netstat",    netstat_blob_start,    netstat_blob_end),
 		PAY("test",       test_blob_start,       test_blob_end),
 		PAY("tcpconnect", tcpconnect_blob_start, tcpconnect_blob_end),
+		PAY("ftpd",       ftpd_blob_start,       ftpd_blob_end),
 	};
 #undef PAY
 	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);

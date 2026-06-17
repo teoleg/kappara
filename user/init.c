@@ -1693,6 +1693,18 @@ void _start(long my_tty)
 		cwrite(banner);
 	}
 
+	/* Launch ftpd as a sibling process once -- only from tty0 so we
+	 * get exactly one daemon regardless of how many user-init threads
+	 * are spawned.  kappara's sys_execve creates a fresh process from
+	 * the ELF and returns; we keep running the shell here.  Fire-and-
+	 * forget: if /usr/bin/ftpd is missing on a stripped image, the
+	 * shell still comes up. */
+	if (my_tty == 0) {
+		const char *argv0 = "/usr/bin/ftpd";
+		const char *argv[] = { argv0, 0 };
+		(void)sys_execve(argv0, argv);
+	}
+
 	char line[LINE_MAX];
 	for (;;) {
 		prompt();

@@ -135,44 +135,72 @@ Carry-overs for step 3:
 
 ### Step 3 -- `cmd/ftpd.c`: the daemon itself
 
-Status: `[ ]`
+Status: `[x]` -- end-to-end shipped (small files clean; throughput
+cliff above ~5 KB tracked as a separate follow-up below).
 
-What to build:
-- Long-running EL0 process, listens on TCP port 21.
-- On each accept, fork (or spawn) a worker that drives the
-  RFC 959 control-channel state machine on that connection.
-- Commands handled (everything else gets `502 Command not
-  implemented`):
-  - `USER any` -> `331 Password required`
-  - `PASS any` -> `230 Logged in`
-  - `SYST` -> `215 UNIX Type: L8`
-  - `TYPE I` -> `200 Binary mode`
-  - `PWD` -> `257 "/" is the current directory`
-  - `CWD /home` -> chdir, `250 OK`
-  - `LIST` -> open data channel, send `ls -l` style listing
-  - `PASV` -> listen on a dynamic port from the PASV pool,
-    reply `227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)`
-  - `RETR name` -> open data channel, send file bytes
-  - `STOR name` -> open data channel, write bytes to /home/name
-  - `QUIT` -> `221 Bye`, close
-- Spawn from `user/init.c` at the same point we spawn telnetd's
-  prereqs (post-network-up).
-- Make stdio go to a dedicated /dev/ttyN or to /dev/klog so
-  log lines from ftpd don't fight the active console.
+What landed:
+- `cmd/ftpd.c`: long-running EL0 daemon driving an RFC 959
+  control state machine.  Commands handled: USER, PASS, SYST,
+  FEAT, TYPE, PWD/XPWD, CWD, PASV, LIST, NLST, RETR, STOR, NOOP,
+  QUIT.  Everything else returns 502.
+- PASV-only; PORT (active) is intentionally NAK'd.  PASV picks
+  one of eight ports in 30000..30007 and listens via the same
+  TPI dance telnetd uses in-kernel, driven from EL0 via
+  putmsg / getmsg.
+- STOR refuses any target not under `/home/` -- belt-and-suspenders
+  on top of the ramdisk1 separation.  `unlink` first to dodge
+  the missing-O_TRUNC carry-over from step 2.
+- `user/init.c`: tty0's init calls `sys_execve("/usr/bin/ftpd")`
+  before entering the shell loop, so ftpd comes up as a sibling
+  process and the shell keeps working.  Only fires for `my_tty==0`
+  so we don't spawn five copies.
+- `Makefile`: ARCH=virt QEMU_ARGS grew `hostfwd=tcp::2121-:21`
+  plus `hostfwd=tcp::3000N-:3000N` for N=0..7.
 
-Gaps this likely surfaces:
-- We don't have `fork()` from EL0 -- only `sys_spawn` (single
-  thread, shared everything in the calling AS).  Per-connection
-  worker has to be a thread, not a process.  That's fine for a
-  lab tool but means SIGINT propagation between sessions is
-  shared.
-- PASV needs a port range.  Pick 30000..30009 and add ten
-  `hostfwd=tcp::30000-:30000` style entries to the Makefile,
-  or just one for now and accept one transfer at a time.
-- We never built a "select / poll" interface; the worker
-  has to alternate read tries.  That's tolerable here because
-  FTP control is line-at-a-time and data channel is one-way
-  per transfer.
+Bugs flushed by writing this:
+- `stream_getmsg` was truncating data when the segment exceeded
+  the caller's `data->maxlen` and silently freeing the rest --
+  fine for tiny TPI ACK ctl mblks, ruinous for STOR of a
+  >MSS-sized chunk.  Now advances `dptr->b_rptr` by the bytes
+  delivered and putbq's the leftover with a freshly-cloned
+  M_PROTO ctl head, so the next getmsg sees the same
+  T_TCP_DATA_IND it would have seen on the original delivery.
+- Pipelined CRLF lines arrived in a single TCP segment but
+  `recv_line` only returned the first line and lost the rest in
+  a stack-local buffer.  Now uses a static pending-bytes stash
+  reset per session.  Single-client server, so a single static
+  is enough -- when we go multi-client this has to live on
+  `struct session`.
+- QEMU user-mode NAT means the host reaches us at 127.0.0.1
+  through `hostfwd=...`, not 10.0.2.15.  Advertising 10.0.2.15
+  in the PASV reply made `ftp(1)` reject with "passive mode
+  address mismatch".  Now lies with `127,0,0,1` so the host's
+  hostfwd table routes the data port back through NAT.
+  Switch the `ADV_IP_*` defines for a real network deployment.
+
+Verified on virt:
+- Banner -> USER -> PASS -> SYST -> TYPE I -> CWD /home -> PASV
+  -> STOR small.txt (27 B, 226 transfer complete) -> QUIT.
+- Side-channel verify via telnet (`nc localhost 2323`):
+  `ls /home` shows the uploaded file, `cat /home/small.txt`
+  reads the bytes back identical to host source.
+
+Carry-overs:
+- Throughput cliff: under ~5 KB transfers complete in tens of
+  ms (we see 4.6 MiB/s).  At ~6 KB and above the connection
+  stalls hard for >30 s and times out at the FTP client.  The
+  cliff sits suspiciously close to TCP_RCV_WND_MAX = 8192 and
+  smells like a window-update vs delayed-ACK interaction --
+  small enough to fit in the initial window, large enough that
+  drain latency closes the window before the kernel sends a
+  window-update.  Need to instrument tcp_rcv_window callers and
+  the drain side before deciding whether the fix lives in TCP
+  or in ftpd's loop.
+- `do_close` on the data channel during STOR does the polite
+  ORDREL roundtrip; we could shortcut on the data fd since
+  the file is already on disk, but leave it for now -- it's
+  not the slowness root cause.
+- Multi-client: only one session at a time, by design.
 
 ### Step 4 -- Host-side recipe + smoke test
 

@@ -1443,7 +1443,8 @@ static long stream_getmsg(struct file *f, struct strbuf *ctl,
 			size_t n = (size_t)(dptr->b_wptr - dptr->b_rptr);
 			if ((int)n > data->maxlen) n = (size_t)data->maxlen;
 			kmemcpy(data->buf, dptr->b_rptr, n);
-			data->len = (int)n;
+			data->len  = (int)n;
+			dptr->b_rptr += n;
 		} else {
 			data->len = -1;
 		}
@@ -1451,7 +1452,56 @@ static long stream_getmsg(struct file *f, struct strbuf *ctl,
 	if (flagsp)
 		*flagsp = 0;
 
-	freemsg(mp);
+	/* If the data mblk still has unconsumed bytes (caller's data->maxlen
+	 * was smaller than the segment), put it back at the head of sd_rq
+	 * so the next getmsg / read picks up the rest.  Without this we'd
+	 * silently drop bytes -- the canonical victim was FTP STOR of an
+	 * ELF where ftpd's recv buf was 512 but TCP MSS was 1460.
+	 *
+	 * Re-queue WITH the M_PROTO ctl head preserved so the next getmsg
+	 * still sees the same primitive (T_TCP_DATA_IND for TCP) -- without
+	 * it the user side would receive raw M_DATA and have no way to
+	 * tell the leftover apart from a fresh segment.  Allocate a fresh
+	 * copy of ctl because the upper module's putp may set up dptr's
+	 * b_cont, and we mustn't tangle ourselves with the original mp's
+	 * topology.  Take sd_readwait.sq_lock to keep the putbq atomic
+	 * against concurrent sh_rq_putp pushers. */
+	if (dptr && dptr->b_rptr < dptr->b_wptr) {
+		mblk_t *leftover;
+		if (cptr) {
+			/* Clone the M_PROTO head so re-delivery looks
+			 * exactly like the original message did. */
+			size_t clen = (size_t)(cptr->b_wptr - cptr->b_rptr);
+			mblk_t *ctl_copy = allocb(clen, 0);
+			if (!ctl_copy) {
+				/* Allocation failure: better to drop the
+				 * leftover than to deadlock-loop the
+				 * caller on a queue we can't put back. */
+				freemsg(mp);
+				return 0;
+			}
+			ctl_copy->b_datap->db_type = M_PROTO;
+			kmemcpy(ctl_copy->b_wptr, cptr->b_rptr, clen);
+			ctl_copy->b_wptr += clen;
+			/* Detach the leftover data tail from mp and
+			 * splice it onto the fresh ctl head. */
+			cptr->b_cont = NULL;
+			ctl_copy->b_cont = dptr;
+			freemsg(cptr);
+			leftover = ctl_copy;
+		} else {
+			/* No ctl on the original message; just re-queue
+			 * the data tail by itself. */
+			leftover = dptr;
+			leftover->b_cont = NULL;
+		}
+		unsigned long lf =
+		    spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		putbq(sd->sd_rq, leftover);
+		spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, lf);
+	} else {
+		freemsg(mp);
+	}
 	return 0;
 }
 

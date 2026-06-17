@@ -56,3 +56,11 @@ test_blob_end:
 tcpconnect_blob_start:
 	.incbin "build/cmd/tcpconnect.elf"
 tcpconnect_blob_end:
+
+	.section ".rodata.ftpd_blob","a",%progbits
+	.balign 8
+	.global ftpd_blob_start
+	.global ftpd_blob_end
+ftpd_blob_start:
+	.incbin "build/cmd/ftpd.elf"
+ftpd_blob_end:

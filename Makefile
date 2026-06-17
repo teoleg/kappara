@@ -152,9 +152,12 @@ else ifeq ($(ARCH),virt)
     ELF           := $(BUILD)/kernel.elf
     KERNEL        := $(BUILD)/kernel.img
     QEMU          := qemu-system-aarch64
+    # FTP needs the control port (21 -> host 2121) plus a small range
+    # of data ports (30000..30007 -> host 30000..30007) for PASV.  The
+    # range must match cmd/ftpd.c's PASV_BASE / PASV_N.
     QEMU_ARGS     := -M virt,gic-version=3 -cpu cortex-a72 -nographic -m 256 \
                      -global virtio-mmio.force-legacy=false \
-                     -netdev user,id=n0,hostfwd=tcp::2323-:23 \
+                     -netdev user,id=n0,hostfwd=tcp::2323-:23,hostfwd=tcp::2121-:21,hostfwd=tcp::30000-:30000,hostfwd=tcp::30001-:30001,hostfwd=tcp::30002-:30002,hostfwd=tcp::30003-:30003,hostfwd=tcp::30004-:30004,hostfwd=tcp::30005-:30005,hostfwd=tcp::30006-:30006,hostfwd=tcp::30007-:30007 \
                      -device virtio-net-device,netdev=n0
 else
     $(error Unknown ARCH=$(ARCH); use ARCH=aarch64 or ARCH=virt)
@@ -406,7 +409,7 @@ $(LIBC_A): $(LIBC_OBJS)
 
 # ---- /usr/bin standalone ELF programs --------------------------------
 CMD_BUILD  := build/cmd
-CMD_NAMES  := ps ping ifconfig netstat test tcpconnect
+CMD_NAMES  := ps ping ifconfig netstat test tcpconnect ftpd
 CMD_ELFS   := $(addprefix $(CMD_BUILD)/, $(addsuffix .elf, $(CMD_NAMES)))
 
 CMD_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
