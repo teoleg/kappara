@@ -73,3 +73,54 @@ struct block_device *ramdisk_get(void)
 {
 	return &ramdisk_bd;
 }
+
+/* ---- ramdisk1 = /home -------------------------------------------------
+ *
+ * Second independent ramdisk backing the writable /home mount.  Same
+ * shape as ramdisk0; the only difference is its own storage region
+ * and bd name so the kfs_mnt_for() lookup in kfs.c picks the right
+ * bitmap.  Sized to fit a few uploaded ELFs.
+ */
+#define RAMDISK_HOME_BLOCKS	1024
+
+static unsigned char ramdisk_home_storage[RAMDISK_HOME_BLOCKS * BLK_SIZE];
+
+static int ramdisk_home_read(struct block_device *bd,
+			     uint32_t blkno, void *buf)
+{
+	(void)bd;
+	if (blkno >= RAMDISK_HOME_BLOCKS)
+		return -1;
+	kmemcpy(buf, ramdisk_home_storage + (size_t)blkno * BLK_SIZE, BLK_SIZE);
+	return 0;
+}
+
+static int ramdisk_home_write(struct block_device *bd,
+			      uint32_t blkno, const void *buf)
+{
+	(void)bd;
+	if (blkno >= RAMDISK_HOME_BLOCKS)
+		return -1;
+	kmemcpy(ramdisk_home_storage + (size_t)blkno * BLK_SIZE, buf, BLK_SIZE);
+	return 0;
+}
+
+static struct block_device ramdisk_home_bd = {
+	.bd_name    = "ramdisk1",
+	.bd_nblocks = RAMDISK_HOME_BLOCKS,
+	.bd_read    = ramdisk_home_read,
+	.bd_write   = ramdisk_home_write,
+};
+
+void ramdisk_home_init(void)
+{
+	kmemset(ramdisk_home_storage, 0, sizeof(ramdisk_home_storage));
+	kprintf("ramdisk: home %u blocks of %u bytes (%u KB)\n",
+		(unsigned)RAMDISK_HOME_BLOCKS, (unsigned)BLK_SIZE,
+		(unsigned)(RAMDISK_HOME_BLOCKS * BLK_SIZE / 1024));
+}
+
+struct block_device *ramdisk_home_get(void)
+{
+	return &ramdisk_home_bd;
+}

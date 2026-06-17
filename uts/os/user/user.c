@@ -676,6 +676,10 @@ extern char netstat_blob_start[];
 extern char netstat_blob_end[];
 extern char test_blob_start[];
 extern char test_blob_end[];
+extern char tcpconnect_blob_start[];
+extern char tcpconnect_blob_end[];
+extern char ftpd_blob_start[];
+extern char ftpd_blob_end[];
 
 static struct blob_priv hello_priv;
 
@@ -742,11 +746,13 @@ void exec_space_init(void)
 #define PAY(name_str, sym_start, sym_end) \
 	{ name_str, (sym_start), (uint32_t)((sym_end) - (sym_start)) }
 	const struct kfs_payload usrbin_payloads[] = {
-		PAY("ps",       ps_blob_start,       ps_blob_end),
-		PAY("ping",     ping_blob_start,     ping_blob_end),
-		PAY("ifconfig", ifconfig_blob_start, ifconfig_blob_end),
-		PAY("netstat", netstat_blob_start, netstat_blob_end),
-		PAY("test",     test_blob_start,     test_blob_end),
+		PAY("ps",         ps_blob_start,         ps_blob_end),
+		PAY("ping",       ping_blob_start,       ping_blob_end),
+		PAY("ifconfig",   ifconfig_blob_start,   ifconfig_blob_end),
+		PAY("netstat",    netstat_blob_start,    netstat_blob_end),
+		PAY("test",       test_blob_start,       test_blob_end),
+		PAY("tcpconnect", tcpconnect_blob_start, tcpconnect_blob_end),
+		PAY("ftpd",       ftpd_blob_start,       ftpd_blob_end),
 	};
 #undef PAY
 	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);
@@ -760,6 +766,17 @@ void exec_space_init(void)
 	else
 		kprintf("exec: /usr/bin mounted from ramdisk (%u files)\n",
 		        n_usrbin);
+
+	/* Step 2 of the FTPD plan: empty kfs ramdisk mounted at /home.
+	 * This is where future FTP STORs land -- separate from /usr/bin
+	 * so a STOR can't overwrite a binary mid-exec.  Pass NULL/0 for
+	 * an empty payload table; the on-disk root dirent stays empty. */
+	kfs_mkimage(ramdisk_home_get(), NULL, 0);
+	struct dentry *home = vfs_mkdir(vfs_root(), "home");
+	if (kfs_mount(ramdisk_home_get(), home) < 0)
+		kprintf("exec: kfs_mount /home failed\n");
+	else
+		kprintf("exec: /home mounted from ramdisk1 (writable)\n");
 }
 
 /* ---- ELF loader ---- */

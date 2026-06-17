@@ -152,9 +152,12 @@ else ifeq ($(ARCH),virt)
     ELF           := $(BUILD)/kernel.elf
     KERNEL        := $(BUILD)/kernel.img
     QEMU          := qemu-system-aarch64
+    # FTP needs the control port (21 -> host 2121) plus a small range
+    # of data ports (30000..30007 -> host 30000..30007) for PASV.  The
+    # range must match cmd/ftpd.c's PASV_BASE / PASV_N.
     QEMU_ARGS     := -M virt,gic-version=3 -cpu cortex-a72 -nographic -m 256 \
                      -global virtio-mmio.force-legacy=false \
-                     -netdev user,id=n0,hostfwd=tcp::2323-:23 \
+                     -netdev user,id=n0,hostfwd=tcp::2323-:23,hostfwd=tcp::2121-:21,hostfwd=tcp::30000-:30000,hostfwd=tcp::30001-:30001,hostfwd=tcp::30002-:30002,hostfwd=tcp::30003-:30003,hostfwd=tcp::30004-:30004,hostfwd=tcp::30005-:30005,hostfwd=tcp::30006-:30006,hostfwd=tcp::30007-:30007 \
                      -device virtio-net-device,netdev=n0
 else
     $(error Unknown ARCH=$(ARCH); use ARCH=aarch64 or ARCH=virt)
@@ -259,6 +262,123 @@ $(KERNEL): $(ELF)
 
 run: $(KERNEL)
 	$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL)
+
+# ARCH=virt only: boot QEMU virt headless in the background, wait
+# for the in-kernel telnetd to come up on hostfwd port 2323, then
+# launch an `nc` client in the foreground.  On exit (Ctrl-C or `quit`
+# inside the shell) both the client and the background QEMU get
+# torn down so you don't leave a dangling vCPU thread behind.
+#
+# Use this when you want to drive the shell over telnet -- the kernel
+# splash + boot trace go to /tmp/kappara-virt.log instead of stdout,
+# and stdin/stdout belong to the telnet session on tty4.
+ifeq ($(ARCH),virt)
+.PHONY: run-telnet run-ftp smoke-ftp
+run-telnet: $(KERNEL)
+	@command -v nc >/dev/null 2>&1 || { \
+		echo "run-telnet: need 'nc' on PATH (apt install netcat-openbsd)"; \
+		exit 1; }
+	@echo "==> booting kappara virt in background (log: /tmp/kappara-virt.log)"
+	@$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL) > /tmp/kappara-virt.log 2>&1 & \
+	  QPID=$$!; \
+	  trap "echo; echo '==> killing qemu (pid '$$QPID')'; kill $$QPID 2>/dev/null; wait 2>/dev/null" EXIT INT TERM; \
+	  echo "==> waiting for telnetd on localhost:2323"; \
+	  for i in 1 2 3 4 5 6 7 8 9 10; do \
+	      sleep 1; \
+	      if grep -q 'telnetd: listening' /tmp/kappara-virt.log 2>/dev/null; then \
+	          break; \
+	      fi; \
+	  done; \
+	  if ! grep -q 'telnetd: listening' /tmp/kappara-virt.log 2>/dev/null; then \
+	      echo "run-telnet: telnetd did not come up; tail of log:"; \
+	      tail -20 /tmp/kappara-virt.log; \
+	      exit 1; \
+	  fi; \
+	  echo "==> connecting (nc localhost 2323) -- ^] then quit, or ^C to bail"; \
+	  nc localhost 2323
+
+# Boot kappara virt in the background and launch `ftp` in passive mode
+# against the in-kernel ftpd.  Use this to interactively push binaries
+# from the host into /home and run them via `exec /home/<name>` from a
+# separate telnet session.  Cleans up the bg QEMU on exit.
+run-ftp: $(KERNEL)
+	@command -v ftp >/dev/null 2>&1 || { \
+		echo "run-ftp: need 'ftp' on PATH (apt install ftp)"; \
+		exit 1; }
+	@echo "==> booting kappara virt in background (log: /tmp/kappara-virt.log)"
+	@$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL) > /tmp/kappara-virt.log 2>&1 & \
+	  QPID=$$!; \
+	  trap "echo; echo '==> killing qemu (pid '$$QPID')'; kill $$QPID 2>/dev/null; wait 2>/dev/null" EXIT INT TERM; \
+	  echo "==> waiting for ftpd on localhost:2121"; \
+	  for i in 1 2 3 4 5 6 7 8 9 10; do \
+	      sleep 1; \
+	      if grep -q 'ftpd: listening' /tmp/kappara-virt.log 2>/dev/null; then \
+	          break; \
+	      fi; \
+	  done; \
+	  if ! grep -q 'ftpd: listening' /tmp/kappara-virt.log 2>/dev/null; then \
+	      echo "run-ftp: ftpd did not come up; tail of log:"; \
+	      tail -20 /tmp/kappara-virt.log; \
+	      exit 1; \
+	  fi; \
+	  echo "==> connecting (ftp -p 127.0.0.1 2121)"; \
+	  echo "==> hints: USER any / PASS any / cd /home / put <file> / bye"; \
+	  HOME=/tmp ftp -pinv 127.0.0.1 2121
+
+# Scripted host-side smoke test: boot virt, upload an embedded ELF via
+# FTP, download it back, byte-compare, then exec it over telnet and
+# check the output looks sane.  All-or-nothing: any failure exits
+# nonzero so CI can flag regressions.  See docs/FTPD.md "Operating
+# recipe" for what this verifies.
+# Smoke test: STOR a small text file (well below the file-size cliff
+# we still haven't tracked down -- see FTPD.md carry-overs), then
+# RETR it back and byte-compare; then exec a previously-uploaded
+# binary by going through STOR + telnet `exec`.  CMD_BUILD is
+# defined later in the file (under the aarch64+virt cmd block);
+# spell out paths explicitly here so we don't depend on the variable
+# being set at the time make parses this rule.
+smoke-ftp: $(KERNEL) build/cmd/ifconfig.elf
+	@command -v ftp >/dev/null 2>&1 || { \
+		echo "smoke-ftp: need 'ftp' on PATH"; exit 1; }
+	@command -v nc >/dev/null 2>&1 || { \
+		echo "smoke-ftp: need 'nc' on PATH"; exit 1; }
+	@LOG=/tmp/kappara-smoke.log; \
+	 SAMPLE=/tmp/kappara-smoke-sample.txt; \
+	 DOWN=/tmp/kappara-smoke-sample-back.txt; \
+	 rm -f $$LOG $$DOWN; \
+	 printf 'hello-from-host\n' > $$SAMPLE; \
+	 echo "==> boot kappara virt (log: $$LOG)"; \
+	 $(QEMU) $(QEMU_ARGS) -kernel $(KERNEL) > $$LOG 2>&1 & \
+	 QPID=$$!; \
+	 trap "kill $$QPID 2>/dev/null; wait 2>/dev/null" EXIT INT TERM; \
+	 for i in 1 2 3 4 5 6 7 8 9 10; do \
+	     sleep 1; \
+	     if grep -q 'ftpd: listening' $$LOG 2>/dev/null \
+	        && grep -q 'telnetd: listening' $$LOG 2>/dev/null; then \
+	         break; \
+	     fi; \
+	 done; \
+	 grep -q 'ftpd: listening' $$LOG 2>/dev/null || { \
+	     echo "smoke-ftp: ftpd did not come up"; tail -20 $$LOG; exit 1; }; \
+	 echo "==> upload + download + byte-compare (small text)"; \
+	 printf 'user anonymous any\nbinary\ncd /home\nput %s sample\nget sample %s\nquit\n' \
+	        $$SAMPLE $$DOWN \
+	     | HOME=/tmp ftp -pinv 127.0.0.1 2121 > /dev/null 2>&1 \
+	     || { echo "smoke-ftp: ftp client failed"; exit 1; }; \
+	 cmp $$SAMPLE $$DOWN \
+	     || { echo "smoke-ftp: roundtripped sample differs from original"; \
+	          diff $$SAMPLE $$DOWN; exit 1; }; \
+	 echo "==> upload ifconfig.elf + exec it over telnet"; \
+	 printf 'user anonymous any\nbinary\ncd /home\nput build/cmd/ifconfig.elf foo\nquit\n' \
+	     | HOME=/tmp ftp -pinv 127.0.0.1 2121 > /dev/null 2>&1 \
+	     || { echo "smoke-ftp: ftp client (upload elf) failed"; exit 1; }; \
+	 OUT=$$( ( sleep 1; printf 'exec /home/foo\r'; sleep 5 ) \
+	          | timeout 10 nc localhost 2323 2>&1 ); \
+	 echo "$$OUT" | grep -q 'eth0' \
+	     || { echo "smoke-ftp: uploaded ELF did not produce expected eth0 output"; \
+	          echo "$$OUT"; exit 1; }; \
+	 echo "==> smoke-ftp PASS"
+endif
 
 # Pi/Debian host friendly defaults: no display window, single-thread
 # TCG so QEMU can't spin more than one host CPU even when WFI on the
@@ -371,7 +491,7 @@ $(LIBC_A): $(LIBC_OBJS)
 
 # ---- /usr/bin standalone ELF programs --------------------------------
 CMD_BUILD  := build/cmd
-CMD_NAMES  := ps ping ifconfig netstat test
+CMD_NAMES  := ps ping ifconfig netstat test tcpconnect ftpd
 CMD_ELFS   := $(addprefix $(CMD_BUILD)/, $(addsuffix .elf, $(CMD_NAMES)))
 
 CMD_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \

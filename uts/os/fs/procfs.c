@@ -181,16 +181,30 @@ static struct procbuf slab_pb;
 static int proc_slab_qopen(queue_t *q)
 {
 	pb_reset(&slab_pb);
-	pb_str(&slab_pb, "NAME        OBJSIZE   FREE  TOTAL\n");
-	for (unsigned i = 0; i < kmem_num_size_caches(); i++) {
-		const struct kmem_cache *c = kmem_get_size_cache(i);
+	pb_str(&slab_pb,
+	       "NAME           OBJSZ   USED   FREE  TOTAL  SLABS    KB\n");
+	unsigned long total_slabs = 0;
+	for (unsigned i = 0; i < kmem_num_caches(); i++) {
+		const struct kmem_cache *c = kmem_get_cache(i);
+		if (!c) break;
+		unsigned long used   = c->total_objs - c->free_objs;
+		unsigned      nslabs = kmem_cache_nslabs(c);
+		unsigned long kib    = (unsigned long)nslabs * 4;	/* PAGE_SIZE/1024 */
+		total_slabs += nslabs;
+
 		pb_pad_str(&slab_pb, c->name, 12);
-		pb_pad_dec(&slab_pb, c->obj_size, 7);
-		pb_str(&slab_pb, "  ");
-		pb_pad_dec(&slab_pb, c->free_objs, 5);
+		pb_pad_dec(&slab_pb, c->obj_size,   7);
+		pb_pad_dec(&slab_pb, used,          7);
+		pb_pad_dec(&slab_pb, c->free_objs,  7);
 		pb_pad_dec(&slab_pb, c->total_objs, 7);
+		pb_pad_dec(&slab_pb, nslabs,        7);
+		pb_pad_dec(&slab_pb, kib,           6);
 		pb_putc(&slab_pb, '\n');
 	}
+	pb_str(&slab_pb, "                                                ");
+	pb_pad_dec(&slab_pb, total_slabs,         7);
+	pb_pad_dec(&slab_pb, total_slabs * 4, 6);
+	pb_str(&slab_pb, "  (totals)\n");
 	pb_flush_to_q(&slab_pb, q);
 	return 0;
 }

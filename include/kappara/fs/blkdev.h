@@ -43,4 +43,10 @@ struct block_device {
 void                  ramdisk_init(void);
 struct block_device  *ramdisk_get(void);
 
+/* Second ramdisk for the writable /home mount (separate from
+ * /usr/bin so an FTP STOR can't overwrite an executable in flight).
+ * Same shape as ramdisk0, distinct storage + name. */
+void                  ramdisk_home_init(void);
+struct block_device  *ramdisk_home_get(void);
+
 #endif

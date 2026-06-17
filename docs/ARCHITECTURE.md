@@ -838,11 +838,14 @@ unACK'd FIN would retransmit into the void.
 T1j congestion control (RFC 5681).  Three new TCB fields drive the
 shape:
 
-- `mss` -- segment size cap.  No SYN-option negotiation yet, so fixed
-  at 536 (RFC 879 conservative default).  Bump this once we wire MSS
-  into the SYN options.
-- `cwnd` -- congestion window in bytes.  Starts at `IW = 2*MSS`
-  (RFC 5681 sec 3.1 for MSS <= 1095).  Caps in-flight bytes
+- `mss` -- segment size cap.  Held at 536 (RFC 879 conservative
+  default) until the SYN handshake completes; `tcp_negotiate_mss`
+  then resolves it to `min(local netif MSS, peer-advertised MSS)`.
+- `cwnd` -- congestion window in bytes.  Starts at `2*MSS` (RFC 5681)
+  before MSS is known, then grows to RFC 6928 IW10 at handshake
+  completion: `min(10*MSS, max(2*MSS, 14600))`.  For an Ethernet
+  link with MSS=1460 that's 14600 bytes -- a short HTTP-style
+  reply fits in one RTT instead of three.  Caps in-flight bytes
   alongside `snd_wnd`.
 - `ssthresh` -- slow-start threshold.  Starts at 65535 (effectively
   unlimited) so we stay in slow start until the first loss event.
@@ -1415,6 +1418,17 @@ classes ship today:
   `/proc/ps` readers, ...).  Fixed at `KSCHED_PRI_SYS_DEFAULT = 60`,
   no quantum tracking; `cl_tick` returns "no class-driven preempt"
   so SYS threads run until they voluntarily yield or block.
+
+  **Pollers must block, not tight-yield.**  A SYS thread that loops
+  `for(;;){ poll(); kthread_yield(); }` ping-pongs with any other
+  SYS peer at the same priority and starves TS-class user threads
+  forever -- the dispatch queue always has a pri-60 entry available
+  so the pri-30 user-init shells never get scheduled.  This was the
+  canonical "telnet-shell never responds" bug.  Pollers
+  (`tcp_rtx`, `uart_rx`, `miniuart_rx`/`slip_rx`) now sleep on
+  `sched_tick_wq` -- a broadcast wait queue woken once per
+  `sched_tick` (100 Hz).  They run at most once per tick when
+  there's work to do, leaving the rest of the tick for TS threads.
 
 * **`SCLASS_TS`** -- every user-space (EL0) thread.  Driven by an
   inlined `ts_dptbl` row: each thread carries a `t_quantum_left`

@@ -320,7 +320,11 @@ static void slip_rx_main(void *arg)
 			buf[n++] = (unsigned char)c;
 		}
 		if (n == 0) {
-			kthread_yield();
+			/* Park on the tick wq instead of tight-yielding
+			 * at SYS priority -- that starves TS-class user
+			 * threads.  Mini-UART RX is slow enough (115200
+			 * baud) that 10ms wakeups are fine. */
+			kthread_sleep_on(&sched_tick_wq);
 			continue;
 		}
 		slip_rx_bytes_total += n;

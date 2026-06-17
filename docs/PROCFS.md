@@ -84,23 +84,43 @@ slab_bytes_tot:     19968
 
 ```
 kappara:/# cat /proc/slabinfo
-NAME        OBJSIZE   FREE  TOTAL
-size-16          16    254    254
-size-32          32     96    127
-size-64          64     48     63
-size-128        128     21     31
-size-256        256     13     15
-size-512        512      0      0
-size-1024      1024      0      0
-size-2048      2048      0      0
+NAME           OBJSZ   USED   FREE  TOTAL  SLABS    KB
+size-16          16      0    254    254      1     4
+size-32          32     88     39    127      1     4
+size-64          64     40     23     63      1     4
+size-128        128     54      8     62      2     8
+size-256        256     11      4     15      1     4
+size-512        512     18      3     21      3    12
+size-1024      1024      5      1      6      2     8
+size-2048      2048      0      0      0      0     0
+mblk             56      1     71     72      1     4
+dblk             24      1    168    169      1     4
+queue           104      0      0      0      0     0
+                                                     13    52  (totals)
 ```
 
-One row per power-of-two size cache.  `OBJSIZE` is the per-object
-size, `FREE`/`TOTAL` count slab slots currently free vs allocated to
-the cache.
+One row per slab cache:
+- The size-N buckets back `kmalloc(N')` for any `N' <= N`.
+- Per-subsystem named caches (today: STREAMS `mblk` / `dblk` /
+  `queue`) appear below the size buckets if they've been
+  `kmem_cache_init`'d -- the registry picks them up at init.
 
-Use this to spot leaks: snapshot before + after a workload and look
-for `FREE` going down without `TOTAL` going up.
+Columns:
+- `OBJSZ`  -- per-object size after alignment rounding.
+- `USED`   -- objects currently handed out (`total - free`).
+- `FREE`   -- objects sitting on the cache's freelist.
+- `TOTAL`  -- objects carved across all backing slab pages.
+- `SLABS`  -- distinct 4 KB pages the cache has pulled from
+              PMM; that's the memory committed to this cache.
+- `KB`     -- `SLABS * 4`, restating the commitment as KiB.
+
+The trailing `(totals)` line sums `SLABS` and `KB` across every
+cache so you can read peak slab-allocator memory pressure at a
+glance.
+
+Use this to spot leaks: snapshot before + after a workload and
+watch `USED` (without a matching drop on shutdown), `SLABS`, or
+the totals climb.
 
 ### /proc/streams
 

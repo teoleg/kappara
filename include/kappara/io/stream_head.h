@@ -91,6 +91,24 @@ struct stdata {
 	 * the wq side without re-walking the head's read queue. */
 	struct wait_queue sd_ioc_wq;
 	struct msgb      *sd_ioc_response;	/* mblk_t alias */
+
+	/* Optional drain notification.  Set by an upstream module's
+	 * qi_qopen (today: tcp).  stream_read / stream_getmsg invokes
+	 * it after consuming bytes off sd_rq, so the module can react
+	 * to "user has drained, flow control may have opened" without
+	 * the head having to know what kind of module is upstream.
+	 *
+	 * Canonical use: TCP's window-update ACK.  When the receive
+	 * window has shrunk to ~0 because the user-side reader fell
+	 * behind, the peer sees window=0 and stops sending.  Once
+	 * the user reads enough to materially re-open the window,
+	 * TCP needs to issue a pure ACK so the peer learns there's
+	 * room again.  Without this callback, the peer waits forever
+	 * for an unsolicited window update -- which is exactly the
+	 * cliff FTP STOR hit around 5 KB.
+	 */
+	void (*sd_on_drain)(struct stdata *sd, void *arg);
+	void  *sd_on_drain_arg;
 };
 
 void streams_head_init(void);

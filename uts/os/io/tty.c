@@ -160,7 +160,17 @@ static int tty_drv_wq_putp(queue_t *q, mblk_t *mp)
 
 	int active = (m->minor == tty_active_minor);
 
-	if (active) {
+	/* Remote-tty output redirect (telnetd etc).  If a hook is
+	 * installed, every byte goes through it instead of touching
+	 * the UART.  The vt cell buffer still updates so a follow-up
+	 * tty_switch can replay history. */
+	if (m->output_hook) {
+		for (uint8_t *p = mp->b_rptr; p < mp->b_wptr; p++)
+			vt_feed(&m->vt, *p);
+		m->output_hook(m->minor, mp->b_rptr,
+		               (unsigned)(mp->b_wptr - mp->b_rptr),
+		               m->output_hook_arg);
+	} else if (active) {
 		/* Batch the UART acquire across the whole mblk -- one
 		 * lock acquire instead of one per byte. */
 		unsigned long flags = uart_acquire();
@@ -345,6 +355,29 @@ void tty_switch(int i)
 	 * (QEMU -display none keeps working transparently). */
 	vt_mark_all_dirty(&tty_minors[i].vt);
 	fbcon_render_vt(&tty_minors[i].vt);
+}
+
+/* ---- remote-tty hooks (bridge to telnetd etc) --------------------------- */
+
+void tty_set_output_hook(int minor,
+                         void (*fn)(int, const void *, unsigned, void *),
+                         void *arg)
+{
+	if (minor < 0 || minor >= NTTY) return;
+	tty_minors[minor].output_hook     = fn;
+	tty_minors[minor].output_hook_arg = arg;
+}
+
+void tty_remote_feed_byte(int minor, unsigned char c)
+{
+	if (minor < 0 || minor >= NTTY) return;
+	queue_t *rq = tty_drv_rq(minor);
+	if (!rq || !rq->q_next) return;
+	mblk_t *mp = allocb(1, 0);
+	if (!mp) return;
+	mp->b_datap->db_type = M_DATA;
+	*mp->b_wptr++ = c;
+	putnext(rq, mp);
 }
 
 /* ---- init ------------------------------------------------------------- */

@@ -325,28 +325,35 @@ void uart_rx_main(void *arg)
 		 */
 		int c = uart_getc_nonblock();
 		if (c < 0) {
-			kthread_yield();
+			/* No data: park on the tick wq instead of yielding
+			 * hot.  sched_tick wakes us at 100 Hz; that's plenty
+			 * since PL011 has a 16-byte RX FIFO and we drain it
+			 * in a tight loop once awake.  Tight kthread_yield
+			 * here used to starve TS-class user threads (see
+			 * the tcp_rtx fix for the same starvation pattern). */
+			kthread_sleep_on(&sched_tick_wq);
 			continue;
 		}
 
 		if (vc_prefix_pending) {
 			vc_prefix_pending = 0;
-			if (c >= '0' && c < '0' + NTTY) {
+			/* Only the visible (UART-backed) ttys are reachable
+			 * via the keyboard switcher.  tty4+ are owned by
+			 * remote bridges (telnetd) and shouldn't appear in
+			 * the local rotation. */
+			if (c >= '0' && c < '0' + NTTY_VISIBLE) {
 				tty_switch(c - '0');
-				kthread_yield();
 				continue;
 			}
 			/* Not a digit -- silently drop both the held
 			 * Ctrl-A and the trailing byte.  The user typed
 			 * a stale prefix; losing one byte beats injecting
 			 * a Ctrl-A into the data stream. */
-			kthread_yield();
 			continue;
 		}
 
 		if (c == 0x18) {	/* Ctrl-X */
 			vc_prefix_pending = 1;
-			kthread_yield();
 			continue;
 		}
 
@@ -382,10 +389,10 @@ void uart_rx_main(void *arg)
 			}
 		}
 
-		/* Yield every iteration so the reader thread gets a turn
-		 * even when piped input is arriving faster than the reader
-		 * can drain it. */
-		kthread_yield();
+		/* Loop back -- if more bytes are queued in the PL011 FIFO
+		 * we drain them in one go (uart_getc_nonblock returns >=0).
+		 * When the FIFO is empty the next iteration sleeps on the
+		 * tick wq, so the reader thread gets the CPU. */
 	}
 }
 
@@ -818,6 +825,12 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name,
 	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
 	sd->sd_ioc_wq   = (struct wait_queue)WAIT_QUEUE_INIT;
 	sd->sd_ioc_response = NULL;
+	/* Slab returns recycled memory; zero the drain hook explicitly
+	 * so stream_read / stream_getmsg's optional callback isn't
+	 * called through a stale function pointer.  Modules whose
+	 * qopen needs the hook (today: tcp) set it themselves. */
+	sd->sd_on_drain     = NULL;
+	sd->sd_on_drain_arg = NULL;
 
 	/* Backref so sh_rq_putp can wake readers without a global
 	 * queue->stdata lookup.  The driver-side queues are not seen
@@ -1169,6 +1182,11 @@ static long stream_read(struct file *f, void *buf, size_t len)
 		/* Chain fully drained. */
 		freemsg(mp);
 	}
+	/* Tell the upstream module that we consumed bytes.  TCP uses
+	 * this to send a window-update ACK when the receive window
+	 * has materially re-opened. */
+	if (copied > 0 && sd->sd_on_drain)
+		sd->sd_on_drain(sd, sd->sd_on_drain_arg);
 	return (long)copied;
 }
 
@@ -1381,9 +1399,36 @@ static long stream_getmsg(struct file *f, struct strbuf *ctl,
 	if (!sd)
 		return -1;
 
-	mblk_t *mp = getq(sd->sd_rq);
-	if (!mp)
-		return -1;
+	/* Block until a message arrives.  Mirrors stream_read's wait
+	 * shape: hold sd_readwait.sq_lock around the getq + EOF check
+	 * + sleep_on so writers can't slip a message in between our
+	 * empty-check and our sleep.  Without this an EL0 caller doing
+	 * "putmsg request; getmsg response" races the kernel module's
+	 * reply -- if our getmsg ran before the M_PROTO ack landed we
+	 * used to return -1 and the caller would mistake it for a
+	 * fatal error.  T_TCP_BIND_REQ from cmd/tcpconnect.c was the
+	 * canonical victim. */
+	mblk_t *mp;
+	unsigned long wflags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+	for (;;) {
+		mp = getq(sd->sd_rq);
+		if (mp) break;
+		if (sd->sd_flags & SD_EOF) {
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
+			                        wflags);
+			return -1;
+		}
+		{ struct kthread *me = curthread;
+		  if (me && (me->sig_pending & SIG_FATAL_MASK)) {
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
+			                        wflags);
+			return -1;
+		  }
+		}
+		kthread_sleep_on_locked(&sd->sd_readwait, wflags);
+		wflags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+	}
+	spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, wflags);
 
 	mblk_t *cptr = NULL;
 	mblk_t *dptr = NULL;
@@ -1409,7 +1454,8 @@ static long stream_getmsg(struct file *f, struct strbuf *ctl,
 			size_t n = (size_t)(dptr->b_wptr - dptr->b_rptr);
 			if ((int)n > data->maxlen) n = (size_t)data->maxlen;
 			kmemcpy(data->buf, dptr->b_rptr, n);
-			data->len = (int)n;
+			data->len  = (int)n;
+			dptr->b_rptr += n;
 		} else {
 			data->len = -1;
 		}
@@ -1417,7 +1463,62 @@ static long stream_getmsg(struct file *f, struct strbuf *ctl,
 	if (flagsp)
 		*flagsp = 0;
 
-	freemsg(mp);
+	/* If the data mblk still has unconsumed bytes (caller's data->maxlen
+	 * was smaller than the segment), put it back at the head of sd_rq
+	 * so the next getmsg / read picks up the rest.  Without this we'd
+	 * silently drop bytes -- the canonical victim was FTP STOR of an
+	 * ELF where ftpd's recv buf was 512 but TCP MSS was 1460.
+	 *
+	 * Re-queue WITH the M_PROTO ctl head preserved so the next getmsg
+	 * still sees the same primitive (T_TCP_DATA_IND for TCP) -- without
+	 * it the user side would receive raw M_DATA and have no way to
+	 * tell the leftover apart from a fresh segment.  Allocate a fresh
+	 * copy of ctl because the upper module's putp may set up dptr's
+	 * b_cont, and we mustn't tangle ourselves with the original mp's
+	 * topology.  Take sd_readwait.sq_lock to keep the putbq atomic
+	 * against concurrent sh_rq_putp pushers. */
+	if (dptr && dptr->b_rptr < dptr->b_wptr) {
+		mblk_t *leftover;
+		if (cptr) {
+			/* Clone the M_PROTO head so re-delivery looks
+			 * exactly like the original message did. */
+			size_t clen = (size_t)(cptr->b_wptr - cptr->b_rptr);
+			mblk_t *ctl_copy = allocb(clen, 0);
+			if (!ctl_copy) {
+				/* Allocation failure: better to drop the
+				 * leftover than to deadlock-loop the
+				 * caller on a queue we can't put back. */
+				freemsg(mp);
+				return 0;
+			}
+			ctl_copy->b_datap->db_type = M_PROTO;
+			kmemcpy(ctl_copy->b_wptr, cptr->b_rptr, clen);
+			ctl_copy->b_wptr += clen;
+			/* Detach the leftover data tail from mp and
+			 * splice it onto the fresh ctl head. */
+			cptr->b_cont = NULL;
+			ctl_copy->b_cont = dptr;
+			freemsg(cptr);
+			leftover = ctl_copy;
+		} else {
+			/* No ctl on the original message; just re-queue
+			 * the data tail by itself. */
+			leftover = dptr;
+			leftover->b_cont = NULL;
+		}
+		unsigned long lf =
+		    spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		putbq(sd->sd_rq, leftover);
+		spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, lf);
+	} else {
+		freemsg(mp);
+	}
+	/* Tell the upstream module that we consumed bytes.  See the
+	 * matching stream_read hook for the canonical TCP use case. */
+	if ((data && data->len > 0) || (ctl && ctl->len > 0)) {
+		if (sd->sd_on_drain)
+			sd->sd_on_drain(sd, sd->sd_on_drain_arg);
+	}
 	return 0;
 }
 
@@ -1465,6 +1566,8 @@ static struct stdata *pipe_end(const char *name)
 	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
 	sd->sd_ioc_wq   = (struct wait_queue)WAIT_QUEUE_INIT;
 	sd->sd_ioc_response = NULL;
+	sd->sd_on_drain     = NULL;
+	sd->sd_on_drain_arg = NULL;
 	rq->q_ptr = sd;	/* so sh_rq_putp can wake readers */
 	wq->q_ptr = sd;
 	sd->sd_all_next = all_open_streams;
@@ -1894,6 +1997,12 @@ void streams_head_init(void)
 	vfs_mknod_chrdev(dev, "tty1", MKDEV(CDEV_MAJ_TTY, 1));
 	vfs_mknod_chrdev(dev, "tty2", MKDEV(CDEV_MAJ_TTY, 2));
 	vfs_mknod_chrdev(dev, "tty3", MKDEV(CDEV_MAJ_TTY, 3));
+	/* tty4: the "remote console".  No keyboard switcher routes to
+	 * it (Ctrl-X N is clamped to NTTY_VISIBLE), and uart_rx_main
+	 * never feeds it; it's owned by telnetd, which installs an
+	 * output_hook + tty_remote_feed_byte's bytes from the TCP
+	 * peer to drive a per-connection user-mode shell. */
+	vfs_mknod_chrdev(dev, "tty4", MKDEV(CDEV_MAJ_TTY, 4));
 
 	/* Networking: register the icmp + udp STREAMS modules (so
 	 * I_PUSH "icmp" / "udp" and the corresponding /dev autopush

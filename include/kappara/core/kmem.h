@@ -44,4 +44,16 @@ void  kfree(void *p);
 unsigned                   kmem_num_size_caches(void);
 const struct kmem_cache   *kmem_get_size_cache(unsigned i);
 
+/* Wider iteration that includes any cache created via kmem_cache_init
+ * (STREAMS mblk / dblk / queue caches today, plus the size buckets).
+ * Same NULL termination shape. */
+unsigned                   kmem_num_caches(void);
+const struct kmem_cache   *kmem_get_cache(unsigned i);
+
+/* Count of distinct slab pages (one PAGE_SIZE chunk each) that this
+ * cache currently has pinned from PMM.  nslabs * PAGE_SIZE is the
+ * memory committed to this cache; total_objs * obj_size is what's
+ * carved out of it. */
+unsigned                   kmem_cache_nslabs(const struct kmem_cache *c);
+
 #endif

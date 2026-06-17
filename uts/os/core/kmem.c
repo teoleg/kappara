@@ -147,6 +147,24 @@ static struct slab *grow_cache(struct kmem_cache *c)
 	return s;
 }
 
+/* Registry of every cache that's been kmem_cache_init'd.  Lets
+ * /proc/slabinfo see the STREAMS caches (mblk_t / dblk_t / queue)
+ * and any future per-subsystem caches alongside the size-buckets,
+ * not just the kmalloc backings.  Bounded array keeps the lookup
+ * branchless and lets us add caches before kmem_init returns. */
+#define KMEM_MAX_REGISTERED	16
+
+static struct kmem_cache *kmem_registered[KMEM_MAX_REGISTERED];
+static unsigned           kmem_n_registered;
+
+static void kmem_register(struct kmem_cache *c)
+{
+	for (unsigned i = 0; i < kmem_n_registered; i++)
+		if (kmem_registered[i] == c) return;
+	if (kmem_n_registered < KMEM_MAX_REGISTERED)
+		kmem_registered[kmem_n_registered++] = c;
+}
+
 void kmem_cache_init(struct kmem_cache *c, const char *name, size_t obj_size)
 {
 	if (obj_size < sizeof(void *))
@@ -159,6 +177,32 @@ void kmem_cache_init(struct kmem_cache *c, const char *name, size_t obj_size)
 	c->slabs         = NULL;
 	c->total_objs    = 0;
 	c->free_objs     = 0;
+
+	kmem_register(c);
+}
+
+/* Walk c's slab list and count the chunks of PMM memory currently
+ * committed to it.  Each slab is one PAGE_SIZE; total bytes pinned
+ * by this cache is `nslabs * PAGE_SIZE`. */
+unsigned kmem_cache_nslabs(const struct kmem_cache *c)
+{
+	unsigned n = 0;
+	for (const struct slab *s = c->slabs; s; s = s->next) n++;
+	return n;
+}
+
+/* Iteration over EVERY cache (size buckets + custom STREAMS caches).
+ * /proc/slabinfo uses these so the human view matches what's actually
+ * eating PMM, not just what kmalloc went through. */
+unsigned kmem_num_caches(void)
+{
+	return kmem_n_registered;
+}
+
+const struct kmem_cache *kmem_get_cache(unsigned i)
+{
+	if (i >= kmem_n_registered) return NULL;
+	return kmem_registered[i];
 }
 
 void *kmem_cache_alloc(struct kmem_cache *c)

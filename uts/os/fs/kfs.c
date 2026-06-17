@@ -216,35 +216,63 @@ static struct file_ops regfile_fops = {
 };
 
 /*
- * Per-mount state.  Single static since we have one kfs mount today;
- * the bitmap cache is loaded at mount and written back on every
- * allocation/free.
+ * Per-mount state.  Each kfs_mount(bd, dp) call grabs the first free
+ * slot here; bitmap caches stay independent so multiple kfs ramdisks
+ * (e.g. /usr/bin + /home) can be mounted side by side without one
+ * stomping the other's free-block view.
+ *
+ * MAX_KFS_MOUNTS sets a static cap; one slot per concurrent kfs.
+ * Increase if you ever mount more.
  */
-static struct {
-	struct block_device *bd;
+#define MAX_KFS_MOUNTS	4
+
+struct kfs_mnt {
+	struct block_device *bd;	/* NULL = slot free */
 	uint8_t              bitmap[BLK_SIZE];
-} kfs_mnt;
+};
+
+static struct kfs_mnt kfs_mnts[MAX_KFS_MOUNTS];
+
+/* O(N) by bd pointer.  Called on the hot path of every block alloc /
+ * free; with N <= MAX_KFS_MOUNTS this is fine. */
+static struct kfs_mnt *kfs_mnt_for(struct block_device *bd)
+{
+	for (unsigned i = 0; i < MAX_KFS_MOUNTS; i++)
+		if (kfs_mnts[i].bd == bd) return &kfs_mnts[i];
+	return NULL;
+}
+
+static struct kfs_mnt *kfs_mnt_alloc(struct block_device *bd)
+{
+	for (unsigned i = 0; i < MAX_KFS_MOUNTS; i++) {
+		if (kfs_mnts[i].bd == NULL) {
+			kfs_mnts[i].bd = bd;
+			kmemset(kfs_mnts[i].bitmap, 0, BLK_SIZE);
+			return &kfs_mnts[i];
+		}
+	}
+	return NULL;
+}
 
 static struct file_ops kfs_dir_fops;	/* fwd; defined below */
 
-static int  kfs_bit_get(uint32_t blk)
+static int  kfs_bit_get(struct kfs_mnt *m, uint32_t blk)
 {
-	return (kfs_mnt.bitmap[blk / 8] >> (blk % 8)) & 1;
+	return (m->bitmap[blk / 8] >> (blk % 8)) & 1;
 }
 
-static void kfs_bit_set(uint32_t blk, int val)
+static void kfs_bit_set(struct kfs_mnt *m, uint32_t blk, int val)
 {
 	if (val)
-		kfs_mnt.bitmap[blk / 8] |=  (uint8_t)(1u << (blk % 8));
+		m->bitmap[blk / 8] |=  (uint8_t)(1u << (blk % 8));
 	else
-		kfs_mnt.bitmap[blk / 8] &= (uint8_t)~(1u << (blk % 8));
+		m->bitmap[blk / 8] &= (uint8_t)~(1u << (blk % 8));
 }
 
-static void kfs_bitmap_save(void)
+static void kfs_bitmap_save(struct kfs_mnt *m)
 {
-	if (kfs_mnt.bd)
-		kfs_mnt.bd->bd_write(kfs_mnt.bd,
-				     KFS_BITMAP_BLOCK, kfs_mnt.bitmap);
+	if (m && m->bd)
+		m->bd->bd_write(m->bd, KFS_BITMAP_BLOCK, m->bitmap);
 }
 
 /*
@@ -257,6 +285,9 @@ static void kfs_bitmap_save(void)
  */
 static uint32_t kfs_alloc_block_zero(struct block_device *bd, uint32_t count)
 {
+	struct kfs_mnt *m = kfs_mnt_for(bd);
+	if (!m) { kprintf("kfs_alloc: no mnt for bd %p\n", bd); return 0; }
+
 	uint32_t total = bd->bd_nblocks;
 	if (total > BLK_SIZE * 8) total = BLK_SIZE * 8;	/* bitmap cap */
 
@@ -264,13 +295,13 @@ static uint32_t kfs_alloc_block_zero(struct block_device *bd, uint32_t count)
 	     start + count <= total; start++) {
 		unsigned ok = 1;
 		for (uint32_t i = 0; i < count; i++) {
-			if (kfs_bit_get(start + i)) { ok = 0; break; }
+			if (kfs_bit_get(m, start + i)) { ok = 0; break; }
 		}
 		if (!ok) continue;
 
 		for (uint32_t i = 0; i < count; i++)
-			kfs_bit_set(start + i, 1);
-		kfs_bitmap_save();
+			kfs_bit_set(m, start + i, 1);
+		kfs_bitmap_save(m);
 
 		unsigned char zero[BLK_SIZE];
 		for (size_t i = 0; i < BLK_SIZE; i++) zero[i] = 0;
@@ -283,11 +314,14 @@ static uint32_t kfs_alloc_block_zero(struct block_device *bd, uint32_t count)
 	return 0;
 }
 
-static void kfs_free_blocks(uint32_t start, uint32_t count)
+static void kfs_free_blocks(struct block_device *bd,
+			    uint32_t start, uint32_t count)
 {
+	struct kfs_mnt *m = kfs_mnt_for(bd);
+	if (!m) return;
 	for (uint32_t i = 0; i < count; i++)
-		kfs_bit_set(start + i, 0);
-	kfs_bitmap_save();
+		kfs_bit_set(m, start + i, 0);
+	kfs_bitmap_save(m);
 }
 
 /* Look up the dir_block to operate on for a directory inode.  The
@@ -460,7 +494,7 @@ static int kfs_dir_unlink(struct inode *dir, const char *name)
 	dir_blk[slot].size_bytes  = 0;
 	dir_blk[slot].type        = 0;
 	if (bd->bd_write(bd, d->dir_block, dir_blk) < 0) return -1;
-	if (reclaim_start) kfs_free_blocks(reclaim_start, KFS_BLOCKS_PER_FILE);
+	if (reclaim_start) kfs_free_blocks(bd, reclaim_start, KFS_BLOCKS_PER_FILE);
 
 	kprintf("kfs_unlink: '%s' from dir_block=%u slot=%d (freed blocks %u..%u)\n",
 		name, d->dir_block, slot, reclaim_start,
@@ -501,7 +535,7 @@ static int kfs_dir_rmdir(struct inode *dir, const char *name)
 	dir_blk[slot].size_bytes  = 0;
 	dir_blk[slot].type        = 0;
 	if (bd->bd_write(bd, d->dir_block, dir_blk) < 0) return -1;
-	kfs_free_blocks(sub_block, 1);
+	kfs_free_blocks(bd, sub_block, 1);
 
 	kprintf("kfs_rmdir: '%s' from dir_block=%u slot=%d (freed block %u)\n",
 		name, d->dir_block, slot, sub_block);
@@ -530,16 +564,21 @@ static struct file_ops kfs_dir_fops = {
 void kfs_mkimage(struct block_device *bd,
 		 const struct kfs_payload *payloads, unsigned n_payloads)
 {
-	/* Build the bitmap in memory as we lay things out, then flush
-	 * it to KFS_BITMAP_BLOCK at the end.  We use the static
-	 * kfs_mnt.bitmap as scratch -- kfs_mount will clobber it from
-	 * disk anyway. */
-	kmemset(kfs_mnt.bitmap, 0, sizeof(kfs_mnt.bitmap));
-	kfs_mnt.bd = bd;
+	/* Allocate or reuse a kfs_mnt slot for this bd so the bitmap we
+	 * compute here is the same slot kfs_mount will reload from disk
+	 * later.  Idempotent: mkimage-then-mount on the same bd hits the
+	 * same slot. */
+	struct kfs_mnt *m = kfs_mnt_for(bd);
+	if (!m) m = kfs_mnt_alloc(bd);
+	if (!m) {
+		kprintf("kfs_mkimage: MAX_KFS_MOUNTS exceeded\n");
+		return;
+	}
+	kmemset(m->bitmap, 0, BLK_SIZE);
 	/* Reserve super, bitmap, root dir. */
-	kfs_bit_set(KFS_SUPER_BLOCK,  1);
-	kfs_bit_set(KFS_BITMAP_BLOCK, 1);
-	kfs_bit_set(KFS_ROOT_BLOCK,   1);
+	kfs_bit_set(m, KFS_SUPER_BLOCK,  1);
+	kfs_bit_set(m, KFS_BITMAP_BLOCK, 1);
+	kfs_bit_set(m, KFS_ROOT_BLOCK,   1);
 
 	struct kfs_super sb;
 	kmemset(&sb, 0, sizeof(sb));
@@ -582,14 +621,14 @@ void kfs_mkimage(struct block_device *bd,
 				rem -= n;
 			}
 			bd->bd_write(bd, cur_block + b, buf);
-			kfs_bit_set(cur_block + b, 1);
+			kfs_bit_set(m, cur_block + b, 1);
 		}
 		cur_block += KFS_BLOCKS_PER_FILE;
 	}
 	bd->bd_write(bd, KFS_ROOT_BLOCK, dir);
 
 	/* Flush the bitmap. */
-	bd->bd_write(bd, KFS_BITMAP_BLOCK, kfs_mnt.bitmap);
+	bd->bd_write(bd, KFS_BITMAP_BLOCK, m->bitmap);
 
 	kprintf("kfs: mkimage wrote %u files (blocks used: 0..%u)\n",
 		n_payloads, (unsigned)(cur_block - 1));
@@ -654,8 +693,13 @@ int kfs_mount(struct block_device *bd, struct dentry *mountpoint)
 		return -1;
 	}
 
-	kfs_mnt.bd = bd;
-	if (bd->bd_read(bd, KFS_BITMAP_BLOCK, kfs_mnt.bitmap) < 0) {
+	struct kfs_mnt *m = kfs_mnt_for(bd);
+	if (!m) m = kfs_mnt_alloc(bd);
+	if (!m) {
+		kprintf("kfs_mount: MAX_KFS_MOUNTS exceeded\n");
+		return -1;
+	}
+	if (bd->bd_read(bd, KFS_BITMAP_BLOCK, m->bitmap) < 0) {
 		kprintf("kfs_mount: bitmap read failed\n");
 		return -1;
 	}

@@ -192,21 +192,50 @@ struct tcp_tcb {
 #define TCP_RTO_MAX	6000	/* 60.0 s                       */
 #define TCP_RTO_INITIAL	100	/* 1.0 s before first RTT sample */
 #define TCP_MAX_RETRANSMITS	5
-#define TCP_SND_BUF_MAX	8192
-#define TCP_RCV_WND_MAX	8192	/* max bytes we advertise as receive window */
+/* Outbound user-data buffer cap.  handle_data_req refuses a putmsg
+ * that would push (in-flight + queued) past this and aborts the
+ * connection with TCP_DISCON_REASON_PROTOERR.  Matching the receive
+ * window (TCP_RCV_WND_MAX = 65535) keeps a single FTP RETR's
+ * userland buffer from getting NAK'd: ftpd reads BUF_SZ chunks and
+ * dumps them into putmsg one after another, so any per-segment cap
+ * less than the file size truncates the download. */
+#define TCP_SND_BUF_MAX	65535
+/* Max bytes we advertise as receive window.  Caps at 65535 because
+ * TCP_LOCAL_WSCALE is 0 (we don't scale the wire window).  8 KB was
+ * what we shipped first; 8 KB plus an FTP STOR worth of data hits
+ * the receive window cliff hard.  64 KB matches what real BSD/Linux
+ * advertised before window scale became standard; combined with the
+ * drain-callback ACK in tcp_on_user_drain it pushes the FTP STOR
+ * cliff out past the kfs per-file cap. */
+#define TCP_RCV_WND_MAX	65535
 /* T1i 2*MSL.  RFC 793 picks 2 minutes; real Solaris defaults to 60s.
  * For kappara everything is local (lo0 or a short SLIP wire), so 1
  * second is plenty to absorb peer FIN retransmits without making
  * tests wait forever for TIME_WAIT->CLOSED.  Bump if you ever wire
  * up a network where stray segments can actually loiter. */
 #define TCP_TIME_WAIT_TICKS	100	/* 1.0 s */
-/* T1j congestion control (RFC 5681).  No MSS option negotiation yet,
- * so MSS is fixed at 536 (RFC 879 conservative default).  IW = 2*MSS
- * per RFC 5681 sec 3.1 for MSS <= 1095.  Initial ssthresh is large
+/* T1j congestion control (RFC 5681 + RFC 6928).  MSS is negotiated
+ * via the SYN option (tcp_negotiate_mss): until then we use the
+ * conservative RFC 879 default of 536 and a 2-segment IW.  Once
+ * the handshake settles, the IW grows to RFC 6928's
+ * min(10*MSS, max(2*MSS, 14600)) -- a single round-trip is enough
+ * to send ~14 KB on Ethernet links, so most HTTP-style transfers
+ * finish in 1 RTT instead of 3.  Initial ssthresh is large
  * enough that we stay in slow start until the first loss event. */
 #define TCP_MSS_DEFAULT		536
 #define TCP_INITIAL_CWND	(2 * TCP_MSS_DEFAULT)
 #define TCP_INITIAL_SSTHRESH	65535
+
+/* RFC 6928 IW = min(10*MSS, max(2*MSS, 14600)).  Used by
+ * tcp_negotiate_mss when the handshake completes; before that
+ * we hold at TCP_INITIAL_CWND. */
+static inline uint32_t tcp_rfc6928_iw(uint16_t mss)
+{
+	uint32_t ten = 10u * (uint32_t)mss;
+	uint32_t two = 2u  * (uint32_t)mss;
+	uint32_t lo  = two > 14600u ? two : 14600u;
+	return ten < lo ? ten : lo;
+}
 
 /* ---- Tick + TCB registry --------------------------------------- */
 
@@ -615,9 +644,10 @@ static void tcp_parse_syn_options(const uint8_t *opts, unsigned olen,
 /* Negotiate effective MSS once both ends have spoken: min of the
  * peer's advertised value and what our outgoing netif can carry.
  * Called once per connection at handshake completion; resizes the
- * initial congestion window to 2 * negotiated MSS (RFC 5681 IW)
- * since the prior value was based on TCP_MSS_DEFAULT, not the
- * route's actual capacity. */
+ * congestion window to RFC 6928's IW10 -- min(10*MSS, max(2*MSS,
+ * 14600)) -- now that we know the route's real MSS rather than the
+ * conservative 536 we started with.  IW10 lets ~14 KB go out in
+ * one RTT after handshake, the modern Linux/BSD default. */
 static void tcp_negotiate_mss(struct tcp_tcb *s, uint16_t peer_mss)
 {
 	uint16_t local = tcp_local_mss(s->remote_ip);
@@ -625,7 +655,7 @@ static void tcp_negotiate_mss(struct tcp_tcb *s, uint16_t peer_mss)
 	if (peer_mss && peer_mss < eff) eff = peer_mss;
 	if (eff < TCP_MSS_DEFAULT) eff = TCP_MSS_DEFAULT;
 	s->mss  = eff;
-	s->cwnd = 2u * eff;
+	s->cwnd = tcp_rfc6928_iw(eff);
 }
 
 /* Compute the receive window we should advertise: TCP_RCV_WND_MAX
@@ -1313,6 +1343,19 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 
 /* ---- qopen / qclose ---------------------------------------------- */
 
+/* Stream-head drain callback: fires after the user has consumed
+ * bytes from sd_rq.  We send a pure ACK so the peer sees the
+ * freshly-reopened receive window.  Without this notification
+ * the sender stalls indefinitely once our queue fills to
+ * TCP_RCV_WND_MAX -- the canonical "FTP STOR cliff at ~5 KB" bug. */
+static void tcp_on_user_drain(struct stdata *sd, void *arg)
+{
+	(void)sd;
+	struct tcp_tcb *s = arg;
+	if (!s || s->state != TCPS_ESTABLISHED) return;
+	(void)tcp_send_segment(s, TCP_FLAG_ACK, NULL);
+}
+
 static int tcp_qopen(queue_t *rq)
 {
 	struct tcp_tcb *s = kmalloc(sizeof(*s));
@@ -1328,6 +1371,18 @@ static int tcp_qopen(queue_t *rq)
 	rq->q_ptr     = s;
 	WR(rq)->q_ptr = s;
 	tcp_tcb_register(s);
+
+	/* Wire the drain callback on the stream head so stream_read /
+	 * stream_getmsg can notify us when the user consumes bytes.
+	 * rq is TCP's read queue; rq->q_next is the head's sd_rq whose
+	 * q_ptr is the owning stdata (see sh_rq_putp). */
+	if (rq->q_next) {
+		struct stdata *sd = (struct stdata *)rq->q_next->q_ptr;
+		if (sd) {
+			sd->sd_on_drain     = tcp_on_user_drain;
+			sd->sd_on_drain_arg = s;
+		}
+	}
 	return 0;
 }
 
@@ -1369,6 +1424,15 @@ static int tcp_qclose(queue_t *rq)
 	if (s->bound) {
 		uint32_t key = tcp_bind_key(s->local_port, 0);
 		send_ip_bind(rq, IP_T_UNBIND_REQ, key);
+	}
+	/* Clear the drain hook before we kfree the tcb so the head
+	 * can't dereference us via sd_on_drain_arg after close. */
+	if (rq->q_next) {
+		struct stdata *sd = (struct stdata *)rq->q_next->q_ptr;
+		if (sd && sd->sd_on_drain_arg == s) {
+			sd->sd_on_drain     = NULL;
+			sd->sd_on_drain_arg = NULL;
+		}
 	}
 	if (s->snd_buf) freemsg(s->snd_buf);
 	tcp_tcb_unregister(s);
@@ -1756,7 +1820,12 @@ static void tcp_retransmit_main(void *arg)
 	(void)arg;
 	uint32_t last_seen = 0;
 	for (;;) {
-		kthread_yield();
+		/* Sleep until sched_tick wakes the tick wq.  Tight
+		 * kthread_yield here used to ping-pong with uart_rx at
+		 * SYS priority and starve TS-class user threads (the
+		 * telnet shell never got CPU time).  Now we run at most
+		 * once per tick, when there's actual work to consider. */
+		kthread_sleep_on(&sched_tick_wq);
 		uint32_t now = tcp_tick_counter;
 		if (now == last_seen) continue;
 		last_seen = now;
