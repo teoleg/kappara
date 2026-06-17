@@ -399,8 +399,10 @@ void kmain(void)
 	/* ramdisk_init zeroes the backing storage and must run BEFORE
 	 * exec_space_init, which calls kfs_mkimage to populate /usr/bin.
 	 * Reversing this order silently wipes the freshly-written cmd
-	 * ELF blocks. */
+	 * ELF blocks.  ramdisk_home_init zeroes the /home backing for
+	 * the same reason -- exec_space_init mkimage's it empty. */
 	ramdisk_init();
+	ramdisk_home_init();
 	exec_space_init();
 
 	/* Draw the boot splash now that everything else is up.  The FB

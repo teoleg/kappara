@@ -98,29 +98,40 @@ for step 1, useful later for ftpd's data channel):
 
 ### Step 2 -- Second writable kfs region mounted at `/home`
 
-Status: `[ ]`
+Status: `[x]` -- shipped.
 
-What to build:
-- A second `struct block_device` -- another ramdisk or a new
-  bram block area.
-- `kfs_mkimage` it empty (no payloads); `kfs_mount` it at
-  `vfs_mkdir(root, "home")`.
-- Verify from shell: `cd /home`, `echo foo bar`, `cat /home/foo`.
-- Verify the kfs WRITE path goes through (existing
-  `regfile_write` + `kfs_dir_creat`).
+What landed:
+- Added a second 512 KB ramdisk (`ramdisk1`) with its own
+  storage, name, and `bd_read`/`bd_write` shims.
+- Refactored kfs from a single static `kfs_mnt` to a small
+  per-`bd` slot table (`MAX_KFS_MOUNTS = 4`).  The bitmap
+  cache is now keyed by `bd` pointer so `/usr/bin` and `/home`
+  no longer stomp each other's free-block view.  Every
+  `kfs_bit_get/set/save` call takes a `struct kfs_mnt *`;
+  `kfs_alloc_block_zero` / `kfs_free_blocks` look up the
+  right mnt from the `bd` they were handed.
+- `exec_space_init` now mkimages ramdisk1 empty and mounts
+  it at `/home`.
+- `main.c` ramdisk_home_init runs alongside ramdisk_init,
+  before exec_space_init (else mkimage zeroes get clobbered).
 
-Why now: STOR has to land somewhere, and we DON'T want it
-landing on the existing `/usr/bin` ramdisk where binaries get
-exec'd.  This also flushes any latent bugs in kfs write that
-the shell `echo > file` path doesn't reach (large writes, many
-small writes, file-already-exists overwrite).
+Verified end-to-end:
+- raspi3b: `touch /home/foo; echo /home/foo hi; cat /home/foo`
+  roundtrips a written file.  `cmd/test all` still 13/13.
+- virt via telnet: same flow over the tcp-bridged shell on
+  tty4.  `ls /` shows `home/` alongside `usr/`, `bin/`, etc.
 
-Gaps this likely surfaces:
-- kfs may not have a "truncate on open" path -- STOR over an
-  existing file would leave stale tail bytes.  Add an O_TRUNC
-  flag or have STOR `unlink` first.
-- The `bram` block device's size cap may bite once we start
-  uploading ELFs (each `cmd/*.c` ELF is ~10-40 KB).
+Carry-overs for step 3:
+- `kfs_dir_creat` allocates a fixed `KFS_BLOCKS_PER_FILE = 64`
+  slot per file (32 KB cap).  Plenty for `cmd/*` ELFs (current
+  largest is ~50 KB and that's `cmd/test.c` with every selftest
+  inside) but may bite if anyone STORs a multi-MB blob.  Track
+  this when ftpd starts seeing real uploads.
+- `regfile_write` appends sequentially; there's no truncate-
+  on-open in kfs yet.  STOR over an existing file would tail
+  with stale bytes from the previous version.  Either drop in
+  `unlink` first (cheap) or wire `O_TRUNC` through to a real
+  `kfs_truncate` (cleaner, do in step 3 when ftpd needs it).
 
 ### Step 3 -- `cmd/ftpd.c`: the daemon itself
 

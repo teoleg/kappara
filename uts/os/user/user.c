@@ -763,6 +763,17 @@ void exec_space_init(void)
 	else
 		kprintf("exec: /usr/bin mounted from ramdisk (%u files)\n",
 		        n_usrbin);
+
+	/* Step 2 of the FTPD plan: empty kfs ramdisk mounted at /home.
+	 * This is where future FTP STORs land -- separate from /usr/bin
+	 * so a STOR can't overwrite a binary mid-exec.  Pass NULL/0 for
+	 * an empty payload table; the on-disk root dirent stays empty. */
+	kfs_mkimage(ramdisk_home_get(), NULL, 0);
+	struct dentry *home = vfs_mkdir(vfs_root(), "home");
+	if (kfs_mount(ramdisk_home_get(), home) < 0)
+		kprintf("exec: kfs_mount /home failed\n");
+	else
+		kprintf("exec: /home mounted from ramdisk1 (writable)\n");
 }
 
 /* ---- ELF loader ---- */
