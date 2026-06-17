@@ -838,11 +838,14 @@ unACK'd FIN would retransmit into the void.
 T1j congestion control (RFC 5681).  Three new TCB fields drive the
 shape:
 
-- `mss` -- segment size cap.  No SYN-option negotiation yet, so fixed
-  at 536 (RFC 879 conservative default).  Bump this once we wire MSS
-  into the SYN options.
-- `cwnd` -- congestion window in bytes.  Starts at `IW = 2*MSS`
-  (RFC 5681 sec 3.1 for MSS <= 1095).  Caps in-flight bytes
+- `mss` -- segment size cap.  Held at 536 (RFC 879 conservative
+  default) until the SYN handshake completes; `tcp_negotiate_mss`
+  then resolves it to `min(local netif MSS, peer-advertised MSS)`.
+- `cwnd` -- congestion window in bytes.  Starts at `2*MSS` (RFC 5681)
+  before MSS is known, then grows to RFC 6928 IW10 at handshake
+  completion: `min(10*MSS, max(2*MSS, 14600))`.  For an Ethernet
+  link with MSS=1460 that's 14600 bytes -- a short HTTP-style
+  reply fits in one RTT instead of three.  Caps in-flight bytes
   alongside `snd_wnd`.
 - `ssthresh` -- slow-start threshold.  Starts at 65535 (effectively
   unlimited) so we stay in slow start until the first loss event.

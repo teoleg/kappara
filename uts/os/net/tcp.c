@@ -200,13 +200,28 @@ struct tcp_tcb {
  * tests wait forever for TIME_WAIT->CLOSED.  Bump if you ever wire
  * up a network where stray segments can actually loiter. */
 #define TCP_TIME_WAIT_TICKS	100	/* 1.0 s */
-/* T1j congestion control (RFC 5681).  No MSS option negotiation yet,
- * so MSS is fixed at 536 (RFC 879 conservative default).  IW = 2*MSS
- * per RFC 5681 sec 3.1 for MSS <= 1095.  Initial ssthresh is large
+/* T1j congestion control (RFC 5681 + RFC 6928).  MSS is negotiated
+ * via the SYN option (tcp_negotiate_mss): until then we use the
+ * conservative RFC 879 default of 536 and a 2-segment IW.  Once
+ * the handshake settles, the IW grows to RFC 6928's
+ * min(10*MSS, max(2*MSS, 14600)) -- a single round-trip is enough
+ * to send ~14 KB on Ethernet links, so most HTTP-style transfers
+ * finish in 1 RTT instead of 3.  Initial ssthresh is large
  * enough that we stay in slow start until the first loss event. */
 #define TCP_MSS_DEFAULT		536
 #define TCP_INITIAL_CWND	(2 * TCP_MSS_DEFAULT)
 #define TCP_INITIAL_SSTHRESH	65535
+
+/* RFC 6928 IW = min(10*MSS, max(2*MSS, 14600)).  Used by
+ * tcp_negotiate_mss when the handshake completes; before that
+ * we hold at TCP_INITIAL_CWND. */
+static inline uint32_t tcp_rfc6928_iw(uint16_t mss)
+{
+	uint32_t ten = 10u * (uint32_t)mss;
+	uint32_t two = 2u  * (uint32_t)mss;
+	uint32_t lo  = two > 14600u ? two : 14600u;
+	return ten < lo ? ten : lo;
+}
 
 /* ---- Tick + TCB registry --------------------------------------- */
 
@@ -615,9 +630,10 @@ static void tcp_parse_syn_options(const uint8_t *opts, unsigned olen,
 /* Negotiate effective MSS once both ends have spoken: min of the
  * peer's advertised value and what our outgoing netif can carry.
  * Called once per connection at handshake completion; resizes the
- * initial congestion window to 2 * negotiated MSS (RFC 5681 IW)
- * since the prior value was based on TCP_MSS_DEFAULT, not the
- * route's actual capacity. */
+ * congestion window to RFC 6928's IW10 -- min(10*MSS, max(2*MSS,
+ * 14600)) -- now that we know the route's real MSS rather than the
+ * conservative 536 we started with.  IW10 lets ~14 KB go out in
+ * one RTT after handshake, the modern Linux/BSD default. */
 static void tcp_negotiate_mss(struct tcp_tcb *s, uint16_t peer_mss)
 {
 	uint16_t local = tcp_local_mss(s->remote_ip);
@@ -625,7 +641,7 @@ static void tcp_negotiate_mss(struct tcp_tcb *s, uint16_t peer_mss)
 	if (peer_mss && peer_mss < eff) eff = peer_mss;
 	if (eff < TCP_MSS_DEFAULT) eff = TCP_MSS_DEFAULT;
 	s->mss  = eff;
-	s->cwnd = 2u * eff;
+	s->cwnd = tcp_rfc6928_iw(eff);
 }
 
 /* Compute the receive window we should advertise: TCP_RCV_WND_MAX
