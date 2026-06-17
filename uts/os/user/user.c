@@ -676,6 +676,8 @@ extern char netstat_blob_start[];
 extern char netstat_blob_end[];
 extern char test_blob_start[];
 extern char test_blob_end[];
+extern char tcpconnect_blob_start[];
+extern char tcpconnect_blob_end[];
 
 static struct blob_priv hello_priv;
 
@@ -742,11 +744,12 @@ void exec_space_init(void)
 #define PAY(name_str, sym_start, sym_end) \
 	{ name_str, (sym_start), (uint32_t)((sym_end) - (sym_start)) }
 	const struct kfs_payload usrbin_payloads[] = {
-		PAY("ps",       ps_blob_start,       ps_blob_end),
-		PAY("ping",     ping_blob_start,     ping_blob_end),
-		PAY("ifconfig", ifconfig_blob_start, ifconfig_blob_end),
-		PAY("netstat", netstat_blob_start, netstat_blob_end),
-		PAY("test",     test_blob_start,     test_blob_end),
+		PAY("ps",         ps_blob_start,         ps_blob_end),
+		PAY("ping",       ping_blob_start,       ping_blob_end),
+		PAY("ifconfig",   ifconfig_blob_start,   ifconfig_blob_end),
+		PAY("netstat",    netstat_blob_start,    netstat_blob_end),
+		PAY("test",       test_blob_start,       test_blob_end),
+		PAY("tcpconnect", tcpconnect_blob_start, tcpconnect_blob_end),
 	};
 #undef PAY
 	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);

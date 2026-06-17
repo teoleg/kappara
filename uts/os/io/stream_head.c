@@ -1388,9 +1388,36 @@ static long stream_getmsg(struct file *f, struct strbuf *ctl,
 	if (!sd)
 		return -1;
 
-	mblk_t *mp = getq(sd->sd_rq);
-	if (!mp)
-		return -1;
+	/* Block until a message arrives.  Mirrors stream_read's wait
+	 * shape: hold sd_readwait.sq_lock around the getq + EOF check
+	 * + sleep_on so writers can't slip a message in between our
+	 * empty-check and our sleep.  Without this an EL0 caller doing
+	 * "putmsg request; getmsg response" races the kernel module's
+	 * reply -- if our getmsg ran before the M_PROTO ack landed we
+	 * used to return -1 and the caller would mistake it for a
+	 * fatal error.  T_TCP_BIND_REQ from cmd/tcpconnect.c was the
+	 * canonical victim. */
+	mblk_t *mp;
+	unsigned long wflags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+	for (;;) {
+		mp = getq(sd->sd_rq);
+		if (mp) break;
+		if (sd->sd_flags & SD_EOF) {
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
+			                        wflags);
+			return -1;
+		}
+		{ struct kthread *me = curthread;
+		  if (me && (me->sig_pending & SIG_FATAL_MASK)) {
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
+			                        wflags);
+			return -1;
+		  }
+		}
+		kthread_sleep_on_locked(&sd->sd_readwait, wflags);
+		wflags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+	}
+	spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, wflags);
 
 	mblk_t *cptr = NULL;
 	mblk_t *dptr = NULL;

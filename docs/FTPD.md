@@ -64,38 +64,37 @@ These are prerequisites, in dependency order:
 
 ### Step 1 -- EL0 TPI dial-out: `cmd/tcpconnect.c`
 
-Status: `[ ]`
+Status: `[x]` -- shipped (see commit log).
 
-Why first: ftpd's data channel needs both PASV (listen + accept,
-already exercised by telnetd) AND the active-open path (because
-RETR sends bytes the client requested -- we don't dial out for
-that, the client does for PASV -- but EVERY TPI roundtrip from
-EL0 needs to work).  No EL0 code today does the full open + I_PUSH
-"tcp" + bind + connect + read/write + close cycle.  We need to
-prove it works before building anything on top of it.
+Built `cmd/tcpconnect.c`: opens `/dev/tcp`, puts T_TCP_BIND_REQ
+(port 0 for ephemeral), gets T_TCP_BIND_ACK, puts T_TCP_CONN_REQ
+to the target, gets T_TCP_CONN_CON, then a half-duplex line loop
+(read stdin / send T_TCP_DATA_REQ / drain one T_TCP_DATA_IND /
+print).  `.` on a line tears the session down via ORDREL.
 
-What to build:
-- `cmd/tcpconnect.c`: standalone ELF, behaves like `nc <ip> <port>`.
-- Open `/dev/tcp`, `ioctl(I_PUSH, "tcp")`, putmsg `T_TCP_BIND_REQ`
-  with port 0 (ephemeral), getmsg expect `T_TCP_BIND_ACK`.
-- putmsg `T_TCP_CONN_REQ` with target IP+port, getmsg expect
-  `T_TCP_CONN_CON`.
-- Then a select-style loop: poll stdin (fd 0) and the TCP fd;
-  shovel one direction to the other.  No real select() yet --
-  alternating non-blocking reads with sys_yield is enough.
+End-to-end verified on virt: `tcpconnect 10.0.2.2 12345` reaches
+a host `nc -l -p 12345`, host PONG appears in shell, typed lines
+land on host.
 
-Test:
-- On host: `nc -l 12345` (or python `socket.recv` loop).
-- In kappara: `tcpconnect 10.0.2.2 12345`, type a line, see it
-  on the host.  Type a line on the host, see it in kappara.
+Bugs flushed by writing this:
+- `stream_getmsg` was non-blocking -- it returned -1 immediately
+  if no message was queued, so an EL0 caller doing "putmsg
+  request; getmsg response" lost the race when the module's
+  reply hadn't reached `sd_rq` yet.  Now wraps getq in a
+  `sd_readwait`-locked sleep loop the same shape as
+  `stream_read`.
+- Don't `I_PUSH "tcp"` after `open("/dev/tcp")`: stream_head's
+  driver-open path autopushes it.  A redundant push stacks two
+  tcp modules and IP_T_BIND_REQ loops through `tcp_wq_putp`
+  twice instead of reaching `ip_wput`.  Code now opens and
+  proceeds straight to T_TCP_BIND_REQ; comment in the source
+  flags the autopush.
 
-Gaps this likely surfaces:
-- EL0 calling `putmsg`/`getmsg` with TPI primitives in the ctl
-  buffer + raw bytes in the data buffer -- we need both to
-  flow through `sys_putmsg_impl` / `sys_getmsg_impl` correctly.
-- Whether the existing user/init.c read_one / cwrite path can
-  share fds with the TCP stream cleanly.
-- Anything ldterm-shaped that assumes the fd is a tty.
+Carry-overs for the bidirectional `nc`-equivalent (out of scope
+for step 1, useful later for ftpd's data channel):
+- Need select / poll or a worker thread to mix stdin and TCP
+  reads.  Either ship `sys_spawn` through libc, or extend
+  `getmsg` with a non-blocking flag.
 
 ### Step 2 -- Second writable kfs region mounted at `/home`
 

@@ -48,3 +48,11 @@ netstat_blob_end:
 test_blob_start:
 	.incbin "build/cmd/test.elf"
 test_blob_end:
+
+	.section ".rodata.tcpconnect_blob","a",%progbits
+	.balign 8
+	.global tcpconnect_blob_start
+	.global tcpconnect_blob_end
+tcpconnect_blob_start:
+	.incbin "build/cmd/tcpconnect.elf"
+tcpconnect_blob_end:
