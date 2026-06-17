@@ -260,6 +260,41 @@ $(KERNEL): $(ELF)
 run: $(KERNEL)
 	$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL)
 
+# ARCH=virt only: boot QEMU virt headless in the background, wait
+# for the in-kernel telnetd to come up on hostfwd port 2323, then
+# launch an `nc` client in the foreground.  On exit (Ctrl-C or `quit`
+# inside the shell) both the client and the background QEMU get
+# torn down so you don't leave a dangling vCPU thread behind.
+#
+# Use this when you want to drive the shell over telnet -- the kernel
+# splash + boot trace go to /tmp/kappara-virt.log instead of stdout,
+# and stdin/stdout belong to the telnet session on tty4.
+ifeq ($(ARCH),virt)
+.PHONY: run-telnet
+run-telnet: $(KERNEL)
+	@command -v nc >/dev/null 2>&1 || { \
+		echo "run-telnet: need 'nc' on PATH (apt install netcat-openbsd)"; \
+		exit 1; }
+	@echo "==> booting kappara virt in background (log: /tmp/kappara-virt.log)"
+	@$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL) > /tmp/kappara-virt.log 2>&1 & \
+	  QPID=$$!; \
+	  trap "echo; echo '==> killing qemu (pid '$$QPID')'; kill $$QPID 2>/dev/null; wait 2>/dev/null" EXIT INT TERM; \
+	  echo "==> waiting for telnetd on localhost:2323"; \
+	  for i in 1 2 3 4 5 6 7 8 9 10; do \
+	      sleep 1; \
+	      if grep -q 'telnetd: listening' /tmp/kappara-virt.log 2>/dev/null; then \
+	          break; \
+	      fi; \
+	  done; \
+	  if ! grep -q 'telnetd: listening' /tmp/kappara-virt.log 2>/dev/null; then \
+	      echo "run-telnet: telnetd did not come up; tail of log:"; \
+	      tail -20 /tmp/kappara-virt.log; \
+	      exit 1; \
+	  fi; \
+	  echo "==> connecting (nc localhost 2323) -- ^] then quit, or ^C to bail"; \
+	  nc localhost 2323
+endif
+
 # Pi/Debian host friendly defaults: no display window, single-thread
 # TCG so QEMU can't spin more than one host CPU even when WFI on the
 # raspi3b model doesn't properly idle the vCPU threads.  Wrap in
