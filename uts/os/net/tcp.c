@@ -1756,7 +1756,12 @@ static void tcp_retransmit_main(void *arg)
 	(void)arg;
 	uint32_t last_seen = 0;
 	for (;;) {
-		kthread_yield();
+		/* Sleep until sched_tick wakes the tick wq.  Tight
+		 * kthread_yield here used to ping-pong with uart_rx at
+		 * SYS priority and starve TS-class user threads (the
+		 * telnet shell never got CPU time).  Now we run at most
+		 * once per tick, when there's actual work to consider. */
+		kthread_sleep_on(&sched_tick_wq);
 		uint32_t now = tcp_tick_counter;
 		if (now == last_seen) continue;
 		last_seen = now;

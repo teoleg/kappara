@@ -28,7 +28,15 @@
 
 #include "kappara/io/vt.h"
 
-#define NTTY	4
+/* NTTY: total tty minors that exist as /dev/tty<i> chrdevs.  The
+ * first NTTY_VISIBLE (tty0..tty3) are local consoles routed through
+ * the UART; the remaining ones are "remote ttys" -- their output
+ * goes through tty_minor.output_hook instead of UART, and their
+ * input is pushed via tty_remote_feed_byte().  Today tty4 is the
+ * single telnet-console slot (telnetd takes over its hook on each
+ * accept and bridges the bytes to/from a TCP session). */
+#define NTTY_VISIBLE	4
+#define NTTY		5
 
 struct stdata;	/* fwd; defined in kappara/io/stream_head.h */
 
@@ -36,7 +44,27 @@ struct tty_minor {
 	struct vt        vt;
 	struct stdata   *sd;
 	int              minor;
+	/* When non-NULL, tty_drv_wq_putp routes each output byte
+	 * through this hook instead of touching the UART.  Used by
+	 * telnetd to bridge a remote-tty's writes into a TCP socket.
+	 * Set/cleared via tty_set_output_hook. */
+	void           (*output_hook)(int minor, const void *buf,
+	                              unsigned len, void *arg);
+	void            *output_hook_arg;
 };
+
+/* Install (or clear with fn=NULL) an output redirect on this minor.
+ * One slot per minor; the next call overwrites.  Reads stay routed
+ * through the normal head sd_rq -- the input side is fed via
+ * tty_remote_feed_byte() from the bridge. */
+void tty_set_output_hook(int minor,
+                         void (*fn)(int, const void *, unsigned, void *),
+                         void *arg);
+
+/* Push one byte into the remote tty's driver read queue, exactly as
+ * if it arrived from a UART.  ldterm + the head pick it up the same
+ * way they do for tty0..3. */
+void tty_remote_feed_byte(int minor, unsigned char c);
 
 /* Register the tty driver + create /dev/tty0..tty<NTTY-1>.  Also
  * initialises tty_minors[i].vt for each.  Called once from

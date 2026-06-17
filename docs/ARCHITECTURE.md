@@ -1416,6 +1416,17 @@ classes ship today:
   no quantum tracking; `cl_tick` returns "no class-driven preempt"
   so SYS threads run until they voluntarily yield or block.
 
+  **Pollers must block, not tight-yield.**  A SYS thread that loops
+  `for(;;){ poll(); kthread_yield(); }` ping-pongs with any other
+  SYS peer at the same priority and starves TS-class user threads
+  forever -- the dispatch queue always has a pri-60 entry available
+  so the pri-30 user-init shells never get scheduled.  This was the
+  canonical "telnet-shell never responds" bug.  Pollers
+  (`tcp_rtx`, `uart_rx`, `miniuart_rx`/`slip_rx`) now sleep on
+  `sched_tick_wq` -- a broadcast wait queue woken once per
+  `sched_tick` (100 Hz).  They run at most once per tick when
+  there's work to do, leaving the rest of the tick for TS threads.
+
 * **`SCLASS_TS`** -- every user-space (EL0) thread.  Driven by an
   inlined `ts_dptbl` row: each thread carries a `t_quantum_left`
   countdown reloaded to `TS_QUANTUM_TICKS = 5` (~50ms at HZ=100).

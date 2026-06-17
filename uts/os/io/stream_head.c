@@ -325,28 +325,35 @@ void uart_rx_main(void *arg)
 		 */
 		int c = uart_getc_nonblock();
 		if (c < 0) {
-			kthread_yield();
+			/* No data: park on the tick wq instead of yielding
+			 * hot.  sched_tick wakes us at 100 Hz; that's plenty
+			 * since PL011 has a 16-byte RX FIFO and we drain it
+			 * in a tight loop once awake.  Tight kthread_yield
+			 * here used to starve TS-class user threads (see
+			 * the tcp_rtx fix for the same starvation pattern). */
+			kthread_sleep_on(&sched_tick_wq);
 			continue;
 		}
 
 		if (vc_prefix_pending) {
 			vc_prefix_pending = 0;
-			if (c >= '0' && c < '0' + NTTY) {
+			/* Only the visible (UART-backed) ttys are reachable
+			 * via the keyboard switcher.  tty4+ are owned by
+			 * remote bridges (telnetd) and shouldn't appear in
+			 * the local rotation. */
+			if (c >= '0' && c < '0' + NTTY_VISIBLE) {
 				tty_switch(c - '0');
-				kthread_yield();
 				continue;
 			}
 			/* Not a digit -- silently drop both the held
 			 * Ctrl-A and the trailing byte.  The user typed
 			 * a stale prefix; losing one byte beats injecting
 			 * a Ctrl-A into the data stream. */
-			kthread_yield();
 			continue;
 		}
 
 		if (c == 0x18) {	/* Ctrl-X */
 			vc_prefix_pending = 1;
-			kthread_yield();
 			continue;
 		}
 
@@ -382,10 +389,10 @@ void uart_rx_main(void *arg)
 			}
 		}
 
-		/* Yield every iteration so the reader thread gets a turn
-		 * even when piped input is arriving faster than the reader
-		 * can drain it. */
-		kthread_yield();
+		/* Loop back -- if more bytes are queued in the PL011 FIFO
+		 * we drain them in one go (uart_getc_nonblock returns >=0).
+		 * When the FIFO is empty the next iteration sleeps on the
+		 * tick wq, so the reader thread gets the CPU. */
 	}
 }
 
@@ -1894,6 +1901,12 @@ void streams_head_init(void)
 	vfs_mknod_chrdev(dev, "tty1", MKDEV(CDEV_MAJ_TTY, 1));
 	vfs_mknod_chrdev(dev, "tty2", MKDEV(CDEV_MAJ_TTY, 2));
 	vfs_mknod_chrdev(dev, "tty3", MKDEV(CDEV_MAJ_TTY, 3));
+	/* tty4: the "remote console".  No keyboard switcher routes to
+	 * it (Ctrl-X N is clamped to NTTY_VISIBLE), and uart_rx_main
+	 * never feeds it; it's owned by telnetd, which installs an
+	 * output_hook + tty_remote_feed_byte's bytes from the TCP
+	 * peer to drive a per-connection user-mode shell. */
+	vfs_mknod_chrdev(dev, "tty4", MKDEV(CDEV_MAJ_TTY, 4));
 
 	/* Networking: register the icmp + udp STREAMS modules (so
 	 * I_PUSH "icmp" / "udp" and the corresponding /dev autopush

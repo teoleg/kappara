@@ -476,6 +476,13 @@ void            kthread_wake_one (struct wait_queue *wq);
  * on it and re-checks the target tid on wake. */
 extern struct wait_queue thread_exit_wq;
 
+/* Broadcast wait queue woken on every sched_tick (100 Hz).  Kernel
+ * polling threads (tcp_rtx, uart_rx) sleep on it instead of tight
+ * kthread_yield loops -- yielding at SYS priority starves TS-class
+ * user threads because dispq_pop always returns to the higher-priority
+ * peer.  See commit log for the canonical telnet-shell starvation bug. */
+extern struct wait_queue sched_tick_wq;
+
 /* Return the kthread with the given tid, or NULL if no live thread
  * owns that id.  O(1) lookup via a sparse table; sys_kill uses this. */
 struct kthread *kthread_find(unsigned tid);

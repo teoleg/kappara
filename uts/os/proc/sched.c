@@ -246,6 +246,9 @@ void kthread_setclass(struct kthread *t, enum sclass_id cid)
  * per waiter per peer-exit, and waitpid storms aren't a hot path. */
 struct wait_queue thread_exit_wq;
 
+/* See sched.h note: kernel pollers sleep on this instead of yielding. */
+struct wait_queue sched_tick_wq;
+
 /*
  * Bitmask of CPUs currently running their idle thread.  Wakers use
  * ipi_wake_idle() to nudge idle CPUs to come look for work without
@@ -1153,6 +1156,11 @@ void sched_tick(void)
 	 * actual retransmit work runs in thread context. */
 	extern void tcp_tick(void);
 	tcp_tick();
+	/* Wake every polling thread parked on the tick wait queue.
+	 * tcp_rtx + uart_rx use this so they're not yielding hot at
+	 * SYS priority (pri 60) and starving TS-class user threads. */
+	if (sched_tick_wq.head)
+		kthread_wake_all(&sched_tick_wq);
 	struct kthread *cur = curthread;
 	if (!cur)
 		return;
