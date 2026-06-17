@@ -223,17 +223,38 @@ Carry-overs:
 
 ### Step 4 -- Host-side recipe + smoke test
 
-Status: `[ ]`
+Status: `[x]` -- shipped.
 
-What to build:
-- Update Makefile QEMU_ARGS for ARCH=virt: add `hostfwd=tcp::2121-:21`
-  and the PASV-port hostfwd(s).
-- `make ARCH=virt run-ftp` target that boots virt and prints a
-  one-line "connect with `ftp 127.0.0.1 2121`" hint.
-- A scripted smoke test (`/tmp/ftp_test.sh`) that pushes a known
-  binary via `ftp` and then verifies `kappara:/# /home/foo`
-  produces expected output.
-- Document the recipe in this file (below the plan section).
+What landed:
+- `make ARCH=virt run-ftp`: boots virt headless in the background,
+  waits for `ftpd: listening`, then drops you into `ftp -p 127.0.0.1
+  2121` with USER/PASS/cd/put hints printed.  Ctrl-C tears the
+  background QEMU down via the trap on EXIT.
+- `make ARCH=virt smoke-ftp`: scripted gate.  Boots virt, STORs a
+  small text file, RETRs it back, byte-compares, then STORs
+  `build/cmd/ifconfig.elf` and verifies `exec /home/foo` over
+  telnet prints the expected `eth0` line.  Exits non-zero on any
+  step's failure so CI can flag regressions.
+- Makefile `QEMU_ARGS` already had the FTP-related hostfwds (control
+  21 -> host 2121, PASV pool 30000..30007 -> same on host).
+
+Operating recipe written under "Operating recipe" below.
+
+Carry-over flagged during step 4 testing:
+- ELF round-trip via FTP currently sees a content corruption on
+  bigger payloads: a small text file (~16 B) round-trips
+  byte-identical, and the uploaded `ifconfig.elf` exec's and
+  prints expected output -- so STOR + exec is intact -- but a
+  STOR-then-RETR of `ifconfig.elf` returns 12288 bytes instead
+  of the original 11776, with zero-filled blocks splicing in
+  around offset 5120.  The on-disk size in `/home` is correct
+  (`ll /home` shows `reg 11776 foo`), so RETR is producing the
+  extra bytes, not STOR; likely an interaction between the new
+  drain-callback ACKing pattern and a stale segment from the
+  PASV listener's port.  Smoke test uses a tiny payload until
+  this is chased -- exec'ing uploaded ELFs still works because
+  the kfs file is correctly sized and exec reads from kfs, not
+  from the buggy RETR path.
 
 ### Step 5 -- Optional follow-ups (out of scope for v1)
 
@@ -248,9 +269,44 @@ Once steps 1-4 are green, the natural extensions:
   bare names.
 - TLS (FTPS) -- well, no.  This is a learning kernel.
 
-## Operating recipe (filled in as steps complete)
+## Operating recipe
 
-(Will be populated as step 4 lands.)
+Host packages needed once:
+
+    apt install qemu-system-arm gcc-aarch64-linux-gnu netcat-openbsd ftp
+
+End-to-end push-and-run:
+
+    # Build everything (kernel + userland + ftpd ELF embedded in /usr/bin)
+    make ARCH=virt -j$(nproc)
+
+    # Terminal A: boot kappara + drop into ftp(1)
+    make ARCH=virt run-ftp
+    ftp> user anonymous any
+    ftp> binary
+    ftp> cd /home
+    ftp> put my_program             # lands at /home/my_program
+    ftp> bye
+
+    # Terminal B: telnet to kappara's shell and exec what you just put
+    nc localhost 2323
+    kappara:/# exec /home/my_program
+
+Scripted gate (CI / pre-commit):
+
+    make ARCH=virt smoke-ftp        # exits 0 on PASS, non-zero on any step's failure
+
+If `run-ftp` says `ftpd did not come up`, tail
+`/tmp/kappara-virt.log` -- that's where the headless QEMU's
+serial output goes.  The most common cause is a stale QEMU
+holding the FTP hostfwd ports from a previous run; `make stop`
+or `pkill -x qemu-system-aarch64` clears it.
+
+Host-side firewall: QEMU `hostfwd` binds to **0.0.0.0** by
+default, so other machines on your network can reach the FTP
+service if you punch holes for ports 2121 + 30000..30007.  Edit
+`QEMU_ARGS` in the Makefile to `hostfwd=tcp:127.0.0.1:...` if you
+want loopback-only.
 
 ## Open questions to revisit later
 
