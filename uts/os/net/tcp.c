@@ -1646,9 +1646,27 @@ static int handle_data_req(queue_t *q, struct tcp_tcb *s, mblk_t *payload)
 	 * those chunks fit before we have to wait for an ACK to free
 	 * room.  Single-mblk model keeps trim logic simple (advance
 	 * b_rptr on ACK trims, snd_nxt - snd_buf_seq tracks how much
-	 * is already on the wire). */
+	 * is already on the wire).
+	 *
+	 * Mask IRQs across the snd_buf swap.  tcp_rput's ACK trim runs
+	 * from the virtio-net IRQ context and mutates snd_buf->b_rptr
+	 * / b_wptr / snd_buf_seq / snd_una.  Without this fence an ACK
+	 * landing between `old = b_wptr - b_rptr` and the kmemcpy
+	 * advances b_rptr but leaves us reading `old` bytes from the
+	 * new (smaller) position -- which spills past b_wptr into the
+	 * tail of the allocb, often zero.  That zero stretch is what
+	 * the FTP RETR roundtrip saw as "12288 bytes back for an 11776
+	 * file with a 512-byte zero block injected mid-stream". */
+	unsigned long irq_flags;
+	__asm__ volatile ("mrs %0, daif" : "=r"(irq_flags));
+	__asm__ volatile ("msr daifset, #2" ::: "memory");
+
 	mblk_t *new_buf = allocb(old + plen, 0);
-	if (!new_buf) { freemsg(payload); return -1; }
+	if (!new_buf) {
+		__asm__ volatile ("msr daif, %0" :: "r"(irq_flags) : "memory");
+		freemsg(payload);
+		return -1;
+	}
 	if (old) {
 		kmemcpy(new_buf->b_wptr, s->snd_buf->b_rptr, old);
 		new_buf->b_wptr += old;
@@ -1666,6 +1684,8 @@ static int handle_data_req(queue_t *q, struct tcp_tcb *s, mblk_t *payload)
 	freemsg(payload);
 
 	tcp_try_send_pending(s);
+
+	__asm__ volatile ("msr daif, %0" :: "r"(irq_flags) : "memory");
 	return 0;
 }
 

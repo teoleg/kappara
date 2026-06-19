@@ -337,23 +337,14 @@ run-ftp: $(KERNEL)
 # check the output looks sane.  All-or-nothing: any failure exits
 # nonzero so CI can flag regressions.  See docs/FTPD.md "Operating
 # recipe" for what this verifies.
-# Smoke test: STOR a small text file (well below the file-size cliff
-# we still haven't tracked down -- see FTPD.md carry-overs), then
-# RETR it back and byte-compare; then exec a previously-uploaded
-# binary by going through STOR + telnet `exec`.  CMD_BUILD is
-# defined later in the file (under the aarch64+virt cmd block);
-# spell out paths explicitly here so we don't depend on the variable
-# being set at the time make parses this rule.
 smoke-ftp: $(KERNEL) build/cmd/ifconfig.elf
 	@command -v ftp >/dev/null 2>&1 || { \
 		echo "smoke-ftp: need 'ftp' on PATH"; exit 1; }
 	@command -v nc >/dev/null 2>&1 || { \
 		echo "smoke-ftp: need 'nc' on PATH"; exit 1; }
 	@LOG=/tmp/kappara-smoke.log; \
-	 SAMPLE=/tmp/kappara-smoke-sample.txt; \
-	 DOWN=/tmp/kappara-smoke-sample-back.txt; \
+	 DOWN=/tmp/kappara-smoke-elf-back; \
 	 rm -f $$LOG $$DOWN; \
-	 printf 'hello-from-host\n' > $$SAMPLE; \
 	 echo "==> boot kappara virt (log: $$LOG)"; \
 	 $(QEMU) $(QEMU_ARGS) -kernel $(KERNEL) > $$LOG 2>&1 & \
 	 QPID=$$!; \
@@ -367,18 +358,14 @@ smoke-ftp: $(KERNEL) build/cmd/ifconfig.elf
 	 done; \
 	 grep -q 'ftpd: listening' $$LOG 2>/dev/null || { \
 	     echo "smoke-ftp: ftpd did not come up"; tail -20 $$LOG; exit 1; }; \
-	 echo "==> upload + download + byte-compare (small text)"; \
-	 printf 'user anonymous any\nbinary\ncd /home\nput %s sample\nget sample %s\nquit\n' \
-	        $$SAMPLE $$DOWN \
+	 echo "==> upload ifconfig.elf, RETR back, byte-compare"; \
+	 printf 'user anonymous any\nbinary\ncd /home\nput build/cmd/ifconfig.elf foo\nget foo %s\nquit\n' \
+	        $$DOWN \
 	     | HOME=/tmp ftp -pinv 127.0.0.1 2121 > /dev/null 2>&1 \
 	     || { echo "smoke-ftp: ftp client failed"; exit 1; }; \
-	 cmp $$SAMPLE $$DOWN \
-	     || { echo "smoke-ftp: roundtripped sample differs from original"; \
-	          diff $$SAMPLE $$DOWN; exit 1; }; \
-	 echo "==> upload ifconfig.elf + exec it over telnet"; \
-	 printf 'user anonymous any\nbinary\ncd /home\nput build/cmd/ifconfig.elf foo\nquit\n' \
-	     | HOME=/tmp ftp -pinv 127.0.0.1 2121 > /dev/null 2>&1 \
-	     || { echo "smoke-ftp: ftp client (upload elf) failed"; exit 1; }; \
+	 cmp build/cmd/ifconfig.elf $$DOWN \
+	     || { echo "smoke-ftp: roundtripped ELF differs from original"; exit 1; }; \
+	 echo "==> exec uploaded ELF over telnet"; \
 	 OUT=$$( ( sleep 1; printf 'exec /home/foo\r'; sleep 5 ) \
 	          | timeout 10 nc localhost 2323 2>&1 ); \
 	 echo "$$OUT" | grep -q 'eth0' \
