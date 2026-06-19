@@ -260,8 +260,15 @@ endif
 $(KERNEL): $(ELF)
 	$(OBJCOPY) -O binary $< $@
 
+# Trap INT/TERM and reap the qemu pid on the way out -- otherwise a
+# Ctrl-C in `-nographic` mode leaves a zombie QEMU holding the
+# hostfwd ports, and the next `make run` fails with "Could not set
+# up host forwarding rule".  Same pattern run-telnet / run-ftp use.
 run: $(KERNEL)
-	$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL)
+	@$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL) & \
+	  QPID=$$!; \
+	  trap "kill $$QPID 2>/dev/null; wait 2>/dev/null" EXIT INT TERM; \
+	  wait $$QPID
 
 # ARCH=virt only: boot QEMU virt headless in the background, wait
 # for the in-kernel telnetd to come up on hostfwd port 2323, then
