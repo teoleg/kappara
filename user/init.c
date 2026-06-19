@@ -399,49 +399,9 @@ static void cmd_pid(void)
 	cwrite("\r\n");
 }
 
-static void cmd_ls(int argc, char *argv[])
-{
-	char path[128];
-	if (argc > 1)
-		resolve_path(argv[1], path, sizeof(path));
-	else {
-		size_t i = 0;
-		while (cwd[i]) { path[i] = cwd[i]; i++; }
-		path[i] = '\0';
-	}
-	char out[256];
-	long n = sys_ls(path, out, sizeof(out));
-	if (n < 0) {
-		cwrite("ls: cannot access '"); cwrite(path); cwrite("'\r\n");
-		return;
-	}
-	for (long i = 0; i < n; i++) {
-		if (out[i] == '\n') cputc('\r');
-		cputc(out[i]);
-	}
-}
-
-static void cmd_ll(int argc, char *argv[])
-{
-	char path[128];
-	if (argc > 1)
-		resolve_path(argv[1], path, sizeof(path));
-	else {
-		size_t i = 0;
-		while (cwd[i]) { path[i] = cwd[i]; i++; }
-		path[i] = '\0';
-	}
-	char out[512];
-	long n = sys_ll(path, out, sizeof(out));
-	if (n < 0) {
-		cwrite("lsl: cannot access '"); cwrite(path); cwrite("'\r\n");
-		return;
-	}
-	for (long i = 0; i < n; i++) {
-		if (out[i] == '\n') cputc('\r');
-		cputc(out[i]);
-	}
-}
+/* cmd_ls and cmd_ll moved to standalone /usr/bin/ls and (TODO)
+ * /usr/bin/ll.  The shell dispatcher's default branch executes
+ * them via execve once they're not matched by a builtin name. */
 
 static void cmd_cd(int argc, char *argv[])
 {
@@ -490,16 +450,7 @@ static void cmd_mkdir(int argc, char *argv[])
 	}
 }
 
-static void cmd_rm(int argc, char *argv[])
-{
-	if (argc < 2) { cwrite("usage: rm <path>\r\n"); return; }
-	char path[128];
-	resolve_path(argv[1], path, sizeof(path));
-	long r = sys_unlink(path);
-	if (r < 0) {
-		cwrite("rm: failed: "); cwrite(path); cwrite("\r\n");
-	}
-}
+/* cmd_rm moved to standalone /usr/bin/rm. */
 
 static void cmd_rmdir(int argc, char *argv[])
 {
@@ -1553,31 +1504,37 @@ static void cmd_kill(int argc, char *argv[])
 
 static void dispatch(char *line)
 {
-	char *argv[TOK_MAX];
+	/* +1 so we always have room for a NULL sentinel even when the
+	 * caller filled TOK_MAX slots; sys_execve walks until NULL. */
+	char *argv[TOK_MAX + 1];
 	int argc = tokenize(line, argv, TOK_MAX);
+	argv[argc] = 0;
 	if (argc == 0) return;
 
+	/* The basic file operators (ls, ll, cat, cp, mv, rm) live in
+	 * /usr/bin as standalone ELFs now; the dispatcher's default
+	 * branch executes them via execve.  Builtins kept for things
+	 * that mutate shell state (cd, pwd, open/close/read/write
+	 * around $fd, push/pop, vc) or share the editor's display
+	 * (ked/vi/kc) -- those can't usefully be separate processes
+	 * yet. */
 	if      (!ustrcmp(argv[0], "help"))   cmd_help();
 	else if (!ustrcmp(argv[0], "pid"))    cmd_pid();
 	else if (!ustrcmp(argv[0], "vc"))     cmd_vc(argc, argv);
 	else if (!ustrcmp(argv[0], "pwd"))    cmd_pwd();
 	else if (!ustrcmp(argv[0], "cd"))     cmd_cd(argc, argv);
-	else if (!ustrcmp(argv[0], "ls"))     cmd_ls(argc, argv);
-	else if (!ustrcmp(argv[0], "ll"))     cmd_ll(argc, argv);
 	else if (!ustrcmp(argv[0], "open"))   cmd_open(argc, argv);
 	else if (!ustrcmp(argv[0], "close"))  cmd_close();
 	else if (!ustrcmp(argv[0], "read"))   cmd_read(argc, argv);
 	else if (!ustrcmp(argv[0], "write"))  cmd_write(argc, argv);
 	else if (!ustrcmp(argv[0], "push"))   cmd_push(argc, argv);
 	else if (!ustrcmp(argv[0], "pop"))    cmd_pop();
-	else if (!ustrcmp(argv[0], "cat"))    cmd_cat(argc, argv);
 	else if (!ustrcmp(argv[0], "echo"))   cmd_echo(argc, argv);
 	else if (!ustrcmp(argv[0], "ked"))    cmd_ked(argc, argv);
 	else if (!ustrcmp(argv[0], "vi"))     cmd_vi(argc, argv);
 	else if (!ustrcmp(argv[0], "kc"))     cmd_kc(argc, argv);
 	else if (!ustrcmp(argv[0], "touch"))  cmd_touch(argc, argv);
 	else if (!ustrcmp(argv[0], "mkdir"))  cmd_mkdir(argc, argv);
-	else if (!ustrcmp(argv[0], "rm"))     cmd_rm(argc, argv);
 	else if (!ustrcmp(argv[0], "rmdir"))  cmd_rmdir(argc, argv);
 	else if (!ustrcmp(argv[0], "append")) cmd_append(argc, argv);
 	else if (!ustrcmp(argv[0], "spawn"))  cmd_spawn(argc, argv);
@@ -1594,7 +1551,9 @@ static void dispatch(char *line)
 		const char *n = argv[0];
 		while (*n && i + 1 < sizeof(path)) path[i++] = *n++;
 		path[i] = '\0';
-		/* pass argv so child's argv[0] = command name */
+		/* pass argv so child's argv[0] = command name; argv is
+		 * NULL-terminated at the top of dispatch() so the kernel
+		 * doesn't read past the real argument list. */
 		long tid = sys_execve(path, (const char *const *)argv);
 		if (tid < 0) {
 			cwrite(argv[0]); cwrite(": command not found\r\n");

@@ -64,3 +64,43 @@ tcpconnect_blob_end:
 ftpd_blob_start:
 	.incbin "build/cmd/ftpd.elf"
 ftpd_blob_end:
+
+	.section ".rodata.ls_blob","a",%progbits
+	.balign 8
+	.global ls_blob_start
+	.global ls_blob_end
+ls_blob_start:
+	.incbin "build/cmd/ls.elf"
+ls_blob_end:
+
+	.section ".rodata.cat_blob","a",%progbits
+	.balign 8
+	.global cat_blob_start
+	.global cat_blob_end
+cat_blob_start:
+	.incbin "build/cmd/cat.elf"
+cat_blob_end:
+
+	.section ".rodata.cp_blob","a",%progbits
+	.balign 8
+	.global cp_blob_start
+	.global cp_blob_end
+cp_blob_start:
+	.incbin "build/cmd/cp.elf"
+cp_blob_end:
+
+	.section ".rodata.mv_blob","a",%progbits
+	.balign 8
+	.global mv_blob_start
+	.global mv_blob_end
+mv_blob_start:
+	.incbin "build/cmd/mv.elf"
+mv_blob_end:
+
+	.section ".rodata.rm_blob","a",%progbits
+	.balign 8
+	.global rm_blob_start
+	.global rm_blob_end
+rm_blob_start:
+	.incbin "build/cmd/rm.elf"
+rm_blob_end:

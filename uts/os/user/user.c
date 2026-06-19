@@ -680,6 +680,16 @@ extern char tcpconnect_blob_start[];
 extern char tcpconnect_blob_end[];
 extern char ftpd_blob_start[];
 extern char ftpd_blob_end[];
+extern char ls_blob_start[];
+extern char ls_blob_end[];
+extern char cat_blob_start[];
+extern char cat_blob_end[];
+extern char cp_blob_start[];
+extern char cp_blob_end[];
+extern char mv_blob_start[];
+extern char mv_blob_end[];
+extern char rm_blob_start[];
+extern char rm_blob_end[];
 
 static struct blob_priv hello_priv;
 
@@ -753,6 +763,11 @@ void exec_space_init(void)
 		PAY("test",       test_blob_start,       test_blob_end),
 		PAY("tcpconnect", tcpconnect_blob_start, tcpconnect_blob_end),
 		PAY("ftpd",       ftpd_blob_start,       ftpd_blob_end),
+		PAY("ls",         ls_blob_start,         ls_blob_end),
+		PAY("cat",        cat_blob_start,        cat_blob_end),
+		PAY("cp",         cp_blob_start,         cp_blob_end),
+		PAY("mv",         mv_blob_start,         mv_blob_end),
+		PAY("rm",         rm_blob_start,         rm_blob_end),
 	};
 #undef PAY
 	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);
