@@ -69,15 +69,23 @@ unrecognised command.  Source lives in `cmd/`.
 | `tcpconnect <ip> <port>`| Userland TCP dial-out via SVR4 STREAMS / TPI.  See [FTPD.md](FTPD.md) step 1 for the motivation. |
 | `ftpd`                  | In-EL0 FTP server, spawned at boot by user-init-0.  Anonymous, passive-only, uploads land under `/home`. See [FTPD.md](FTPD.md). |
 | `ls [path]`             | List a directory.                                       |
+| `ll [path]`             | "ls -l": each row is `type size name`.                  |
 | `cat <path> [...]`      | Concatenate files to stdout.                            |
 | `cp <src> <dst>`        | Copy a regular file.                                    |
 | `mv <src> <dst>`        | Move/rename (copy + unlink under the hood).             |
 | `rm <path> [...]`       | Unlink regular files.                                   |
+| `head [-n N] <file>`    | Print the first N lines (default 10) of each file.      |
+| `tail [-n N] <file>`    | Print the last N lines (default 10) of each file.       |
+| `wc <file> [...]`       | Print line / word / byte counts for each file plus a totals row. |
+| `grep <pattern> <file> [...]` | Print lines containing the fixed-string pattern.  Case-sensitive; no regex. |
+| `echo <args...>`        | Print args separated by space, then a newline.  Reachable via `/usr/bin/echo` -- the bare `echo` resolves to the shell builtin (which writes to a file, different semantics). |
 
-`/usr/bin` is capped at `KFS_DIRENTS=14`; adding a new top-level
-ELF burns a kernel-image slab plus a kfs slot, so new selftests
-go into `cmd/test.c` as another entry in the registry, not a
-new ELF.
+`/usr/bin` is capped at `KFS_DIRENTS=18` per dirent block; bump
+that and `KFS_NAME_MAX` together if you need more.  The ramdisk
+itself caps at `(RAMDISK_BLOCKS - 3) / KFS_BLOCKS_PER_FILE`
+slots (currently 31).  New selftests go into `cmd/test.c` as
+another entry in its registry, not a new ELF -- the registry
+shares one slab.
 
 `test` subcommands (the registry lives in `cmd/test.c`):
 

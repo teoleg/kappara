@@ -690,6 +690,18 @@ extern char mv_blob_start[];
 extern char mv_blob_end[];
 extern char rm_blob_start[];
 extern char rm_blob_end[];
+extern char ll_blob_start[];
+extern char ll_blob_end[];
+extern char head_blob_start[];
+extern char head_blob_end[];
+extern char tail_blob_start[];
+extern char tail_blob_end[];
+extern char wc_blob_start[];
+extern char wc_blob_end[];
+extern char grep_blob_start[];
+extern char grep_blob_end[];
+extern char echo_blob_start[];
+extern char echo_blob_end[];
 
 static struct blob_priv hello_priv;
 
@@ -768,6 +780,12 @@ void exec_space_init(void)
 		PAY("cp",         cp_blob_start,         cp_blob_end),
 		PAY("mv",         mv_blob_start,         mv_blob_end),
 		PAY("rm",         rm_blob_start,         rm_blob_end),
+		PAY("ll",         ll_blob_start,         ll_blob_end),
+		PAY("head",       head_blob_start,       head_blob_end),
+		PAY("tail",       tail_blob_start,       tail_blob_end),
+		PAY("wc",         wc_blob_start,         wc_blob_end),
+		PAY("grep",       grep_blob_start,       grep_blob_end),
+		PAY("echo",       echo_blob_start,       echo_blob_end),
 	};
 #undef PAY
 	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);

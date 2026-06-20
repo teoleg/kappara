@@ -104,3 +104,51 @@ mv_blob_end:
 rm_blob_start:
 	.incbin "build/cmd/rm.elf"
 rm_blob_end:
+
+	.section ".rodata.ll_blob","a",%progbits
+	.balign 8
+	.global ll_blob_start
+	.global ll_blob_end
+ll_blob_start:
+	.incbin "build/cmd/ll.elf"
+ll_blob_end:
+
+	.section ".rodata.head_blob","a",%progbits
+	.balign 8
+	.global head_blob_start
+	.global head_blob_end
+head_blob_start:
+	.incbin "build/cmd/head.elf"
+head_blob_end:
+
+	.section ".rodata.tail_blob","a",%progbits
+	.balign 8
+	.global tail_blob_start
+	.global tail_blob_end
+tail_blob_start:
+	.incbin "build/cmd/tail.elf"
+tail_blob_end:
+
+	.section ".rodata.wc_blob","a",%progbits
+	.balign 8
+	.global wc_blob_start
+	.global wc_blob_end
+wc_blob_start:
+	.incbin "build/cmd/wc.elf"
+wc_blob_end:
+
+	.section ".rodata.grep_blob","a",%progbits
+	.balign 8
+	.global grep_blob_start
+	.global grep_blob_end
+grep_blob_start:
+	.incbin "build/cmd/grep.elf"
+grep_blob_end:
+
+	.section ".rodata.echo_blob","a",%progbits
+	.balign 8
+	.global echo_blob_start
+	.global echo_blob_end
+echo_blob_start:
+	.incbin "build/cmd/echo.elf"
+echo_blob_end:

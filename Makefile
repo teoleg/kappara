@@ -485,7 +485,8 @@ $(LIBC_A): $(LIBC_OBJS)
 
 # ---- /usr/bin standalone ELF programs --------------------------------
 CMD_BUILD  := build/cmd
-CMD_NAMES  := ps ping ifconfig netstat test tcpconnect ftpd ls cat cp mv rm
+CMD_NAMES  := ps ping ifconfig netstat test tcpconnect ftpd \
+              ls ll cat cp mv rm head tail wc grep echo
 CMD_ELFS   := $(addprefix $(CMD_BUILD)/, $(addsuffix .elf, $(CMD_NAMES)))
 
 CMD_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \

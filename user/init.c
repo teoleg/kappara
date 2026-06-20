@@ -1543,13 +1543,24 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "halt"))   cmd_halt(argc, argv);
 	else if (!ustrcmp(argv[0], "ftrace")) cmd_ftrace(argc, argv);
 	else {
-		/* Try /usr/bin/<argv[0]> */
+		/* Absolute path -> use as-is; bare name -> prepend
+		 * `/usr/bin/`.  Without this guard, typing
+		 * `/usr/bin/echo` would resolve to
+		 * `/usr/bin//usr/bin/echo`, which obviously doesn't
+		 * exist. */
 		char path[128];
-		const char *prefix = "/usr/bin/";
 		size_t i = 0;
-		while (prefix[i] && i + 1 < sizeof(path)) { path[i] = prefix[i]; i++; }
-		const char *n = argv[0];
-		while (*n && i + 1 < sizeof(path)) path[i++] = *n++;
+		if (argv[0][0] == '/') {
+			const char *n = argv[0];
+			while (*n && i + 1 < sizeof(path)) path[i++] = *n++;
+		} else {
+			const char *prefix = "/usr/bin/";
+			while (prefix[i] && i + 1 < sizeof(path)) {
+				path[i] = prefix[i]; i++;
+			}
+			const char *n = argv[0];
+			while (*n && i + 1 < sizeof(path)) path[i++] = *n++;
+		}
 		path[i] = '\0';
 		/* pass argv so child's argv[0] = command name; argv is
 		 * NULL-terminated at the top of dispatch() so the kernel

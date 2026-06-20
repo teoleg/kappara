@@ -30,7 +30,12 @@
 #include "kappara/core/printk.h"
 #include "kappara/core/string.h"
 
-#define RAMDISK_BLOCKS	1024
+/* RAMDISK_BLOCKS = 2048 blocks * 512 B = 1 MB.  Bumped from 1024
+ * once /usr/bin grew past 15 ELFs -- the kfs slot scheme reserves
+ * KFS_BLOCKS_PER_FILE = 64 blocks per file regardless of actual size,
+ * so the ceiling is (RAMDISK_BLOCKS - 3) / 64 files.  1024 blocks
+ * caps at 15; 2048 gets us to 31 with room to spare. */
+#define RAMDISK_BLOCKS	2048
 
 static unsigned char ramdisk_storage[RAMDISK_BLOCKS * BLK_SIZE];
 

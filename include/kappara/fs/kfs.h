@@ -47,8 +47,14 @@ struct kfs_super {
 	uint8_t		pad[BLK_SIZE - 8];
 };
 
-#define KFS_NAME_MAX	24
-#define KFS_DIRENTS	14		/* per directory block (36-byte slots) */
+/* Filesystem-wide name limit and per-dir-block entry cap.  Each
+ * kfs_dirent is `KFS_NAME_MAX + 12` bytes (name + start_block + size
+ * + type).  We pack as many as fit in one 512 B block, so the two
+ * constants move together: 16 / 18 give 16*18 + 12*18 = 504 B used.
+ * Bumped from the original 24 / 14 once /usr/bin grew past 14 ELFs;
+ * 16 still covers every name we ship (longest = "tcpconnect"). */
+#define KFS_NAME_MAX	16
+#define KFS_DIRENTS	18
 
 #define KFS_TYPE_FILE	0
 #define KFS_TYPE_DIR	1
