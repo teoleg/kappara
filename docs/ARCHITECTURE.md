@@ -158,6 +158,10 @@ VA              Size    Purpose
                         Grows up from EXEC_HEAP_VA, controlled by SYS_brk
 0x30000000      1 MB    ld-kappara.so  (LD_VA, ET_EXEC bootstrap loader,
                         DYNAMIC.md stage 5 -- only mapped for ET_DYN apps)
+0x38000000      2 MB    libc.so        (LIBC_VA, ET_DYN shared C library,
+                        DYNAMIC.md stage 6 -- only mapped for ET_DYN apps.
+                        Inside the first 1 GB so it fits the vm_map's
+                        single L2; 0x40000000+ is the peripheral block.)
 ```
 
 R6: each exec'd process owns its own vm_map (L0/L1/L2/L3 page

@@ -96,4 +96,16 @@ typedef struct {
 	int64_t  r_addend;
 } Elf64_Rela;
 
+/* Sym: dynamic symbol table entry.  For our cross-DSO resolver we
+ * only read st_name (string-table offset), st_value (image VA), and
+ * st_shndx (zero == SHN_UNDEF = imported, skip). */
+typedef struct {
+	uint32_t st_name;
+	uint8_t  st_info;
+	uint8_t  st_other;
+	uint16_t st_shndx;
+	uint64_t st_value;
+	uint64_t st_size;
+} Elf64_Sym;
+
 #endif

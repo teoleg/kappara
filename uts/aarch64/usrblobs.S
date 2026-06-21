@@ -171,3 +171,15 @@ uptime_blob_end:
 ld_kappara_blob_start:
 	.incbin "build/ld-kappara/ld-kappara.so"
 ld_kappara_blob_end:
+
+/* libc.so -- stage 6 shared C library.  Same blob shape as
+ * ld-kappara.so; kernel reads via libc_so_blob_{start,end} during
+ * exec, loads at LIBC_VA, applies its RELATIVE relocs, and resolves
+ * cmd binaries' GLOB_DAT / JUMP_SLOT entries against its dynsym. */
+	.section ".rodata.libc_so_blob","a",%progbits
+	.balign 8
+	.global libc_so_blob_start
+	.global libc_so_blob_end
+libc_so_blob_start:
+	.incbin "build/cmd/libc/libc.so"
+libc_so_blob_end:

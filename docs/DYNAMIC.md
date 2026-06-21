@@ -241,19 +241,54 @@ unrelated), `/bin/hello` still loads via the ET_EXEC path.
 
 ### Stage 6 -- Convert libc to `libc.so`
 
-Status: `[ ]`
+Status: `[x]`
 
-What changes: `LIBC` builds as a shared object (`-shared`, with a
-proper SONAME), gets registered as `/lib/libc.so` via the same
-`vfs_mknod_regfile` path /bin uses today.  cmd binaries link
-against the shared object (`-l:libc.so`) instead of `libc.a`;
-every binary now ships with a `DT_NEEDED libc.so` entry.
+What landed:
 
-What we get: each cmd binary shrinks by ~10 KB (no per-binary
-copy of printf).  More importantly, the dynamic-linking pipeline
-is fully exercised.
+- **libc.so build**: `LIBC_SO` target in `Makefile` links the same
+  `-fPIC` `.o` files (from stage 2) with `-shared -nostdlib -soname
+  libc.so -Bsymbolic`.  `-Bsymbolic` is crucial: without it every
+  libc-internal call (printf → vsnprintf, etc.) emits a JUMP_SLOT
+  pointing back at libc itself, which the kernel-side resolver
+  would have to handle.
+- **cmd binaries DT_NEEDED libc.so**: link line drops `-static`,
+  switches to `-l:libc.so` against the freshly-built shared
+  object, keeps `--no-dynamic-linker` (we always use
+  ld-kappara.so).  Each cmd carries a `DT_NEEDED libc.so` entry.
+- **Kernel loads libc.so**: new `LIBC_VA = 0x38000000` (kept INSIDE
+  the first 1 GB -- the vm_map's single L2 table covers
+  [0, 1 GB) only; 0x40000000+ is the peripheral block, writes there
+  silently land on MMIO).  Loader maps libc.so's PT_LOADs at
+  `LIBC_VA + p_vaddr` and applies its own RELATIVE relocs.
+- **Cross-DSO resolution**: new helpers `walk_dynamic`,
+  `image_to_ptr`, `resolve_in_libc`, `resolve_xdso_relocs`.  For
+  each `GLOB_DAT` / `JUMP_SLOT` in the app's `.rela.dyn` /
+  `.rela.plt`, look up the symbol name in libc.so's `dynsym`,
+  write `LIBC_VA + sym.st_value` at `app_base + r_offset`.  Linear
+  scan over libc.so's symtab (capped at 256 entries -- we ship ~70).
+- **fork() updated**: clones the LD_VA + LIBC_VA windows alongside
+  EXEC/STACK/HEAP, and accepts `parent_tf->elr` in either the
+  EXEC or LIBC window (a libc-wrapped syscall's ELR sits in libc).
+- **VFS registration**: `/lib/libc.so` and `/lib/ld-kappara.so`
+  are now visible regular files (blob-backed); `cat /lib/libc.so`
+  works.  Required by the doc and lays groundwork for stage 7
+  dlopen's name-to-blob path.
 
-Test: `smoke-ftp PASS`, binary sizes shrink visibly.
+Architectural choice: cross-DSO resolution stays in the kernel
+for stage 6 (smaller diff, ld.so stays a pass-through).  Stage 7
+will move both the symbol lookup and the relocation application
+into ld-kappara.so user-space alongside dlopen.
+
+Binary size impact:
+
+    pre-libc.so:  ifconfig.elf=9568, test.elf=22072, ftpd.elf=13664
+    post:         ifconfig.elf=5320, test.elf=18184, ftpd.elf=9512
+                  + libc.so=21720 shared
+
+Each cmd binary shrinks by 4-5 KB (no embedded printf / malloc).
+
+Verified: `cmd/test all` 13/13, `make ARCH=virt smoke-ftp` 4/5
+PASS (within noise), `/bin/hello` ET_EXEC unchanged.
 
 ### Stage 7 -- `dlopen` / `dlsym`
 

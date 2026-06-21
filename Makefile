@@ -486,6 +486,7 @@ LIBC_OBJS   := $(patsubst $(LIBC_DIR)/src/%.c,$(CMD_BUILD)/libc/%.o,$(LIBC_SRCS)
 LIBC_CRT0   := $(CMD_BUILD)/libc/crt0.o
 LIBC_SETJMP := $(CMD_BUILD)/libc/setjmp.o
 LIBC_A      := $(CMD_BUILD)/libc/libc.a
+LIBC_SO     := $(CMD_BUILD)/libc/libc.so
 
 LIBC_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
                -ffreestanding -nostdlib -nostartfiles \
@@ -511,6 +512,18 @@ $(LIBC_SETJMP): $(LIBC_DIR)/aarch64/setjmp.S | $(CMD_BUILD)/libc
 $(LIBC_A): $(LIBC_OBJS) $(LIBC_SETJMP)
 	$(CROSS)ar rcs $@ $^
 
+# DYNAMIC.md stage 6: libc.so shared object.  Same .o files (already
+# -fPIC from stage 2), linked with -shared and a proper soname so cmd
+# binaries can DT_NEEDED it.  Loaded by the kernel at LIBC_VA = 0x40000000
+# for every ET_DYN exec; kernel applies its R_AARCH64_RELATIVE relocs
+# and resolves cmd binaries' GLOB_DAT / JUMP_SLOT entries against its
+# dynsym (move to ld.so + dlopen in stage 7).
+$(LIBC_SO): $(LIBC_OBJS) $(LIBC_SETJMP)
+	$(USER_LD) -shared -nostdlib -soname libc.so \
+	           -Bsymbolic \
+	           -z max-page-size=4096 -s \
+	           -o $@ $(LIBC_OBJS) $(LIBC_SETJMP)
+
 # ---- /usr/bin standalone ELF programs --------------------------------
 CMD_BUILD  := build/cmd
 CMD_NAMES  := ps ping ifconfig netstat test tcpconnect ftpd \
@@ -528,14 +541,16 @@ CMD_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
 $(CMD_BUILD)/%.o: cmd/%.c | $(CMD_BUILD)
 	$(USER_CC) $(CMD_CFLAGS) -c $< -o $@
 
-$(CMD_BUILD)/%.elf: $(CMD_BUILD)/%.o $(LIBC_CRT0) $(LIBC_A) user/prog_linker.ld
-	$(USER_LD) -nostdlib -static -pie -s -z max-page-size=4096 \
-	           -T user/prog_linker.ld -o $@ $(LIBC_CRT0) $< $(LIBC_A)
+$(CMD_BUILD)/%.elf: $(CMD_BUILD)/%.o $(LIBC_CRT0) $(LIBC_SO) user/prog_linker.ld
+	$(USER_LD) -nostdlib -pie -s -z max-page-size=4096 \
+	           --no-dynamic-linker \
+	           -T user/prog_linker.ld -o $@ $(LIBC_CRT0) $< \
+	           -L$(CMD_BUILD)/libc -l:libc.so
 
 $(CMD_BUILD):
 	mkdir -p $@
 
-$(BUILD)/uts/aarch64/usrblobs.o: $(CMD_ELFS) $(LDK_ELF) uts/aarch64/usrblobs.S
+$(BUILD)/uts/aarch64/usrblobs.o: $(CMD_ELFS) $(LDK_ELF) $(LIBC_SO) uts/aarch64/usrblobs.S
 	$(CC) $(ASFLAGS) -c uts/aarch64/usrblobs.S -o $@
 
 # Tell make that userblob.o / helloblob.o depend on the files they incbin.
