@@ -183,3 +183,14 @@ ld_kappara_blob_end:
 libc_so_blob_start:
 	.incbin "build/cmd/libc/libc.so"
 libc_so_blob_end:
+
+/* libdltest.so -- stage 7 dlopen smoke test target.  Tiny self-
+ * contained ET_DYN with no DT_NEEDED.  Registered at /lib/libdltest.so;
+ * the dlopen syscall reads it via vfs and loads at DLOPEN_VA. */
+	.section ".rodata.libdltest_blob","a",%progbits
+	.balign 8
+	.global libdltest_blob_start
+	.global libdltest_blob_end
+libdltest_blob_start:
+	.incbin "build/dltest/libdltest.so"
+libdltest_blob_end:

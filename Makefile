@@ -481,7 +481,8 @@ LIBC_SRCS   := $(LIBC_DIR)/src/string.c \
                $(LIBC_DIR)/src/file.c    \
                $(LIBC_DIR)/src/ctype.c   \
                $(LIBC_DIR)/src/errno.c   \
-               $(LIBC_DIR)/src/time.c
+               $(LIBC_DIR)/src/time.c    \
+               $(LIBC_DIR)/src/dlfcn.c
 LIBC_OBJS   := $(patsubst $(LIBC_DIR)/src/%.c,$(CMD_BUILD)/libc/%.o,$(LIBC_SRCS))
 LIBC_CRT0   := $(CMD_BUILD)/libc/crt0.o
 LIBC_SETJMP := $(CMD_BUILD)/libc/setjmp.o
@@ -524,6 +525,28 @@ $(LIBC_SO): $(LIBC_OBJS) $(LIBC_SETJMP)
 	           -z max-page-size=4096 -s \
 	           -o $@ $(LIBC_OBJS) $(LIBC_SETJMP)
 
+# DYNAMIC.md stage 7: tiny self-contained shared object for testing
+# dlopen / dlsym end-to-end.  No DT_NEEDED, just two exported functions
+# and one RELATIVE-relocated string pointer.
+DLTEST_BUILD := build/dltest
+DLTEST_SO    := $(DLTEST_BUILD)/libdltest.so
+
+$(DLTEST_BUILD):
+	mkdir -p $@
+
+$(DLTEST_BUILD)/dltest.o: lib/libdltest/dltest.c | $(DLTEST_BUILD)
+	$(USER_CC) -Wall -Wextra -Werror -std=gnu11 \
+	           -ffreestanding -nostdlib -nostartfiles \
+	           -fno-stack-protector -fPIC \
+	           -mcpu=cortex-a53 -mgeneral-regs-only \
+	           -O2 -g \
+	           -c $< -o $@
+
+$(DLTEST_SO): $(DLTEST_BUILD)/dltest.o
+	$(USER_LD) -shared -nostdlib -soname libdltest.so \
+	           -z max-page-size=4096 -s \
+	           -o $@ $<
+
 # ---- /usr/bin standalone ELF programs --------------------------------
 CMD_BUILD  := build/cmd
 CMD_NAMES  := ps ping ifconfig netstat test tcpconnect ftpd \
@@ -550,7 +573,7 @@ $(CMD_BUILD)/%.elf: $(CMD_BUILD)/%.o $(LIBC_CRT0) $(LIBC_SO) user/prog_linker.ld
 $(CMD_BUILD):
 	mkdir -p $@
 
-$(BUILD)/uts/aarch64/usrblobs.o: $(CMD_ELFS) $(LDK_ELF) $(LIBC_SO) uts/aarch64/usrblobs.S
+$(BUILD)/uts/aarch64/usrblobs.o: $(CMD_ELFS) $(LDK_ELF) $(LIBC_SO) $(DLTEST_SO) uts/aarch64/usrblobs.S
 	$(CC) $(ASFLAGS) -c uts/aarch64/usrblobs.S -o $@
 
 # Tell make that userblob.o / helloblob.o depend on the files they incbin.

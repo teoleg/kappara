@@ -273,6 +273,13 @@ void user_spawn(void)
 #define LIBC_VA        0x38000000UL
 #define LIBC_SIZE      0x00200000UL	/* 2 MB ceiling for libc.so */
 
+/* DYNAMIC.md stage 7: runtime-loaded shared objects (dlopen).  Single
+ * slot per process for now; if a future caller needs to dlopen
+ * multiple .so files, allocate slots in DLOPEN_VA..DLOPEN_VA+DLOPEN_SIZE.
+ * Inside the first 1 GB (same reason as LIBC_VA). */
+#define DLOPEN_VA      0x39000000UL
+#define DLOPEN_SIZE    0x00200000UL	/* 2 MB ceiling */
+
 /* SPAWN_STACK_SIZE is defined near the top of the file. */
 #define SPAWN_MAX		((USER_SIZE / SPAWN_STACK_SIZE) - 1)
 
@@ -567,10 +574,24 @@ long sys_fork_impl(struct trap_frame *parent_tf)
 	     * windows.  fork_clone_pages walks every mapped page in the
 	     * range and skips holes, so unused tail pages cost nothing. */
 	    fork_clone_pages(cvm, pvm, LD_VA, LD_VA + LD_SIZE) < 0 ||
-	    fork_clone_pages(cvm, pvm, LIBC_VA, LIBC_VA + LIBC_SIZE) < 0) {
+	    fork_clone_pages(cvm, pvm, LIBC_VA, LIBC_VA + LIBC_SIZE) < 0 ||
+	    /* DYNAMIC.md stage 7: clone the dlopen window too if anything's
+	     * loaded.  fork_clone_pages skips unmapped pages so the cost
+	     * is zero for processes that don't dlopen. */
+	    fork_clone_pages(cvm, pvm, DLOPEN_VA, DLOPEN_VA + DLOPEN_SIZE) < 0) {
 		kprintf("fork: PMM exhausted during page clone\n");
 		vm_map_put(cvm);	/* destroy frees the partial mappings */
 		return -1;
+	}
+
+	/* Inherit the dlopen handle so the child can dlsym the same .so
+	 * without re-dlopen'ing. */
+	cvm->dlopen_base = pvm->dlopen_base;
+	{
+		unsigned i = 0;
+		for (; i + 1 < sizeof(cvm->dlopen_path) && pvm->dlopen_path[i]; i++)
+			cvm->dlopen_path[i] = pvm->dlopen_path[i];
+		cvm->dlopen_path[i] = '\0';
 	}
 
 	cvm->heap_brk   = pvm->heap_brk;
@@ -751,6 +772,10 @@ extern char ld_kappara_blob_end[];
 extern char libc_so_blob_start[];
 extern char libc_so_blob_end[];
 
+/* DYNAMIC.md stage 7: tiny test .so for dlopen end-to-end coverage. */
+extern char libdltest_blob_start[];
+extern char libdltest_blob_end[];
+
 static struct blob_priv hello_priv;
 
 void exec_space_init(void)
@@ -807,13 +832,17 @@ void exec_space_init(void)
 	{
 		static struct blob_priv libc_so_priv;
 		static struct blob_priv ld_so_priv;
+		static struct blob_priv dltest_so_priv;
 		libc_so_priv.data = (const unsigned char *)libc_so_blob_start;
 		libc_so_priv.size = (size_t)(libc_so_blob_end - libc_so_blob_start);
 		ld_so_priv.data   = (const unsigned char *)ld_kappara_blob_start;
 		ld_so_priv.size   = (size_t)(ld_kappara_blob_end - ld_kappara_blob_start);
+		dltest_so_priv.data = (const unsigned char *)libdltest_blob_start;
+		dltest_so_priv.size = (size_t)(libdltest_blob_end - libdltest_blob_start);
 		struct dentry *lib = vfs_mkdir(vfs_root(), "lib");
 		vfs_mknod_regfile(lib, "libc.so", &blob_fops, &libc_so_priv);
 		vfs_mknod_regfile(lib, "ld-kappara.so", &blob_fops, &ld_so_priv);
+		vfs_mknod_regfile(lib, "libdltest.so", &blob_fops, &dltest_so_priv);
 	}
 
 	/*
@@ -941,6 +970,12 @@ static void exec_thread_main(void *p)
  * Static so it lives in BSS rather than on the kernel stack.
  */
 static unsigned char elf_read_buf[256 * 1024];
+
+/* DYNAMIC.md stage 7: separate read buffer for dlopen so it doesn't
+ * race with execve.  64 KB is enough for our largest .so today
+ * (libc.so at ~22 KB). */
+static unsigned char dlopen_read_buf[64 * 1024];
+static spinlock_t dlopen_buf_lock;
 
 /*
  * DYNAMIC.md stage 5: load a static ET_EXEC ELF (today only ld-kappara.so)
@@ -1603,4 +1638,167 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 
 	kthread_dispatch(t);
 	return (long)t->tid;
+}
+
+/* ---- DYNAMIC.md stage 7: dlopen / dlsym -------------------------- */
+
+/* Shared by dlopen and dlsym: read the shared object into
+ * dlopen_read_buf and return its size, or -1.  Holds dlopen_buf_lock
+ * for the duration; caller must release.  Path comes pre-copied from
+ * user space (kernel pointer). */
+static long dlopen_read(const char *path)
+{
+	long sz = read_file_kernel(path, dlopen_read_buf,
+				    sizeof(dlopen_read_buf));
+	if (sz < (long)sizeof(Elf64_Ehdr)) {
+		kprintf("dlopen: read '%s' failed (%ld bytes)\n", path, sz);
+		return -1;
+	}
+	const Elf64_Ehdr *eh = (const Elf64_Ehdr *)dlopen_read_buf;
+	if (eh->e_ident[EI_MAG0] != 0x7f ||
+	    eh->e_ident[EI_MAG1] != 'E'  ||
+	    eh->e_ident[EI_MAG2] != 'L'  ||
+	    eh->e_ident[EI_MAG3] != 'F'  ||
+	    eh->e_ident[EI_CLASS] != 2  ||
+	    eh->e_ident[EI_DATA]  != 1  ||
+	    eh->e_machine != EM_AARCH64 ||
+	    eh->e_type != ET_DYN) {
+		kprintf("dlopen: '%s' not an AArch64 ET_DYN ELF\n", path);
+		return -1;
+	}
+	return sz;
+}
+
+uint64_t sys_dlopen_impl(const char *path)
+{
+	struct kthread *t = curthread;
+	if (!t || !t->t_proc || !t->t_proc->vm) return 0;
+	struct vm_map *vm = t->t_proc->vm;
+	if (vm->heap_brk == 0) return 0;	/* not exec'd */
+
+	/* Cached-handle fast path: same path -> same base. */
+	if (vm->dlopen_base != 0 &&
+	    kstrcmp(vm->dlopen_path, path) == 0)
+		return vm->dlopen_base;
+	if (vm->dlopen_base != 0) {
+		kprintf("dlopen: only one .so per process for now\n");
+		return 0;
+	}
+
+	unsigned long flags = spin_lock_irq_save(&dlopen_buf_lock);
+
+	if (dlopen_read(path) < 0) {
+		spin_unlock_irq_restore(&dlopen_buf_lock, flags);
+		return 0;
+	}
+
+	const Elf64_Ehdr *eh = (const Elf64_Ehdr *)dlopen_read_buf;
+	const uint64_t load_base = DLOPEN_VA;
+
+	/* Load PT_LOADs at p_vaddr + load_base. */
+	for (unsigned i = 0; i < eh->e_phnum; i++) {
+		const Elf64_Phdr *ph = (const Elf64_Phdr *)(dlopen_read_buf +
+				 eh->e_phoff + (uint64_t)i * eh->e_phentsize);
+		if (ph->p_type != PT_LOAD) continue;
+		uint64_t va = ph->p_vaddr + load_base;
+		if (va < DLOPEN_VA ||
+		    va + ph->p_memsz > DLOPEN_VA + DLOPEN_SIZE) {
+			kprintf("dlopen: LOAD outside window\n");
+			spin_unlock_irq_restore(&dlopen_buf_lock, flags);
+			return 0;
+		}
+		uint64_t seg_start = va & ~(uint64_t)PAGE_MASK;
+		uint64_t seg_end   = (va + ph->p_memsz + PAGE_SIZE - 1)
+		                     & ~(uint64_t)PAGE_MASK;
+		unsigned n_pages   = (unsigned)((seg_end - seg_start) / PAGE_SIZE);
+		if (vmap_alloc_pages(vm, seg_start, n_pages, 1) < 0) {
+			kprintf("dlopen: PMM exhausted\n");
+			spin_unlock_irq_restore(&dlopen_buf_lock, flags);
+			return 0;
+		}
+		if (ph->p_filesz > 0) {
+			if (vmap_copyin(vm, va, dlopen_read_buf + ph->p_offset,
+			                ph->p_filesz) < 0) {
+				spin_unlock_irq_restore(&dlopen_buf_lock, flags);
+				return 0;
+			}
+		}
+	}
+
+	/* Apply this .so's RELATIVE relocations.  Cross-DSO (GLOB_DAT /
+	 * JUMP_SLOT against libc.so) is not yet supported for dlopen'd
+	 * objects -- stage 7 minimum is self-contained .so files. */
+	struct dyn_info dyn = {0};
+	if (walk_dynamic(dlopen_read_buf, eh, &dyn) == 0 && dyn.rela_size > 0) {
+		const Elf64_Rela *relas = image_to_ptr(dlopen_read_buf, eh,
+						       dyn.rela_off);
+		if (relas) {
+			unsigned n = (unsigned)(dyn.rela_size / sizeof(Elf64_Rela));
+			(void)apply_relative_relocs(vm, load_base, relas, n);
+		}
+	}
+
+	/* D-cache flush + I-cache invalidate for the new code pages. */
+	__asm__ volatile (
+		"dsb  ish\n"
+		"ic   iallu\n"
+		"dsb  ish\n"
+		"isb\n"
+		::: "memory");
+
+	vm->dlopen_base = load_base;
+	/* Copy path into the embedded buffer; the caller's kpath[] is on
+	 * the kernel stack and won't survive past the syscall return. */
+	{
+		unsigned i = 0;
+		for (; i + 1 < sizeof(vm->dlopen_path) && path[i]; i++)
+			vm->dlopen_path[i] = path[i];
+		vm->dlopen_path[i] = '\0';
+	}
+
+	spin_unlock_irq_restore(&dlopen_buf_lock, flags);
+	return load_base;
+}
+
+uint64_t sys_dlsym_impl(uint64_t handle, const char *name)
+{
+	struct kthread *t = curthread;
+	if (!t || !t->t_proc || !t->t_proc->vm) return 0;
+	struct vm_map *vm = t->t_proc->vm;
+	if (handle == 0 || handle != vm->dlopen_base) return 0;
+	if (vm->dlopen_path[0] == '\0') return 0;
+
+	unsigned long flags = spin_lock_irq_save(&dlopen_buf_lock);
+
+	if (dlopen_read(vm->dlopen_path) < 0) {
+		spin_unlock_irq_restore(&dlopen_buf_lock, flags);
+		return 0;
+	}
+
+	const Elf64_Ehdr *eh = (const Elf64_Ehdr *)dlopen_read_buf;
+	struct dyn_info dyn = {0};
+	if (walk_dynamic(dlopen_read_buf, eh, &dyn) < 0) {
+		spin_unlock_irq_restore(&dlopen_buf_lock, flags);
+		return 0;
+	}
+
+	const Elf64_Sym *symtab = image_to_ptr(dlopen_read_buf, eh,
+					       dyn.symtab_off);
+	const unsigned char *strtab = image_to_ptr(dlopen_read_buf, eh,
+						   dyn.strtab_off);
+	uint64_t resolved = 0;
+	if (symtab && strtab) {
+		for (unsigned i = 0; i < 256; i++) {
+			const Elf64_Sym *s = &symtab[i];
+			if (s->st_name == 0) continue;
+			if (s->st_shndx == 0) continue;	/* SHN_UNDEF */
+			if (sym_name_eq(strtab, s->st_name, name)) {
+				resolved = handle + s->st_value;
+				break;
+			}
+		}
+	}
+
+	spin_unlock_irq_restore(&dlopen_buf_lock, flags);
+	return resolved;
 }

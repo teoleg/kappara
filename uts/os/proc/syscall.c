@@ -448,6 +448,35 @@ static long sys_clock_gettime(long a0, long a1, long a2,
 	return 0;
 }
 
+/* DYNAMIC.md stage 7: dlopen/dlsym dispatch.  Both wrappers pull the
+ * path (or symbol name) string from userland via strncpy_from_user and
+ * hand off to sys_dlopen_impl / sys_dlsym_impl in user.c. */
+static long sys_dlopen(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	char kpath[128];
+	const char *path = (const char *)(uintptr_t)a0;
+	if (syscall_from_user) {
+		if (strncpy_from_user(kpath, path, sizeof(kpath)) < 0)
+			return 0;
+		path = kpath;
+	}
+	return (long)sys_dlopen_impl(path);
+}
+
+static long sys_dlsym(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	char kname[64];
+	const char *name = (const char *)(uintptr_t)a1;
+	if (syscall_from_user) {
+		if (strncpy_from_user(kname, name, sizeof(kname)) < 0)
+			return 0;
+		name = kname;
+	}
+	return (long)sys_dlsym_impl((uint64_t)a0, name);
+}
+
 static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_log]    = sys_log,
 	[SYS_getpid] = sys_getpid,
@@ -483,6 +512,8 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_tcgetpgrp]   = sys_tcgetpgrp,
 	[SYS_brk]         = sys_brk,
 	[SYS_clock_gettime] = sys_clock_gettime,
+	[SYS_dlopen]      = sys_dlopen,
+	[SYS_dlsym]       = sys_dlsym,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

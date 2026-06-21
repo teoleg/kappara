@@ -16,6 +16,7 @@
  * progress; main() prints a one-line summary.
  */
 
+#include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -743,6 +744,38 @@ fail:
 
 struct test_entry { const char *name; int (*fn)(void); };
 
+/* DYNAMIC.md stage 7: dlopen/dlsym round-trip.
+ *
+ * Loads /lib/libdltest.so (a tiny self-contained .so shipped in the
+ * kernel image), resolves "dltest_answer" + "dltest_get_label",
+ * calls them, checks both that the function returned 42 and that
+ * the string pointer (which goes through R_AARCH64_RELATIVE) matches
+ * "dltest". */
+static int test_dl(void)
+{
+	void *h = dlopen("/lib/libdltest.so", 0);
+	if (!h) { puts("dl: dlopen failed"); return 1; }
+
+	int (*answer)(void) = (int (*)(void))dlsym(h, "dltest_answer");
+	if (!answer) { puts("dl: dlsym dltest_answer failed"); return 1; }
+	int r = answer();
+	if (r != 42) { printf("dl: answer returned %d, want 42\n", r); return 1; }
+
+	const char *(*get_label)(void) =
+		(const char *(*)(void))dlsym(h, "dltest_get_label");
+	if (!get_label) { puts("dl: dlsym dltest_get_label failed"); return 1; }
+	const char *label = get_label();
+	if (!label || strcmp(label, "dltest") != 0) {
+		printf("dl: get_label returned '%s', want 'dltest'\n",
+		       label ? label : "(null)");
+		return 1;
+	}
+
+	printf("dl: dlopen/dlsym round-trip OK (handle=%p answer=%d label=%s)\n",
+	       h, r, label);
+	return 0;
+}
+
 static const struct test_entry tests[] = {
 	{ "fork",     test_fork },
 	{ "wait",     test_wait },
@@ -757,6 +790,7 @@ static const struct test_entry tests[] = {
 	{ "tcp",      test_tcp },
 	{ "tcpmulti", test_tcpmulti },
 	{ "tcpbig",   test_tcpbig },
+	{ "dl",       test_dl },
 };
 
 #define N_TESTS (sizeof(tests) / sizeof(tests[0]))

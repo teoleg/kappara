@@ -106,6 +106,7 @@ shares one slab.
 | `tcp`          | TPI smoke test for `/dev/tcp`: 3-fd flow (listener / client / responder), 3-way handshake, bidirectional data, graceful close. |
 | `tcpmulti`     | multi-accept proof: two clients connect to one listener, listener stays in LISTEN, both accepted onto separate responder fds, cross-traffic verified. |
 | `tcpbig`       | RFC 5681 slow-start proof: ship 2000 bytes from C to R (well over IW=2*MSS), drain on the receiver until everything arrives intact.  Exercises MSS segmentation + cwnd growth across multiple RTTs. |
+| `dl`           | DYNAMIC.md stage 7 smoke: dlopen `/lib/libdltest.so`, resolve `dltest_answer` + `dltest_get_label`, check `answer == 42` and the RELATIVE-relocated string pointer reads "dltest". |
 
 The `crash` shell builtin is unchanged: `crash` from the shell prompt
 derefs NULL directly and the EL0 fault path SIGSEGVs the calling

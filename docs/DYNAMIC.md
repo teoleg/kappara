@@ -292,11 +292,69 @@ PASS (within noise), `/bin/hello` ET_EXEC unchanged.
 
 ### Stage 7 -- `dlopen` / `dlsym`
 
-Status: `[ ]` (optional)
+Status: `[x]`
 
-User-space wrappers around the linker's "load this .so" path.
-Useful for FTP-uploading new modules and loading them at
-runtime without re-execve.  Wait until 1-6 are solid.
+Runtime shared-object loading via two new syscalls
+(`SYS_dlopen=36`, `SYS_dlsym=37`).  User-space wrappers in
+`<dlfcn.h>` / `lib/libc/src/dlfcn.c`; new VA window
+`DLOPEN_VA = 0x39000000` (2 MB) for the loaded object.
+
+Today the kernel does the actual loading; ld-kappara.so is still a
+pass-through.  Moving the loader and reloc walk into ld.so user
+space is the next refinement (and the prerequisite for nested
+DT_NEEDED chains), but the syscall path lets us ship dlopen
+end-to-end without it.
+
+What landed:
+
+- `SYS_dlopen(const char *path)`: reads the file via
+  `read_file_kernel` into a dedicated `dlopen_read_buf` (lock-
+  protected so multiple processes can dlopen in parallel),
+  validates ET_DYN + EM_AARCH64, allocates PT_LOAD pages at
+  `DLOPEN_VA + p_vaddr`, applies R_AARCH64_RELATIVE relocs.
+  Returns the load base or 0.
+
+- `SYS_dlsym(handle, const char *name)`: re-reads the file (path
+  cached on `vm_map->dlopen_path[]`), walks dynsym for `name`,
+  returns `handle + sym.st_value` or 0.
+
+- libc dlfcn.c provides `dlopen` / `dlsym` plus stub
+  `dlclose` / `dlerror` for source compatibility.
+
+- `vm_map` gained `dlopen_base` (handle) and `dlopen_path[128]`
+  (embedded buffer; the kernel-stack `kpath[]` from the syscall
+  wrapper wouldn't survive past return).  `fork()` clones the
+  DLOPEN_VA window and inherits both fields so the child can
+  `dlsym` the parent's handle.
+
+- One shared object per process for now.  A second dlopen with a
+  different path returns 0 (`"only one .so per process"`); same
+  path returns the cached handle.  Multi-slot allocation will
+  come with stage 7b if/when something needs it.
+
+- `lib/libdltest/dltest.c` -- a tiny self-contained .so (no
+  DT_NEEDED) with `dltest_answer()` returning 42 and
+  `dltest_get_label()` returning a string-table pointer (which
+  exercises the RELATIVE reloc on dlopen).  Registered at
+  `/lib/libdltest.so`.
+
+- New `cmd/test all` entry `dl`: dlopens `/lib/libdltest.so`,
+  resolves both symbols, calls them, checks `answer == 42` and
+  `strcmp(label, "dltest") == 0`.
+
+Limitations (deferred to stage 8 / open questions):
+
+- Dlopen'd objects can't `DT_NEEDED libc.so` -- cross-DSO
+  resolution for runtime-loaded modules would need either the
+  kernel to walk libc.so's dynsym again (easy) or ld.so to take
+  over the whole dynamic-linking pipeline (the eventual goal).
+- No `dlclose`: the mapped pages live until the process exits.
+- No `dlerror`: dlopen/dlsym just return NULL on failure.
+- Single slot per process; the cache key is the full path string,
+  no SONAME-based dedup.
+
+Verified: `cmd/test all` 14/14 (the new `dl` test passes), boot
+unchanged, `make ARCH=virt smoke-ftp` 5/5 PASS.
 
 ## Open questions
 

@@ -162,6 +162,9 @@ VA              Size    Purpose
                         DYNAMIC.md stage 6 -- only mapped for ET_DYN apps.
                         Inside the first 1 GB so it fits the vm_map's
                         single L2; 0x40000000+ is the peripheral block.)
+0x39000000      2 MB    dlopen slot    (DLOPEN_VA, DYNAMIC.md stage 7 --
+                        SYS_dlopen maps a runtime-loaded .so here, one
+                        slot per process.)
 ```
 
 R6: each exec'd process owns its own vm_map (L0/L1/L2/L3 page

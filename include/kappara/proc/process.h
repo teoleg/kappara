@@ -58,6 +58,13 @@ struct vm_map {
 	unsigned  spawn_next;
 	int       refs;		/* threads sharing this map */
 	spinlock_t lock;
+	/* DYNAMIC.md stage 7: dlopen state.  Single shared object slot
+	 * per process for now; if a caller dlopen's the same path twice
+	 * we return the cached handle.  0 means nothing loaded.
+	 * dlopen_path is an embedded buffer because syscall wrappers'
+	 * stack-local kpath[] copies wouldn't survive past return. */
+	uint64_t  dlopen_base;
+	char      dlopen_path[128];
 };
 
 struct process {
