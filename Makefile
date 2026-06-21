@@ -443,8 +443,8 @@ HELLO_ELF := $(USER_BUILD)/hello.elf
 $(USER_BUILD)/hello.o: user/hello.c user/syscall.h | $(USER_BUILD)
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
-$(HELLO_ELF): $(USER_BUILD)/hello.o user/prog_linker.ld
-	$(USER_LD) -nostdlib -static -s -z max-page-size=4096 -T user/prog_linker.ld -o $@ $<
+$(HELLO_ELF): $(USER_BUILD)/hello.o user/hello_linker.ld
+	$(USER_LD) -nostdlib -static -s -z max-page-size=4096 -T user/hello_linker.ld -o $@ $<
 
 $(USER_BUILD):
 	mkdir -p $@
@@ -499,7 +499,7 @@ CMD_ELFS   := $(addprefix $(CMD_BUILD)/, $(addsuffix .elf, $(CMD_NAMES)))
 
 CMD_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
               -ffreestanding -nostdlib -nostartfiles \
-              -fno-stack-protector -fno-pie -fno-pic \
+              -fno-stack-protector -fPIE \
               -mcpu=cortex-a53 -mgeneral-regs-only \
               -O2 -g \
               -I$(LIBC_DIR)/include \
@@ -509,7 +509,7 @@ $(CMD_BUILD)/%.o: cmd/%.c | $(CMD_BUILD)
 	$(USER_CC) $(CMD_CFLAGS) -c $< -o $@
 
 $(CMD_BUILD)/%.elf: $(CMD_BUILD)/%.o $(LIBC_CRT0) $(LIBC_A) user/prog_linker.ld
-	$(USER_LD) -nostdlib -static -s -z max-page-size=4096 \
+	$(USER_LD) -nostdlib -static -pie -s -z max-page-size=4096 \
 	           -T user/prog_linker.ld -o $@ $(LIBC_CRT0) $< $(LIBC_A)
 
 $(CMD_BUILD):

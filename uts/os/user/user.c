@@ -899,12 +899,23 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 	if (eh->e_ident[EI_CLASS] != 2 || /* ELF64 */
 	    eh->e_ident[EI_DATA]  != 1 || /* LE    */
 	    eh->e_machine != EM_AARCH64 ||
-	    eh->e_type    != ET_EXEC) {
-		kprintf("execve: not an AArch64 ET_EXEC ELF\n"); return -1;
+	    (eh->e_type != ET_EXEC && eh->e_type != ET_DYN)) {
+		kprintf("execve: not an AArch64 ET_EXEC/ET_DYN ELF\n"); return -1;
 	}
 	if (eh->e_phoff == 0 || eh->e_phnum == 0) {
 		kprintf("execve: no program headers\n"); return -1;
 	}
+
+	/* DYNAMIC.md stage 3+4: ET_DYN binaries (PIE / static-pie) carry
+	 * p_vaddr values relative to 0; we pick load_base = EXEC_VA at
+	 * runtime and relocate.  ET_EXEC binaries (the hello-blob et al.)
+	 * still carry absolute p_vaddr in the EXEC_VA window and need no
+	 * fixup -- load_base = 0 leaves p_vaddr alone.
+	 *
+	 * One offset value drives both PT_LOAD placement and the
+	 * R_AARCH64_RELATIVE walk; e_entry gets the same treatment so the
+	 * trap frame points at the right instruction. */
+	const uint64_t load_base = (eh->e_type == ET_DYN) ? EXEC_VA : 0;
 
 	/* R6: build a fresh vm_map and allocate per-page user storage
 	 * from PMM.  No fixed slot pool.  Order of operations:
@@ -924,23 +935,36 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 		return -1;
 	}
 
-	/* (2) Code: walk PT_LOAD, allocate pages, copy bytes. */
+	/* (2) Code: walk PT_LOAD, allocate pages, copy bytes.
+	 *
+	 * For ET_DYN binaries this uses load_base = EXEC_VA so multiple
+	 * PT_LOADs that the linker emitted at p_vaddr 0, 0x1000, 0x2000
+	 * end up at EXEC_VA + offset.  For ET_EXEC, load_base = 0 so the
+	 * (absolute) p_vaddr is used as-is. */
+	uint64_t pt_dynamic_vaddr = 0;
+	uint64_t pt_dynamic_filesz = 0;
 	for (unsigned i = 0; i < eh->e_phnum; i++) {
 		Elf64_Phdr *ph = (Elf64_Phdr *)(elf_read_buf +
 				 eh->e_phoff + (uint64_t)i * eh->e_phentsize);
+		if (ph->p_type == PT_DYNAMIC) {
+			pt_dynamic_vaddr  = ph->p_vaddr + load_base;
+			pt_dynamic_filesz = ph->p_filesz;
+			continue;
+		}
 		if (ph->p_type != PT_LOAD) continue;
 
-		if (ph->p_vaddr < EXEC_VA ||
-		    ph->p_vaddr + ph->p_memsz > EXEC_VA + EXEC_SIZE) {
+		uint64_t va = ph->p_vaddr + load_base;
+		if (va < EXEC_VA ||
+		    va + ph->p_memsz > EXEC_VA + EXEC_SIZE) {
 			kprintf("execve: LOAD segment 0x%lx+0x%lx "
 				"outside exec window\n",
-				(unsigned long)ph->p_vaddr,
+				(unsigned long)va,
 				(unsigned long)ph->p_memsz);
 			vm_map_put(vm);
 			return -1;
 		}
-		uint64_t seg_start = ph->p_vaddr & ~(uint64_t)PAGE_MASK;
-		uint64_t seg_end   = (ph->p_vaddr + ph->p_memsz + PAGE_SIZE - 1)
+		uint64_t seg_start = va & ~(uint64_t)PAGE_MASK;
+		uint64_t seg_end   = (va + ph->p_memsz + PAGE_SIZE - 1)
 		                     & ~(uint64_t)PAGE_MASK;
 		unsigned n_pages   = (unsigned)((seg_end - seg_start) / PAGE_SIZE);
 		if (vmap_alloc_pages(vm, seg_start, n_pages, /*zero=*/1) < 0) {
@@ -949,11 +973,103 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 			return -1;
 		}
 		if (ph->p_filesz > 0) {
-			if (vmap_copyin(vm, ph->p_vaddr,
+			if (vmap_copyin(vm, va,
 			                elf_read_buf + ph->p_offset,
 			                ph->p_filesz) < 0) {
 				vm_map_put(vm);
 				return -1;
+			}
+		}
+	}
+
+	/* (2b) Apply R_AARCH64_RELATIVE relocations from PT_DYNAMIC -> DT_RELA.
+	 *
+	 * Static-pie binaries have a .rela.dyn table of relative relocs.
+	 * For each entry the loader writes (load_base + r_addend) at
+	 * (load_base + r_offset).  GLOB_DAT and JUMP_SLOT show up only
+	 * once libc.so is split out (stage 5+); for now we treat them
+	 * as a hard error -- something compiled with -fPIC and DT_NEEDED.
+	 *
+	 * The walk is two-pass: first scan the Dyn array for DT_RELA /
+	 * DT_RELASZ / DT_RELAENT, then apply each Rela.
+	 */
+	if (eh->e_type == ET_DYN && pt_dynamic_vaddr != 0) {
+		uint64_t rela_off  = 0;
+		uint64_t rela_size = 0;
+		uint64_t rela_ent  = sizeof(Elf64_Rela);
+		const Elf64_Dyn *dyn_arr = NULL;
+
+		/* PT_DYNAMIC sits inside one of the PT_LOADs we just copied.
+		 * Its file image is contiguous in elf_read_buf -- the simpler
+		 * path is to walk it there rather than via vmap_copyin. */
+		for (unsigned i = 0; i < eh->e_phnum; i++) {
+			Elf64_Phdr *ph = (Elf64_Phdr *)(elf_read_buf +
+					 eh->e_phoff + (uint64_t)i * eh->e_phentsize);
+			if (ph->p_type != PT_DYNAMIC) continue;
+			dyn_arr = (const Elf64_Dyn *)
+			          (elf_read_buf + ph->p_offset);
+			break;
+		}
+		if (!dyn_arr) {
+			kprintf("execve: ET_DYN without PT_DYNAMIC payload\n");
+			vm_map_put(vm);
+			return -1;
+		}
+		unsigned dyn_n = (unsigned)(pt_dynamic_filesz / sizeof(Elf64_Dyn));
+		for (unsigned i = 0; i < dyn_n; i++) {
+			if (dyn_arr[i].d_tag == DT_NULL)    break;
+			if (dyn_arr[i].d_tag == DT_RELA)    rela_off  = dyn_arr[i].d_un;
+			if (dyn_arr[i].d_tag == DT_RELASZ)  rela_size = dyn_arr[i].d_un;
+			if (dyn_arr[i].d_tag == DT_RELAENT) rela_ent  = dyn_arr[i].d_un;
+			if (dyn_arr[i].d_tag == DT_NEEDED) {
+				kprintf("execve: DT_NEEDED requires dynamic linker "
+					"(stage 5)\n");
+				vm_map_put(vm);
+				return -1;
+			}
+		}
+
+		if (rela_size > 0 && rela_ent == sizeof(Elf64_Rela)) {
+			/* DT_RELA gives the load-relative *image* offset of the
+			 * rela table.  Locate it in the file image via the file
+			 * offset of whichever PT_LOAD covers it. */
+			const Elf64_Rela *relas = NULL;
+			for (unsigned i = 0; i < eh->e_phnum; i++) {
+				Elf64_Phdr *ph = (Elf64_Phdr *)(elf_read_buf +
+						 eh->e_phoff + (uint64_t)i * eh->e_phentsize);
+				if (ph->p_type != PT_LOAD) continue;
+				if (rela_off >= ph->p_vaddr &&
+				    rela_off + rela_size <=
+				        ph->p_vaddr + ph->p_filesz) {
+					relas = (const Elf64_Rela *)
+					        (elf_read_buf + ph->p_offset +
+					         (rela_off - ph->p_vaddr));
+					break;
+				}
+			}
+			if (!relas) {
+				kprintf("execve: DT_RELA outside PT_LOAD images\n");
+				vm_map_put(vm);
+				return -1;
+			}
+			unsigned n_rel = (unsigned)(rela_size / rela_ent);
+			for (unsigned i = 0; i < n_rel; i++) {
+				uint32_t t = ELF64_R_TYPE(relas[i].r_info);
+				if (t == R_AARCH64_NONE) continue;
+				if (t != R_AARCH64_RELATIVE) {
+					kprintf("execve: reloc type %u not supported "
+						"(stage 5+)\n", t);
+					vm_map_put(vm);
+					return -1;
+				}
+				uint64_t fixup = load_base + (uint64_t)relas[i].r_addend;
+				uint64_t va    = load_base + relas[i].r_offset;
+				if (vmap_copyin(vm, va, &fixup, sizeof(fixup)) < 0) {
+					kprintf("execve: reloc target 0x%lx unmapped\n",
+						(unsigned long)va);
+					vm_map_put(vm);
+					return -1;
+				}
 			}
 		}
 	}
@@ -1035,7 +1151,7 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 
 	struct exec_args *a = kmalloc(sizeof(*a));
 	if (!a) { vm_map_put(vm); return -1; }
-	a->entry = eh->e_entry;
+	a->entry = eh->e_entry + load_base;
 	a->sp    = sp;   /* SP points at argc word on the exec stack */
 
 	const char *base = path;

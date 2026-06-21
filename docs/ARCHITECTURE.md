@@ -192,21 +192,27 @@ next command).
    the 256 KB static `elf_read_buf` can be written directly without a
    `copy_to_user` round-trip).
 2. Validates the ELF64 header: magic, ELF64 class, LE, `EM_AARCH64`,
-   `ET_EXEC`.
-3. Zeroes `exec_storage` and `exec_stack_storage` (BSS-clean start).
-4. Copies each PT_LOAD segment from `elf_read_buf` into `exec_storage`
-   at `p_vaddr - EXEC_VA`.  Segments outside `[0x20000000, 0x20200000)`
+   `ET_EXEC` or `ET_DYN` (PIE).
+3. Picks `load_base`: `EXEC_VA` for ET_DYN (cmd/* are static PIE since
+   docs/DYNAMIC.md stages 3+4), `0` for ET_EXEC (only `/bin/hello`).
+4. Copies each PT_LOAD segment from `elf_read_buf` into pages allocated
+   at `p_vaddr + load_base` via `vmap_alloc_pages` + `vmap_copyin`.
+   Segments whose relocated VA falls outside `[EXEC_VA, EXEC_VA+EXEC_SIZE)`
    are rejected.
-5. `dsb ish; ic iallu; dsb ish; isb` — D→I cache coherence.
-6. Builds the exec stack: argv strings are packed from `EXEC_STACK_TOP`
+5. For ET_DYN: walks `PT_DYNAMIC` for `DT_RELA / DT_RELASZ`, applies each
+   `R_AARCH64_RELATIVE` by writing `load_base + r_addend` at user VA
+   `load_base + r_offset`.  `GLOB_DAT` / `JUMP_SLOT` / `DT_NEEDED` are
+   hard errors -- they show up once libc.so is split out (stage 5+).
+6. `dsb ish; ic iallu; dsb ish; isb` — D→I cache coherence.
+7. Builds the exec stack: argv strings are packed from `EXEC_STACK_TOP`
    downward (each NUL-terminated, 8-byte aligned), then the pointer array
    (`argv[0]..argv[argc-1]`, NULL terminator), then `argc` as a
    `uint64_t`.  SP is set to the `argc` word.  Because the pointer table
    is `(argc + 2)` words of 8 bytes each, an 8-byte padding word is
    inserted when `(argc + 2)` is odd to keep SP 16-byte aligned — the
    AArch64 ABI requirement at function-call boundaries.
-7. Spawns an `exec` kthread with `kthread_inherit_fds` (so fd 0/1/2 are
-   all `/dev/console`) and calls `aarch64_enter_userspace(e_entry, sp, 0)`.
+8. Spawns an `exec` kthread with `kthread_inherit_fds` (so fd 0/1/2 are
+   all `/dev/console`) and calls `aarch64_enter_userspace(e_entry + load_base, sp, 0)`.
 
 Exec stack frame at entry (grows down from `EXEC_STACK_TOP = 0x20400000`):
 ```

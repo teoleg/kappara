@@ -112,50 +112,68 @@ Test: `cmd/test all` 13/13, `make ARCH=virt smoke-ftp` PASS 5/5.
 
 ### Stage 3 -- Convert cmd binaries to PIE
 
-Status: `[ ]`
+Status: `[x]`
 
-What changes: `CMD_CFLAGS` gets `-fPIE`, `cmd/*.elf` linker line
-gets `-pie`, and `user/prog_linker.ld` becomes either empty or
-just sets `OUTPUT_FORMAT(elf64-littleaarch64)` and the page size.
-The linker produces ET_DYN binaries (with a notional load address
-of 0) and a `.dynamic` section even for "statically linked" PIE
-output.
+Shipped together with stage 4 because cmd/test.c has a registry of
+`{ const char *name; int (*fn)(void); }` -- exactly the
+pointer-array pattern that needs `R_AARCH64_RELATIVE` to work.
+Stage 3 alone would leave `cmd/test` broken.
 
-What this DOESN'T do yet: actually use the loader for relocations.
-The exec loader at this point still memcopies `PT_LOAD` and assumes
-the binary is happy at its preferred address.  PIE binaries
-preferring 0 means we map them at EXEC_VA = 0x20000000, and
-**relocations referencing globals will be wrong** until stage 4
-applies them.
+What changed:
 
-What we get: confirmation that the build pipeline produces
-ET_DYN.  Stage 3's deliverable is the change in `.dynamic` and a
-build that still produces working binaries because their PIE
-relocations happen to coincide with the offsets the loader picks
-(this works for `cmd/hello.c`-shaped binaries; non-trivial ones
-break, which is the motivation for stage 4).
+- `CMD_CFLAGS` swapped `-fno-pie -fno-pic` for `-fPIE`.
+- cmd/*.elf link line gets `-pie`.
+- `user/prog_linker.ld` rewritten for PIE: explicit `PHDRS` (text
+  PT_LOAD + data PT_LOAD + PT_DYNAMIC), `.dynamic` / `.rela.dyn`
+  sections, no absolute `. = 0x20000000`.
+- `user/hello_linker.ld` (new) keeps `/bin/hello` as ET_EXEC at
+  the old fixed VA -- the minimal test of the loader's ET_EXEC
+  branch.  hello has no libc, no relocations.
+
+Verify: `readelf -h build/cmd/test.elf` reports `Type: DYN`,
+`Entry: 0x470` (a small offset, not the absolute VA), and
+`readelf -d` shows DT_RELA with 32 RELACOUNT entries -- the test
+registry's function pointers.
 
 ### Stage 4 -- Apply ELF relocations at load time
 
-Status: `[ ]`
+Status: `[x]`
 
-This is the keystone.  Without it nothing past here works.
+The keystone.  `sys_execve_impl` now:
 
-What to build: in `uts/os/user/user.c`, when execve loads an ELF
-with `PT_DYNAMIC`, walk the dynamic tags, locate `.rela.dyn` /
-`.rela.plt` / symbol table / string table, and apply every
-`R_AARCH64_RELATIVE` (load_base + addend), `R_AARCH64_GLOB_DAT`
-(look up symbol; for stage 4 every symbol resolves inside the
-binary itself), and `R_AARCH64_JUMP_SLOT` (eager resolution for
-now).
+1. Accepts `ET_DYN` as well as `ET_EXEC`.
+2. Picks `load_base = EXEC_VA` for ET_DYN, `0` for ET_EXEC.
+3. Walks `PT_LOAD`: places each segment at `p_vaddr + load_base`
+   and validates the relocated VA against the EXEC window.
+4. Locates `PT_DYNAMIC`, walks the `Elf64_Dyn` array for
+   `DT_RELA` / `DT_RELASZ` / `DT_RELAENT`.
+5. For each `Elf64_Rela`: if type is `R_AARCH64_RELATIVE`, writes
+   `load_base + r_addend` at user VA `load_base + r_offset` via
+   `vmap_copyin` (8-byte fixup per reloc).
+6. Entry point becomes `e_entry + load_base`.
 
-The exec loader keeps loading at EXEC_VA; what's new is the
-fixup walk after `PT_LOAD` copies finish.  This is the moment
-"PIE binary that references a global" starts actually working.
+Unsupported reloc types (`GLOB_DAT`, `JUMP_SLOT`) abort with a
+diagnostic; they show up only once libc.so is split out
+(stages 5+).  `DT_NEEDED` is also a hard error -- there's no
+dynamic linker yet.
 
-Test: write a PIE test binary that does `static int x = 42;`
-read by an `extern` function later in the same .so -- specifically
-exercises `GLOB_DAT`.  `cmd/test all` 13/13 still.
+ELF type additions in `include/kappara/abi/elf.h`: `ET_DYN`,
+`PT_DYNAMIC`, `PT_INTERP`, `PT_PHDR`, `DT_*` tags, the
+`R_AARCH64_*` reloc constants, `Elf64_Dyn` / `Elf64_Rela`.
+
+Verified end-to-end:
+
+- `cmd/test all` 13/13 -- exercises the relocated pointer
+  registry; without stage 4 the test names would be garbage and
+  the function-pointer dispatch would jump to bogus addresses.
+- `/bin/hello` (ET_EXEC, no libc) still exec's cleanly at the
+  old fixed `0x20000000` entry -- proves the ET_EXEC branch
+  isn't regressed.
+- `make ARCH=virt smoke-ftp` PASS 5/5 with the now-PIE ftpd.elf
+  (entry at `EXEC_VA + 0x200`).
+- Distinct PIE binaries land at distinct entry offsets:
+  ftpd=0x200, uptime=0x140, test=0x470 -- proves e_entry is
+  honoured via `load_base + e_entry`, not hardcoded.
 
 ### Stage 5 -- Dynamic linker: `/lib/ld-kappara.so`
 
