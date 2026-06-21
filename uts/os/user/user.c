@@ -252,6 +252,14 @@ void user_spawn(void)
 #define EXEC_HEAP_VA   0x20400000UL	/* heap: grows up from here */
 #define EXEC_HEAP_SIZE 0x00200000UL	/* 2 MB ceiling */
 
+/* DYNAMIC.md stage 5: ld-kappara.so window.  The stage 5 dynamic
+ * linker is ET_EXEC at this fixed VA (deliberately not PIE -- it's
+ * the bootstrap; relocating itself before it can run is a
+ * chicken-and-egg problem).  The kernel loads it here alongside any
+ * ET_DYN application and points the trap frame at LD_VA's _start. */
+#define LD_VA          0x30000000UL
+#define LD_SIZE        0x00100000UL	/* 1 MB ceiling for ld.so */
+
 /* SPAWN_STACK_SIZE is defined near the top of the file. */
 #define SPAWN_MAX		((USER_SIZE / SPAWN_STACK_SIZE) - 1)
 
@@ -705,6 +713,13 @@ extern char echo_blob_end[];
 extern char uptime_blob_start[];
 extern char uptime_blob_end[];
 
+/* DYNAMIC.md stage 5: ld-kappara.so is referenced directly by the
+ * exec loader; it doesn't go through VFS for the bootstrap.  Once
+ * dlopen lands (stage 7) the file will also be registered at
+ * /lib/ld-kappara.so for symbolic discovery. */
+extern char ld_kappara_blob_start[];
+extern char ld_kappara_blob_end[];
+
 static struct blob_priv hello_priv;
 
 void exec_space_init(void)
@@ -877,6 +892,64 @@ static void exec_thread_main(void *p)
  * Static so it lives in BSS rather than on the kernel stack.
  */
 static unsigned char elf_read_buf[256 * 1024];
+
+/*
+ * DYNAMIC.md stage 5: load a static ET_EXEC ELF (today only ld-kappara.so)
+ * from a kernel buffer into the given vm_map.  No relocations -- the ELF's
+ * p_vaddr is honoured as-is, and the caller validates it falls into the
+ * allowed VA window.  Returns e_entry on success, 0 on failure.
+ *
+ * This is the secondary loader used by sys_execve_impl to map the dynamic
+ * linker alongside ET_DYN applications.  The primary PT_LOAD walk in
+ * sys_execve_impl handles ET_DYN with relocs; we don't share code yet
+ * because that path is already non-trivial.  If a future binary needs
+ * relocations from the secondary slot, refactor then.
+ */
+static uint64_t load_static_elf(struct vm_map *vm,
+                                 const unsigned char *img, size_t img_sz,
+                                 uint64_t va_min, uint64_t va_max)
+{
+	if (img_sz < sizeof(Elf64_Ehdr)) return 0;
+
+	const Elf64_Ehdr *eh = (const Elf64_Ehdr *)img;
+	if (eh->e_ident[EI_MAG0] != 0x7f ||
+	    eh->e_ident[EI_MAG1] != 'E'  ||
+	    eh->e_ident[EI_MAG2] != 'L'  ||
+	    eh->e_ident[EI_MAG3] != 'F' ||
+	    eh->e_ident[EI_CLASS] != 2 || eh->e_ident[EI_DATA] != 1 ||
+	    eh->e_machine != EM_AARCH64 || eh->e_type != ET_EXEC) {
+		kprintf("ld-loader: bad ELF (type/class/machine)\n");
+		return 0;
+	}
+
+	for (unsigned i = 0; i < eh->e_phnum; i++) {
+		const Elf64_Phdr *ph = (const Elf64_Phdr *)(img +
+				 eh->e_phoff + (uint64_t)i * eh->e_phentsize);
+		if (ph->p_type != PT_LOAD) continue;
+		if (ph->p_vaddr < va_min ||
+		    ph->p_vaddr + ph->p_memsz > va_max) {
+			kprintf("ld-loader: LOAD 0x%lx+0x%lx outside [%lx,%lx)\n",
+				(unsigned long)ph->p_vaddr,
+				(unsigned long)ph->p_memsz,
+				(unsigned long)va_min, (unsigned long)va_max);
+			return 0;
+		}
+		uint64_t seg_start = ph->p_vaddr & ~(uint64_t)PAGE_MASK;
+		uint64_t seg_end   = (ph->p_vaddr + ph->p_memsz + PAGE_SIZE - 1)
+		                     & ~(uint64_t)PAGE_MASK;
+		unsigned n_pages   = (unsigned)((seg_end - seg_start) / PAGE_SIZE);
+		if (vmap_alloc_pages(vm, seg_start, n_pages, /*zero=*/1) < 0) {
+			kprintf("ld-loader: PMM exhausted\n");
+			return 0;
+		}
+		if (ph->p_filesz > 0) {
+			if (vmap_copyin(vm, ph->p_vaddr,
+			                img + ph->p_offset, ph->p_filesz) < 0)
+				return 0;
+		}
+	}
+	return eh->e_entry;
+}
 
 #define EXEC_MAX_ARGS    32
 #define EXEC_MAX_ARGLEN  128
@@ -1074,6 +1147,27 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 		}
 	}
 
+	/* (2c) DYNAMIC.md stage 5: load /lib/ld-kappara.so alongside any
+	 * ET_DYN binary.  ld.so is the bootstrap dynamic linker; control
+	 * lands here first, it parses auxv to find AT_ENTRY, jumps to
+	 * the app.  ET_EXEC binaries (only /bin/hello today) skip the
+	 * loader -- they have no PT_DYNAMIC, no DT_NEEDED, nothing to do.
+	 *
+	 * ld.so is itself ET_EXEC at fixed LD_VA so we don't have a
+	 * chicken-and-egg relocation bootstrap. */
+	uint64_t ld_entry = 0;
+	if (eh->e_type == ET_DYN) {
+		const unsigned char *ld_img = (const unsigned char *)ld_kappara_blob_start;
+		size_t ld_sz = (size_t)(ld_kappara_blob_end - ld_kappara_blob_start);
+		ld_entry = load_static_elf(vm, ld_img, ld_sz,
+		                            LD_VA, LD_VA + LD_SIZE);
+		if (ld_entry == 0) {
+			kprintf("execve: failed to load ld-kappara.so\n");
+			vm_map_put(vm);
+			return -1;
+		}
+	}
+
 	/* (3) Stack: allocate the entire 2 MB region upfront.  TODO:
 	 * lazy/demand allocation via EL0 page faults is a future R6b. */
 	if (vmap_alloc_pages(vm, EXEC_STACK_VA, EXEC_SIZE / PAGE_SIZE,
@@ -1095,18 +1189,30 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 	vm->heap_brk   = EXEC_HEAP_VA;
 	vm->spawn_next = 0;
 
-	/* (5) exec stack setup -- write argv onto the mapped stack via
-	 * vmap_copyin (which walks vm's L3 to find each page).
+	/* (5) exec stack setup -- write argv/envp/auxv onto the mapped
+	 * stack via vmap_copyin (which walks vm's L3 to find each page).
 	 *
-	 * Stack layout (grows down from EXEC_STACK_TOP):
-	 *   [string data -- argv strings packed from top down]
+	 * Stack layout (grows down from EXEC_STACK_TOP), POSIX shape:
+	 *   [string data]
 	 *   [16-byte alignment pad]
-	 *   [argv[argc] = NULL,  8 bytes]
-	 *   [argv[argc-1],       8 bytes]
+	 *   [auxv AT_NULL  ]  (16 bytes -- {a_type=0, a_val=0})
+	 *   [auxv AT_ENTRY ]  (16 bytes -- {a_type=9, a_val=app_entry})
+	 *   [envp[0] = NULL]   8 bytes
+	 *   [argv[argc] = NUL] 8 bytes
+	 *   [argv[argc-1]   ]
 	 *   ...
-	 *   [argv[0],            8 bytes]
-	 *   [argc as uint64_t,   8 bytes]  <-- SP points here
-	 */
+	 *   [argv[0]        ]
+	 *   [argc           ]  <-- SP, 16-byte aligned
+	 *
+	 * The cmd binary's crt0 reads argc / argv from [sp] / [sp+8]
+	 * and is auxv-oblivious; ld-kappara.so's _start parses past
+	 * envp to find auxv[AT_ENTRY] and jumps there.
+	 *
+	 * Padding test: total bytes from SP to strings is
+	 * 8 (argc) + 8*argc (argv slots) + 8 (argv NUL) + 8 (envp NUL)
+	 * + 16 (AT_ENTRY) + 16 (AT_NULL) = 56 + 8*argc.  SP must be
+	 * 16-aligned, so we pad with 8 bytes when (56 + 8*argc) % 16
+	 * != 0, i.e. when argc is even. */
 	int effective_argc = (argc > EXEC_MAX_ARGS) ? EXEC_MAX_ARGS : argc;
 	uint64_t sp = EXEC_STACK_TOP;
 	uint64_t uva_strings[EXEC_MAX_ARGS];
@@ -1124,10 +1230,35 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 		uva_strings[i] = sp;
 	}
 
-	/* 16-byte align before pointer array */
+	/* 16-byte align before the auxv/envp/argv block. */
 	sp &= ~(uint64_t)15;
 
-	if ((effective_argc + 2) & 1) {
+	if (!(effective_argc & 1)) {
+		sp -= 8;
+		uint64_t zero = 0;
+		vmap_copyin(vm, sp, &zero, sizeof(zero));
+	}
+
+	/* auxv[1] = AT_NULL terminator */
+	{
+		uint64_t at_null[2] = { 0, 0 };
+		sp -= sizeof(at_null);
+		vmap_copyin(vm, sp, at_null, sizeof(at_null));
+	}
+
+	/* auxv[0] = AT_ENTRY -> app entry (post-load_base).  ET_EXEC
+	 * binaries also get this slot populated even though their
+	 * loader is the kernel (ld.so isn't entered for ET_EXEC) -- it
+	 * costs 16 bytes and keeps the stack shape uniform. */
+	{
+		uint64_t at_entry[2] = { 9 /* AT_ENTRY */,
+		                        eh->e_entry + load_base };
+		sp -= sizeof(at_entry);
+		vmap_copyin(vm, sp, at_entry, sizeof(at_entry));
+	}
+
+	/* envp terminator (empty environment for now). */
+	{
 		sp -= 8;
 		uint64_t zero = 0;
 		vmap_copyin(vm, sp, &zero, sizeof(zero));
@@ -1149,9 +1280,12 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 	uint64_t argc_word = (uint64_t)effective_argc;
 	vmap_copyin(vm, sp, &argc_word, sizeof(argc_word));
 
+	/* For ET_DYN: enter ld-kappara.so first; it parses auxv for
+	 * AT_ENTRY and tail-calls the app.  ET_EXEC binaries are
+	 * entered directly (no ld.so loaded). */
 	struct exec_args *a = kmalloc(sizeof(*a));
 	if (!a) { vm_map_put(vm); return -1; }
-	a->entry = eh->e_entry + load_base;
+	a->entry = (ld_entry != 0) ? ld_entry : (eh->e_entry + load_base);
 	a->sp    = sp;   /* SP points at argc word on the exec stack */
 
 	const char *base = path;

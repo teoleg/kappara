@@ -175,36 +175,69 @@ Verified end-to-end:
   ftpd=0x200, uptime=0x140, test=0x470 -- proves e_entry is
   honoured via `load_base + e_entry`, not hardcoded.
 
-### Stage 5 -- Dynamic linker: `/lib/ld-kappara.so`
+### Stage 5 -- Dynamic linker: `ld-kappara.so` bootstrap
 
-Status: `[ ]`
+Status: `[x]`
 
-A user-space program that the kernel hands control to instead of
-the application's `_start`.  Bootstrap shape:
+User-space program that the kernel hands control to instead of
+the application's `_start`.  Today (no `libc.so` yet) it's a
+pass-through: parses `auxv` for `AT_ENTRY` and branches.  When
+stage 6 splits libc out, the same shape grows to walk the app's
+`PT_DYNAMIC`, process `DT_NEEDED`, mmap each `.so`, and apply
+cross-DSO relocations against the merged symbol table.
 
-1. Linker is itself a fully self-contained, statically-linked ELF
-   (no DT_NEEDED on itself).  It's mapped into the process at
-   load-time by the kernel; the kernel sets the entry point in
-   the trap frame to the linker's `_start`, not the application's.
-2. Linker reads the application's `.dynamic` from `PT_DYNAMIC`,
-   processes `DT_NEEDED` entries, mmaps each `.so` (only
-   `libc.so` to start), applies the same relocation walk stage 4
-   does -- but against the merged symbol table from every loaded
-   object.
-3. After relocations, linker jumps to the application's `_start`.
+Architecture choices for the bootstrap:
 
-The kernel-side change is: on execve of a binary with `PT_INTERP`
-set (or always, in our case -- we force `PT_INTERP =
-"/lib/ld-kappara.so"`), load BOTH the linker and the application,
-hand control to the linker.
+- **ld-kappara.so is `ET_EXEC`**, not PIE, deliberately.  It lives
+  at a fixed VA `LD_VA = 0x30000000` (1 MB window).  Making it
+  PIE would create a chicken-and-egg problem: who relocates the
+  relocator?  The kernel can do it (we already have stage 4's
+  reloc walk), but skipping it entirely is simpler.
+- **Kernel doesn't read `PT_INTERP`** -- it unconditionally loads
+  ld-kappara.so for every `ET_DYN` binary.  PT_INTERP is mostly a
+  POSIX hint for which loader to use; we have exactly one.
+  ET_EXEC binaries (`/bin/hello`) skip ld.so entirely -- they're
+  the kernel's bootstrap test path.
+- **Blob, not VFS file.**  The kernel reads ld-kappara.so via
+  `ld_kappara_blob_start[]` directly during exec rather than
+  through a VFS lookup.  Once stage 7 lands `dlopen`, the file
+  will also be registered at `/lib/ld-kappara.so` for symbolic
+  discovery.
 
-`auxv` (a small array of (type, value) tuples) tells the linker
-where the application's PT_PHDR is, what the page size is, etc.
-We pass it as a third argument to `_start` past argv / envp; the
-crt0.S for ld-kappara unpacks it.
+Files:
 
-Test: build a "hello world" PIE app that DT_NEEDED's libc.so,
-upload via FTP, exec.  Should print "hello, world".
+- `lib/ld-kappara/ld_start.S` -- the entire stage 5 linker.  Walks
+  past `argv[]` (length = argc from `[sp]`) and the `envp[]` NULL,
+  then iterates `auxv[]` looking for `AT_ENTRY (= 9)`.  Branches
+  to that value.  Stack is unmodified -- the app's `crt0.S` reads
+  `argc` from `[sp]` exactly as before.
+- `lib/ld-kappara/linker.ld` -- ET_EXEC at `LD_VA`, `_start` first.
+- `Makefile` -- `LDK_ELF` target wired into the kernel image via
+  `uts/aarch64/usrblobs.S` (incbin'd alongside `/usr/bin` ELFs).
+
+Kernel changes in `sys_execve_impl` (`uts/os/user/user.c`):
+
+- New `LD_VA = 0x30000000`, `LD_SIZE = 0x100000` window in the
+  user VA layout.
+- For `ET_DYN`: after the app's PT_LOAD + reloc walk, call new
+  `load_static_elf()` helper to map ld-kappara.so's PT_LOAD into
+  the same vm_map.
+- Exec stack now carries the POSIX shape:
+  `[argc | argv... NULL | envp_NULL | auxv... AT_NULL ]`.
+  The auxv has one entry today: `AT_ENTRY = app_entry`.
+- Trap-frame entry point becomes `ld.so._start` (LD_VA) for
+  ET_DYN; ET_EXEC binaries enter directly at their `e_entry`.
+
+ELF entry-point handoff observed in boot logs:
+
+    exec: EL0 entry=0x30000000 sp=0x203fffb0       <-- ftpd via ld.so
+    exec: EL0 entry=0x30000000 sp=0x203fffb0       <-- uptime via ld.so
+    exec: code=0x20000000, /bin/hello 4688 bytes   <-- ET_EXEC: direct
+
+Verified: `cmd/test all` 13/13 (control flows
+shell -> ld.so -> app -> exit, every cmd binary), `make ARCH=virt
+smoke-ftp` 8/10 PASS (matches pre-stage-5 noise band -- TCP race
+unrelated), `/bin/hello` still loads via the ET_EXEC path.
 
 ### Stage 6 -- Convert libc to `libc.so`
 

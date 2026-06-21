@@ -449,6 +449,26 @@ $(HELLO_ELF): $(USER_BUILD)/hello.o user/hello_linker.ld
 $(USER_BUILD):
 	mkdir -p $@
 
+# ---- ld-kappara.so: stage 5 user-space dynamic linker (DYNAMIC.md) ----
+# Loaded by the kernel at LD_VA = 0x30000000 alongside any ET_DYN
+# application.  Trap frame enters here; pass-through for now (parses
+# auxv for AT_ENTRY, jumps).  See lib/ld-kappara/ld_start.S.
+LDK_BUILD   := build/ld-kappara
+LDK_ELF     := $(LDK_BUILD)/ld-kappara.so
+LDK_OBJS    := $(LDK_BUILD)/ld_start.o
+
+$(LDK_BUILD):
+	mkdir -p $@
+
+$(LDK_BUILD)/ld_start.o: lib/ld-kappara/ld_start.S | $(LDK_BUILD)
+	$(USER_CC) -ffreestanding -nostdlib -nostartfiles \
+	           -mcpu=cortex-a53 -mgeneral-regs-only \
+	           -c $< -o $@
+
+$(LDK_ELF): $(LDK_OBJS) lib/ld-kappara/linker.ld
+	$(USER_LD) -nostdlib -static -s -z max-page-size=4096 \
+	           -T lib/ld-kappara/linker.ld -o $@ $(LDK_OBJS)
+
 # ---- libc + /usr/bin standalone ELF programs -----------------------
 CMD_BUILD  := build/cmd
 LIBC_DIR    := lib/libc
@@ -515,7 +535,7 @@ $(CMD_BUILD)/%.elf: $(CMD_BUILD)/%.o $(LIBC_CRT0) $(LIBC_A) user/prog_linker.ld
 $(CMD_BUILD):
 	mkdir -p $@
 
-$(BUILD)/uts/aarch64/usrblobs.o: $(CMD_ELFS) uts/aarch64/usrblobs.S
+$(BUILD)/uts/aarch64/usrblobs.o: $(CMD_ELFS) $(LDK_ELF) uts/aarch64/usrblobs.S
 	$(CC) $(ASFLAGS) -c uts/aarch64/usrblobs.S -o $@
 
 # Tell make that userblob.o / helloblob.o depend on the files they incbin.

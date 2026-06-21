@@ -160,3 +160,14 @@ echo_blob_end:
 uptime_blob_start:
 	.incbin "build/cmd/uptime.elf"
 uptime_blob_end:
+
+/* ld-kappara.so -- stage 5 dynamic linker.  Not a /usr/bin entry;
+ * the kernel reads it directly via ld_kappara_blob_{start,end}
+ * during exec to load it into the user vm_map at LD_VA. */
+	.section ".rodata.ld_kappara_blob","a",%progbits
+	.balign 8
+	.global ld_kappara_blob_start
+	.global ld_kappara_blob_end
+ld_kappara_blob_start:
+	.incbin "build/ld-kappara/ld-kappara.so"
+ld_kappara_blob_end:

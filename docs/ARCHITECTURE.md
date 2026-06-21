@@ -156,6 +156,8 @@ VA              Size    Purpose
                         Stack top = 0x20400000
 0x20400000      2 MB    exec heap      (exec_heap_storage[slot])
                         Grows up from EXEC_HEAP_VA, controlled by SYS_brk
+0x30000000      1 MB    ld-kappara.so  (LD_VA, ET_EXEC bootstrap loader,
+                        DYNAMIC.md stage 5 -- only mapped for ET_DYN apps)
 ```
 
 R6: each exec'd process owns its own vm_map (L0/L1/L2/L3 page
@@ -202,17 +204,32 @@ next command).
 5. For ET_DYN: walks `PT_DYNAMIC` for `DT_RELA / DT_RELASZ`, applies each
    `R_AARCH64_RELATIVE` by writing `load_base + r_addend` at user VA
    `load_base + r_offset`.  `GLOB_DAT` / `JUMP_SLOT` / `DT_NEEDED` are
-   hard errors -- they show up once libc.so is split out (stage 5+).
-6. `dsb ish; ic iallu; dsb ish; isb` — D→I cache coherence.
-7. Builds the exec stack: argv strings are packed from `EXEC_STACK_TOP`
-   downward (each NUL-terminated, 8-byte aligned), then the pointer array
-   (`argv[0]..argv[argc-1]`, NULL terminator), then `argc` as a
-   `uint64_t`.  SP is set to the `argc` word.  Because the pointer table
-   is `(argc + 2)` words of 8 bytes each, an 8-byte padding word is
-   inserted when `(argc + 2)` is odd to keep SP 16-byte aligned — the
-   AArch64 ABI requirement at function-call boundaries.
-8. Spawns an `exec` kthread with `kthread_inherit_fds` (so fd 0/1/2 are
-   all `/dev/console`) and calls `aarch64_enter_userspace(e_entry + load_base, sp, 0)`.
+   hard errors -- they show up once libc.so is split out (stage 6+).
+6. For ET_DYN: loads `ld-kappara.so` (stage 5 user-space dynamic linker)
+   into the same vm_map at `LD_VA = 0x30000000` via `load_static_elf`.
+   ld.so is itself `ET_EXEC` (deliberately not PIE -- it's the bootstrap)
+   so the loader just memcpy's PT_LOAD and records `e_entry`.
+7. `dsb ish; ic iallu; dsb ish; isb` — D→I cache coherence.
+8. Builds the exec stack with POSIX shape: argv strings packed from
+   `EXEC_STACK_TOP` downward, then:
+   ```
+   [auxv AT_NULL    ]   16 bytes
+   [auxv AT_ENTRY=9 ]   16 bytes (a_val = app's e_entry + load_base)
+   [envp[0] = NULL  ]    8 bytes
+   [argv[argc] = NUL]    8 bytes
+   [argv[argc-1]    ]
+   ...
+   [argv[0]         ]
+   [argc            ]   <-- SP, 16-byte aligned
+   ```
+   Total below SP from strings: `56 + 8*argc` bytes; pad 8 when argc
+   is even to keep SP 16-byte aligned (AArch64 ABI at call boundaries).
+9. Spawns an `exec` kthread with `kthread_inherit_fds` (so fd 0/1/2 are
+   all `/dev/console`) and calls `aarch64_enter_userspace(entry, sp, 0)`,
+   where `entry` is ld.so's `_start` (`LD_VA`) for ET_DYN and the app's
+   `e_entry` for ET_EXEC.  ld.so reads `auxv[AT_ENTRY]` and tail-calls
+   the application; the app's `crt0.S` sees the same `argc`/`argv`
+   layout it always did.
 
 Exec stack frame at entry (grows down from `EXEC_STACK_TOP = 0x20400000`):
 ```
