@@ -152,3 +152,11 @@ grep_blob_end:
 echo_blob_start:
 	.incbin "build/cmd/echo.elf"
 echo_blob_end:
+
+	.section ".rodata.uptime_blob","a",%progbits
+	.balign 8
+	.global uptime_blob_start
+	.global uptime_blob_end
+uptime_blob_start:
+	.incbin "build/cmd/uptime.elf"
+uptime_blob_end:

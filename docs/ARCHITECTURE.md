@@ -262,12 +262,17 @@ so it has no host-OS dependencies.
 |-------------------------|--------------------------------------------------------------|
 | `aarch64/crt0.S`        | `_start`: loads argc/argv from exec stack, calls `main`, then `sys_exit`. |
 | `aarch64/internal.h`    | `__syscall1/__syscall3`, syscall numbers, `ssize_t`.          |
-| `src/string.c`          | `strlen`, `strcpy`, `strncpy`, `memcpy`, `memset`, `strcmp`. |
+| `src/string.c`          | `strlen`, `strcmp`, `strncmp`, `strcpy`, `strncpy`, `strcat`, `strncat`, `strchr`, `strrchr`, `strstr`, `strdup`, `strtok`, `memcpy`, `memset`, `memmove`, `memcmp`, `memchr`. |
 | `src/printf.c`          | `printf`, `vprintf`, `sprintf`, `snprintf`, `vsnprintf`.      |
+| `src/stdlib.c`          | `exit`, `_exit`, `atoi`, `atol`, `strtol`, `abs`, `labs`, `qsort` (insertion sort), `bsearch`, `getenv` (stub).  No `atof` -- `-mgeneral-regs-only` forbids `double`. |
+| `src/ctype.c`           | `isdigit`/`isalpha`/`isalnum`/`isspace`/`isupper`/`islower`/`isxdigit`/`isprint`/`iscntrl`/`ispunct` + `toupper`/`tolower`. |
+| `src/errno.c`           | Global `int errno;` (TLS deferred; kernel doesn't populate it yet -- writes work, reads return the last write or zero). |
+| `src/time.c`            | `clock_gettime(CLOCK_MONOTONIC, ts)` + `time(NULL)` via `SYS_clock_gettime`. |
 | `src/malloc.c`          | `malloc`, `free`, `calloc`, `realloc` — free-list allocator backed by `SYS_brk`.  `heap_grow()` calls `brk(0)` + `brk(cur+n)` (rounded up to 4 KB) to extend the heap on demand. |
-| `src/file.c`            | `FILE*` layer: `fopen/fclose/fread/fwrite/fgets/fputs/fputc/fgetc`, `fprintf/vfprintf`, `puts/putchar`.  `stdin/stdout/stderr` backed by fd 0/1/2. |
+| `src/file.c`            | `FILE*` layer: `fopen/fclose/fread/fwrite/fgets/fputs/fputc/fgetc`, `fprintf/vfprintf`, `puts/putchar/getchar`, `getline`, `perror`, `fflush` (no-op).  `stdin/stdout/stderr` backed by fd 0/1/2. |
 | `src/io.c`              | `read`, `write`, `open`, `close`, `pipe`, `_exit`.            |
-| `include/`              | `<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<unistd.h>`, `<stddef.h>`, `<stdarg.h>`, `<sys/types.h>`. |
+| `aarch64/setjmp.S`      | `setjmp`/`longjmp` — saves x19-x30 + SP.  d8-d15 deliberately skipped because userland is `-mgeneral-regs-only` and CPACR_EL1.FPEN is not enabled for EL0. |
+| `include/`              | `<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<ctype.h>`, `<errno.h>`, `<setjmp.h>`, `<time.h>`, `<unistd.h>`, `<stddef.h>`, `<stdarg.h>`, `<sys/types.h>`. |
 
 The malloc heap lives in a dedicated 2 MB user-VA window at
 `EXEC_HEAP_VA = 0x20400000` mapped to `exec_heap_storage` in kernel

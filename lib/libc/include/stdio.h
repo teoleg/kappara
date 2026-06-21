@@ -28,9 +28,23 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
 int  puts  (const char *s);
 int  fputs (const char *s, FILE *f);
 int  putchar(int c);
+int  getchar(void);
 int  fputc (int c, FILE *f);
 int  fgetc (FILE *f);
 char *fgets(char *buf, int n, FILE *f);
+
+/* getline -- read until '\n' or EOF into a malloc'd buffer.  *bufp /
+ * *cap are reused/grown across calls.  Returns the byte count read
+ * (including the trailing '\n' if present), or -1 on EOF/error. */
+ssize_t getline(char **bufp, size_t *cap, FILE *f);
+
+/* perror -- write "prefix: <human message>\n" to stderr.  Today the
+ * kernel doesn't populate errno, so this prints "<prefix>: error". */
+void perror(const char *prefix);
+
+/* fflush is a no-op -- the FILE layer is unbuffered.  Provided so
+ * code that calls fflush(stdout) compiles. */
+int  fflush(FILE *f);
 
 /* file ops */
 FILE  *fopen (const char *path, const char *mode);

@@ -28,6 +28,7 @@
 #define __NR_execve      27
 #define __NR_brk         33
 #define __NR_fork        34
+#define __NR_clock_gettime 35
 
 static inline long __syscall0(long nr) {
     register long x0 __asm__("x0");

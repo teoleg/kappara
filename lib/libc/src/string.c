@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdlib.h>
 
 size_t strlen(const char *s)
 {
@@ -56,6 +57,18 @@ char *strcat(char *dst, const char *src)
     return dst;
 }
 
+char *strncat(char *dst, const char *src, size_t n)
+{
+    char *d = dst;
+    while (*d)
+        d++;
+    while (n-- && (*d = *src++)) {
+        d++;
+    }
+    *d = '\0';
+    return dst;
+}
+
 char *strchr(const char *s, int c)
 {
     for (; *s; s++)
@@ -64,6 +77,66 @@ char *strchr(const char *s, int c)
     if (c == '\0')
         return (char *)s;
     return (char *)0;
+}
+
+char *strrchr(const char *s, int c)
+{
+    const char *last = (const char *)0;
+    for (; *s; s++)
+        if ((unsigned char)*s == (unsigned char)c)
+            last = s;
+    if (c == '\0')
+        return (char *)s;
+    return (char *)last;
+}
+
+char *strstr(const char *hay, const char *needle)
+{
+    if (!*needle)
+        return (char *)hay;
+    size_t nlen = strlen(needle);
+    for (; *hay; hay++) {
+        if (*hay == *needle && !strncmp(hay, needle, nlen))
+            return (char *)hay;
+    }
+    return (char *)0;
+}
+
+char *strdup(const char *s)
+{
+    size_t n = strlen(s) + 1;
+    char *p = malloc(n);
+    if (!p) return (char *)0;
+    memcpy(p, s, n);
+    return p;
+}
+
+/* strtok keeps a static cursor between calls; not thread-safe but
+ * matches the POSIX shape libc users expect. */
+char *strtok(char *s, const char *delim)
+{
+    static char *save;
+    if (s)
+        save = s;
+    if (!save)
+        return (char *)0;
+
+    while (*save && strchr(delim, (unsigned char)*save))
+        save++;
+    if (!*save) {
+        save = (char *)0;
+        return (char *)0;
+    }
+
+    char *tok = save;
+    while (*save && !strchr(delim, (unsigned char)*save))
+        save++;
+    if (*save) {
+        *save++ = '\0';
+    } else {
+        save = (char *)0;
+    }
+    return tok;
 }
 
 void *memcpy(void *dst, const void *src, size_t n)
@@ -110,4 +183,15 @@ int memcmp(const void *a, const void *b, size_t n)
         pb++;
     }
     return 0;
+}
+
+void *memchr(const void *s, int c, size_t n)
+{
+    const unsigned char *p = (const unsigned char *)s;
+    while (n--) {
+        if (*p == (unsigned char)c)
+            return (void *)p;
+        p++;
+    }
+    return (void *)0;
 }

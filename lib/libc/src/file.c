@@ -118,9 +118,52 @@ int fprintf(FILE *f, const char *fmt, ...) {
 }
 
 int putchar(int c) { return fputc(c, stdout); }
+int getchar(void)  { return fgetc(stdin); }
 
 int puts(const char *s) {
     fputs(s, stdout);
     fputc('\n', stdout);
     return 1;
+}
+
+int fflush(FILE *f) {
+    (void)f;
+    return 0;
+}
+
+void perror(const char *prefix) {
+    if (prefix && *prefix) {
+        fputs(prefix, stderr);
+        fputs(": ", stderr);
+    }
+    /* No errno -> human-string table yet.  Print a placeholder. */
+    fputs("error\n", stderr);
+}
+
+ssize_t getline(char **bufp, size_t *cap, FILE *f) {
+    if (!bufp || !cap || !f) return -1;
+    if (!*bufp) {
+        *cap = 128;
+        *bufp = malloc(*cap);
+        if (!*bufp) return -1;
+    }
+    size_t n = 0;
+    for (;;) {
+        int c = fgetc(f);
+        if (c == EOF) {
+            if (n == 0) return -1;
+            break;
+        }
+        if (n + 2 > *cap) {
+            size_t newcap = *cap * 2;
+            char *nb = realloc(*bufp, newcap);
+            if (!nb) return -1;
+            *bufp = nb;
+            *cap = newcap;
+        }
+        (*bufp)[n++] = (char)c;
+        if (c == '\n') break;
+    }
+    (*bufp)[n] = '\0';
+    return (ssize_t)n;
 }

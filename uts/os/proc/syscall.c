@@ -412,6 +412,42 @@ static long sys_brk(long a0, long a1, long a2, long a3, long a4, long a5)
 	return sys_brk_impl((uint64_t)(unsigned long)a0);
 }
 
+/*
+ * SYS_clock_gettime -- monotonic CNTPCT-derived timespec.
+ *
+ * The clk_id argument is ignored: we have one clock (the AArch64
+ * generic timer, monotonic since boot).  Reading CNTPCT_EL0 +
+ * CNTFRQ_EL0 from EL1 is always safe.
+ *
+ * The user buffer is { tv_sec; tv_nsec } -- two longs, matching
+ * lib/libc/include/time.h.  copy_to_user gates the write so a bad
+ * pointer returns -1 instead of panicking the kernel.
+ */
+struct __ts_kernel { long tv_sec; long tv_nsec; };
+
+static long sys_clock_gettime(long a0, long a1, long a2,
+			      long a3, long a4, long a5)
+{
+	(void)a0; (void)a2; (void)a3; (void)a4; (void)a5;
+	uint64_t cnt, freq;
+	__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(cnt));
+	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+	if (freq == 0)
+		return -1;
+	struct __ts_kernel kts;
+	kts.tv_sec  = (long)(cnt / freq);
+	uint64_t rem = cnt - (uint64_t)kts.tv_sec * freq;
+	kts.tv_nsec = (long)((rem * 1000000000ULL) / freq);
+	void *uts = (void *)(uintptr_t)a1;
+	if (syscall_from_user) {
+		if (copy_to_user(uts, &kts, sizeof(kts)) < 0)
+			return -1;
+	} else {
+		*(struct __ts_kernel *)uts = kts;
+	}
+	return 0;
+}
+
 static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_log]    = sys_log,
 	[SYS_getpid] = sys_getpid,
@@ -446,6 +482,7 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_tcsetpgrp]   = sys_tcsetpgrp,
 	[SYS_tcgetpgrp]   = sys_tcgetpgrp,
 	[SYS_brk]         = sys_brk,
+	[SYS_clock_gettime] = sys_clock_gettime,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

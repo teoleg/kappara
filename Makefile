@@ -458,9 +458,13 @@ LIBC_SRCS   := $(LIBC_DIR)/src/string.c \
                $(LIBC_DIR)/src/io.c      \
                $(LIBC_DIR)/src/signal.c  \
                $(LIBC_DIR)/src/malloc.c  \
-               $(LIBC_DIR)/src/file.c
+               $(LIBC_DIR)/src/file.c    \
+               $(LIBC_DIR)/src/ctype.c   \
+               $(LIBC_DIR)/src/errno.c   \
+               $(LIBC_DIR)/src/time.c
 LIBC_OBJS   := $(patsubst $(LIBC_DIR)/src/%.c,$(CMD_BUILD)/libc/%.o,$(LIBC_SRCS))
 LIBC_CRT0   := $(CMD_BUILD)/libc/crt0.o
+LIBC_SETJMP := $(CMD_BUILD)/libc/setjmp.o
 LIBC_A      := $(CMD_BUILD)/libc/libc.a
 
 LIBC_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
@@ -480,13 +484,17 @@ $(LIBC_CRT0): $(LIBC_DIR)/aarch64/crt0.S | $(CMD_BUILD)/libc
 	$(USER_CC) $(filter-out -finstrument-functions,$(LIBC_CFLAGS)) \
 	           -c $< -o $@
 
-$(LIBC_A): $(LIBC_OBJS)
+$(LIBC_SETJMP): $(LIBC_DIR)/aarch64/setjmp.S | $(CMD_BUILD)/libc
+	$(USER_CC) $(filter-out -finstrument-functions,$(LIBC_CFLAGS)) \
+	           -c $< -o $@
+
+$(LIBC_A): $(LIBC_OBJS) $(LIBC_SETJMP)
 	$(CROSS)ar rcs $@ $^
 
 # ---- /usr/bin standalone ELF programs --------------------------------
 CMD_BUILD  := build/cmd
 CMD_NAMES  := ps ping ifconfig netstat test tcpconnect ftpd \
-              ls ll cat cp mv rm head tail wc grep echo
+              ls ll cat cp mv rm head tail wc grep echo uptime
 CMD_ELFS   := $(addprefix $(CMD_BUILD)/, $(addsuffix .elf, $(CMD_NAMES)))
 
 CMD_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \

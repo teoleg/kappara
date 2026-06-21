@@ -71,3 +71,60 @@ long atol(const char *s)
 {
     return strtol(s, (char **)0, 10);
 }
+
+/* atof is intentionally absent: kappara userland builds with
+ * -mgeneral-regs-only, which forbids `double` return types.  Code
+ * that needs string->number should use strtol/atoi instead. */
+
+int  abs (int n)  { return n < 0 ? -n : n; }
+long labs(long n) { return n < 0 ? -n : n; }
+
+/* No env in kappara -- userland is a single static shell.  Returning
+ * NULL is the correct contract: ISO C says getenv returns NULL when
+ * the name isn't bound, and nothing is bound here. */
+char *getenv(const char *name)
+{
+    (void)name;
+    return (char *)0;
+}
+
+/* qsort -- insertion sort.  Fine for the smallish arrays cmd tools
+ * pass (ls directory entries, ftp file lists).  O(n^2) but no heap
+ * required for stack-frame recursion, no extra allocation. */
+void qsort(void *base, size_t nmemb, size_t size,
+           int (*cmp)(const void *, const void *))
+{
+    unsigned char *b = (unsigned char *)base;
+    for (size_t i = 1; i < nmemb; i++) {
+        for (size_t j = i; j > 0; j--) {
+            unsigned char *a = b + (j - 1) * size;
+            unsigned char *c = b + j * size;
+            if (cmp(a, c) <= 0)
+                break;
+            for (size_t k = 0; k < size; k++) {
+                unsigned char t = a[k];
+                a[k] = c[k];
+                c[k] = t;
+            }
+        }
+    }
+}
+
+void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
+              int (*cmp)(const void *, const void *))
+{
+    const unsigned char *b = (const unsigned char *)base;
+    size_t lo = 0, hi = nmemb;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const void *p = b + mid * size;
+        int r = cmp(key, p);
+        if (r == 0)
+            return (void *)p;
+        if (r < 0)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    return (void *)0;
+}

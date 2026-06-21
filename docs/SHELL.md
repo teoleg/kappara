@@ -79,9 +79,11 @@ unrecognised command.  Source lives in `cmd/`.
 | `wc <file> [...]`       | Print line / word / byte counts for each file plus a totals row. |
 | `grep <pattern> <file> [...]` | Print lines containing the fixed-string pattern.  Case-sensitive; no regex. |
 | `echo <args...>`        | Print args separated by space, then a newline.  Reachable via `/usr/bin/echo` -- the bare `echo` resolves to the shell builtin (which writes to a file, different semantics). |
+| `uptime`                | Print monotonic seconds since boot.  Output shape: `up 42s` / `up 5m 03s` / `up 1h 23m 45s`.  Exercises the new `SYS_clock_gettime` syscall + `<time.h>` end-to-end. |
 
-`/usr/bin` is capped at `KFS_DIRENTS=18` per dirent block; bump
-that and `KFS_NAME_MAX` together if you need more.  The ramdisk
+`/usr/bin` is capped at `KFS_DIRENTS=21` per dirent block; bump
+that and `KFS_NAME_MAX` together if you need more (currently 12
+chars max, fitting the longest entry `tcpconnect`).  The ramdisk
 itself caps at `(RAMDISK_BLOCKS - 3) / KFS_BLOCKS_PER_FILE`
 slots (currently 31).  New selftests go into `cmd/test.c` as
 another entry in its registry, not a new ELF -- the registry

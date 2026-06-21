@@ -702,6 +702,8 @@ extern char grep_blob_start[];
 extern char grep_blob_end[];
 extern char echo_blob_start[];
 extern char echo_blob_end[];
+extern char uptime_blob_start[];
+extern char uptime_blob_end[];
 
 static struct blob_priv hello_priv;
 
@@ -786,6 +788,7 @@ void exec_space_init(void)
 		PAY("wc",         wc_blob_start,         wc_blob_end),
 		PAY("grep",       grep_blob_start,       grep_blob_end),
 		PAY("echo",       echo_blob_start,       echo_blob_end),
+		PAY("uptime",     uptime_blob_start,     uptime_blob_end),
 	};
 #undef PAY
 	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);

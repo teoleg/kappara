@@ -67,8 +67,11 @@
 				 * v0: child shares parent's vm_map, gets  *
 				 * its own stack slot with parent's stack  *
 				 * copied.  See docs/ARCHITECTURE.md.      */
+#define SYS_clock_gettime 35	/* (int clk_id, struct timespec *ts) -> 0/-1 *
+				 * clk_id is currently ignored; we always   *
+				 * return CNTPCT-derived monotonic time.    */
 
-#define SYS_MAX		35
+#define SYS_MAX		36
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

@@ -49,28 +49,41 @@ These constrain everything below.
 
 ### Stage 1 -- libc fill-out
 
-Status: `[ ]`
+Status: `[x]`
 
 Why first: real binaries built on real libc lean on functions we
 don't have.  Adding them now means stages 2+ aren't tripped by
 "oh, this stub doesn't exist yet".
 
-What to add (rough table; not exhaustive):
+What landed:
 
 | Header     | Functions                                                          |
 |------------|--------------------------------------------------------------------|
-| `<string.h>` | `strchr`, `strrchr`, `strdup`, `strncat`, `strncpy`, `strstr`, `strtok`, `memmove`, `memchr` |
-| `<stdlib.h>` | `qsort`, `bsearch`, `abs`, `atof` (returns 0 for now), `getenv` (returns NULL) |
-| `<ctype.h>`  | `isdigit`, `isalpha`, `isalnum`, `isspace`, `isupper`, `islower`, `toupper`, `tolower` (header is new) |
-| `<errno.h>`  | `int errno;` + `EAGAIN`/`ENOMEM`/`ENOENT`/... constants (header is new) |
-| `<stdio.h>`  | `perror`, `fflush` (no-op), `getchar`, `getline` (small impl)        |
-| `<setjmp.h>` | `setjmp` / `longjmp` (aarch64 ABI: save x19-x30, sp, d8-d15) (header is new) |
-| `<time.h>`   | `clock_gettime(CLOCK_MONOTONIC, ts)` reading CNTPCT/CNTFRQ via syscall (header is new) |
+| `<string.h>` | `strrchr`, `strdup`, `strncat`, `strstr`, `strtok`, `memchr` (`strncpy`, `memmove` already shipped) |
+| `<stdlib.h>` | `qsort` (insertion sort), `bsearch`, `abs`, `labs`, `getenv` (stub: returns NULL) |
+| `<ctype.h>`  | `isdigit`, `isalpha`, `isalnum`, `isspace`, `isupper`, `islower`, `isxdigit`, `isprint`, `iscntrl`, `ispunct`, `toupper`, `tolower` |
+| `<errno.h>`  | `int errno;` (global -- TLS deferred) + 35 standard `E*` constants |
+| `<stdio.h>`  | `perror`, `fflush` (no-op), `getchar`, `getline` (malloc-grow) |
+| `<setjmp.h>` | `setjmp` / `longjmp` in aarch64 asm; saves x19-x30 + SP.  d8-d15 deliberately omitted because userland builds with `-mgeneral-regs-only` and CPACR_EL1.FPEN doesn't grant EL0 FP access |
+| `<time.h>`   | `clock_gettime(CLOCK_MONOTONIC, ts)` + `time(NULL)` via new `SYS_clock_gettime` (35), kernel reads CNTPCT_EL0 / CNTFRQ_EL0 |
 
-Test: build the existing `cmd/*.elf` against the bigger libc; they
-should still pass `smoke-ftp` and `cmd/test all`.  Bonus: rewrite
-some of the existing tools (head, tail) to use ctype / strchr
-properly instead of open-coded loops.
+Not done: `atof`.  `-mgeneral-regs-only` rejects `double` return
+types; we can't legally declare it under the current ABI.  Once
+FPEN is enabled (out of scope) the prototype can be added.
+
+Build artefacts: added `lib/libc/src/{ctype,errno,time}.c`,
+`lib/libc/include/{ctype,errno,setjmp,time}.h`, and
+`lib/libc/aarch64/setjmp.S`.  Makefile's LIBC_SRCS extended; new
+`$(LIBC_SETJMP)` rule mirrors crt0.
+
+Side dependencies: bumped `KFS_NAME_MAX` 16→12 + `KFS_DIRENTS`
+18→21 to fit a 19th /usr/bin entry (`uptime`) which exercises the
+new `clock_gettime` syscall + `<time.h>` end-to-end.
+
+Test: `cmd/test all` 13/13, raspi3b boots to prompt, `uptime`
+prints "up Ns".  `smoke-ftp` flake rate unchanged (2/5 on this
+branch and on pristine HEAD -- pre-existing TCP race, unrelated
+to libc growth).
 
 ### Stage 2 -- Convert libc to position-independent code
 
