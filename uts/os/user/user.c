@@ -1336,48 +1336,15 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 		}
 	}
 
-	/* (2b) Apply relocations for ET_DYN.  Stage 4 did RELATIVE only;
-	 * stage 6 adds JUMP_SLOT and GLOB_DAT resolved against libc.so.
+	/* (2b) DYNAMIC.md stage 8: load ld-kappara.so and libc.so for any
+	 * ET_DYN binary.  We DO NOT walk PT_DYNAMIC or apply any relocs --
+	 * that's ld-kappara.so's job now.  We just copy bytes; ld.so reads
+	 * the auxv we build below to find each object's load base, then
+	 * walks each .dynamic and writes the fixups itself.
 	 *
-	 *   - .rela.dyn: a mix of RELATIVE and GLOB_DAT.  Kernel applies
-	 *     RELATIVE here; GLOB_DAT is deferred to step (2d) after
-	 *     libc.so is loaded.
-	 *   - .rela.plt: pure JUMP_SLOT (PLT slots for libc functions).
-	 *     Also deferred to (2d).
-	 *
-	 * Stage 7 will move (2d) into ld-kappara.so user-space alongside
-	 * dlopen, leaving only RELATIVE here for both app and libc.so. */
-	struct dyn_info app_dyn = {0};
-	if (eh->e_type == ET_DYN) {
-		if (walk_dynamic(elf_read_buf, eh, &app_dyn) < 0) {
-			kprintf("execve: ET_DYN without PT_DYNAMIC payload\n");
-			vm_map_put(vm);
-			return -1;
-		}
-		if (app_dyn.rela_size > 0) {
-			const Elf64_Rela *relas = image_to_ptr(elf_read_buf, eh,
-							       app_dyn.rela_off);
-			if (!relas) {
-				kprintf("execve: DT_RELA outside PT_LOAD\n");
-				vm_map_put(vm);
-				return -1;
-			}
-			unsigned n = (unsigned)(app_dyn.rela_size / sizeof(Elf64_Rela));
-			if (apply_relative_relocs(vm, load_base, relas, n) < 0) {
-				vm_map_put(vm);
-				return -1;
-			}
-		}
-	}
-
-	/* (2c) DYNAMIC.md stage 5: load /lib/ld-kappara.so alongside any
-	 * ET_DYN binary.  ld.so is the bootstrap dynamic linker; control
-	 * lands here first, it parses auxv to find AT_ENTRY, jumps to
-	 * the app.  ET_EXEC binaries (only /bin/hello today) skip the
-	 * loader -- they have no PT_DYNAMIC, no DT_NEEDED, nothing to do.
-	 *
-	 * ld.so is itself ET_EXEC at fixed LD_VA so we don't have a
-	 * chicken-and-egg relocation bootstrap. */
+	 * ld.so is itself ET_EXEC at fixed LD_VA so it needs no relocation
+	 * bootstrap.  libc.so is ET_DYN at LIBC_VA and ld.so applies its
+	 * RELATIVE relocs from user space. */
 	uint64_t ld_entry = 0;
 	if (eh->e_type == ET_DYN) {
 		const unsigned char *ld_img = (const unsigned char *)ld_kappara_blob_start;
@@ -1389,48 +1356,24 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 			vm_map_put(vm);
 			return -1;
 		}
-	}
 
-	/* (2d) DYNAMIC.md stage 6: load libc.so + resolve the app's
-	 * GLOB_DAT / JUMP_SLOT entries against its dynsym.
-	 *
-	 * libc.so is itself ET_DYN with R_AARCH64_RELATIVE relocs for
-	 * its internal pointers (printf format tables, FILE* statics,
-	 * etc.).  We load it at LIBC_VA, apply RELATIVE, then walk the
-	 * app's .rela.dyn (GLOB_DAT) and .rela.plt (JUMP_SLOT) writing
-	 * `LIBC_VA + sym.st_value` at each `app_base + r_offset`.
-	 *
-	 * Stage 7 moves this resolution into ld-kappara.so user-space
-	 * alongside dlopen, but the kernel path is the simpler shape
-	 * for the first cut. */
-	if (eh->e_type == ET_DYN) {
+		/* Load libc.so PT_LOADs at LIBC_VA + p_vaddr.  No reloc walk --
+		 * ld.so handles it. */
 		const unsigned char *libc_img = (const unsigned char *)libc_so_blob_start;
-		size_t libc_sz = (size_t)(libc_so_blob_end - libc_so_blob_start);
-		if (libc_sz < sizeof(Elf64_Ehdr)) {
-			kprintf("execve: libc.so blob too small\n");
-			vm_map_put(vm);
-			return -1;
-		}
 		const Elf64_Ehdr *libc_eh = (const Elf64_Ehdr *)libc_img;
-		if (libc_eh->e_type != ET_DYN ||
-		    libc_eh->e_machine != EM_AARCH64) {
+		if (libc_eh->e_type != ET_DYN || libc_eh->e_machine != EM_AARCH64) {
 			kprintf("execve: libc.so blob malformed\n");
 			vm_map_put(vm);
 			return -1;
 		}
-
-		/* Load libc.so's PT_LOADs at p_vaddr + LIBC_VA. */
 		for (unsigned i = 0; i < libc_eh->e_phnum; i++) {
 			const Elf64_Phdr *ph = (const Elf64_Phdr *)(libc_img +
 					libc_eh->e_phoff +
 					(uint64_t)i * libc_eh->e_phentsize);
 			if (ph->p_type != PT_LOAD) continue;
-
 			uint64_t va = ph->p_vaddr + LIBC_VA;
-			if (va < LIBC_VA ||
-			    va + ph->p_memsz > LIBC_VA + LIBC_SIZE) {
-				kprintf("execve: libc.so LOAD 0x%lx+0x%lx outside window\n",
-					(unsigned long)va, (unsigned long)ph->p_memsz);
+			if (va < LIBC_VA || va + ph->p_memsz > LIBC_VA + LIBC_SIZE) {
+				kprintf("execve: libc.so LOAD outside window\n");
 				vm_map_put(vm);
 				return -1;
 			}
@@ -1449,73 +1392,6 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 					vm_map_put(vm);
 					return -1;
 				}
-			}
-		}
-
-		/* Walk libc.so's own .dynamic + apply its RELATIVE relocs. */
-		struct dyn_info libc_dyn = {0};
-		if (walk_dynamic(libc_img, libc_eh, &libc_dyn) < 0) {
-			kprintf("execve: libc.so has no PT_DYNAMIC\n");
-			vm_map_put(vm);
-			return -1;
-		}
-		if (libc_dyn.rela_size > 0) {
-			const Elf64_Rela *relas = image_to_ptr(libc_img, libc_eh,
-							       libc_dyn.rela_off);
-			if (!relas) {
-				kprintf("execve: libc.so DT_RELA outside PT_LOAD\n");
-				vm_map_put(vm);
-				return -1;
-			}
-			unsigned n = (unsigned)(libc_dyn.rela_size / sizeof(Elf64_Rela));
-			if (apply_relative_relocs(vm, LIBC_VA, relas, n) < 0) {
-				vm_map_put(vm);
-				return -1;
-			}
-		}
-
-		/* Resolve app's cross-DSO relocs.  Pull app's symtab/strtab
-		 * out of elf_read_buf via image_to_ptr (DT_SYMTAB / DT_STRTAB
-		 * tags carry image VAs the same way DT_RELA does). */
-		const Elf64_Sym *app_symtab = image_to_ptr(elf_read_buf, eh,
-							   app_dyn.symtab_off);
-		const unsigned char *app_strtab = image_to_ptr(elf_read_buf, eh,
-							       app_dyn.strtab_off);
-		if (!app_symtab || !app_strtab) {
-			kprintf("execve: app symtab/strtab unreachable\n");
-			vm_map_put(vm);
-			return -1;
-		}
-
-		/* .rela.dyn (GLOB_DAT entries among the RELATIVEs we already
-		 * applied) -- second pass with the type filter. */
-		if (app_dyn.rela_size > 0) {
-			const Elf64_Rela *relas = image_to_ptr(elf_read_buf, eh,
-							       app_dyn.rela_off);
-			unsigned n = (unsigned)(app_dyn.rela_size / sizeof(Elf64_Rela));
-			if (resolve_xdso_relocs(vm, load_base, relas, n,
-						app_symtab, app_strtab,
-						libc_img, libc_eh, &libc_dyn) < 0) {
-				vm_map_put(vm);
-				return -1;
-			}
-		}
-
-		/* .rela.plt (JUMP_SLOT) */
-		if (app_dyn.jmprel_size > 0) {
-			const Elf64_Rela *relas = image_to_ptr(elf_read_buf, eh,
-							       app_dyn.jmprel_off);
-			if (!relas) {
-				kprintf("execve: app DT_JMPREL outside PT_LOAD\n");
-				vm_map_put(vm);
-				return -1;
-			}
-			unsigned n = (unsigned)(app_dyn.jmprel_size / sizeof(Elf64_Rela));
-			if (resolve_xdso_relocs(vm, load_base, relas, n,
-						app_symtab, app_strtab,
-						libc_img, libc_eh, &libc_dyn) < 0) {
-				vm_map_put(vm);
-				return -1;
 			}
 		}
 	}
@@ -1562,9 +1438,8 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 	 *
 	 * Padding test: total bytes from SP to strings is
 	 * 8 (argc) + 8*argc (argv slots) + 8 (argv NUL) + 8 (envp NUL)
-	 * + 16 (AT_ENTRY) + 16 (AT_NULL) = 56 + 8*argc.  SP must be
-	 * 16-aligned, so we pad with 8 bytes when (56 + 8*argc) % 16
-	 * != 0, i.e. when argc is even. */
+	 * + 4 * 16 (auxv: 3 entries + NULL terminator) = 88 + 8*argc.
+	 * SP must be 16-aligned, so we pad with 8 bytes when argc is odd. */
 	int effective_argc = (argc > EXEC_MAX_ARGS) ? EXEC_MAX_ARGS : argc;
 	uint64_t sp = EXEC_STACK_TOP;
 	uint64_t uva_strings[EXEC_MAX_ARGS];
@@ -1585,28 +1460,47 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 	/* 16-byte align before the auxv/envp/argv block. */
 	sp &= ~(uint64_t)15;
 
+	/* Pad before auxv when argc is even.  Total below SP from strings:
+	 * 8(argc) + 8*argc + 8(argv NUL) + 8(envp NUL) + 64 (4 auxv slots)
+	 * = 88 + 8*argc.  88 mod 16 = 8, so for SP 16-aligned: need an
+	 * extra 8 bytes of padding when 8*argc is also 0 mod 16 (= argc
+	 * even). */
 	if (!(effective_argc & 1)) {
 		sp -= 8;
 		uint64_t zero = 0;
 		vmap_copyin(vm, sp, &zero, sizeof(zero));
 	}
 
-	/* auxv[1] = AT_NULL terminator */
+	/* DYNAMIC.md stage 8: auxv lets ld-kappara.so locate every loaded
+	 * object.  Order doesn't matter -- ld_main walks all entries; we
+	 * just terminate with AT_NULL.  Layout pushed top-down:
+	 *   AT_NULL                  | terminator
+	 *   AT_ENTRY = app's _start  | where ld.so jumps after relocs
+	 *   AT_KAPPARA_LIBC_BASE     | libc.so load_base (0 for ET_EXEC)
+	 *   AT_KAPPARA_APP_BASE      | app load_base (0 for ET_EXEC)
+	 */
 	{
 		uint64_t at_null[2] = { 0, 0 };
 		sp -= sizeof(at_null);
 		vmap_copyin(vm, sp, at_null, sizeof(at_null));
 	}
-
-	/* auxv[0] = AT_ENTRY -> app entry (post-load_base).  ET_EXEC
-	 * binaries also get this slot populated even though their
-	 * loader is the kernel (ld.so isn't entered for ET_EXEC) -- it
-	 * costs 16 bytes and keeps the stack shape uniform. */
 	{
 		uint64_t at_entry[2] = { 9 /* AT_ENTRY */,
 		                        eh->e_entry + load_base };
 		sp -= sizeof(at_entry);
 		vmap_copyin(vm, sp, at_entry, sizeof(at_entry));
+	}
+	{
+		uint64_t at_libc[2] = { 0x101 /* AT_KAPPARA_LIBC_BASE */,
+		                        (eh->e_type == ET_DYN) ? LIBC_VA : 0 };
+		sp -= sizeof(at_libc);
+		vmap_copyin(vm, sp, at_libc, sizeof(at_libc));
+	}
+	{
+		uint64_t at_app[2] = { 0x100 /* AT_KAPPARA_APP_BASE */,
+		                       (eh->e_type == ET_DYN) ? load_base : 0 };
+		sp -= sizeof(at_app);
+		vmap_copyin(vm, sp, at_app, sizeof(at_app));
 	}
 
 	/* envp terminator (empty environment for now). */

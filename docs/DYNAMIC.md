@@ -290,6 +290,63 @@ Each cmd binary shrinks by 4-5 KB (no embedded printf / malloc).
 Verified: `cmd/test all` 13/13, `make ARCH=virt smoke-ftp` 4/5
 PASS (within noise), `/bin/hello` ET_EXEC unchanged.
 
+### Stage 8 -- Move the dynamic linker out of the kernel
+
+Status: `[x]`
+
+The "user-space dynamic linker" promised by the original
+DYNAMIC.md vision.  Kernel now does NO relocation work for execve:
+it just memcopies PT_LOADs of the app, ld-kappara.so, and libc.so
+into the new vm_map, builds an auxv, and lets ld.so do the rest
+from EL0.
+
+What landed:
+
+- `lib/ld-kappara/ld_main.c` -- the actual linker.  ~200 lines of
+  C with inline syscalls (`SYS_log` for diagnostics only -- the
+  relocation walk is pure memory writes).  Parses auxv for
+  `AT_KAPPARA_APP_BASE` (0x100) / `AT_KAPPARA_LIBC_BASE` (0x101) /
+  `AT_ENTRY` (9), walks each object's PT_DYNAMIC at its load_base,
+  applies all relocations, returns the app's entry point.
+- `lib/ld-kappara/ld_start.S` -- shrunk to 15 instructions: walk
+  past argc/argv/envp to find auxv, call ld_main(auxv), `br x0` to
+  the returned entry point.  Stack is unchanged so the app's
+  crt0 reads argc/argv as usual.
+- `Makefile` extended: ld-kappara.so now links from two `.o`
+  files (start + main).
+- `uts/os/user/user.c` shrunk significantly: the old (2b) RELATIVE
+  walk for the app, the (2d) libc.so RELATIVE + cross-DSO walks
+  are all gone.  Kernel just allocates pages and copies bytes.
+  libc.so is still kernel-loaded (saves a vfs round-trip per
+  exec); ld.so reads it from memory at the address the auxv tells
+  it to.
+- Auxv gains two custom entries -- `AT_KAPPARA_APP_BASE` /
+  `AT_KAPPARA_LIBC_BASE` -- conveying the kernel's load-placement
+  choices to ld.so.  Stack padding math updated for the new
+  4-entry auxv block (88 + 8*argc total, pad 8 when argc is even).
+
+Benefits:
+
+- Kernel `sys_execve_impl` is ~200 lines shorter and has no
+  knowledge of ELF symbol tables, hash tables, or reloc types.
+- The dynamic-linking logic is now testable in user space -- the
+  exact same code that runs at boot also runs for any future
+  dlopen-driven nested load.
+- Cleaner mental model: the kernel does I/O + memory setup; the
+  linker does linking.
+
+What didn't move (yet):
+
+- `sys_dlopen_impl` still does its own reloc walk because it can
+  be called at any time and ld.so is already done by then.  A
+  cleaner factoring would have dlopen IPC into ld.so to do the
+  fixups, but this is a future refinement (stage 9?).
+
+Verified: `cmd/test all` 14/14 (every cmd binary now goes
+kernel -> ld.so._start -> ld_main -> reloc walk -> app._start),
+`make ARCH=virt smoke-ftp` 3/3 PASS, `/bin/hello` ET_EXEC still
+loads via the direct path (no ld.so involvement for ET_EXEC).
+
 ### Stage 7 -- `dlopen` / `dlsym`
 
 Status: `[x]`

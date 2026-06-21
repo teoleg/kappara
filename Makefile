@@ -455,15 +455,22 @@ $(USER_BUILD):
 # auxv for AT_ENTRY, jumps).  See lib/ld-kappara/ld_start.S.
 LDK_BUILD   := build/ld-kappara
 LDK_ELF     := $(LDK_BUILD)/ld-kappara.so
-LDK_OBJS    := $(LDK_BUILD)/ld_start.o
+LDK_OBJS    := $(LDK_BUILD)/ld_start.o $(LDK_BUILD)/ld_main.o
+
+LDK_CFLAGS  := -Wall -Wextra -Werror -std=gnu11 \
+               -ffreestanding -nostdlib -nostartfiles \
+               -fno-stack-protector -fno-pie -fno-pic \
+               -mcpu=cortex-a53 -mgeneral-regs-only \
+               -O2 -g -Iinclude
 
 $(LDK_BUILD):
 	mkdir -p $@
 
 $(LDK_BUILD)/ld_start.o: lib/ld-kappara/ld_start.S | $(LDK_BUILD)
-	$(USER_CC) -ffreestanding -nostdlib -nostartfiles \
-	           -mcpu=cortex-a53 -mgeneral-regs-only \
-	           -c $< -o $@
+	$(USER_CC) $(LDK_CFLAGS) -c $< -o $@
+
+$(LDK_BUILD)/ld_main.o: lib/ld-kappara/ld_main.c | $(LDK_BUILD)
+	$(USER_CC) $(LDK_CFLAGS) -c $< -o $@
 
 $(LDK_ELF): $(LDK_OBJS) lib/ld-kappara/linker.ld
 	$(USER_LD) -nostdlib -static -s -z max-page-size=4096 \

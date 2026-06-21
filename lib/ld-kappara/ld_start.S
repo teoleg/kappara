@@ -1,55 +1,34 @@
 /*
- * lib/ld-kappara/ld_start.S -- minimal dynamic linker (stage 5)
+ * lib/ld-kappara/ld_start.S -- entry stub for ld-kappara.so
  *
- * The kernel loads us at LD_VA (0x30000000) and points the trap
- * frame's ELR/SP at our _start with the application's stack frame
- * already constructed:
+ * The kernel hands us control with the application's stack frame
+ * already constructed: argc / argv / envp / auxv per SysV.  We walk
+ * past argc + argv + envp to find the auxv pointer, hand it to
+ * ld_main (C), which applies all relocations and returns the
+ * application's entry point.  We then jump to it with the stack
+ * unchanged so the application's crt0 reads argc/argv as usual.
  *
- *   sp + 0           argc
- *   sp + 8           argv[0]
- *   ...              argv[argc-1]
- *   sp + 8*(argc+1)  NULL (argv terminator)
- *   sp + ...         envp[0] (none today)
- *   sp + ...         NULL (envp terminator)
- *                    auxv[0].a_type
- *                    auxv[0].a_un.a_val
- *   ...              AT_NULL (a_type == 0)
- *
- * Stage 5 deliverable: walk the auxv for AT_ENTRY (a_type == 9)
- * and branch to it.  The app's crt0 reads argc/argv from [sp] /
- * [sp+8] -- we leave the stack untouched.
- *
- * Stage 6 will grow this to walk the app's PT_DYNAMIC (located
- * via AT_PHDR / AT_PHNUM), process DT_NEEDED entries, mmap each
- * shared object, and apply cross-DSO relocations.
- *
- * No registers other than x0..x5 (scratch) are clobbered; the
- * AArch64 ABI says x19..x30 are caller-saved at entry, so the
- * app sees a clean register file.
+ * No callee-saved register dance is needed -- ld_main is leaf-ish
+ * and we don't return.  We don't have a heap; ld_main's locals fit
+ * in registers + the existing stack frame.
  */
 	.section ".text._start","ax",%progbits
 	.global _start
 _start:
 	/* Walk past argv to envp[0]. */
-	ldr	x0, [sp]		/* argc */
-	add	x1, sp, #16		/* &argv[0] : skip argc + argv[argc]=NULL slot */
-	add	x1, x1, x0, lsl #3	/* sp + 8 + 8*argc + 8 = past argv NULL */
+	ldr	x0, [sp]			/* argc                          */
+	add	x1, sp, #16			/* &argv[0] (past argc + argv NUL) */
+	add	x1, x1, x0, lsl #3		/* &envp[0]                       */
 
-	/* Walk past envp to auxv[0]. */
+	/* Walk envp to NUL terminator. */
 1:	ldr	x2, [x1], #8
 	cbnz	x2, 1b
 
-	/* Walk auxv looking for AT_ENTRY (a_type == 9).  Always read
-	 * both type+value per iteration (keeps x1 incrementing in pairs);
-	 * cbnz on type catches the AT_NULL terminator. */
-	mov	x3, #0			/* x3 = app entry accumulator */
-2:	ldr	x4, [x1], #8		/* a_type */
-	ldr	x5, [x1], #8		/* a_un.a_val */
-	cmp	x4, #9			/* AT_ENTRY */
-	csel	x3, x5, x3, eq
-	cbnz	x4, 2b
+	/* x1 now points at auxv[0].  Call ld_main(auxv). */
+	mov	x0, x1
+	bl	ld_main
 
-	/* Hand control to the application's entry point.  Stack is
-	 * unchanged; argc / argv / envp / auxv all visible to the
-	 * app's crt0. */
-	br	x3
+	/* ld_main returns app entry in x0.  Jump to it without
+	 * touching the stack -- the app's crt0 reads argc / argv
+	 * from [sp] / [sp+8]. */
+	br	x0
