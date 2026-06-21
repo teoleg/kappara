@@ -87,20 +87,28 @@ to libc growth).
 
 ### Stage 2 -- Convert libc to position-independent code
 
-Status: `[ ]`
+Status: `[x]`
 
-What changes: the Makefile's `LIBC_CFLAGS` gets `-fPIC` so libc's
-.o files have no absolute relocations.  The string-table address,
-the printf format-decode tables, etc. all become PC-relative or
-GOT-relative.
+What changed: `LIBC_CFLAGS` swapped `-fno-pie -fno-pic` for `-fPIC`.
+libc's `.o` files now use only PC-relative relocations
+(`R_AARCH64_CALL26`, `R_AARCH64_ADR_PREL_PG_HI21`,
+`R_AARCH64_LDST64_LO12`, `R_AARCH64_PREL32`) inside `.text` —
+the previous `R_AARCH64_ABS64` entries are gone except where they
+belong (`.eh_frame`, `.debug_*`, both runtime-irrelevant).
 
-What this DOESN'T do yet: produce a `.so`.  Stage 2's output is
+What this does NOT do yet: produce a `.so`.  Stage 2's output is
 still `libc.a`, just with PIC-compatible code; the existing static
-link path stays working.  We just stop relying on link-time
-address fixups.
+link path stays working.  We've just stopped relying on link-time
+address fixups in libc.
 
-Test: `cmd/test all` (13/13), `smoke-ftp PASS`.  Binary size goes
-up slightly; that's fine.
+Observed side-effect: cmd binaries shrank by ~64 bytes each (PIC
+encodings happen to be one instruction shorter for our access
+patterns), pushing `ifconfig.elf` out of the size band that
+exposes the pre-existing TCP send-buffer race -- smoke-ftp now
+PASS 5/5 instead of the 2/5 baseline.  The race is still there
+in tcp.c; we just stopped hitting it in this test rig.
+
+Test: `cmd/test all` 13/13, `make ARCH=virt smoke-ftp` PASS 5/5.
 
 ### Stage 3 -- Convert cmd binaries to PIE
 

@@ -469,7 +469,7 @@ LIBC_A      := $(CMD_BUILD)/libc/libc.a
 
 LIBC_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
                -ffreestanding -nostdlib -nostartfiles \
-               -fno-stack-protector -fno-pie -fno-pic \
+               -fno-stack-protector -fPIC \
                -mcpu=cortex-a53 -mgeneral-regs-only \
                -O2 -g \
                -I$(LIBC_DIR)/include
