@@ -83,6 +83,8 @@ long sys_fork_impl(struct trap_frame *parent_tf);
  * mapping by exiting (no dlclose yet). */
 uint64_t sys_dlopen_impl(const char *path);
 uint64_t sys_dlsym_impl(uint64_t handle, const char *name);
+long     sys_dlclose_impl(uint64_t handle);
+long     sys_dlerror_impl(char *user_buf, unsigned cap);
 
 #endif
 

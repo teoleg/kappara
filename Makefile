@@ -540,17 +540,22 @@ $(DLTEST_BUILD)/dltest.o: lib/libdltest/dltest.c | $(DLTEST_BUILD)
 	           -fno-stack-protector -fPIC \
 	           -mcpu=cortex-a53 -mgeneral-regs-only \
 	           -O2 -g \
+	           -I$(LIBC_DIR)/include \
 	           -c $< -o $@
 
-$(DLTEST_SO): $(DLTEST_BUILD)/dltest.o
+# libdltest.so DT_NEEDED's libc.so so its printf / strlen calls go
+# through the dlopen resolver's cross-DSO path.
+$(DLTEST_SO): $(DLTEST_BUILD)/dltest.o $(LIBC_SO)
 	$(USER_LD) -shared -nostdlib -soname libdltest.so \
 	           -z max-page-size=4096 -s \
-	           -o $@ $<
+	           --no-dynamic-linker \
+	           -o $@ $< -L$(CMD_BUILD)/libc -l:libc.so
 
 # ---- /usr/bin standalone ELF programs --------------------------------
 CMD_BUILD  := build/cmd
 CMD_NAMES  := ps ping ifconfig netstat test tcpconnect ftpd \
-              ls ll cat cp mv rm head tail wc grep echo uptime
+              ls ll cat cp mv rm head tail wc grep echo uptime \
+              nm ldd objdump
 CMD_ELFS   := $(addprefix $(CMD_BUILD)/, $(addsuffix .elf, $(CMD_NAMES)))
 
 CMD_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \

@@ -33,6 +33,8 @@
 /* d_tag (PT_DYNAMIC entries) */
 #define DT_NULL		0
 #define DT_NEEDED	1
+#define DT_HASH		4	/* SysV hash table -- nbucket+nchain header
+				 * lets us bound dynsym walks */
 #define DT_STRTAB	5
 #define DT_SYMTAB	6
 #define DT_RELA		7	/* offset of Rela table */

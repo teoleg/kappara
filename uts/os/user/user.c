@@ -75,6 +75,7 @@
 #include "kappara/proc/process.h"
 #include "kappara/proc/sched.h"
 #include "kappara/core/string.h"
+#include "kappara/core/uaccess.h"
 #include "kappara/abi/syscall.h"
 #include "kappara/proc/user.h"
 #include "kappara/fs/vfs.h"
@@ -273,12 +274,13 @@ void user_spawn(void)
 #define LIBC_VA        0x38000000UL
 #define LIBC_SIZE      0x00200000UL	/* 2 MB ceiling for libc.so */
 
-/* DYNAMIC.md stage 7: runtime-loaded shared objects (dlopen).  Single
- * slot per process for now; if a future caller needs to dlopen
- * multiple .so files, allocate slots in DLOPEN_VA..DLOPEN_VA+DLOPEN_SIZE.
- * Inside the first 1 GB (same reason as LIBC_VA). */
-#define DLOPEN_VA      0x39000000UL
-#define DLOPEN_SIZE    0x00200000UL	/* 2 MB ceiling */
+/* DYNAMIC.md stage 7: runtime-loaded shared objects (dlopen).  Up to
+ * DLOPEN_MAX_SLOTS concurrent objects in [DLOPEN_VA, DLOPEN_VA + 2 MB);
+ * each slot owns a fixed 512 KB sub-window.  Inside the first 1 GB (same
+ * reason as LIBC_VA). */
+#define DLOPEN_VA        0x39000000UL
+#define DLOPEN_SIZE      0x00200000UL	/* 2 MB total */
+#define DLOPEN_SLOT_SIZE 0x00080000UL	/* 512 KB per slot, * 4 slots */
 
 /* SPAWN_STACK_SIZE is defined near the top of the file. */
 #define SPAWN_MAX		((USER_SIZE / SPAWN_STACK_SIZE) - 1)
@@ -584,15 +586,19 @@ long sys_fork_impl(struct trap_frame *parent_tf)
 		return -1;
 	}
 
-	/* Inherit the dlopen handle so the child can dlsym the same .so
-	 * without re-dlopen'ing. */
-	cvm->dlopen_base = pvm->dlopen_base;
-	{
+	/* Inherit the dlopen slot table so the child can dlsym/dlclose the
+	 * parent's handles.  Each slot's path is a fixed embedded buffer
+	 * (kernel-stack copy of the syscall arg wouldn't survive past
+	 * return, so we don't keep pointers). */
+	for (unsigned s = 0; s < DLOPEN_MAX_SLOTS; s++) {
+		cvm->dlopen_slots[s].base = pvm->dlopen_slots[s].base;
 		unsigned i = 0;
-		for (; i + 1 < sizeof(cvm->dlopen_path) && pvm->dlopen_path[i]; i++)
-			cvm->dlopen_path[i] = pvm->dlopen_path[i];
-		cvm->dlopen_path[i] = '\0';
+		for (; i + 1 < sizeof(cvm->dlopen_slots[s].path) &&
+		       pvm->dlopen_slots[s].path[i]; i++)
+			cvm->dlopen_slots[s].path[i] = pvm->dlopen_slots[s].path[i];
+		cvm->dlopen_slots[s].path[i] = '\0';
 	}
+	cvm->dlerror_msg[0] = '\0';
 
 	cvm->heap_brk   = pvm->heap_brk;
 	cvm->spawn_next = pvm->spawn_next;
@@ -757,6 +763,12 @@ extern char echo_blob_start[];
 extern char echo_blob_end[];
 extern char uptime_blob_start[];
 extern char uptime_blob_end[];
+extern char nm_blob_start[];
+extern char nm_blob_end[];
+extern char ldd_blob_start[];
+extern char ldd_blob_end[];
+extern char objdump_blob_start[];
+extern char objdump_blob_end[];
 
 /* DYNAMIC.md stage 5: ld-kappara.so is referenced directly by the
  * exec loader; it doesn't go through VFS for the bootstrap.  Once
@@ -882,6 +894,9 @@ void exec_space_init(void)
 		PAY("grep",       grep_blob_start,       grep_blob_end),
 		PAY("echo",       echo_blob_start,       echo_blob_end),
 		PAY("uptime",     uptime_blob_start,     uptime_blob_end),
+		PAY("nm",         nm_blob_start,         nm_blob_end),
+		PAY("ldd",        ldd_blob_start,        ldd_blob_end),
+		PAY("objdump",    objdump_blob_start,    objdump_blob_end),
 	};
 #undef PAY
 	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);
@@ -1068,6 +1083,8 @@ struct dyn_info {
 	uint64_t rela_off,   rela_size;	/* DT_RELA   / DT_RELASZ   */
 	uint64_t jmprel_off, jmprel_size; /* DT_JMPREL / DT_PLTRELSZ */
 	uint64_t symtab_off, strtab_off; /* DT_SYMTAB / DT_STRTAB    */
+	uint64_t strsz;			 /* DT_STRSZ -- bounds st_name */
+	uint64_t hash_off;		 /* DT_HASH  -- nchain == nsyms */
 };
 
 /* Walk PT_DYNAMIC of `eh` and populate `out`.  Returns 0 on success
@@ -1095,6 +1112,8 @@ static int walk_dynamic(const unsigned char *img, const Elf64_Ehdr *eh,
 		case DT_PLTRELSZ: out->jmprel_size  = dyn[i].d_un; break;
 		case DT_SYMTAB:   out->symtab_off   = dyn[i].d_un; break;
 		case DT_STRTAB:   out->strtab_off   = dyn[i].d_un; break;
+		case DT_STRSZ:    out->strsz        = dyn[i].d_un; break;
+		case DT_HASH:     out->hash_off     = dyn[i].d_un; break;
 		}
 	}
 	return 0;
@@ -1134,6 +1153,20 @@ static int sym_name_eq(const unsigned char *libc_strtab,
 	return *s == 0 && *want == 0;
 }
 
+/* Return the symbol-table entry count for a .so by reading the SysV
+ * hash table header (DT_HASH).  The .hash section starts with
+ * { uint32_t nbucket; uint32_t nchain; ... }, where nchain == # symbols.
+ * Returns 0 if no hash table is present (caller should fall back to a
+ * conservative scan bounded by string-table safety). */
+static unsigned dyn_nsyms(const unsigned char *img, const Elf64_Ehdr *eh,
+			   const struct dyn_info *dyn)
+{
+	if (dyn->hash_off == 0) return 0;
+	const uint32_t *h = image_to_ptr(img, eh, dyn->hash_off);
+	if (!h) return 0;
+	return (unsigned)h[1];	/* nchain == nsyms */
+}
+
 /* Resolve a symbol name against libc.so's dynsym.  Returns the
  * runtime VA (= LIBC_VA + symbol value) if found, 0 otherwise.
  *
@@ -1151,14 +1184,12 @@ static uint64_t resolve_in_libc(const char *name,
 						   libc_dyn->strtab_off);
 	if (!symtab || !strtab) return 0;
 
-	/* libc.so symtab size isn't directly in DT_*.  GNU_HASH or HASH
-	 * give it; rather than parse a hash table, walk until we hit a
-	 * symbol whose st_name overflows the string-table size implied
-	 * by the next section -- or just bound to a generous max.
-	 * The actual exported set is ~50 symbols; 256 is plenty. */
-	for (unsigned i = 0; i < 256; i++) {
+	unsigned nsyms = dyn_nsyms(libc_img, libc_eh, libc_dyn);
+	if (nsyms == 0 || nsyms > 4096) nsyms = 256;	/* defensive cap */
+	for (unsigned i = 0; i < nsyms; i++) {
 		const Elf64_Sym *s = &symtab[i];
 		if (s->st_name == 0) continue;
+		if (libc_dyn->strsz && s->st_name >= libc_dyn->strsz) continue;
 		if (s->st_shndx == 0)  continue;	/* SHN_UNDEF */
 		if (sym_name_eq(strtab, s->st_name, name))
 			return LIBC_VA + s->st_value;
@@ -1669,31 +1700,53 @@ static long dlopen_read(const char *path)
 	return sz;
 }
 
+/* Set vm->dlerror_msg.  Embedded buffer; truncates instead of allocating. */
+static void dlerror_set(struct vm_map *vm, const char *msg)
+{
+	unsigned i = 0;
+	for (; i + 1 < sizeof(vm->dlerror_msg) && msg[i]; i++)
+		vm->dlerror_msg[i] = msg[i];
+	vm->dlerror_msg[i] = '\0';
+}
+
 uint64_t sys_dlopen_impl(const char *path)
 {
 	struct kthread *t = curthread;
 	if (!t || !t->t_proc || !t->t_proc->vm) return 0;
 	struct vm_map *vm = t->t_proc->vm;
-	if (vm->heap_brk == 0) return 0;	/* not exec'd */
+	if (vm->heap_brk == 0) {
+		/* Init shells (no per-process backing) can't dlopen. */
+		return 0;
+	}
 
-	/* Cached-handle fast path: same path -> same base. */
-	if (vm->dlopen_base != 0 &&
-	    kstrcmp(vm->dlopen_path, path) == 0)
-		return vm->dlopen_base;
-	if (vm->dlopen_base != 0) {
-		kprintf("dlopen: only one .so per process for now\n");
+	/* Cached-handle fast path: same path -> same handle. */
+	for (unsigned s = 0; s < DLOPEN_MAX_SLOTS; s++) {
+		if (vm->dlopen_slots[s].base != 0 &&
+		    kstrcmp(vm->dlopen_slots[s].path, path) == 0)
+			return vm->dlopen_slots[s].base;
+	}
+
+	/* Find a free slot. */
+	int free_slot = -1;
+	for (unsigned s = 0; s < DLOPEN_MAX_SLOTS; s++) {
+		if (vm->dlopen_slots[s].base == 0) { free_slot = (int)s; break; }
+	}
+	if (free_slot < 0) {
+		dlerror_set(vm, "dlopen: no free slot (DLOPEN_MAX_SLOTS reached)");
 		return 0;
 	}
 
 	unsigned long flags = spin_lock_irq_save(&dlopen_buf_lock);
 
 	if (dlopen_read(path) < 0) {
+		dlerror_set(vm, "dlopen: file read or ELF validation failed");
 		spin_unlock_irq_restore(&dlopen_buf_lock, flags);
 		return 0;
 	}
 
 	const Elf64_Ehdr *eh = (const Elf64_Ehdr *)dlopen_read_buf;
-	const uint64_t load_base = DLOPEN_VA;
+	const uint64_t load_base = DLOPEN_VA + (uint64_t)free_slot * DLOPEN_SLOT_SIZE;
+	const uint64_t slot_end  = load_base + DLOPEN_SLOT_SIZE;
 
 	/* Load PT_LOADs at p_vaddr + load_base. */
 	for (unsigned i = 0; i < eh->e_phnum; i++) {
@@ -1701,9 +1754,8 @@ uint64_t sys_dlopen_impl(const char *path)
 				 eh->e_phoff + (uint64_t)i * eh->e_phentsize);
 		if (ph->p_type != PT_LOAD) continue;
 		uint64_t va = ph->p_vaddr + load_base;
-		if (va < DLOPEN_VA ||
-		    va + ph->p_memsz > DLOPEN_VA + DLOPEN_SIZE) {
-			kprintf("dlopen: LOAD outside window\n");
+		if (va < load_base || va + ph->p_memsz > slot_end) {
+			dlerror_set(vm, "dlopen: LOAD outside slot window");
 			spin_unlock_irq_restore(&dlopen_buf_lock, flags);
 			return 0;
 		}
@@ -1712,29 +1764,66 @@ uint64_t sys_dlopen_impl(const char *path)
 		                     & ~(uint64_t)PAGE_MASK;
 		unsigned n_pages   = (unsigned)((seg_end - seg_start) / PAGE_SIZE);
 		if (vmap_alloc_pages(vm, seg_start, n_pages, 1) < 0) {
-			kprintf("dlopen: PMM exhausted\n");
+			dlerror_set(vm, "dlopen: PMM exhausted");
 			spin_unlock_irq_restore(&dlopen_buf_lock, flags);
 			return 0;
 		}
 		if (ph->p_filesz > 0) {
 			if (vmap_copyin(vm, va, dlopen_read_buf + ph->p_offset,
 			                ph->p_filesz) < 0) {
+				dlerror_set(vm, "dlopen: vmap_copyin failed");
 				spin_unlock_irq_restore(&dlopen_buf_lock, flags);
 				return 0;
 			}
 		}
 	}
 
-	/* Apply this .so's RELATIVE relocations.  Cross-DSO (GLOB_DAT /
-	 * JUMP_SLOT against libc.so) is not yet supported for dlopen'd
-	 * objects -- stage 7 minimum is self-contained .so files. */
+	/* Apply this .so's RELATIVE relocations + resolve cross-DSO
+	 * GLOB_DAT / JUMP_SLOT against libc.so's dynsym -- same shape as
+	 * sys_execve_impl's (2b) + (2d) for the app, just with a different
+	 * load_base.  A dlopen'd .so can now DT_NEEDED libc.so and call
+	 * printf / fork / etc.  Cross-DSO against other dlopen'd modules
+	 * is not yet supported (would need a registry of currently-loaded
+	 * objects). */
 	struct dyn_info dyn = {0};
-	if (walk_dynamic(dlopen_read_buf, eh, &dyn) == 0 && dyn.rela_size > 0) {
-		const Elf64_Rela *relas = image_to_ptr(dlopen_read_buf, eh,
-						       dyn.rela_off);
-		if (relas) {
-			unsigned n = (unsigned)(dyn.rela_size / sizeof(Elf64_Rela));
-			(void)apply_relative_relocs(vm, load_base, relas, n);
+	if (walk_dynamic(dlopen_read_buf, eh, &dyn) == 0) {
+		if (dyn.rela_size > 0) {
+			const Elf64_Rela *relas = image_to_ptr(dlopen_read_buf, eh,
+							       dyn.rela_off);
+			if (relas) {
+				unsigned n = (unsigned)(dyn.rela_size / sizeof(Elf64_Rela));
+				(void)apply_relative_relocs(vm, load_base, relas, n);
+			}
+		}
+
+		/* Cross-DSO resolution against libc.so (loaded by execve at
+		 * LIBC_VA).  Reuses the same helpers execve uses. */
+		const unsigned char *libc_img = (const unsigned char *)libc_so_blob_start;
+		const Elf64_Ehdr *libc_eh = (const Elf64_Ehdr *)libc_img;
+		struct dyn_info libc_dyn = {0};
+		if (walk_dynamic(libc_img, libc_eh, &libc_dyn) == 0) {
+			const Elf64_Sym *symtab = image_to_ptr(dlopen_read_buf, eh,
+							       dyn.symtab_off);
+			const unsigned char *strtab = image_to_ptr(dlopen_read_buf, eh,
+								   dyn.strtab_off);
+			if (symtab && strtab) {
+				if (dyn.rela_size > 0) {
+					const Elf64_Rela *relas = image_to_ptr(dlopen_read_buf, eh,
+									       dyn.rela_off);
+					unsigned n = (unsigned)(dyn.rela_size / sizeof(Elf64_Rela));
+					(void)resolve_xdso_relocs(vm, load_base, relas, n,
+								  symtab, strtab,
+								  libc_img, libc_eh, &libc_dyn);
+				}
+				if (dyn.jmprel_size > 0) {
+					const Elf64_Rela *relas = image_to_ptr(dlopen_read_buf, eh,
+									       dyn.jmprel_off);
+					unsigned n = (unsigned)(dyn.jmprel_size / sizeof(Elf64_Rela));
+					(void)resolve_xdso_relocs(vm, load_base, relas, n,
+								  symtab, strtab,
+								  libc_img, libc_eh, &libc_dyn);
+				}
+			}
 		}
 	}
 
@@ -1746,18 +1835,27 @@ uint64_t sys_dlopen_impl(const char *path)
 		"isb\n"
 		::: "memory");
 
-	vm->dlopen_base = load_base;
-	/* Copy path into the embedded buffer; the caller's kpath[] is on
-	 * the kernel stack and won't survive past the syscall return. */
+	/* Slot bookkeeping: stash base + path so dlsym / dlclose can find it. */
+	vm->dlopen_slots[free_slot].base = load_base;
 	{
 		unsigned i = 0;
-		for (; i + 1 < sizeof(vm->dlopen_path) && path[i]; i++)
-			vm->dlopen_path[i] = path[i];
-		vm->dlopen_path[i] = '\0';
+		char *dst = vm->dlopen_slots[free_slot].path;
+		for (; i + 1 < sizeof(vm->dlopen_slots[free_slot].path) && path[i]; i++)
+			dst[i] = path[i];
+		dst[i] = '\0';
 	}
 
 	spin_unlock_irq_restore(&dlopen_buf_lock, flags);
 	return load_base;
+}
+
+/* Locate the slot whose base matches `handle`; -1 if none. */
+static int dlopen_slot_of(const struct vm_map *vm, uint64_t handle)
+{
+	if (handle == 0) return -1;
+	for (unsigned s = 0; s < DLOPEN_MAX_SLOTS; s++)
+		if (vm->dlopen_slots[s].base == handle) return (int)s;
+	return -1;
 }
 
 uint64_t sys_dlsym_impl(uint64_t handle, const char *name)
@@ -1765,12 +1863,16 @@ uint64_t sys_dlsym_impl(uint64_t handle, const char *name)
 	struct kthread *t = curthread;
 	if (!t || !t->t_proc || !t->t_proc->vm) return 0;
 	struct vm_map *vm = t->t_proc->vm;
-	if (handle == 0 || handle != vm->dlopen_base) return 0;
-	if (vm->dlopen_path[0] == '\0') return 0;
+	int slot = dlopen_slot_of(vm, handle);
+	if (slot < 0) {
+		dlerror_set(vm, "dlsym: invalid handle");
+		return 0;
+	}
 
 	unsigned long flags = spin_lock_irq_save(&dlopen_buf_lock);
 
-	if (dlopen_read(vm->dlopen_path) < 0) {
+	if (dlopen_read(vm->dlopen_slots[slot].path) < 0) {
+		dlerror_set(vm, "dlsym: backing file unreadable");
 		spin_unlock_irq_restore(&dlopen_buf_lock, flags);
 		return 0;
 	}
@@ -1778,6 +1880,7 @@ uint64_t sys_dlsym_impl(uint64_t handle, const char *name)
 	const Elf64_Ehdr *eh = (const Elf64_Ehdr *)dlopen_read_buf;
 	struct dyn_info dyn = {0};
 	if (walk_dynamic(dlopen_read_buf, eh, &dyn) < 0) {
+		dlerror_set(vm, "dlsym: no PT_DYNAMIC");
 		spin_unlock_irq_restore(&dlopen_buf_lock, flags);
 		return 0;
 	}
@@ -1788,9 +1891,12 @@ uint64_t sys_dlsym_impl(uint64_t handle, const char *name)
 						   dyn.strtab_off);
 	uint64_t resolved = 0;
 	if (symtab && strtab) {
-		for (unsigned i = 0; i < 256; i++) {
+		unsigned nsyms = dyn_nsyms(dlopen_read_buf, eh, &dyn);
+		if (nsyms == 0 || nsyms > 4096) nsyms = 256;	/* defensive */
+		for (unsigned i = 0; i < nsyms; i++) {
 			const Elf64_Sym *s = &symtab[i];
 			if (s->st_name == 0) continue;
+			if (dyn.strsz && s->st_name >= dyn.strsz) continue;
 			if (s->st_shndx == 0) continue;	/* SHN_UNDEF */
 			if (sym_name_eq(strtab, s->st_name, name)) {
 				resolved = handle + s->st_value;
@@ -1799,6 +1905,69 @@ uint64_t sys_dlsym_impl(uint64_t handle, const char *name)
 		}
 	}
 
+	if (!resolved)
+		dlerror_set(vm, "dlsym: symbol not found");
+
 	spin_unlock_irq_restore(&dlopen_buf_lock, flags);
 	return resolved;
+}
+
+/* sys_dlclose -- unmap a previously-dlopen'd slot.  Walks every page
+ * in [base, base + DLOPEN_SLOT_SIZE), pmm_free's any backing pages, and
+ * clears the slot's bookkeeping.  Returns 0 on success / -1 on bad
+ * handle.  Doesn't bother to free L3 tables (still re-usable by another
+ * dlopen at the same slot). */
+long sys_dlclose_impl(uint64_t handle)
+{
+	struct kthread *t = curthread;
+	if (!t || !t->t_proc || !t->t_proc->vm) return -1;
+	struct vm_map *vm = t->t_proc->vm;
+	int slot = dlopen_slot_of(vm, handle);
+	if (slot < 0) {
+		dlerror_set(vm, "dlclose: invalid handle");
+		return -1;
+	}
+
+	uint64_t base = vm->dlopen_slots[slot].base;
+	for (uint64_t va = base; va < base + DLOPEN_SLOT_SIZE; va += PAGE_SIZE)
+		(void)mmu_vmap_unmap_user_4k(vm, va);
+
+	/* I-cache invalidate: the slot's code may have been executed and is
+	 * now being torn down; a future dlopen at the same slot puts fresh
+	 * code there. */
+	__asm__ volatile (
+		"dsb  ish\n"
+		"ic   iallu\n"
+		"dsb  ish\n"
+		"isb\n"
+		::: "memory");
+
+	vm->dlopen_slots[slot].base = 0;
+	vm->dlopen_slots[slot].path[0] = '\0';
+	return 0;
+}
+
+/* sys_dlerror -- copy the current error string to a user buffer.
+ * Clears the error after copying (POSIX-style: second call returns 0).
+ * Returns the number of bytes copied (excluding NUL), or 0 if no error. */
+long sys_dlerror_impl(char *user_buf, unsigned cap)
+{
+	struct kthread *t = curthread;
+	if (!t || !t->t_proc || !t->t_proc->vm) return 0;
+	struct vm_map *vm = t->t_proc->vm;
+	if (vm->dlerror_msg[0] == '\0') return 0;
+
+	unsigned n = 0;
+	while (n + 1 < cap && vm->dlerror_msg[n]) n++;
+
+	char nul = '\0';
+	if (syscall_from_user) {
+		if (copy_to_user(user_buf, vm->dlerror_msg, n) < 0) return 0;
+		if (copy_to_user(user_buf + n, &nul, 1) < 0) return 0;
+	} else {
+		for (unsigned i = 0; i < n; i++) user_buf[i] = vm->dlerror_msg[i];
+		user_buf[n] = '\0';
+	}
+	vm->dlerror_msg[0] = '\0';
+	return (long)n;
 }

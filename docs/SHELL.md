@@ -80,14 +80,19 @@ unrecognised command.  Source lives in `cmd/`.
 | `grep <pattern> <file> [...]` | Print lines containing the fixed-string pattern.  Case-sensitive; no regex. |
 | `echo <args...>`        | Print args separated by space, then a newline.  Reachable via `/usr/bin/echo` -- the bare `echo` resolves to the shell builtin (which writes to a file, different semantics). |
 | `uptime`                | Print monotonic seconds since boot.  Output shape: `up 42s` / `up 5m 03s` / `up 1h 23m 45s`.  Exercises the new `SYS_clock_gettime` syscall + `<time.h>` end-to-end. |
+| `nm <elf>`              | Dump dynamic symbols of an ELF, one per line: `value type name`.  T=text, D=data, U=undefined.  Covers `.dynsym` (stripped libraries hide `.symtab`). |
+| `ldd <elf>`             | List `DT_NEEDED` entries of an ELF -- typically just `libc.so`. |
+| `objdump [-h\|-p\|-x] <elf>` | Dump ELF header, program headers, and/or section headers (subset of GNU objdump). |
 
-`/usr/bin` is capped at `KFS_DIRENTS=21` per dirent block; bump
-that and `KFS_NAME_MAX` together if you need more (currently 12
-chars max, fitting the longest entry `tcpconnect`).  The ramdisk
-itself caps at `(RAMDISK_BLOCKS - 3) / KFS_BLOCKS_PER_FILE`
-slots (currently 31).  New selftests go into `cmd/test.c` as
-another entry in its registry, not a new ELF -- the registry
-shares one slab.
+`/usr/bin` is capped at `KFS_DIRENTS=22` per dirent block; bump
+that and `KFS_NAME_MAX` together if you need more.  The dirent
+struct is `__attribute__((packed))` so KFS_NAME_MAX doesn't have
+to be 4-byte aligned (otherwise the compiler adds padding and
+the per-entry size grows by up to 3 bytes).  Longest entry today
+is `tcpconnect` (10 chars + NUL = 11).  The ramdisk itself caps
+at `(RAMDISK_BLOCKS - 3) / KFS_BLOCKS_PER_FILE` slots (currently
+31).  New selftests go into `cmd/test.c` as another entry in its
+registry, not a new ELF -- the registry shares one slab.
 
 `test` subcommands (the registry lives in `cmd/test.c`):
 

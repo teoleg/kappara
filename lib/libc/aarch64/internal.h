@@ -31,6 +31,8 @@
 #define __NR_clock_gettime 35
 #define __NR_dlopen      36
 #define __NR_dlsym       37
+#define __NR_dlclose     38
+#define __NR_dlerror     39
 
 static inline long __syscall0(long nr) {
     register long x0 __asm__("x0");

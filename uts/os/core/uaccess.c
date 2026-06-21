@@ -46,6 +46,13 @@
  * range check; for now two static windows is correct.
  */
 #define USER_VA		0x10000000UL
+/* DYNAMIC.md windows -- keep in sync with uts/os/user/user.c. */
+#define LD_VA		0x30000000UL
+#define LD_SIZE		0x00100000UL
+#define LIBC_VA		0x38000000UL
+#define LIBC_SIZE	0x00200000UL
+#define DLOPEN_VA	0x39000000UL
+#define DLOPEN_SIZE	0x00200000UL
 #define USER_SIZE	0x00200000UL
 
 #define EXEC_VA		0x20000000UL
@@ -65,6 +72,13 @@ int user_ptr_ok(const void *p, size_t n)
 	if (a >= USER_VA && end <= USER_VA + USER_SIZE)
 		return 1;
 	if (a >= EXEC_VA && end <= EXEC_VA + EXEC_TOTAL)
+		return 1;
+	/* DYNAMIC.md stages 5-7: dynamic linker, libc.so, dlopen slots. */
+	if (a >= LD_VA && end <= LD_VA + LD_SIZE)
+		return 1;
+	if (a >= LIBC_VA && end <= LIBC_VA + LIBC_SIZE)
+		return 1;
+	if (a >= DLOPEN_VA && end <= DLOPEN_VA + DLOPEN_SIZE)
 		return 1;
 	return 0;
 }

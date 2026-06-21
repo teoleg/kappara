@@ -744,35 +744,63 @@ fail:
 
 struct test_entry { const char *name; int (*fn)(void); };
 
-/* DYNAMIC.md stage 7: dlopen/dlsym round-trip.
+/* DYNAMIC.md stage 7: dlopen/dlsym/dlclose/dlerror full surface.
  *
- * Loads /lib/libdltest.so (a tiny self-contained .so shipped in the
- * kernel image), resolves "dltest_answer" + "dltest_get_label",
- * calls them, checks both that the function returned 42 and that
- * the string pointer (which goes through R_AARCH64_RELATIVE) matches
- * "dltest". */
+ *   1. dlopen libdltest.so, resolve 3 functions, call them.
+ *   2. dlopen the same path again -- should return the cached handle.
+ *   3. dlsym a missing symbol -- expect NULL + non-empty dlerror.
+ *   4. dlclose, then dlopen again -- should re-acquire the same slot.
+ *   5. dlclose with a bad handle -- expect non-zero return + dlerror.
+ */
 static int test_dl(void)
 {
 	void *h = dlopen("/lib/libdltest.so", 0);
-	if (!h) { puts("dl: dlopen failed"); return 1; }
+	if (!h) { printf("dl: dlopen failed: %s\n", dlerror()); return 1; }
 
 	int (*answer)(void) = (int (*)(void))dlsym(h, "dltest_answer");
 	if (!answer) { puts("dl: dlsym dltest_answer failed"); return 1; }
-	int r = answer();
-	if (r != 42) { printf("dl: answer returned %d, want 42\n", r); return 1; }
+	if (answer() != 42) { puts("dl: answer wrong"); return 1; }
 
 	const char *(*get_label)(void) =
 		(const char *(*)(void))dlsym(h, "dltest_get_label");
 	if (!get_label) { puts("dl: dlsym dltest_get_label failed"); return 1; }
-	const char *label = get_label();
-	if (!label || strcmp(label, "dltest") != 0) {
-		printf("dl: get_label returned '%s', want 'dltest'\n",
-		       label ? label : "(null)");
+	if (strcmp(get_label(), "dltest") != 0) { puts("dl: label wrong"); return 1; }
+
+	int (*use_libc)(void) = (int (*)(void))dlsym(h, "dltest_use_libc");
+	if (!use_libc) { puts("dl: dlsym dltest_use_libc failed"); return 1; }
+	if (use_libc() != 6) { puts("dl: use_libc wrong"); return 1; }
+
+	/* 2: cached handle. */
+	void *h2 = dlopen("/lib/libdltest.so", 0);
+	if (h2 != h) { puts("dl: cached dlopen mismatch"); return 1; }
+
+	/* 3: missing symbol -> NULL + non-empty dlerror. */
+	void *miss = dlsym(h, "nonexistent_symbol");
+	if (miss) { puts("dl: dlsym should have failed"); return 1; }
+	const char *err = dlerror();
+	if (!err) { puts("dl: dlerror should be set"); return 1; }
+	/* POSIX: second call returns NULL. */
+	if (dlerror()) { puts("dl: dlerror should reset"); return 1; }
+
+	/* 4: dlclose + re-dlopen at same slot. */
+	if (dlclose(h) != 0) { puts("dl: dlclose failed"); return 1; }
+	void *h3 = dlopen("/lib/libdltest.so", 0);
+	if (h3 != h) {
+		printf("dl: re-dlopen got %p, want %p\n", h3, h);
 		return 1;
 	}
 
-	printf("dl: dlopen/dlsym round-trip OK (handle=%p answer=%d label=%s)\n",
-	       h, r, label);
+	/* 5: bad-handle dlclose. */
+	if (dlclose((void *)0xdeadbeef) == 0) {
+		puts("dl: bad dlclose should fail");
+		return 1;
+	}
+	if (!dlerror()) { puts("dl: bad dlclose should set error"); return 1; }
+
+	/* Tidy up. */
+	(void)dlclose(h3);
+
+	printf("dl: full dlopen/dlsym/dlclose/dlerror surface OK\n");
 	return 0;
 }
 

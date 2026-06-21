@@ -78,8 +78,14 @@
 				 * Look up `name` in the shared object's    *
 				 * dynsym; return the resolved runtime VA   *
 				 * or 0 if absent.                          */
+#define SYS_dlclose	38	/* (handle) -> 0 / -1                       *
+				 * Unmap the slot's pages, release the      *
+				 * handle.                                  */
+#define SYS_dlerror	39	/* (char *buf, size_t cap) -> bytes / 0    *
+				 * Copy the most recent error string and   *
+				 * clear it.                                */
 
-#define SYS_MAX		38
+#define SYS_MAX		40
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

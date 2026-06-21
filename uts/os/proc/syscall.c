@@ -477,6 +477,19 @@ static long sys_dlsym(long a0, long a1, long a2, long a3, long a4, long a5)
 	return (long)sys_dlsym_impl((uint64_t)a0, name);
 }
 
+static long sys_dlclose(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_dlclose_impl((uint64_t)a0);
+}
+
+static long sys_dlerror(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	/* sys_dlerror_impl handles copy_to_user via syscall_from_user. */
+	return sys_dlerror_impl((char *)(uintptr_t)a0, (unsigned)a1);
+}
+
 static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_log]    = sys_log,
 	[SYS_getpid] = sys_getpid,
@@ -514,6 +527,8 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_clock_gettime] = sys_clock_gettime,
 	[SYS_dlopen]      = sys_dlopen,
 	[SYS_dlsym]       = sys_dlsym,
+	[SYS_dlclose]     = sys_dlclose,
+	[SYS_dlerror]     = sys_dlerror,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

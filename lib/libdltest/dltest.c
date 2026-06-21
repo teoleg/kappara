@@ -1,13 +1,14 @@
 /*
- * lib/libdltest/dltest.c -- minimal shared object for testing dlopen
+ * lib/libdltest/dltest.c -- shared object for testing dlopen/dlsym
  *
- * Self-contained: no DT_NEEDED, no libc references.  Just two exported
- * functions and one absolute-pointer global to prove R_AARCH64_RELATIVE
- * applies correctly on dlopen.
- *
- * cmd/test.c's "dl" subtest dlopens this, dlsym's "dltest_answer", and
- * checks the return value is 42.
+ * Has DT_NEEDED libc.so so its calls to printf / strlen go through the
+ * cross-DSO resolver -- exercising the same JUMP_SLOT / GLOB_DAT path
+ * that execve uses for cmd binaries.  cmd/test.c's "dl" subtest dlopens
+ * this, dlsyms three functions, and checks their return values.
  */
+
+#include <stdio.h>
+#include <string.h>
 
 static const char *dltest_label = "dltest";
 
@@ -22,4 +23,14 @@ const char *dltest_get_label(void)
 	 * R_AARCH64_RELATIVE -- a one-instruction self-resolving smoke
 	 * test for the dlopen reloc walk. */
 	return dltest_label;
+}
+
+/* Exercises cross-DSO calls back into libc.so.  Returns the length
+ * of its own label string as reported by libc's strlen, plus prints
+ * a message to stdout via libc's printf.  Both calls go through
+ * JUMP_SLOT entries the dlopen resolver writes against libc.so. */
+int dltest_use_libc(void)
+{
+	printf("dltest: hello from a dlopen'd .so via libc.so printf\n");
+	return (int)strlen(dltest_label);
 }

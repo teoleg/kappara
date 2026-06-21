@@ -161,6 +161,30 @@ uptime_blob_start:
 	.incbin "build/cmd/uptime.elf"
 uptime_blob_end:
 
+	.section ".rodata.nm_blob","a",%progbits
+	.balign 8
+	.global nm_blob_start
+	.global nm_blob_end
+nm_blob_start:
+	.incbin "build/cmd/nm.elf"
+nm_blob_end:
+
+	.section ".rodata.ldd_blob","a",%progbits
+	.balign 8
+	.global ldd_blob_start
+	.global ldd_blob_end
+ldd_blob_start:
+	.incbin "build/cmd/ldd.elf"
+ldd_blob_end:
+
+	.section ".rodata.objdump_blob","a",%progbits
+	.balign 8
+	.global objdump_blob_start
+	.global objdump_blob_end
+objdump_blob_start:
+	.incbin "build/cmd/objdump.elf"
+objdump_blob_end:
+
 /* ld-kappara.so -- stage 5 dynamic linker.  Not a /usr/bin entry;
  * the kernel reads it directly via ld_kappara_blob_{start,end}
  * during exec to load it into the user vm_map at LD_VA. */
