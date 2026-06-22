@@ -94,33 +94,65 @@ the header metadata fields now carry real values.
 
 ### Stage B -- EFI app + ExitBootServices
 
-Status: `[ ]`
+Status: `[x]`
 
 Make `kernel.img` actually be a valid PE32+ executable.  The
 Linux trick is to use the same 64-byte header as both the ARM64
 Image header AND the start of an MZ-flavoured PE32+ header (the
 magic overlap is real; PE's first two bytes "MZ" coincide with
-the start of the `b _start` AArch64 jump instruction at the
-right opcode pattern).
+the AArch64 `add x13, x18, #0x16` instruction, encoded as
+`4d 5a 00 91`).
 
-What this entails:
+What landed:
 
-- Linker script grows a `.text` section for the PE header
-  literals (just bytes).
-- A small `efi_main(EFI_HANDLE, EFI_SYSTEM_TABLE *)` C function
-  that:
-  1. Walks the EFI Configuration Table looking for an ACPI 2.0
-     entry (UUID `8868e871-e4f1-11d3-bc22-0080c73c8881`); stashes
-     the RSDP.
-  2. Calls `BootServices->GetMemoryMap` to learn the physical
-     ranges.
-  3. Calls `BootServices->ExitBootServices`.
-  4. Disables the EFI MMU mapping (or trusts it) and hands
-     control to the kappara `kmain` -- but with the ACPI pointer
-     and the memory map preserved.
+- `uts/virt/boot.S` grew a PE32+ header block immediately after
+  the 64-byte Linux Image header: PE signature, COFF header
+  (Machine=0xAA64, Characteristics=0x0207 = RELOCS_STRIPPED |
+  EXECUTABLE_IMAGE | LINE_NUMS_STRIPPED | DEBUG_STRIPPED), PE32+
+  optional header (Magic=0x020B, ImageBase=0x40080000,
+  SectionAlignment=0x1000, FileAlignment=0x200, Subsystem=0x0A
+  EFI_APPLICATION, NumberOfRvaAndSizes=16), and a single `.text`
+  section descriptor.  `.balign 0x1000` after the section table
+  pads the header region to SizeOfHeaders so the .text section
+  starts at file offset 0x1000.
+- `uts/virt/linker.ld` exposes `_text_rva`, `_pe_size_of_headers`,
+  and `_text_section_size_lo32` for those header fields.  EDK II
+  requires the full 16-entry DataDirectory even though we leave
+  all entries zero.
+- `uts/virt/efi.h` + `uts/virt/efi_main.c` implement
+  `efi_main(handle, system_table)`:
+  1. Walks `system_table->tables` (the EFI Configuration Table)
+     for ACPI 2.0 GUID `8868e871-e4f1-11d3-bc22-0080c73c8881`,
+     stashing the RSDP in `efi_acpi_rsdp` (BSS, read by kmain).
+  2. Calls `BootServices->GetMemoryMap` into a 4 KB BSS buffer
+     (`efi_memmap_storage`); records size, descriptor_size,
+     and descriptor_version for stage C.
+  3. Calls `BootServices->ExitBootServices` with the returned
+     map key.  After this we own the machine.
+- `boot.S` adds an `efi_pe_entry` stub at the start of the .text
+  section (so its RVA is inside a section per the PE spec).
+  It saves x0/x1 (image handle, system table) to x19/x20, sets
+  sp to `stack_top`, calls `efi_main`, then on success branches
+  to the regular Linux Image entry path (`.Lreal_start`); on
+  failure spins in WFI.
+- `tools/pad_pe.py` post-processes `kernel.img` after `objcopy
+  -O binary` to zero-pad the file out to SizeOfImage.  Without
+  this EDK II's PE loader sees SizeOfRawData reaching past
+  end-of-file and rejects the image with
+  "Script Error Status: Unsupported".
 
-What this does NOT do: any device discovery.  We get to kmain,
-print "ACPI at 0x..., usable RAM at 0x..-0x..", spin.
+What this does NOT do: anything device-specific.  Stage C will
+walk the ACPI pointer + EFI memory map we stashed; for now
+under UEFI we hand off to `.Lreal_start` and rely on the
+pre-existing identity-mapped early-MMU state (cleanup is on
+the stage C TODO).
+
+Verified: under AAVMF + QEMU virt the kernel loads and the
+firmware jumps to it (synchronous exception fires in our RX
+region at the expected handover point, as expected without
+stage C's ACPI/MMU rework).  `make test` still reports ALL
+TESTS PASS via the `-kernel` path -- the regular dev workflow
+is unchanged.
 
 ### Stage C -- ACPI parser
 

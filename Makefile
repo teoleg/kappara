@@ -30,6 +30,7 @@ ARCH_OBJS   := \
     $(BUILD)/uts/virt/slip-stubs.o \
     $(BUILD)/uts/virt/virtio_net.o \
     $(BUILD)/uts/virt/telnetd.o \
+    $(BUILD)/uts/virt/efi_main.o \
     $(BUILD)/uts/aarch64/userblob.o \
     $(BUILD)/uts/aarch64/helloblob.o \
     $(BUILD)/uts/aarch64/usrblobs.o
@@ -169,6 +170,13 @@ $(ELF): $(OBJS) $(KSYM_OBJ) $(LINKER_LD)
 
 $(KERNEL): $(ELF)
 	$(OBJCOPY) -O binary $< $@
+	@# AWS.md stage B: pad the file so its size matches the PE
+	@# SizeOfImage we baked into the header.  Without this the
+	@# .text section's SizeOfRawData (= __kernel_end - __kernel_start
+	@# - 0x1000) extends past the actual file end (objcopy doesn't
+	@# carry trailing BSS bytes), and EDK II's PE loader refuses
+	@# with EFI_UNSUPPORTED.
+	@./tools/pad_pe.py $@
 
 # Trap INT/TERM and reap the qemu pid on the way out -- otherwise a
 # Ctrl-C in `-nographic` mode leaves a zombie QEMU holding the
