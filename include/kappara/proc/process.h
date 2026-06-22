@@ -74,6 +74,11 @@ struct vm_map {
 	 * Init shells (boot vm_map) carry an empty cwd; sys_execve stamps
 	 * the parent's cwd into the child so each exec'd process inherits. */
 	char      cwd[128];
+	/* INDIE.md Path B stage 3: anonymous mmap high-water mark.  Each
+	 * SYS_mmap with MAP_ANONYMOUS allocates from ANON_VA upward;
+	 * anon_next bumps by the rounded length.  Real free-range tracking
+	 * (so munmap can reclaim) is a future refinement. */
+	uint64_t  anon_next;
 };
 
 struct process {

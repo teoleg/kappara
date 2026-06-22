@@ -690,10 +690,20 @@ static long linux_sys_set_tid_address(long a0, long a1, long a2, long a3, long a
 }
 static long linux_sys_mprotect(long a0, long a1, long a2, long a3, long a4, long a5)
 {
-	/* RELRO write-protect on startup.  Static-pie binaries call it;
-	 * we don't enforce W^X yet, so report success. */
-	(void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-	return 0;
+	(void)a3; (void)a4; (void)a5;
+	return sys_mprotect_impl((uint64_t)a0, (uint64_t)a1, (int)a2);
+}
+
+static long linux_sys_mmap(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return sys_mmap_impl((uint64_t)a0, (uint64_t)a1, (int)a2,
+			      (int)a3, (int)a4, (uint64_t)a5);
+}
+
+static long linux_sys_munmap(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_munmap_impl((uint64_t)a0, (uint64_t)a1);
 }
 static long linux_sys_ioctl(long a0, long a1, long a2, long a3, long a4, long a5)
 {
@@ -734,6 +744,8 @@ static const syscall_fn linux_syscall_table[LINUX_NR_MAX] = {
 	[96]  = linux_sys_set_tid_address,
 	[172] = linux_sys_getpid,
 	[214] = linux_sys_brk,
+	[215] = linux_sys_munmap,
+	[222] = linux_sys_mmap,
 	[226] = linux_sys_mprotect,
 };
 

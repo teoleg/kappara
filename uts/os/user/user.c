@@ -247,11 +247,23 @@ void user_spawn(void)
  * arrays and MMU mapping happen later in exec_space_init.
  */
 #define EXEC_VA        0x20000000UL
-#define EXEC_SIZE      0x00200000UL	/* 2 MB code region */
-#define EXEC_STACK_VA  0x20200000UL
-#define EXEC_STACK_TOP 0x20400000UL	/* SP starts here, grows down */
-#define EXEC_HEAP_VA   0x20400000UL	/* heap: grows up from here */
-#define EXEC_HEAP_SIZE 0x00200000UL	/* 2 MB ceiling */
+#define EXEC_SIZE      0x01000000UL	/* 16 MB code+data region.
+					 * INDIE.md Path B stage 2: was 2 MB
+					 * but real static-musl binaries
+					 * push past that; 16 MB fits any
+					 * reasonable single program. */
+#define EXEC_STACK_VA  0x21000000UL
+#define EXEC_STACK_SIZE 0x00200000UL	/* 2 MB stack */
+#define EXEC_STACK_TOP 0x21200000UL	/* SP starts here, grows down */
+#define EXEC_HEAP_VA   0x21200000UL	/* heap: grows up from here */
+#define EXEC_HEAP_SIZE 0x00400000UL	/* 4 MB ceiling */
+
+/* INDIE.md Path B stage 3: anonymous mmap window.  SYS_mmap with
+ * MAP_ANONYMOUS allocates pages here; vm->anon_next is the high-water
+ * mark.  Sits between the exec range and LD_VA so cmd binaries and
+ * Linux-ABI programs share the same anon allocator. */
+#define ANON_VA        0x22000000UL
+#define ANON_SIZE      0x08000000UL	/* 128 MB */
 
 /* DYNAMIC.md stage 5: ld-kappara.so window.  The stage 5 dynamic
  * linker is ET_EXEC at this fixed VA (deliberately not PIE -- it's
@@ -449,6 +461,81 @@ static int vmap_copyin(struct vm_map *vm, uint64_t user_va,
 	return 0;
 }
 
+/* INDIE.md Path B stage 3: anonymous mmap.  Linux SYS_mmap(addr,
+ * length, prot, flags, fd, offset) -- we only support MAP_ANONYMOUS
+ * (no file mapping yet).  Allocates pages from the ANON_VA window
+ * and bumps vm->anon_next.  Returns the new mapping or -1 (which
+ * Linux turns into MAP_FAILED at the libc wrapper).
+ *
+ * No coalescing: each mmap reserves a fresh range from anon_next.
+ * Real free-range tracking (so munmap reclaims VA) is a follow-on. */
+long sys_mmap_impl(uint64_t addr, uint64_t length, int prot,
+		   int flags, int fd, uint64_t offset)
+{
+	(void)addr; (void)prot; (void)fd; (void)offset;
+	struct kthread *t = curthread;
+	if (!t || !t->t_proc || !t->t_proc->vm) return -1;
+	struct vm_map *vm = t->t_proc->vm;
+	if (length == 0) return -1;
+
+	/* Today we only do anonymous mappings; file mapping needs the
+	 * file-cache plumbing dlopen has, generalized.  Reject explicit
+	 * non-anonymous flags rather than silently doing the wrong thing. */
+	const int MAP_ANONYMOUS = 0x20;
+	if (!(flags & MAP_ANONYMOUS)) {
+		kprintf("mmap: file mapping not supported (flags=0x%x)\n", flags);
+		return -1;
+	}
+
+	/* Initialise anon_next on first use.  Pre-stage-3 vm_maps don't
+	 * touch this field (kmemset zeros it), so check against 0. */
+	if (vm->anon_next == 0) vm->anon_next = ANON_VA;
+
+	uint64_t aligned = (length + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
+	uint64_t base = vm->anon_next;
+	if (base + aligned > ANON_VA + ANON_SIZE) {
+		kprintf("mmap: ANON window exhausted (asking %lu KB)\n",
+			(unsigned long)(aligned / 1024));
+		return -1;
+	}
+	unsigned n_pages = (unsigned)(aligned / PAGE_SIZE);
+	if (vmap_alloc_pages(vm, base, n_pages, /*zero=*/1) < 0) {
+		kprintf("mmap: PMM exhausted (asked %lu KB)\n",
+			(unsigned long)(aligned / 1024));
+		return -1;
+	}
+	vm->anon_next = base + aligned;
+	return (long)base;
+}
+
+long sys_munmap_impl(uint64_t addr, uint64_t length)
+{
+	struct kthread *t = curthread;
+	if (!t || !t->t_proc || !t->t_proc->vm) return -1;
+	struct vm_map *vm = t->t_proc->vm;
+	if (length == 0) return -1;
+	if (addr < ANON_VA || addr + length > ANON_VA + ANON_SIZE) return -1;
+
+	uint64_t aligned = (length + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
+	for (uint64_t v = addr; v < addr + aligned; v += PAGE_SIZE)
+		mmu_vmap_unmap_user_4k(vm, v);
+	__asm__ volatile (
+		"dsb	ishst\n"
+		"tlbi	vmalle1\n"
+		"dsb	ish\n"
+		"isb\n" ::: "memory");
+	return 0;
+}
+
+/* sys_mprotect_impl -- no-op today.  Real W^X enforcement requires
+ * flipping the L3 entries' AP bits; for now we just accept the call
+ * so static-pie RELRO startup doesn't fail. */
+long sys_mprotect_impl(uint64_t addr, uint64_t length, int prot)
+{
+	(void)addr; (void)length; (void)prot;
+	return 0;
+}
+
 long sys_brk_impl(uint64_t addr)
 {
 	struct kthread *t = curthread;
@@ -569,7 +656,7 @@ long sys_fork_impl(struct trap_frame *parent_tf)
 
 	if (fork_clone_pages(cvm, pvm, EXEC_VA, EXEC_VA + EXEC_SIZE) < 0 ||
 	    fork_clone_pages(cvm, pvm, EXEC_STACK_VA,
-	                     EXEC_STACK_VA + EXEC_SIZE) < 0 ||
+	                     EXEC_STACK_VA + EXEC_STACK_SIZE) < 0 ||
 	    fork_clone_pages(cvm, pvm, EXEC_HEAP_VA,
 	                     EXEC_HEAP_VA + EXEC_HEAP_SIZE) < 0 ||
 	    /* DYNAMIC.md stages 5/6: child also needs ld.so + libc.so
@@ -580,7 +667,9 @@ long sys_fork_impl(struct trap_frame *parent_tf)
 	    /* DYNAMIC.md stage 7: clone the dlopen window too if anything's
 	     * loaded.  fork_clone_pages skips unmapped pages so the cost
 	     * is zero for processes that don't dlopen. */
-	    fork_clone_pages(cvm, pvm, DLOPEN_VA, DLOPEN_VA + DLOPEN_SIZE) < 0) {
+	    fork_clone_pages(cvm, pvm, DLOPEN_VA, DLOPEN_VA + DLOPEN_SIZE) < 0 ||
+	    /* INDIE.md Path B stage 3: clone the anon mmap window. */
+	    fork_clone_pages(cvm, pvm, ANON_VA, ANON_VA + ANON_SIZE) < 0) {
 		kprintf("fork: PMM exhausted during page clone\n");
 		vm_map_put(cvm);	/* destroy frees the partial mappings */
 		return -1;
@@ -602,6 +691,7 @@ long sys_fork_impl(struct trap_frame *parent_tf)
 
 	cvm->heap_brk   = pvm->heap_brk;
 	cvm->spawn_next = pvm->spawn_next;
+	cvm->anon_next  = pvm->anon_next;	/* INDIE.md stage 3 */
 
 	/* Flush D-cache + invalidate I-cache for the freshly-copied
 	 * code pages so the child fetches them cleanly. */
@@ -1412,7 +1502,7 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 
 	/* (3) Stack: allocate the entire 2 MB region upfront.  TODO:
 	 * lazy/demand allocation via EL0 page faults is a future R6b. */
-	if (vmap_alloc_pages(vm, EXEC_STACK_VA, EXEC_SIZE / PAGE_SIZE,
+	if (vmap_alloc_pages(vm, EXEC_STACK_VA, EXEC_STACK_SIZE / PAGE_SIZE,
 	                     /*zero=*/1) < 0) {
 		kprintf("execve: PMM exhausted allocating stack\n");
 		vm_map_put(vm);

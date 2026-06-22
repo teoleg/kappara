@@ -122,7 +122,7 @@ Limitations:
 
 ### Stage 2 -- Bigger / flexible exec window
 
-Status: `[ ]`
+Status: `[x]`
 
 `EXEC_VA = 0x20000000` with `EXEC_SIZE = 2 MB` is way too small.
 A static-musl `hello` already pushes 30 KB; anything real wants
@@ -138,21 +138,56 @@ more.
 
 After this stage anything up to ~16 MB of code+data works.
 
+What landed:
+
+- `EXEC_SIZE` bumped 2 MB -> 16 MB.  `EXEC_STACK_VA` shifted to
+  `0x21000000`, `EXEC_HEAP_VA` to `0x21200000`.  New
+  `EXEC_STACK_SIZE = 2 MB` constant; `EXEC_HEAP_SIZE` bumped to
+  4 MB.
+- `EXEC_TOTAL` in uaccess.c updated to span 22 MB
+  (code + stack + heap).
+- **Bug surfaced and fixed in mmu.c**: fresh vm_maps inherit the
+  kernel's identity-mapped L2 BLOCKs (`vmap_dup_kernel_l2`).
+  `mmu_vmap_user_va_to_kva` used to return the kernel KVA for any
+  L2 BLOCK entry, which made `fork_clone_pages` think 16 MB of
+  EXEC_VA was full of valid user pages and try to deep-clone
+  kernel memory.  Pre-stage-2 EXEC_VA fit in one 2 MB L2 chunk
+  that was always TABLE-promoted by the first vmap_alloc_pages,
+  so the bug was masked.  Fix: `mmu_vmap_user_va_to_kva` now
+  returns NULL for L2 BLOCK entries -- user pages always go
+  through TABLE+L3.
+
 ### Stage 3 -- `SYS_mmap` / `SYS_munmap` / `SYS_mprotect`
 
-Status: `[ ]`
+Status: `[x]`
 
-Real implementation, not stubs.  musl's malloc uses `mmap` for
-big allocations; signal handling uses `mmap` + `mprotect` for
-the alternate signal stack.
+What landed:
 
-- Reserve `ANON_VA = 0x50000000` (16 MB) for anonymous mmap'd
-  pages.  Each `SYS_mmap` finds a contiguous free range, allocates
-  PMM pages, installs L3 mappings.
-- `SYS_munmap` reverses it: walks the range, unmaps + pmm_free's.
-- `SYS_mprotect` updates the L3 entries' permission bits.  Real
-  W^X enforcement for the first time; cmd binaries already get RO
-  text, so this should be a no-op for them.
+- `ANON_VA = 0x22000000`, `ANON_SIZE = 128 MB` (kept inside the
+  1 GB L2 range, after EXEC's 22 MB total).
+- `struct vm_map` gains `anon_next` -- high-water mark that bumps
+  by every mmap request.  Initialised to `ANON_VA` on first use.
+- `sys_mmap_impl(addr, length, prot, flags, fd, offset)`: rejects
+  anything without `MAP_ANONYMOUS`, rounds length up to page,
+  allocates pages, maps from `anon_next`, bumps it.  Address-hint
+  is ignored (we always pick).
+- `sys_munmap_impl(addr, length)`: walks the range and unmaps.
+  Doesn't reclaim the VA range -- the high-water mark only grows.
+  Real free-range tracking is a future refinement.
+- `sys_mprotect_impl`: stub returning 0 -- enough to satisfy
+  static-pie RELRO startup.  Real W^X requires AP-bit flips on
+  existing L3 entries, deferred.
+- Linux dispatch: `mmap=222`, `munmap=215`, `mprotect=226` route
+  through the new impls.
+- `fork()` clones the ANON range and inherits `anon_next` so
+  mmap'd pages survive across fork.
+- `tools/sdk-test/linux-mmap.c` -- proof: SYS_mmap then write a
+  magic string then SYS_write the string back via the new page
+  then SYS_munmap then SYS_exit.  Verified by
+  `make ARCH=virt smoke-linux-mmap`.
+
+Verified: smoke-linux PASS, smoke-linux-mmap PASS, cmd/test all
+14/14, smoke-ftp 3/3.
 
 ### Stage 4 -- `PT_INTERP` for dynamic musl binaries
 
