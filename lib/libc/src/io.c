@@ -114,5 +114,16 @@ int execve(const char *path, const char *const argv[])
     return (int)__syscall3(__NR_execve, (long)(unsigned long)path,
                                          (long)(unsigned long)argv, 0);
 }
+
+int chdir(const char *path)
+{
+    return (int)__syscall1(__NR_chdir, (long)(unsigned long)path);
+}
+
+char *getcwd(char *buf, size_t cap)
+{
+    long n = __syscall3(__NR_getcwd, (long)(unsigned long)buf, (long)cap, 0);
+    return (n < 0) ? (char *)0 : buf;
+}
 /* _exit lives in stdlib.c -- shared by exit() and the direct
  * _exit() callers.  Don't duplicate it here. */

@@ -35,6 +35,7 @@ struct vm_map init_vm_map = {
 	.heap_brk = 0,	/* boot map has no heap; sys_brk rejects */
 	.refs     = 1,	/* held by init_process */
 	.lock     = SPINLOCK_INIT,
+	.cwd      = "/",
 };
 
 struct process init_process = {
@@ -96,6 +97,8 @@ struct vm_map *vm_map_create(void)
 	kmemset(vm, 0, sizeof(*vm));
 	vm->refs     = 1;
 	vm->heap_brk = 0;	/* sys_execve / sys_fork stamp this */
+	vm->cwd[0]   = '/';
+	vm->cwd[1]   = '\0';
 #ifdef __aarch64__
 	if (mmu_vmap_create(vm) < 0) {
 		kfree(vm);

@@ -1,248 +1,194 @@
-# Running independently-built software on kappara
+# Running Linux binaries on kappara
 
-This is the roadmap for getting kappara from "every binary is
-checked into the source tree" to "anyone can build a binary
-elsewhere, drop it on a running kappara box, and have it just
-work."
+This is the roadmap for getting kappara from "binaries built
+against our libc.so" to "any aarch64 Linux binary just runs."
 
-Goal: a clean line where the kappara source tree and the
-*things that run on kappara* are two separate worlds.  External
-developers should not need our `cmd/`, our `Makefile`, our
-`/usr/bin` blob registration, or any commit access to ship code
-for kappara.
+Goal: zero SDK.  An external developer does
 
-The shape of the deliverable: an SDK tarball + a `kappara-cc`
-wrapper.  `kappara-cc hello.c -o hello && scp hello kappara:/home/`
-and it runs.  No special blessing required.
+    aarch64-linux-musl-gcc hello.c -o hello
 
-Stages, mirroring the convention from `docs/FTPD.md` /
-`docs/DYNAMIC.md`: each one flips `[ ]` to `[x]` when its work
-lands.
+and `scp`s `hello` to a running kappara box, and `exec /home/hello`
+prints "hello".  The binary thinks it's running on Linux.
 
-## What we already have (DYNAMIC.md stages 1-8)
+The previous stage 1 (publishable kappara SDK + `kappara-cc`
+wrapper) shipped as a sanity check; it stays in-tree as the
+fallback for anyone who specifically wants to build against
+kappara's own libc, but the main goal of this doc is now the
+Linux-personality path.
 
-- Real ELF dynamic linker in user space (`lib/ld-kappara`).
-- `libc.so` shared.  Cmd binaries link against it via DT_NEEDED.
-- `dlopen` / `dlsym` / `dlclose` / `dlerror` syscall surface.
-- PIE binaries load at `EXEC_VA = 0x20000000`, libc.so at
-  `LIBC_VA = 0x38000000`, ld.so at `LD_VA = 0x30000000`.
-- ELF inspection tools in `/usr/bin`: `nm`, `ldd`, `objdump`.
+## Why musl, not glibc
 
-The dynamic-linking machinery is in place; what's missing is the
-SDK packaging, a few loader features (PT_INTERP, general
-DT_NEEDED), a bigger code window, and enough libc surface for
-non-toy programs.
+- musl is ~30× smaller than glibc and statically-linkable.
+- musl makes no assumptions about `/proc`, `/sys`, NSS, locales,
+  or any of the dozen surfaces glibc consults at startup.
+- Static-musl binaries are completely self-contained ELFs --
+  no `DT_NEEDED`, no `PT_INTERP`, no shared-library hunt.
+- musl is the "what you'd ship inside a Docker scratch image"
+  default for a reason.
+
+glibc compat is theoretically possible but is a much bigger
+investment for no real win at kappara's scale.
 
 ## Stages
 
-### Stage 1 -- Publishable SDK (`kappara-cc`)
-
-Status: `[x]`
-
-Ship a tarball that contains everything a foreign toolchain needs:
-
-- `sysroot/include/`   -- `<stdio.h>`, `<stdlib.h>`, `<string.h>`,
-                          and the public `kappara/abi/*.h` headers.
-- `sysroot/lib/libc.so` -- the same shared object the in-tree
-                           build produces.
-- `sysroot/lib/crt0.o`  -- `_start` for cmd binaries.
-- `sysroot/lib/prog_linker.ld` -- our PIE linker script.
-- `sysroot/lib/ld-kappara.so` -- bundled so external builds can
-                                 reference the same loader.
-
-And a `bin/kappara-cc` wrapper script that invokes
-`aarch64-linux-gnu-gcc` with:
-
-    --sysroot=<sdk-root>
-    -ffreestanding -nostdlib -nostartfiles
-    -fno-stack-protector -fPIE -mgeneral-regs-only
-    + linker glue (`-pie --no-dynamic-linker -l:libc.so` etc.)
-
-Test deliverable: `tools/sdk-test/hello.c` (a `printf("hi")`
-binary) builds via `kappara-cc` from a clean directory (no
-checkout of `uts/`), uploads via FTP, runs.
-
-What landed:
-
-- `build/sdk/sysroot/{include,lib}` -- staged sysroot with libc
-  headers, kernel ABI headers, libc.so, crt0.o, prog_linker.ld,
-  ld-kappara.so.
-- `tools/kappara-cc.in` -- shell wrapper that invokes
-  `aarch64-linux-gnu-gcc` with `--sysroot=...` and the right
-  -fPIE/-pie flags + linker script + DT_NEEDED libc.so.
-- `make sdk` -- assembles the SDK.
-- `make sdk-tarball` -- packages it as `build/kappara-sdk.tar.gz`.
-- `make ARCH=virt smoke-sdk` -- end-to-end test: builds
-  `tools/sdk-test/hello.c` in a fresh `/tmp` dir using only the
-  SDK (no access to `uts/`), boots kappara virt, FTP-uploads the
-  resulting binary, exec's it via telnet, checks output.
-
-Verified: smoke-sdk passes 3/3.  An external developer can
-extract `kappara-sdk.tar.gz`, run
-`kappara-sdk/bin/kappara-cc hello.c -o hello`, FTP it to a
-running kappara instance, and exec it.
-
-### Stage 2 -- Honour `PT_INTERP`
+### Stage 1 -- Run a static-pie musl `hello` binary
 
 Status: `[ ]`
 
-Today the kernel hardcodes the loader path: every `ET_DYN`
-exec gets `ld-kappara.so` whether the binary asks for it or
-not.  Real-world binaries embed their interpreter as a
-`PT_INTERP` segment (e.g. `/lib/ld-kappara.so`).
+The minimum-viable Path B.  After this stage:
 
-What changes:
+    aarch64-linux-musl-gcc -static-pie hello.c -o hello
+    scp hello kappara:/home/
+    exec /home/hello
 
-- Drop `--no-dynamic-linker` from `kappara-cc`'s default flags;
-  externally-built binaries will carry `PT_INTERP = /lib/ld-kappara.so`.
-- Kernel `sys_execve_impl` reads `PT_INTERP`, verifies it
-  matches a permitted loader, loads THAT (not the hardcoded one).
-- For backward compatibility: binaries without `PT_INTERP` (our
-  current cmd ELFs) still get `ld-kappara.so` at `LD_VA`.
-
-This is a small kernel patch (~30 lines).  Mostly an honesty fix:
-we should respect what the binary says.
-
-### Stage 3 -- General `DT_NEEDED` resolution in ld.so
-
-Status: `[ ]`
-
-Today ld.so only knows about `libc.so` because the kernel pre-
-loaded it at a known VA and passed `AT_KAPPARA_LIBC_BASE`.  A
-binary that `DT_NEEDED`s a second library (`libdltest.so`,
-`libssl.so`, whatever) has no way to get it loaded at exec time.
+prints "hello, world".  No SDK, no kappara-cc, no special flags.
+The binary is a vanilla static-pie musl ELF.
 
 What needs to land:
 
-- New syscall `SYS_mmap_file` (or extend dlopen so ld.so can
-  call it): open a VFS path, load its PT_LOADs at a chosen VA,
-  return the load base.  Same primitive dlopen uses today.
-- ld.so walks the app's `.dynamic` for `DT_NEEDED` strings.
-- For each name, search `/lib/` (and maybe `/usr/lib/`) for a
-  matching file, call `SYS_mmap_file`, recurse into the loaded
-  object's own `DT_NEEDED` chain.
-- Build a merged symbol table from all loaded objects; resolve
-  `GLOB_DAT` / `JUMP_SLOT` against it (currently we only look in
-  libc.so).
+- **Linux syscall translation table.**  The arch trap dispatcher
+  recognises both kappara's and Linux's `x8` syscall numbers and
+  routes accordingly.  At minimum the dispatch covers what musl
+  uses at startup (`SYS_mprotect`, `SYS_writev` or `SYS_write`,
+  `SYS_exit_group`, `SYS_ioctl`, `SYS_set_tid_address` -- which we
+  can fake).  Strategy: a separate `linux_to_kappara[]` array
+  keyed on the Linux number; kappara natives keep their existing
+  range.
 
-After this stage, a binary that does
-`DT_NEEDED [libsomething.so]` just works as long as
-`/lib/libsomething.so` exists.
+- **Linux auxv entries on the exec stack.**  musl's `__init_libc`
+  reads `AT_PAGESZ`, `AT_RANDOM`, `AT_HWCAP`, `AT_PLATFORM`,
+  `AT_EXECFN`, `AT_SECURE`, `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`.
+  The ones musl tolerates missing get omitted; the load-bearing
+  ones (`AT_PAGESZ = 4096`, `AT_RANDOM = pointer to 16 bytes of
+  noise on stack`) get populated.
 
-### Stage 4 -- Bigger code window + variable `load_base`
+- **`SYS_mmap`** (Linux 222).  Musl uses it for the malloc heap
+  and signal-stack allocations.  Implementation maps anonymous
+  zero-pages at a chosen VA in a new "anon" window (`ANON_VA =
+  0x50000000`?) similar to how DLOPEN_VA works.
 
-Status: `[ ]`
+- **`SYS_mprotect`** (Linux 226).  Static-pie startup uses it
+  for RELRO (mark pages read-only after relocs).  Initial impl
+  can no-op (return 0) — we don't enforce W^X yet anyway.
 
-`EXEC_VA = 0x20000000` is only a 2 MB window.  Real binaries
-push past this fast (any C++ program with even modest STL use
-is bigger than that).
+- **`SYS_exit_group`** (Linux 94).  Same as our `SYS_exit`;
+  just an alias.
 
-What changes:
+Verified by: a smoke target that runs a checked-in static-pie
+musl `hello` and greps the output for "hello".
 
-- Bump `EXEC_SIZE` from 2 MB to 16 MB (or 64 MB).
-- Each `vm_map`'s L2 table covers 1 GB; we have plenty of room.
-- Pick `load_base` based on the binary's `PT_LOAD` layout
-  rather than hardcoding `EXEC_VA`.  Today we assume p_vaddr=0
-  for the first PT_LOAD; allow others (binaries linked at
-  0x400000 etc.).
-
-Optional: ASLR-style placement.  Not a priority for hobby OS.
-
-### Stage 5 -- libc surface expansion (musl-subset)
+### Stage 2 -- Bigger / flexible exec window
 
 Status: `[ ]`
 
-Our libc has ~70 functions.  Real software uses hundreds.  Pick
-musl as the reference (much smaller and cleaner than glibc) and
-implement the functions an "average" C program uses.
+`EXEC_VA = 0x20000000` with `EXEC_SIZE = 2 MB` is way too small.
+A static-musl `hello` already pushes 30 KB; anything real wants
+more.
 
-Likely big wins:
+- Bump `EXEC_SIZE` to 16 MB (we have plenty of VA space, the
+  vm_map's L2 covers 1 GB).
+- Allow PT_LOADs with arbitrary `p_vaddr` -- not just our
+  linker-script-assumed 0.  Pick `load_base` based on the lowest
+  `p_vaddr` and shift everything by the same delta.
+- Validate the relocated VA range stays inside `[EXEC_VA,
+  EXEC_VA + EXEC_SIZE)` -- same as today, just bigger.
 
-- `<stdio.h>`: `printf` family is mostly OK; need `vfprintf`
-  exposing more format specifiers (`%a`, `%g`, `%n` — debatable).
-- `<unistd.h>`: `getopt`, `sleep` (need `SYS_clock_nanosleep`),
-  `usleep`, `getcwd`, `chdir`.
-- `<sys/time.h>`: `gettimeofday`, `clock`.
-- `<sys/stat.h>`: `stat`, `fstat`, `mkdir` (we have).
-- `<string.h>`: `strerror`, `strcasecmp`, `strspn`, `strcspn`.
-- `<stdlib.h>`: `setenv`/`getenv` (need a real env vector),
-  `system`/`popen` (hard -- needs `posix_spawn`).
-- `<pthread.h>`: significant.  Threads exist via `sys_spawn` --
-  need a libc layer that mimics pthreads against it.
+After this stage anything up to ~16 MB of code+data works.
 
-Defer: locales, wide chars, full POSIX regex, networking
-beyond what STREAMS gives us.
-
-### Stage 6 -- Port real third-party software
+### Stage 3 -- `SYS_mmap` / `SYS_munmap` / `SYS_mprotect`
 
 Status: `[ ]`
 
-Pick three programs of increasing complexity, build them
-externally via `kappara-cc`, run them on kappara.  Each one
-exposes gaps that get fixed in stage 5.
+Real implementation, not stubs.  musl's malloc uses `mmap` for
+big allocations; signal handling uses `mmap` + `mprotect` for
+the alternate signal stack.
 
-Suggested ladder:
+- Reserve `ANON_VA = 0x50000000` (16 MB) for anonymous mmap'd
+  pages.  Each `SYS_mmap` finds a contiguous free range, allocates
+  PMM pages, installs L3 mappings.
+- `SYS_munmap` reverses it: walks the range, unmaps + pmm_free's.
+- `SYS_mprotect` updates the L3 entries' permission bits.  Real
+  W^X enforcement for the first time; cmd binaries already get RO
+  text, so this should be a no-op for them.
 
-1. **`sqlite3`** -- single .c file, statically linked, almost
-   pure C.  Good first target.
-2. **`lua`** -- two .c files for the interpreter + a separate
-   small program.  Tests dlopen for the C API.
-3. **`coreutils`'s `ls`** -- exercises getopt, readdir
-   (we don't have `getdents` yet), stat, etc.  Compare output
-   against our built-in `/usr/bin/ls`.
+### Stage 4 -- `PT_INTERP` for dynamic musl binaries
 
-Each port is its own change set; the SDK is what makes the work
-possible.
+Status: `[ ]`
 
-### Stage 7 -- (Stretch) Linux personality layer
+Once stages 1-3 handle static-pie, the dynamic case becomes
+straightforward.  `aarch64-linux-musl-gcc hello.c -o hello`
+(no `-static-pie`) produces a binary with
+`PT_INTERP = /lib/ld-musl-aarch64.so.1`.
 
-Status: `[ ]` (optional)
+- Kernel `sys_execve_impl` reads `PT_INTERP`.  If present, opens
+  that file via VFS and loads it as the entry point.
+- The kernel-shipped `ld-kappara.so` stays the loader for our own
+  cmd binaries (no `PT_INTERP`).
+- A symlink (`vfs_link`?) or a parallel registration at
+  `/lib/ld-musl-aarch64.so.1` → musl's ld.so binary.
 
-Run *unmodified Linux aarch64 ELFs* by:
+### Stage 5 -- General `DT_NEEDED` resolution
 
-- Reading `PT_INTERP = /lib64/ld-linux-aarch64.so.1` and
-  redirecting to a Linux-compat ld-kappara loader.
-- Loading musl-libc.so (built once on host) instead of our
-  libc.so.
-- A syscall translation table at EL1: when an EL0 binary issues
-  `svc #0` with `x8 = 64` (Linux write), the kernel sees the
-  Linux number, looks up the equivalent kappara handler (`SYS_write`
-  = 6), and calls it.
-- Mostly a "match enough syscalls" exercise; the syscall set
-  Linux apps actually use day-to-day is ~50, not the full ~400.
+Status: `[ ]`
 
-This is the biggest single-stage lift in the plan and the most
-optional.  Don't start until 1-6 are solid.
+For a dynamic musl binary to actually run we need a real ld.so
+that walks `DT_NEEDED`.  Two options:
 
-## Dependency chain
+- A. **Use musl's own ld.so.**  Ship `ld-musl-aarch64.so.1`
+  (the real one, from upstream musl) at `/lib/`.  It handles
+  `DT_NEEDED` resolution natively; we just point `PT_INTERP` at
+  it.  Probably the right call -- we don't need to reimplement
+  ld.so semantics.
+- B. **Teach ld-kappara.so DT_NEEDED.**  Extend our existing
+  user-space linker to walk `DT_NEEDED`, mmap each `.so` from
+  `/lib/`, and merge symbol tables.  Smaller artefact, but more
+  code in our tree.
 
-```
-1. SDK -----+
-            |
-            v
-2. PT_INTERP
-   ld.so
-            |
-            +-> 3. General DT_NEEDED
-            |
-            +-> 4. Bigger EXEC window
-            |
-            +-> 5. libc expansion <--+
-                                     |
-                                     |
-            6. port real software ---+
-                                     |
-            7. Linux personality (stretch)
-```
+Decision deferred to whichever feels less painful at the time.
 
-Stages 2-4 are largely independent and small; 5 is the biggest
-ongoing investment.  6 drives 5 by surfacing real gaps.
+### Stage 6 -- Ship a musl-libc.so at `/lib/`
+
+Status: `[ ]`
+
+Build musl-libc-aarch64 once, on the host, ship the resulting
+`libc.musl-aarch64.so.1` as a kappara blob (same incbin trick as
+our libc.so / dltest.so today).  Register it at the path the
+musl PT_INTERP expects.
+
+Once this lands, *dynamic* musl binaries run unmodified.  This is
+the moment Path B becomes "real Linux binaries".
+
+### Stage 7 -- Port a few real programs
+
+Status: `[ ]`
+
+Pick a ladder and walk it.  Each port surfaces a syscall musl
+uses that we hadn't seen yet; add it to the translation table.
+
+- `sqlite3 :memory:` (no FS needed)
+- `lua` REPL
+- a busybox subset (`ls`, `cat`, `wc`)
+- a small static webserver (e.g. `mongoose` single-file)
+
+At each step: build the program on host with
+`aarch64-linux-musl-gcc -static-pie`, scp it, run it, fix what
+breaks.
 
 ## What this is NOT
 
-- A goal to run macOS / Windows / BSD binaries.  AArch64 Linux
-  ELFs only, when we get there.
-- A goal to be a glibc-binary-compatible target.  Musl's surface
-  is what we'll aim at for stretch goal.
-- A goal to ship a distribution.  We're building a runtime; what
-  people ship on top is theirs.
+- A goal to run glibc binaries.  Musl-only.
+- A goal to run x86_64 binaries.  Aarch64-only.
+- A goal to implement every Linux syscall.  Only the ones musl
+  + the ported programs actually issue.  Realistically that's
+  ~40-60 syscalls, not all 400+.
+- A goal to be `binfmt_misc`-compatible or to support multiple
+  personalities concurrently.  One ABI translation, one direction.
+
+## What about the SDK?
+
+Stage 1 of the previous INDIE plan shipped a working SDK +
+`kappara-cc`.  That still exists -- the build targets (`make
+sdk`, `make sdk-tarball`, `make ARCH=virt smoke-sdk`) stay in
+the Makefile and the tarball still ships.  It's just no longer
+*the* path -- it's the fallback for "I specifically want to
+build against kappara, not against Linux."

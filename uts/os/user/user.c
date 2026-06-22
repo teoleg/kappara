@@ -1295,6 +1295,20 @@ long sys_execve_impl(const char *path, int argc, const char *const argv[])
 		return -1;
 	}
 
+	/* Inherit cwd from the calling thread's vm_map (the shell's),
+	 * matching POSIX semantics where execve preserves cwd. */
+	{
+		struct kthread *parent = curthread;
+		if (parent && parent->t_proc && parent->t_proc->vm &&
+		    parent->t_proc->vm->cwd[0]) {
+			const char *src = parent->t_proc->vm->cwd;
+			unsigned i = 0;
+			for (; i + 1 < sizeof(vm->cwd) && src[i]; i++)
+				vm->cwd[i] = src[i];
+			vm->cwd[i] = '\0';
+		}
+	}
+
 	/* (2) Code: walk PT_LOAD, allocate pages, copy bytes.
 	 *
 	 * For ET_DYN binaries this uses load_base = EXEC_VA so multiple

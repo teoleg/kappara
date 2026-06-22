@@ -3,13 +3,11 @@
  *
  * Reads a directory listing through the SYS_ls syscall (which returns
  * names separated by '\n', NUL-terminated) and prints them one per
- * line.  No flags yet; we treat the first positional as a path,
- * default "." resolved to the shell's cwd via the kernel's path
- * resolver.
+ * line.  Default path is "/" because we don't have per-process cwd
+ * yet -- a future change adds chdir/getcwd and SYS_ls + sibling
+ * syscalls will resolve relative paths against vm_map->cwd.
  *
- * Companion to the cd/pwd/ls trio that lived in init.c; with
- * exec'd via /usr/bin lookup the shell's dispatcher falls through
- * cleanly here.  See docs/SHELL.md for the migration to standalone.
+ * See docs/SHELL.md for the migration to standalone.
  */
 
 #include <stdio.h>

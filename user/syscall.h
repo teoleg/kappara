@@ -46,6 +46,8 @@
 #define SYS_tcgetpgrp	32
 #define SYS_brk		33
 #define SYS_fork	34
+#define SYS_chdir	40
+#define SYS_getcwd	41
 
 #define SIG_BLOCK	0
 #define SIG_UNBLOCK	1
@@ -330,6 +332,16 @@ static inline long sys_brk(unsigned long addr)
 static inline long sys_fork(void)
 {
 	return _syscall0(SYS_fork);
+}
+
+static inline long sys_chdir(const char *path)
+{
+	return _syscall1(SYS_chdir, (long)(unsigned long)path);
+}
+
+static inline long sys_getcwd(char *buf, size_t cap)
+{
+	return _syscall2(SYS_getcwd, (long)(unsigned long)buf, (long)cap);
 }
 
 /* ioctl commands -- mirror include/kappara/stream_head.h. */
