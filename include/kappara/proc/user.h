@@ -86,5 +86,14 @@ uint64_t sys_dlsym_impl(uint64_t handle, const char *name);
 long     sys_dlclose_impl(uint64_t handle);
 long     sys_dlerror_impl(char *user_buf, unsigned cap);
 
+/* INDIE.md Path B stage 3: anonymous mmap.  Linux-ABI binaries use
+ * mmap for the malloc heap once sbrk is exhausted, plus signal-stack
+ * setup.  Today only MAP_ANONYMOUS is supported; file mapping comes
+ * later. */
+long sys_mmap_impl(uint64_t addr, uint64_t length, int prot,
+		   int flags, int fd, uint64_t offset);
+long sys_munmap_impl(uint64_t addr, uint64_t length);
+long sys_mprotect_impl(uint64_t addr, uint64_t length, int prot);
+
 #endif
 

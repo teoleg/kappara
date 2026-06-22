@@ -408,12 +408,10 @@ static void cmd_cd(int argc, char *argv[])
 	const char *target = (argc > 1) ? argv[1] : "/";
 	char path[128];
 	resolve_path(target, path, sizeof(path));
-	/* Probe before mutating cwd: sys_ls returns -1 for both a
-	 * non-existent path and a regular file (vfs_listdir rejects
-	 * anything that isn't INODE_DIR), so a single call covers
-	 * "no such directory" without needing a stat syscall. */
-	char probe[1];
-	if (sys_ls(path, probe, sizeof(probe)) < 0) {
+	/* SYS_chdir does the directory check (verifies path is INODE_DIR)
+	 * and updates the kernel's per-process cwd so anything we exec
+	 * sees the right cwd via the same syscall. */
+	if (sys_chdir(path) < 0) {
 		cwrite("cd: no such directory: ");
 		cwrite(path); cwrite("\r\n");
 		return;

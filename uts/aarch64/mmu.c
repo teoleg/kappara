@@ -453,11 +453,18 @@ void *mmu_vmap_user_va_to_kva(const struct vm_map *vm, uint64_t va)
 	unsigned l2_idx = (unsigned)(va >> BLOCK_2M_SHIFT) & 0x1ff;
 	uint64_t e2 = l2[l2_idx];
 	if (!(e2 & D_VALID)) return NULL;
-	if (!(e2 & D_TABLE)) {
-		/* 2 MB block (legacy path).  Direct PA + offset. */
-		uint64_t pa = e2 & D_PA_MASK;
-		return (void *)(uintptr_t)(pa + (va & (BLOCK_2M_SIZE - 1)));
-	}
+	/* If the L2 entry is a 2 MB BLOCK, it's the inherited kernel
+	 * identity mapping (every fresh vm_map dups l2_table whose
+	 * entries are kernel BLOCKs).  User pages always go through an
+	 * L3 TABLE installed by vmap_l3_for / mmu_vmap_map_user_4k.  So
+	 * BLOCK means "not a user mapping" -- return NULL so fork's
+	 * page-walker and friends don't try to clone kernel memory.
+	 *
+	 * Pre-INDIE.md stage 2, EXEC_VA fit in one 2 MB chunk that
+	 * always got TABLE-promoted by the first allocation, so this
+	 * fallback was harmless.  Now that EXEC_VA spans 16 MB the
+	 * untouched chunks stayed BLOCK and looked "mapped". */
+	if (!(e2 & D_TABLE)) return NULL;
 	uint64_t *l3 = (uint64_t *)(uintptr_t)(e2 & D_PA_MASK);
 	unsigned l3_idx = (unsigned)(va >> PAGE_SHIFT) & 0x1ff;
 	uint64_t e3 = l3[l3_idx];

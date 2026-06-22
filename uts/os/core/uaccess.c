@@ -46,7 +46,13 @@
  * range check; for now two static windows is correct.
  */
 #define USER_VA		0x10000000UL
-/* DYNAMIC.md windows -- keep in sync with uts/os/user/user.c. */
+/* DYNAMIC.md + INDIE.md windows -- keep in sync with
+ * uts/os/user/user.c.  EXEC_TOTAL covers code+stack+heap as one
+ * contiguous span. */
+#define EXEC_VA		0x20000000UL
+#define EXEC_TOTAL	0x01600000UL	/* 16 MB code + 2 MB stack + 4 MB heap */
+#define ANON_VA		0x22000000UL
+#define ANON_SIZE	0x08000000UL
 #define LD_VA		0x30000000UL
 #define LD_SIZE		0x00100000UL
 #define LIBC_VA		0x38000000UL
@@ -55,8 +61,6 @@
 #define DLOPEN_SIZE	0x00200000UL
 #define USER_SIZE	0x00200000UL
 
-#define EXEC_VA		0x20000000UL
-#define EXEC_TOTAL	0x00400000UL	/* code region + stack region */
 
 int syscall_from_user;
 
@@ -72,6 +76,9 @@ int user_ptr_ok(const void *p, size_t n)
 	if (a >= USER_VA && end <= USER_VA + USER_SIZE)
 		return 1;
 	if (a >= EXEC_VA && end <= EXEC_VA + EXEC_TOTAL)
+		return 1;
+	/* INDIE.md Path B stage 3: anonymous mmap range. */
+	if (a >= ANON_VA && end <= ANON_VA + ANON_SIZE)
 		return 1;
 	/* DYNAMIC.md stages 5-7: dynamic linker, libc.so, dlopen slots. */
 	if (a >= LD_VA && end <= LD_VA + LD_SIZE)

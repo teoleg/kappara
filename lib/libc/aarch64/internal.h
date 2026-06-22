@@ -33,6 +33,8 @@
 #define __NR_dlsym       37
 #define __NR_dlclose     38
 #define __NR_dlerror     39
+#define __NR_chdir       40
+#define __NR_getcwd      41
 
 static inline long __syscall0(long nr) {
     register long x0 __asm__("x0");

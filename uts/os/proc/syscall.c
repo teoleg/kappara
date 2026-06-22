@@ -45,8 +45,10 @@
 #include <stdint.h>
 
 #include "kappara/core/printk.h"
+#include "kappara/core/string.h"
 #include "kappara/proc/sched.h"
 #include "kappara/proc/signal.h"
+#include "kappara/proc/process.h"
 #include "kappara/io/stream_head.h"
 #include "kappara/io/streams.h"
 #include "kappara/abi/syscall.h"
@@ -55,6 +57,57 @@
 #include "kappara/fs/vfs.h"
 
 typedef long (*syscall_fn)(long, long, long, long, long, long);
+
+/* Resolve a syscall path argument against the calling process's cwd.
+ *
+ *  - Absolute paths (start with '/') copy through unchanged.
+ *  - "." and ".." get the cwd prepended; vfs_lookup doesn't understand
+ *    them itself, but path_canon (here) collapses them.
+ *  - Relative paths get "cwd/" + path with one collapse pass.
+ *
+ * `path` is a kernel-side string (caller has already copy_from_user'd
+ * any user pointer).  `out` is a kernel buffer of `cap` bytes.  Returns
+ * `out` on success, or NULL if the result wouldn't fit. */
+static const char *resolve_path_kva(const char *path, char *out, size_t cap)
+{
+	if (!path || !out || cap < 2) return NULL;
+
+	if (path[0] == '/') {
+		size_t i = 0;
+		while (path[i] && i + 1 < cap) { out[i] = path[i]; i++; }
+		out[i] = '\0';
+	} else {
+		struct kthread *t = curthread;
+		const char *cwd = "/";
+		if (t && t->t_proc && t->t_proc->vm &&
+		    t->t_proc->vm->cwd[0] == '/')
+			cwd = t->t_proc->vm->cwd;
+		size_t i = 0;
+		while (cwd[i] && i + 1 < cap) { out[i] = cwd[i]; i++; }
+		/* "/foo" join if cwd != "/" */
+		if (i > 1 && i + 1 < cap) out[i++] = '/';
+		size_t j = 0;
+		while (path[j] && i + 1 < cap) out[i++] = path[j++];
+		out[i] = '\0';
+	}
+
+	/* In-place collapse of "/." -> "/" and "//" -> "/".  "/.." is
+	 * not handled (uncommon for the path-taking syscalls). */
+	char *w = out;
+	for (char *r = out; *r; r++) {
+		if (r[0] == '/' && r[1] == '.' && (r[2] == '/' || r[2] == '\0')) {
+			*w++ = '/';	/* keep the slash; for-loop r++ skips the dot */
+			r++;
+			continue;
+		}
+		if (r[0] == '/' && r[1] == '/') continue;
+		*w++ = *r;
+	}
+	*w = '\0';
+	/* Trim trailing slash (unless path is just "/") */
+	if (w > out + 1 && w[-1] == '/') *--w = '\0';
+	return out;
+}
 
 static long sys_log(long arg0, long a1, long a2, long a3, long a4, long a5)
 {
@@ -298,9 +351,65 @@ static long sys_ls(long a0, long a1, long a2, long a3, long a4, long a5)
 		path = "/";
 	}
 
-	struct dentry *d = vfs_lookup(path);
+	/* Resolve "." / "foo" / "./foo" against the process's cwd. */
+	char resolved[128];
+	const char *p = resolve_path_kva(path, resolved, sizeof(resolved));
+	if (!p) return -1;
+	struct dentry *d = vfs_lookup(p);
 	if (!d) return -1;	/* ENOENT — normal control flow, no kprintf */
 	return vfs_listdir(d, out, cap);
+}
+
+/* SYS_chdir(const char *path) -- update vm_map->cwd. */
+static long sys_chdir(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	struct kthread *t = curthread;
+	if (!t || !t->t_proc || !t->t_proc->vm) return -1;
+
+	char kpath[128];
+	const char *path = (const char *)(uintptr_t)a0;
+	if (syscall_from_user) {
+		if (strncpy_from_user(kpath, path, sizeof(kpath)) < 0)
+			return -1;
+		path = kpath;
+	}
+
+	char resolved[128];
+	const char *p = resolve_path_kva(path, resolved, sizeof(resolved));
+	if (!p) return -1;
+	struct dentry *d = vfs_lookup(p);
+	if (!d || !d->d_inode || d->d_inode->i_type != INODE_DIR) return -1;
+
+	struct vm_map *vm = t->t_proc->vm;
+	size_t i = 0;
+	while (p[i] && i + 1 < sizeof(vm->cwd)) { vm->cwd[i] = p[i]; i++; }
+	vm->cwd[i] = '\0';
+	return 0;
+}
+
+/* SYS_getcwd(char *buf, size_t cap) -- copy vm_map->cwd to user. */
+static long sys_getcwd(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	struct kthread *t = curthread;
+	if (!t || !t->t_proc || !t->t_proc->vm) return -1;
+	char *user_buf = (char *)(uintptr_t)a0;
+	size_t cap = (size_t)a1;
+	struct vm_map *vm = t->t_proc->vm;
+	const char *src = (vm->cwd[0] == '/') ? vm->cwd : "/";
+
+	size_t n = 0;
+	while (src[n] && n + 1 < cap) n++;
+	if (syscall_from_user) {
+		if (copy_to_user(user_buf, src, n) < 0) return -1;
+		char nul = '\0';
+		if (copy_to_user(user_buf + n, &nul, 1) < 0) return -1;
+	} else {
+		for (size_t i = 0; i < n; i++) user_buf[i] = src[i];
+		user_buf[n] = '\0';
+	}
+	return (long)n;
 }
 
 static long sys_sigaction(long a0, long a1, long a2, long a3, long a4, long a5)
@@ -529,11 +638,126 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_dlsym]       = sys_dlsym,
 	[SYS_dlclose]     = sys_dlclose,
 	[SYS_dlerror]     = sys_dlerror,
+	[SYS_chdir]       = sys_chdir,
+	[SYS_getcwd]      = sys_getcwd,
+};
+
+/* INDIE.md Path B: Linux syscall translation.
+ *
+ * Maps Linux aarch64 syscall numbers (asm-generic/unistd.h) to our
+ * native handlers when the calling binary uses the Linux ABI.  Today
+ * we route any `x8 >= 50` through the Linux table -- our native
+ * syscalls all sit below 42 and the Linux numbers we care about for
+ * static-musl programs (write=64, exit=93, brk=214, mmap=222,
+ * mprotect=226, exit_group=94, writev=66) all start at 50+.
+ *
+ * The handful of overlapping low numbers (Linux ioctl=29 vs SYS_getpgrp)
+ * stays on the native table for now; binaries using those won't work
+ * until a real per-process ABI flag lands. */
+#define LINUX_NR_MAX 280
+
+static long linux_sys_write(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return syscall_table[SYS_write](a0, a1, a2, a3, a4, a5);
+}
+static long linux_sys_read(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return syscall_table[SYS_read](a0, a1, a2, a3, a4, a5);
+}
+static long linux_sys_close(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return syscall_table[SYS_close](a0, a1, a2, a3, a4, a5);
+}
+static long linux_sys_exit(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return syscall_table[SYS_exit](a0, a1, a2, a3, a4, a5);
+}
+static long linux_sys_brk(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return syscall_table[SYS_brk](a0, a1, a2, a3, a4, a5);
+}
+static long linux_sys_getpid(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return syscall_table[SYS_getpid](a0, a1, a2, a3, a4, a5);
+}
+static long linux_sys_set_tid_address(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	/* Linux set_tid_address(int *tid_addr): musl uses it for thread
+	 * cancellation.  We have no concept; pretend we set it and return
+	 * the current tid so musl is happy. */
+	(void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return syscall_table[SYS_getpid](0, 0, 0, 0, 0, 0);
+}
+static long linux_sys_mprotect(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a3; (void)a4; (void)a5;
+	return sys_mprotect_impl((uint64_t)a0, (uint64_t)a1, (int)a2);
+}
+
+static long linux_sys_mmap(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return sys_mmap_impl((uint64_t)a0, (uint64_t)a1, (int)a2,
+			      (int)a3, (int)a4, (uint64_t)a5);
+}
+
+static long linux_sys_munmap(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_munmap_impl((uint64_t)a0, (uint64_t)a1);
+}
+static long linux_sys_ioctl(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return syscall_table[SYS_ioctl](a0, a1, a2, a3, a4, a5);
+}
+static long linux_sys_writev(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	/* writev(fd, iovec[], niov).  iovec = {void *base; size_t len;}.
+	 * Pasted-together by walking the iovec and issuing SYS_write per
+	 * entry.  Not atomic, but musl's startup printf only uses 1-elt
+	 * iovecs in practice. */
+	(void)a3; (void)a4; (void)a5;
+	int fd = (int)a0;
+	const long *iov = (const long *)(uintptr_t)a1;
+	int niov = (int)a2;
+	if (!iov || niov <= 0) return 0;
+	long total = 0;
+	for (int i = 0; i < niov; i++) {
+		long base = iov[i * 2];
+		long len  = iov[i * 2 + 1];
+		if (len == 0) continue;
+		long w = syscall_table[SYS_write](fd, base, len, 0, 0, 0);
+		if (w < 0) return w;
+		total += w;
+		if (w < len) break;
+	}
+	return total;
+}
+
+static const syscall_fn linux_syscall_table[LINUX_NR_MAX] = {
+	[29]  = linux_sys_ioctl,
+	[57]  = linux_sys_close,
+	[63]  = linux_sys_read,
+	[64]  = linux_sys_write,
+	[66]  = linux_sys_writev,
+	[93]  = linux_sys_exit,
+	[94]  = linux_sys_exit,	/* exit_group */
+	[96]  = linux_sys_set_tid_address,
+	[172] = linux_sys_getpid,
+	[214] = linux_sys_brk,
+	[215] = linux_sys_munmap,
+	[222] = linux_sys_mmap,
+	[226] = linux_sys_mprotect,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5)
 {
+	/* Linux-ABI dispatch first: any number >= 50 with a Linux entry
+	 * routes through the translation table. */
+	if ((unsigned long)num >= 50 && (unsigned long)num < LINUX_NR_MAX &&
+	    linux_syscall_table[num]) {
+		return linux_syscall_table[num](a0, a1, a2, a3, a4, a5);
+	}
 	if ((unsigned long)num >= SYS_MAX || !syscall_table[num]) {
 		kprintf("syscall: bad number %ld\n", num);
 		return -1;

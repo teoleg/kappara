@@ -84,8 +84,13 @@
 #define SYS_dlerror	39	/* (char *buf, size_t cap) -> bytes / 0    *
 				 * Copy the most recent error string and   *
 				 * clear it.                                */
+#define SYS_chdir	40	/* (const char *path) -> 0 / -1            *
+				 * Set per-process cwd; verifies path is   *
+				 * a directory.                            */
+#define SYS_getcwd	41	/* (char *buf, size_t cap) -> bytes / -1   *
+				 * Copy cwd to user buffer.                */
 
-#define SYS_MAX		40
+#define SYS_MAX		42
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

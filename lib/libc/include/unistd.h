@@ -17,5 +17,7 @@ long    lseek(int fd, long off, int whence);
 long    ls   (const char *path, char *out, size_t cap);
 long    ll   (const char *path, char *out, size_t cap);
 int     execve(const char *path, const char *const argv[]);
+int     chdir (const char *path);
+char   *getcwd(char *buf, size_t cap);
 void   _exit (int status) __attribute__((noreturn));
 #endif /* _UNISTD_H */
