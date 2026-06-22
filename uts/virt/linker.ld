@@ -54,3 +54,12 @@ SECTIONS
 
 	/DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }
+
+/* AWS.md stage A: split image_size into 32-bit halves for the
+ * little-endian quad field in boot.S's Linux Image header.  The
+ * assembler can't compute __kernel_end - __kernel_start, but ABSOLUTE
+ * here turns the expression into a symbol whose VALUE is the result --
+ * boot.S then emits two .long entries that the linker resolves into
+ * the right 64-bit value. */
+_kernel_image_size_lo32 = ABSOLUTE((__kernel_end - __kernel_start) & 0xffffffff);
+_kernel_image_size_hi32 = ABSOLUTE(((__kernel_end - __kernel_start) >> 32) & 0xffffffff);

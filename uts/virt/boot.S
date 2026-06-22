@@ -21,24 +21,45 @@
 .section ".text.boot"
 .global _start
 
-/* Linux ARM64 boot protocol header (Documentation/arm64/booting.rst).
- * QEMU's -kernel loader on aarch64 looks at offset 0x38 for the
- * "ARM\x64" magic to identify the image; without the header it can't
- * tell where to place us, so we copy the header layout Linux's
- * arch/arm64/kernel/head.S uses.  The first 4 bytes "MZ" are the
- * MS-DOS magic so EFI can also boot us as a PE/COFF binary (we
- * skip the PE COFF body since QEMU doesn't need it). */
+/* Linux ARM64 boot protocol header (Documentation/arch/arm64/booting.rst).
+ *
+ * Layout, all little-endian (64 bytes total):
+ *
+ *   off  size  field
+ *   ---  ----  ----------------------------------------------------
+ *   0    4     code0          executable / MZ magic for EFI compat
+ *   4    4     code1          `b _real_start` (skips header)
+ *   8    8     text_offset    where image lands within its 2MB region
+ *   16   8     image_size     total bytes incl. BSS (from linker)
+ *   24   8     flags          page-size + placement (4K, anywhere)
+ *   32   24    reserved (3 quads)
+ *   56   4     "ARM\x64" magic
+ *   60   4     PE COFF offset (0 until AWS.md stage B fills it)
+ *
+ * AWS.md stage A: image_size + text_offset + flags now carry real
+ * values (used to be zeros) so GRUB and other ARM64 Linux bootloaders
+ * can place us correctly.  Stage B adds the EFI PE header next to
+ * this so AWS Nitro UEFI boots us as a PE/COFF executable.
+ *
+ * code0 = `add x13, x18, #0x16` encodes as "MZ\x00\x91" little-endian
+ * -- the first two bytes are the MS-DOS PE magic so EFI accepts us;
+ * the instruction itself is a no-op for us (writes to scratch x13
+ * which we never read).  EFI never executes code0; it jumps to the
+ * PE entry point listed at offset 60.
+ */
 _start:
-	add	x13, x18, #0x16		/* encodes as "MZ" little-endian: PE magic */
-	b	.Lreal_start
-	.quad	0			/* image_load_offset_le */
-	.quad	0			/* image_size_le (0 = inherit from -kernel) */
-	.quad	0			/* image_flags_le */
+	add	x13, x18, #0x16		/* code0: "MZ" magic */
+	b	.Lreal_start		/* code1: skip past header */
+	.quad	0x80000			/* text_offset = 0x80000 (Linux convention) */
+	.long	_kernel_image_size_lo32	/* image_size = __kernel_end - __kernel_start, */
+	.long	_kernel_image_size_hi32	/* split lo/hi because the assembler can't */
+					/* compute the linker-time difference */
+	.quad	0x0A			/* flags: 4K pages, anywhere placement */
 	.quad	0
 	.quad	0
 	.quad	0
 	.ascii	"ARM\x64"		/* magic at offset 0x38 */
-	.long	0			/* PE COFF offset (0 = none) */
+	.long	0			/* PE COFF offset (filled by stage B) */
 
 .Lreal_start:
 	/* Only core 0 of cluster 0 proceeds.  Should be the only one

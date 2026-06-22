@@ -48,21 +48,49 @@ lands.
 
 ### Stage A -- Linux ARM64 Image header
 
-Status: `[ ]`
+Status: `[x]`
 
 Boot stub written in asm: 64 bytes prefixed to our raw binary
-with the right magic at offset 56 (`ARM\x64`), the text offset,
-the image size, flags (4 KB pages, little-endian, no swap), and
-a `b _start` at offset 0.  No real code.  GRUB only needs the
-header to load us.
+with the right magic at offset 56 (`ARM\x64`), text_offset,
+image_size, flags (4 KB pages, anywhere placement), and a `b _start`
+at offset 4.
+
+What landed:
+
+- `uts/virt/boot.S` already carried a placeholder Image header
+  (QEMU's `-kernel` checks for the "ARM\x64" magic at offset 0x38
+  to identify the image).  Stage A fills in the rest of the
+  fields: `text_offset = 0x80000` (Linux convention),
+  `image_size = __kernel_end - __kernel_start`, `flags = 0x0A`
+  (bit 1 = 4K pages, bit 3 = "anywhere" placement).
+- `uts/virt/linker.ld` exports `_kernel_image_size_lo32` and
+  `_kernel_image_size_hi32` via `ABSOLUTE(...)`.  The assembler
+  can't compute the linker-time difference, so we emit two
+  `.long` references the linker resolves into the right
+  little-endian 64-bit field.  Same trick Linux head.S uses.
+- code0 is still `add x13, x18, #0x16` which encodes as bytes
+  `4d 5a 00 91` -- "MZ\x00\x91".  The first two bytes are the
+  MS-DOS PE magic so EFI accepts us; the AArch64 instruction
+  itself is a harmless no-op (writes to scratch x13 we never
+  read).  PE COFF offset at byte 60 stays 0 until stage B
+  points it at the EFI PE header.
+
+Header bytes (`od -An -tx1 -N64 build/kernel.img`):
+
+    4d 5a 00 91 0f 00 00 14 00 00 08 00 00 00 00 00
+    00 40 78 00 00 00 00 00 0a 00 00 00 00 00 00 00
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    00 00 00 00 00 00 00 00 41 52 4d 64 00 00 00 00
+                                        ^^ "ARM\x64"
 
 This stage does NOT yet add EFI parsing.  After this stage we
-still don't boot on AWS -- but we can produce a binary that
-GRUB-style loaders are willing to drop into RAM at the right
-address, which is the prerequisite for everything below.
+still don't boot on AWS -- but we produce a binary that GRUB
+and other Linux-aware loaders are willing to drop into RAM at
+the right address, the prerequisite for stage B.
 
-Build target: `build/aws64/kernel.img` (raw bytes) gets a header
-prefix; downstream targets get a `.efi` variant separately.
+Verified: `make test` ALL TESTS PASS.  The same kernel image
+QEMU has been booting via `-kernel` is unchanged in behaviour;
+the header metadata fields now carry real values.
 
 ### Stage B -- EFI app + ExitBootServices
 
