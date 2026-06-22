@@ -70,5 +70,21 @@ long sys_brk_impl(uint64_t addr);
 struct trap_frame;
 long sys_fork_impl(struct trap_frame *parent_tf);
 
+/* DYNAMIC.md stage 7: dlopen / dlsym.  dlopen reads the named shared
+ * object from VFS, loads PT_LOADs at DLOPEN_VA, applies R_AARCH64_RELATIVE
+ * relocs, stashes the load base on the calling process's vm_map.  Returns
+ * the load base (= the handle) or 0 on failure.
+ *
+ * dlsym walks the loaded .so's dynsym for `name` and returns its runtime
+ * VA (handle + st_value), or 0 if absent.
+ *
+ * Today only one .so per process can be dlopen'd; calling dlopen twice
+ * with the same path returns the cached handle.  Caller releases the
+ * mapping by exiting (no dlclose yet). */
+uint64_t sys_dlopen_impl(const char *path);
+uint64_t sys_dlsym_impl(uint64_t handle, const char *name);
+long     sys_dlclose_impl(uint64_t handle);
+long     sys_dlerror_impl(char *user_buf, unsigned cap);
+
 #endif
 

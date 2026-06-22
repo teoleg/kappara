@@ -24,6 +24,12 @@ void *kmemset(void *dst, int c, size_t n)
 	return dst;
 }
 
+/* GCC emits calls to memset for large struct {0} initializers even
+ * under -ffreestanding.  Alias to kmemset so the linker resolves them
+ * to our impl. */
+void *memset(void *dst, int c, size_t n) __attribute__((alias("kmemset")));
+void *memcpy(void *dst, const void *src, size_t n) __attribute__((alias("kmemcpy")));
+
 void *kmemcpy(void *dst, const void *src, size_t n)
 {
 	unsigned char *d = dst;

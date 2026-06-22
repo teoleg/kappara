@@ -240,21 +240,17 @@ What landed:
 
 Operating recipe written under "Operating recipe" below.
 
-Carry-over flagged during step 4 testing:
-- ELF round-trip via FTP currently sees a content corruption on
-  bigger payloads: a small text file (~16 B) round-trips
-  byte-identical, and the uploaded `ifconfig.elf` exec's and
-  prints expected output -- so STOR + exec is intact -- but a
-  STOR-then-RETR of `ifconfig.elf` returns 12288 bytes instead
-  of the original 11776, with zero-filled blocks splicing in
-  around offset 5120.  The on-disk size in `/home` is correct
-  (`ll /home` shows `reg 11776 foo`), so RETR is producing the
-  extra bytes, not STOR; likely an interaction between the new
-  drain-callback ACKing pattern and a stale segment from the
-  PASV listener's port.  Smoke test uses a tiny payload until
-  this is chased -- exec'ing uploaded ELFs still works because
-  the kfs file is correctly sized and exec reads from kfs, not
-  from the buggy RETR path.
+Carry-over closed:
+- The "RETR returns 512-byte zero block injected mid-stream"
+  bug was racy IRQ vs `handle_data_req` snd_buf reassignment.
+  Reading `old = b_wptr - b_rptr` and then `kmemcpy(.., b_rptr, old)`
+  is not atomic against a tcp_rput ACK trim that advances
+  `b_rptr` (so the kmemcpy reads `old` bytes from the new,
+  smaller position -- spilling past `b_wptr` into the tail of
+  the allocb, often zero).  Fixed by fencing the whole snd_buf
+  swap with DAIF mask/restore.  smoke-ftp now byte-compares
+  the full `build/cmd/ifconfig.elf` (11776 B) and passes
+  reproducibly.
 
 ### Step 5 -- Optional follow-ups (out of scope for v1)
 

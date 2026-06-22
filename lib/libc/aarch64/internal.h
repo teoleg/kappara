@@ -11,15 +11,28 @@
 #define __NR_putmsg      8
 #define __NR_getmsg      9
 #define __NR_ioctl       7
+#define __NR_ls          10
 #define __NR_pipe        11
+#define __NR_creat       12
+#define __NR_seek        13
+#define __NR_mkdir       14
 #define __NR_exit        16
+#define __NR_unlink      17
+#define __NR_rmdir       18
 #define __NR_kill        19
+#define __NR_ll          20
 #define __NR_sigaction   22
 #define __NR_sigprocmask 24
 #define __NR_sigsuspend  25
 #define __NR_wait        26
+#define __NR_execve      27
 #define __NR_brk         33
 #define __NR_fork        34
+#define __NR_clock_gettime 35
+#define __NR_dlopen      36
+#define __NR_dlsym       37
+#define __NR_dlclose     38
+#define __NR_dlerror     39
 
 static inline long __syscall0(long nr) {
     register long x0 __asm__("x0");

@@ -156,6 +156,15 @@ VA              Size    Purpose
                         Stack top = 0x20400000
 0x20400000      2 MB    exec heap      (exec_heap_storage[slot])
                         Grows up from EXEC_HEAP_VA, controlled by SYS_brk
+0x30000000      1 MB    ld-kappara.so  (LD_VA, ET_EXEC bootstrap loader,
+                        DYNAMIC.md stage 5 -- only mapped for ET_DYN apps)
+0x38000000      2 MB    libc.so        (LIBC_VA, ET_DYN shared C library,
+                        DYNAMIC.md stage 6 -- only mapped for ET_DYN apps.
+                        Inside the first 1 GB so it fits the vm_map's
+                        single L2; 0x40000000+ is the peripheral block.)
+0x39000000      2 MB    dlopen slot    (DLOPEN_VA, DYNAMIC.md stage 7 --
+                        SYS_dlopen maps a runtime-loaded .so here, one
+                        slot per process.)
 ```
 
 R6: each exec'd process owns its own vm_map (L0/L1/L2/L3 page
@@ -192,21 +201,42 @@ next command).
    the 256 KB static `elf_read_buf` can be written directly without a
    `copy_to_user` round-trip).
 2. Validates the ELF64 header: magic, ELF64 class, LE, `EM_AARCH64`,
-   `ET_EXEC`.
-3. Zeroes `exec_storage` and `exec_stack_storage` (BSS-clean start).
-4. Copies each PT_LOAD segment from `elf_read_buf` into `exec_storage`
-   at `p_vaddr - EXEC_VA`.  Segments outside `[0x20000000, 0x20200000)`
+   `ET_EXEC` or `ET_DYN` (PIE).
+3. Picks `load_base`: `EXEC_VA` for ET_DYN (cmd/* are static PIE since
+   docs/DYNAMIC.md stages 3+4), `0` for ET_EXEC (only `/bin/hello`).
+4. Copies each PT_LOAD segment from `elf_read_buf` into pages allocated
+   at `p_vaddr + load_base` via `vmap_alloc_pages` + `vmap_copyin`.
+   Segments whose relocated VA falls outside `[EXEC_VA, EXEC_VA+EXEC_SIZE)`
    are rejected.
-5. `dsb ish; ic iallu; dsb ish; isb` — D→I cache coherence.
-6. Builds the exec stack: argv strings are packed from `EXEC_STACK_TOP`
-   downward (each NUL-terminated, 8-byte aligned), then the pointer array
-   (`argv[0]..argv[argc-1]`, NULL terminator), then `argc` as a
-   `uint64_t`.  SP is set to the `argc` word.  Because the pointer table
-   is `(argc + 2)` words of 8 bytes each, an 8-byte padding word is
-   inserted when `(argc + 2)` is odd to keep SP 16-byte aligned — the
-   AArch64 ABI requirement at function-call boundaries.
-7. Spawns an `exec` kthread with `kthread_inherit_fds` (so fd 0/1/2 are
-   all `/dev/console`) and calls `aarch64_enter_userspace(e_entry, sp, 0)`.
+5. For ET_DYN: walks `PT_DYNAMIC` for `DT_RELA / DT_RELASZ`, applies each
+   `R_AARCH64_RELATIVE` by writing `load_base + r_addend` at user VA
+   `load_base + r_offset`.  `GLOB_DAT` / `JUMP_SLOT` / `DT_NEEDED` are
+   hard errors -- they show up once libc.so is split out (stage 6+).
+6. For ET_DYN: loads `ld-kappara.so` (stage 5 user-space dynamic linker)
+   into the same vm_map at `LD_VA = 0x30000000` via `load_static_elf`.
+   ld.so is itself `ET_EXEC` (deliberately not PIE -- it's the bootstrap)
+   so the loader just memcpy's PT_LOAD and records `e_entry`.
+7. `dsb ish; ic iallu; dsb ish; isb` — D→I cache coherence.
+8. Builds the exec stack with POSIX shape: argv strings packed from
+   `EXEC_STACK_TOP` downward, then:
+   ```
+   [auxv AT_NULL    ]   16 bytes
+   [auxv AT_ENTRY=9 ]   16 bytes (a_val = app's e_entry + load_base)
+   [envp[0] = NULL  ]    8 bytes
+   [argv[argc] = NUL]    8 bytes
+   [argv[argc-1]    ]
+   ...
+   [argv[0]         ]
+   [argc            ]   <-- SP, 16-byte aligned
+   ```
+   Total below SP from strings: `56 + 8*argc` bytes; pad 8 when argc
+   is even to keep SP 16-byte aligned (AArch64 ABI at call boundaries).
+9. Spawns an `exec` kthread with `kthread_inherit_fds` (so fd 0/1/2 are
+   all `/dev/console`) and calls `aarch64_enter_userspace(entry, sp, 0)`,
+   where `entry` is ld.so's `_start` (`LD_VA`) for ET_DYN and the app's
+   `e_entry` for ET_EXEC.  ld.so reads `auxv[AT_ENTRY]` and tail-calls
+   the application; the app's `crt0.S` sees the same `argc`/`argv`
+   layout it always did.
 
 Exec stack frame at entry (grows down from `EXEC_STACK_TOP = 0x20400000`):
 ```
@@ -262,12 +292,17 @@ so it has no host-OS dependencies.
 |-------------------------|--------------------------------------------------------------|
 | `aarch64/crt0.S`        | `_start`: loads argc/argv from exec stack, calls `main`, then `sys_exit`. |
 | `aarch64/internal.h`    | `__syscall1/__syscall3`, syscall numbers, `ssize_t`.          |
-| `src/string.c`          | `strlen`, `strcpy`, `strncpy`, `memcpy`, `memset`, `strcmp`. |
+| `src/string.c`          | `strlen`, `strcmp`, `strncmp`, `strcpy`, `strncpy`, `strcat`, `strncat`, `strchr`, `strrchr`, `strstr`, `strdup`, `strtok`, `memcpy`, `memset`, `memmove`, `memcmp`, `memchr`. |
 | `src/printf.c`          | `printf`, `vprintf`, `sprintf`, `snprintf`, `vsnprintf`.      |
+| `src/stdlib.c`          | `exit`, `_exit`, `atoi`, `atol`, `strtol`, `abs`, `labs`, `qsort` (insertion sort), `bsearch`, `getenv` (stub).  No `atof` -- `-mgeneral-regs-only` forbids `double`. |
+| `src/ctype.c`           | `isdigit`/`isalpha`/`isalnum`/`isspace`/`isupper`/`islower`/`isxdigit`/`isprint`/`iscntrl`/`ispunct` + `toupper`/`tolower`. |
+| `src/errno.c`           | Global `int errno;` (TLS deferred; kernel doesn't populate it yet -- writes work, reads return the last write or zero). |
+| `src/time.c`            | `clock_gettime(CLOCK_MONOTONIC, ts)` + `time(NULL)` via `SYS_clock_gettime`. |
 | `src/malloc.c`          | `malloc`, `free`, `calloc`, `realloc` — free-list allocator backed by `SYS_brk`.  `heap_grow()` calls `brk(0)` + `brk(cur+n)` (rounded up to 4 KB) to extend the heap on demand. |
-| `src/file.c`            | `FILE*` layer: `fopen/fclose/fread/fwrite/fgets/fputs/fputc/fgetc`, `fprintf/vfprintf`, `puts/putchar`.  `stdin/stdout/stderr` backed by fd 0/1/2. |
+| `src/file.c`            | `FILE*` layer: `fopen/fclose/fread/fwrite/fgets/fputs/fputc/fgetc`, `fprintf/vfprintf`, `puts/putchar/getchar`, `getline`, `perror`, `fflush` (no-op).  `stdin/stdout/stderr` backed by fd 0/1/2. |
 | `src/io.c`              | `read`, `write`, `open`, `close`, `pipe`, `_exit`.            |
-| `include/`              | `<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<unistd.h>`, `<stddef.h>`, `<stdarg.h>`, `<sys/types.h>`. |
+| `aarch64/setjmp.S`      | `setjmp`/`longjmp` — saves x19-x30 + SP.  d8-d15 deliberately skipped because userland is `-mgeneral-regs-only` and CPACR_EL1.FPEN is not enabled for EL0. |
+| `include/`              | `<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<ctype.h>`, `<errno.h>`, `<setjmp.h>`, `<time.h>`, `<unistd.h>`, `<stddef.h>`, `<stdarg.h>`, `<sys/types.h>`. |
 
 The malloc heap lives in a dedicated 2 MB user-VA window at
 `EXEC_HEAP_VA = 0x20400000` mapped to `exec_heap_storage` in kernel

@@ -58,6 +58,17 @@ struct vm_map {
 	unsigned  spawn_next;
 	int       refs;		/* threads sharing this map */
 	spinlock_t lock;
+	/* DYNAMIC.md stage 7: dlopen state.  Up to DLOPEN_MAX_SLOTS shared
+	 * objects can be loaded concurrently in a process; each occupies a
+	 * fixed 512 KB sub-window of the 2 MB DLOPEN_VA range.  A slot with
+	 * base == 0 is free.  dlerror_msg holds the most recent error
+	 * message for the libc dlerror() wrapper to query. */
+#define DLOPEN_MAX_SLOTS 4
+	struct {
+		uint64_t base;
+		char     path[128];
+	}         dlopen_slots[DLOPEN_MAX_SLOTS];
+	char      dlerror_msg[128];
 };
 
 struct process {

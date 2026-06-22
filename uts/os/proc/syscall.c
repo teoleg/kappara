@@ -412,6 +412,84 @@ static long sys_brk(long a0, long a1, long a2, long a3, long a4, long a5)
 	return sys_brk_impl((uint64_t)(unsigned long)a0);
 }
 
+/*
+ * SYS_clock_gettime -- monotonic CNTPCT-derived timespec.
+ *
+ * The clk_id argument is ignored: we have one clock (the AArch64
+ * generic timer, monotonic since boot).  Reading CNTPCT_EL0 +
+ * CNTFRQ_EL0 from EL1 is always safe.
+ *
+ * The user buffer is { tv_sec; tv_nsec } -- two longs, matching
+ * lib/libc/include/time.h.  copy_to_user gates the write so a bad
+ * pointer returns -1 instead of panicking the kernel.
+ */
+struct __ts_kernel { long tv_sec; long tv_nsec; };
+
+static long sys_clock_gettime(long a0, long a1, long a2,
+			      long a3, long a4, long a5)
+{
+	(void)a0; (void)a2; (void)a3; (void)a4; (void)a5;
+	uint64_t cnt, freq;
+	__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(cnt));
+	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+	if (freq == 0)
+		return -1;
+	struct __ts_kernel kts;
+	kts.tv_sec  = (long)(cnt / freq);
+	uint64_t rem = cnt - (uint64_t)kts.tv_sec * freq;
+	kts.tv_nsec = (long)((rem * 1000000000ULL) / freq);
+	void *uts = (void *)(uintptr_t)a1;
+	if (syscall_from_user) {
+		if (copy_to_user(uts, &kts, sizeof(kts)) < 0)
+			return -1;
+	} else {
+		*(struct __ts_kernel *)uts = kts;
+	}
+	return 0;
+}
+
+/* DYNAMIC.md stage 7: dlopen/dlsym dispatch.  Both wrappers pull the
+ * path (or symbol name) string from userland via strncpy_from_user and
+ * hand off to sys_dlopen_impl / sys_dlsym_impl in user.c. */
+static long sys_dlopen(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	char kpath[128];
+	const char *path = (const char *)(uintptr_t)a0;
+	if (syscall_from_user) {
+		if (strncpy_from_user(kpath, path, sizeof(kpath)) < 0)
+			return 0;
+		path = kpath;
+	}
+	return (long)sys_dlopen_impl(path);
+}
+
+static long sys_dlsym(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	char kname[64];
+	const char *name = (const char *)(uintptr_t)a1;
+	if (syscall_from_user) {
+		if (strncpy_from_user(kname, name, sizeof(kname)) < 0)
+			return 0;
+		name = kname;
+	}
+	return (long)sys_dlsym_impl((uint64_t)a0, name);
+}
+
+static long sys_dlclose(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_dlclose_impl((uint64_t)a0);
+}
+
+static long sys_dlerror(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	/* sys_dlerror_impl handles copy_to_user via syscall_from_user. */
+	return sys_dlerror_impl((char *)(uintptr_t)a0, (unsigned)a1);
+}
+
 static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_log]    = sys_log,
 	[SYS_getpid] = sys_getpid,
@@ -446,6 +524,11 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_tcsetpgrp]   = sys_tcsetpgrp,
 	[SYS_tcgetpgrp]   = sys_tcgetpgrp,
 	[SYS_brk]         = sys_brk,
+	[SYS_clock_gettime] = sys_clock_gettime,
+	[SYS_dlopen]      = sys_dlopen,
+	[SYS_dlsym]       = sys_dlsym,
+	[SYS_dlclose]     = sys_dlclose,
+	[SYS_dlerror]     = sys_dlerror,
 };
 
 long syscall_dispatch(long num, long a0, long a1, long a2,

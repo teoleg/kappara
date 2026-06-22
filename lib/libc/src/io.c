@@ -71,5 +71,48 @@ int ioctl(int fd, int cmd, long arg)
 {
     return (int)__syscall3(__NR_ioctl, (long)fd, (long)cmd, arg);
 }
+
+int creat(const char *path)
+{
+    return (int)__syscall1(__NR_creat, (long)(unsigned long)path);
+}
+
+int mkdir(const char *path)
+{
+    return (int)__syscall1(__NR_mkdir, (long)(unsigned long)path);
+}
+
+int rmdir(const char *path)
+{
+    return (int)__syscall1(__NR_rmdir, (long)(unsigned long)path);
+}
+
+int unlink(const char *path)
+{
+    return (int)__syscall1(__NR_unlink, (long)(unsigned long)path);
+}
+
+long lseek(int fd, long off, int whence)
+{
+    return __syscall3(__NR_seek, (long)fd, off, (long)whence);
+}
+
+long ls(const char *path, char *out, size_t cap)
+{
+    return __syscall3(__NR_ls, (long)(unsigned long)path,
+                                (long)(unsigned long)out, (long)cap);
+}
+
+long ll(const char *path, char *out, size_t cap)
+{
+    return __syscall3(__NR_ll, (long)(unsigned long)path,
+                                (long)(unsigned long)out, (long)cap);
+}
+
+int execve(const char *path, const char *const argv[])
+{
+    return (int)__syscall3(__NR_execve, (long)(unsigned long)path,
+                                         (long)(unsigned long)argv, 0);
+}
 /* _exit lives in stdlib.c -- shared by exit() and the direct
  * _exit() callers.  Don't duplicate it here. */

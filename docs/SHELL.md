@@ -21,17 +21,19 @@ input, this matters in practice only if you `Ctrl-X` mid-edit.
 
 | Command                    | What it does                                                |
 |----------------------------|-------------------------------------------------------------|
-| `ls [path]`                | List directory entries (names only).                         |
-| `ll [path]`               | "ls -l": each row is `type size name`.  For chrdevs the size column shows `major,minor`. |
-| `cd [path]`                | Change directory.  `.`, `..`, mixed `..` are all canonicalized.  No arg = `/`.  The target is probed with `sys_ls` first -- non-existent paths and regular files are rejected without mutating cwd. |
-| `pwd`                      | Print working directory.                                    |
-| `cat <path>`               | Dump a file's bytes to the console.                         |
+| `ls [path]`                | List directory entries.  Standalone `/usr/bin/ls`.           |
+| `ll [path]`                | "ls -l": each row is `type size name`.  Still a shell builtin -- standalone version pending. |
+| `cd [path]`                | Change directory.  `.`, `..`, mixed `..` are all canonicalized.  No arg = `/`.  The target is probed with `sys_ls` first -- non-existent paths and regular files are rejected without mutating cwd.  Builtin (cwd lives in the shell process). |
+| `pwd`                      | Print working directory.  Builtin.                          |
+| `cat <path> [...]`         | Dump file bytes to stdout.  Standalone `/usr/bin/cat`.       |
+| `cp <src> <dst>`           | Copy a regular file.  Standalone `/usr/bin/cp`.              |
+| `mv <src> <dst>`           | Move/rename via copy + unlink.  Standalone `/usr/bin/mv`.    |
 | `echo <path> <text>`       | Overwrite a file with `<text>` (creates if missing).        |
 | `vc <n> <text>`            | Write `<text>` to `/dev/tty<n>` (one-digit minor) without doing the cwd-relative open the `echo` command does.  Lets you put bytes into an inactive virtual console's cell buffer; switch to that tty via `Ctrl-X <n>` to see them.  See ARCHITECTURE.md "Virtual consoles" for the bigger picture. |
 | `append <path> <text>`     | Append `<text>` + newline to a file.                        |
 | `touch <path>`             | Create an empty file under a kfs mount.                     |
 | `mkdir <path>`             | Create a directory under a kfs mount.                       |
-| `rm <path>`                | Remove a regular file (kfs blocks reclaimed via the bitmap).|
+| `rm <path> [...]`          | Remove regular files (kfs blocks reclaimed via the bitmap).  Standalone `/usr/bin/rm`. |
 | `rmdir <path>`             | Remove an empty directory.                                  |
 | `ked <path>`               | Tiny ed-like line editor.  See [KED.md](KED.md).             |
 | `vi <path>`                | Modal full-screen editor (vi-lite).  See [VI.md](VI.md).     |
@@ -57,18 +59,40 @@ mounted at `/usr/bin`.  Typing their name without `exec` works because
 the shell's PATH fallback automatically tries `/usr/bin/<name>` for any
 unrecognised command.  Source lives in `cmd/`.
 
-| Program             | What it does                                            |
-|---------------------|---------------------------------------------------------|
-| `ps`                | Read and display `/proc/ps` (thread list with TID/state/name). |
-| `ping [ip] [count]` | Send ICMP echo requests via `/dev/icmp`.  Default target `127.0.0.1`, count 4. |
-| `ifconfig`          | Dump `/proc/netif` (one row per registered netif).      |
-| `netstat`           | Dump `/proc/netif` + `/proc/slip` + `/proc/tcp`.        |
-| `test <name>`       | Run one selftest (see subcommand list below).  `test all` runs every test, `test` with no args prints the list. |
+| Program                 | What it does                                            |
+|-------------------------|---------------------------------------------------------|
+| `ps`                    | Read and display `/proc/ps` (thread list with TID/state/name). |
+| `ping [ip] [count]`     | Send ICMP echo requests via `/dev/icmp`.  Default target `127.0.0.1`, count 4. |
+| `ifconfig`              | Dump `/proc/netif` (one row per registered netif).      |
+| `netstat`               | Dump `/proc/netif` + `/proc/slip` + `/proc/tcp`.        |
+| `test <name>`           | Run one selftest (see subcommand list below).  `test all` runs every test, `test` with no args prints the list. |
+| `tcpconnect <ip> <port>`| Userland TCP dial-out via SVR4 STREAMS / TPI.  See [FTPD.md](FTPD.md) step 1 for the motivation. |
+| `ftpd`                  | In-EL0 FTP server, spawned at boot by user-init-0.  Anonymous, passive-only, uploads land under `/home`. See [FTPD.md](FTPD.md). |
+| `ls [path]`             | List a directory.                                       |
+| `ll [path]`             | "ls -l": each row is `type size name`.                  |
+| `cat <path> [...]`      | Concatenate files to stdout.                            |
+| `cp <src> <dst>`        | Copy a regular file.                                    |
+| `mv <src> <dst>`        | Move/rename (copy + unlink under the hood).             |
+| `rm <path> [...]`       | Unlink regular files.                                   |
+| `head [-n N] <file>`    | Print the first N lines (default 10) of each file.      |
+| `tail [-n N] <file>`    | Print the last N lines (default 10) of each file.       |
+| `wc <file> [...]`       | Print line / word / byte counts for each file plus a totals row. |
+| `grep <pattern> <file> [...]` | Print lines containing the fixed-string pattern.  Case-sensitive; no regex. |
+| `echo <args...>`        | Print args separated by space, then a newline.  Reachable via `/usr/bin/echo` -- the bare `echo` resolves to the shell builtin (which writes to a file, different semantics). |
+| `uptime`                | Print monotonic seconds since boot.  Output shape: `up 42s` / `up 5m 03s` / `up 1h 23m 45s`.  Exercises the new `SYS_clock_gettime` syscall + `<time.h>` end-to-end. |
+| `nm <elf>`              | Dump dynamic symbols of an ELF, one per line: `value type name`.  T=text, D=data, U=undefined.  Covers `.dynsym` (stripped libraries hide `.symtab`). |
+| `ldd <elf>`             | List `DT_NEEDED` entries of an ELF -- typically just `libc.so`. |
+| `objdump [-h\|-p\|-x] <elf>` | Dump ELF header, program headers, and/or section headers (subset of GNU objdump). |
 
-The five `/usr/bin` programs cap at `KFS_DIRENTS=14`; adding a new
-top-level ELF burns a kernel-image slab plus a kfs slot, so new
-selftests go into `cmd/test.c` as another entry in the registry,
-not a new ELF.
+`/usr/bin` is capped at `KFS_DIRENTS=22` per dirent block; bump
+that and `KFS_NAME_MAX` together if you need more.  The dirent
+struct is `__attribute__((packed))` so KFS_NAME_MAX doesn't have
+to be 4-byte aligned (otherwise the compiler adds padding and
+the per-entry size grows by up to 3 bytes).  Longest entry today
+is `tcpconnect` (10 chars + NUL = 11).  The ramdisk itself caps
+at `(RAMDISK_BLOCKS - 3) / KFS_BLOCKS_PER_FILE` slots (currently
+31).  New selftests go into `cmd/test.c` as another entry in its
+registry, not a new ELF -- the registry shares one slab.
 
 `test` subcommands (the registry lives in `cmd/test.c`):
 
@@ -87,6 +111,7 @@ not a new ELF.
 | `tcp`          | TPI smoke test for `/dev/tcp`: 3-fd flow (listener / client / responder), 3-way handshake, bidirectional data, graceful close. |
 | `tcpmulti`     | multi-accept proof: two clients connect to one listener, listener stays in LISTEN, both accepted onto separate responder fds, cross-traffic verified. |
 | `tcpbig`       | RFC 5681 slow-start proof: ship 2000 bytes from C to R (well over IW=2*MSS), drain on the receiver until everything arrives intact.  Exercises MSS segmentation + cwnd growth across multiple RTTs. |
+| `dl`           | DYNAMIC.md stage 7 smoke: dlopen `/lib/libdltest.so`, resolve `dltest_answer` + `dltest_get_label`, check `answer == 42` and the RELATIVE-relocated string pointer reads "dltest". |
 
 The `crash` shell builtin is unchanged: `crash` from the shell prompt
 derefs NULL directly and the EL0 fault path SIGSEGVs the calling

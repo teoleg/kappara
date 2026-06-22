@@ -260,8 +260,15 @@ endif
 $(KERNEL): $(ELF)
 	$(OBJCOPY) -O binary $< $@
 
+# Trap INT/TERM and reap the qemu pid on the way out -- otherwise a
+# Ctrl-C in `-nographic` mode leaves a zombie QEMU holding the
+# hostfwd ports, and the next `make run` fails with "Could not set
+# up host forwarding rule".  Same pattern run-telnet / run-ftp use.
 run: $(KERNEL)
-	$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL)
+	@$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL) & \
+	  QPID=$$!; \
+	  trap "kill $$QPID 2>/dev/null; wait 2>/dev/null" EXIT INT TERM; \
+	  wait $$QPID
 
 # ARCH=virt only: boot QEMU virt headless in the background, wait
 # for the in-kernel telnetd to come up on hostfwd port 2323, then
@@ -273,7 +280,7 @@ run: $(KERNEL)
 # splash + boot trace go to /tmp/kappara-virt.log instead of stdout,
 # and stdin/stdout belong to the telnet session on tty4.
 ifeq ($(ARCH),virt)
-.PHONY: run-telnet run-ftp smoke-ftp
+.PHONY: run-telnet run-ftp smoke-ftp smoke-sdk
 run-telnet: $(KERNEL)
 	@command -v nc >/dev/null 2>&1 || { \
 		echo "run-telnet: need 'nc' on PATH (apt install netcat-openbsd)"; \
@@ -330,23 +337,14 @@ run-ftp: $(KERNEL)
 # check the output looks sane.  All-or-nothing: any failure exits
 # nonzero so CI can flag regressions.  See docs/FTPD.md "Operating
 # recipe" for what this verifies.
-# Smoke test: STOR a small text file (well below the file-size cliff
-# we still haven't tracked down -- see FTPD.md carry-overs), then
-# RETR it back and byte-compare; then exec a previously-uploaded
-# binary by going through STOR + telnet `exec`.  CMD_BUILD is
-# defined later in the file (under the aarch64+virt cmd block);
-# spell out paths explicitly here so we don't depend on the variable
-# being set at the time make parses this rule.
 smoke-ftp: $(KERNEL) build/cmd/ifconfig.elf
 	@command -v ftp >/dev/null 2>&1 || { \
 		echo "smoke-ftp: need 'ftp' on PATH"; exit 1; }
 	@command -v nc >/dev/null 2>&1 || { \
 		echo "smoke-ftp: need 'nc' on PATH"; exit 1; }
 	@LOG=/tmp/kappara-smoke.log; \
-	 SAMPLE=/tmp/kappara-smoke-sample.txt; \
-	 DOWN=/tmp/kappara-smoke-sample-back.txt; \
+	 DOWN=/tmp/kappara-smoke-elf-back; \
 	 rm -f $$LOG $$DOWN; \
-	 printf 'hello-from-host\n' > $$SAMPLE; \
 	 echo "==> boot kappara virt (log: $$LOG)"; \
 	 $(QEMU) $(QEMU_ARGS) -kernel $(KERNEL) > $$LOG 2>&1 & \
 	 QPID=$$!; \
@@ -360,24 +358,65 @@ smoke-ftp: $(KERNEL) build/cmd/ifconfig.elf
 	 done; \
 	 grep -q 'ftpd: listening' $$LOG 2>/dev/null || { \
 	     echo "smoke-ftp: ftpd did not come up"; tail -20 $$LOG; exit 1; }; \
-	 echo "==> upload + download + byte-compare (small text)"; \
-	 printf 'user anonymous any\nbinary\ncd /home\nput %s sample\nget sample %s\nquit\n' \
-	        $$SAMPLE $$DOWN \
+	 echo "==> upload ifconfig.elf, RETR back, byte-compare"; \
+	 printf 'user anonymous any\nbinary\ncd /home\nput build/cmd/ifconfig.elf foo\nget foo %s\nquit\n' \
+	        $$DOWN \
 	     | HOME=/tmp ftp -pinv 127.0.0.1 2121 > /dev/null 2>&1 \
 	     || { echo "smoke-ftp: ftp client failed"; exit 1; }; \
-	 cmp $$SAMPLE $$DOWN \
-	     || { echo "smoke-ftp: roundtripped sample differs from original"; \
-	          diff $$SAMPLE $$DOWN; exit 1; }; \
-	 echo "==> upload ifconfig.elf + exec it over telnet"; \
-	 printf 'user anonymous any\nbinary\ncd /home\nput build/cmd/ifconfig.elf foo\nquit\n' \
-	     | HOME=/tmp ftp -pinv 127.0.0.1 2121 > /dev/null 2>&1 \
-	     || { echo "smoke-ftp: ftp client (upload elf) failed"; exit 1; }; \
+	 cmp build/cmd/ifconfig.elf $$DOWN \
+	     || { echo "smoke-ftp: roundtripped ELF differs from original"; exit 1; }; \
+	 echo "==> exec uploaded ELF over telnet"; \
 	 OUT=$$( ( sleep 1; printf 'exec /home/foo\r'; sleep 5 ) \
 	          | timeout 10 nc localhost 2323 2>&1 ); \
 	 echo "$$OUT" | grep -q 'eth0' \
 	     || { echo "smoke-ftp: uploaded ELF did not produce expected eth0 output"; \
 	          echo "$$OUT"; exit 1; }; \
 	 echo "==> smoke-ftp PASS"
+
+# INDIE.md stage 1 deliverable: build hello.c outside the kappara tree
+# via kappara-cc, upload it via FTP, exec it via telnet, check output.
+# Proves "external developer can ship code for kappara" end-to-end.
+smoke-sdk: $(KERNEL) sdk
+	@command -v ftp >/dev/null 2>&1 || { \
+		echo "smoke-sdk: need 'ftp' on PATH"; exit 1; }
+	@command -v nc >/dev/null 2>&1 || { \
+		echo "smoke-sdk: need 'nc' on PATH"; exit 1; }
+	@TMPDIR=$$(mktemp -d); \
+	 LOG=/tmp/kappara-sdk.log; \
+	 trap "rm -rf $$TMPDIR" EXIT INT TERM; \
+	 echo "==> build hello.c from $$TMPDIR (no uts/ access)"; \
+	 cp tools/sdk-test/hello.c $$TMPDIR/hello.c; \
+	 ( cd $$TMPDIR && $(abspath $(SDK_BUILD))/bin/kappara-cc hello.c -o hello ) \
+	     2>&1 | grep -v "^$$" | grep -v "build-id"; \
+	 test -f $$TMPDIR/hello || { echo "smoke-sdk: build failed"; exit 1; }; \
+	 file $$TMPDIR/hello | grep -q "ELF 64-bit LSB pie executable" \
+	     || { echo "smoke-sdk: wrong ELF type"; file $$TMPDIR/hello; exit 1; }; \
+	 echo "==> boot kappara virt"; \
+	 rm -f $$LOG; \
+	 $(QEMU) $(QEMU_ARGS) -kernel $(KERNEL) > $$LOG 2>&1 & \
+	 QPID=$$!; \
+	 trap "kill $$QPID 2>/dev/null; rm -rf $$TMPDIR; wait 2>/dev/null" EXIT INT TERM; \
+	 for i in 1 2 3 4 5 6 7 8 9 10; do \
+	     sleep 1; \
+	     grep -q 'ftpd: listening' $$LOG 2>/dev/null \
+	      && grep -q 'telnetd: listening' $$LOG 2>/dev/null && break; \
+	 done; \
+	 grep -q 'ftpd: listening' $$LOG 2>/dev/null || { \
+	     echo "smoke-sdk: ftpd did not come up"; tail -20 $$LOG; exit 1; }; \
+	 echo "==> upload hello to /home"; \
+	 printf 'user anonymous any\nbinary\ncd /home\nput %s/hello hello\nquit\n' $$TMPDIR \
+	     | HOME=/tmp ftp -pinv 127.0.0.1 2121 > /dev/null 2>&1 \
+	     || { echo "smoke-sdk: ftp upload failed"; exit 1; }; \
+	 echo "==> exec /home/hello over telnet"; \
+	 OUT=$$( ( sleep 1; printf 'exec /home/hello 42\r'; sleep 5 ) \
+	          | timeout 10 nc localhost 2323 2>&1 ); \
+	 echo "$$OUT" | grep -q 'hello from outside the tree' \
+	     || { echo "smoke-sdk: expected hello message not seen"; \
+	          echo "$$OUT"; exit 1; }; \
+	 echo "$$OUT" | grep -q 'first arg: 42 (atoi: 42)' \
+	     || { echo "smoke-sdk: argv/atoi didn't work"; \
+	          echo "$$OUT"; exit 1; }; \
+	 echo "==> smoke-sdk PASS"
 endif
 
 # Pi/Debian host friendly defaults: no display window, single-thread
@@ -449,11 +488,38 @@ HELLO_ELF := $(USER_BUILD)/hello.elf
 $(USER_BUILD)/hello.o: user/hello.c user/syscall.h | $(USER_BUILD)
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
-$(HELLO_ELF): $(USER_BUILD)/hello.o user/prog_linker.ld
-	$(USER_LD) -nostdlib -static -s -z max-page-size=4096 -T user/prog_linker.ld -o $@ $<
+$(HELLO_ELF): $(USER_BUILD)/hello.o user/hello_linker.ld
+	$(USER_LD) -nostdlib -static -s -z max-page-size=4096 -T user/hello_linker.ld -o $@ $<
 
 $(USER_BUILD):
 	mkdir -p $@
+
+# ---- ld-kappara.so: stage 5 user-space dynamic linker (DYNAMIC.md) ----
+# Loaded by the kernel at LD_VA = 0x30000000 alongside any ET_DYN
+# application.  Trap frame enters here; pass-through for now (parses
+# auxv for AT_ENTRY, jumps).  See lib/ld-kappara/ld_start.S.
+LDK_BUILD   := build/ld-kappara
+LDK_ELF     := $(LDK_BUILD)/ld-kappara.so
+LDK_OBJS    := $(LDK_BUILD)/ld_start.o $(LDK_BUILD)/ld_main.o
+
+LDK_CFLAGS  := -Wall -Wextra -Werror -std=gnu11 \
+               -ffreestanding -nostdlib -nostartfiles \
+               -fno-stack-protector -fno-pie -fno-pic \
+               -mcpu=cortex-a53 -mgeneral-regs-only \
+               -O2 -g -Iinclude
+
+$(LDK_BUILD):
+	mkdir -p $@
+
+$(LDK_BUILD)/ld_start.o: lib/ld-kappara/ld_start.S | $(LDK_BUILD)
+	$(USER_CC) $(LDK_CFLAGS) -c $< -o $@
+
+$(LDK_BUILD)/ld_main.o: lib/ld-kappara/ld_main.c | $(LDK_BUILD)
+	$(USER_CC) $(LDK_CFLAGS) -c $< -o $@
+
+$(LDK_ELF): $(LDK_OBJS) lib/ld-kappara/linker.ld
+	$(USER_LD) -nostdlib -static -s -z max-page-size=4096 \
+	           -T lib/ld-kappara/linker.ld -o $@ $(LDK_OBJS)
 
 # ---- libc + /usr/bin standalone ELF programs -----------------------
 CMD_BUILD  := build/cmd
@@ -464,14 +530,20 @@ LIBC_SRCS   := $(LIBC_DIR)/src/string.c \
                $(LIBC_DIR)/src/io.c      \
                $(LIBC_DIR)/src/signal.c  \
                $(LIBC_DIR)/src/malloc.c  \
-               $(LIBC_DIR)/src/file.c
+               $(LIBC_DIR)/src/file.c    \
+               $(LIBC_DIR)/src/ctype.c   \
+               $(LIBC_DIR)/src/errno.c   \
+               $(LIBC_DIR)/src/time.c    \
+               $(LIBC_DIR)/src/dlfcn.c
 LIBC_OBJS   := $(patsubst $(LIBC_DIR)/src/%.c,$(CMD_BUILD)/libc/%.o,$(LIBC_SRCS))
 LIBC_CRT0   := $(CMD_BUILD)/libc/crt0.o
+LIBC_SETJMP := $(CMD_BUILD)/libc/setjmp.o
 LIBC_A      := $(CMD_BUILD)/libc/libc.a
+LIBC_SO     := $(CMD_BUILD)/libc/libc.so
 
 LIBC_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
                -ffreestanding -nostdlib -nostartfiles \
-               -fno-stack-protector -fno-pie -fno-pic \
+               -fno-stack-protector -fPIC \
                -mcpu=cortex-a53 -mgeneral-regs-only \
                -O2 -g \
                -I$(LIBC_DIR)/include
@@ -486,17 +558,105 @@ $(LIBC_CRT0): $(LIBC_DIR)/aarch64/crt0.S | $(CMD_BUILD)/libc
 	$(USER_CC) $(filter-out -finstrument-functions,$(LIBC_CFLAGS)) \
 	           -c $< -o $@
 
-$(LIBC_A): $(LIBC_OBJS)
+$(LIBC_SETJMP): $(LIBC_DIR)/aarch64/setjmp.S | $(CMD_BUILD)/libc
+	$(USER_CC) $(filter-out -finstrument-functions,$(LIBC_CFLAGS)) \
+	           -c $< -o $@
+
+$(LIBC_A): $(LIBC_OBJS) $(LIBC_SETJMP)
 	$(CROSS)ar rcs $@ $^
+
+# DYNAMIC.md stage 6: libc.so shared object.  Same .o files (already
+# -fPIC from stage 2), linked with -shared and a proper soname so cmd
+# binaries can DT_NEEDED it.  Loaded by the kernel at LIBC_VA = 0x40000000
+# for every ET_DYN exec; kernel applies its R_AARCH64_RELATIVE relocs
+# and resolves cmd binaries' GLOB_DAT / JUMP_SLOT entries against its
+# dynsym (move to ld.so + dlopen in stage 7).
+$(LIBC_SO): $(LIBC_OBJS) $(LIBC_SETJMP)
+	$(USER_LD) -shared -nostdlib -soname libc.so \
+	           -Bsymbolic \
+	           -z max-page-size=4096 -s \
+	           -o $@ $(LIBC_OBJS) $(LIBC_SETJMP)
+
+# DYNAMIC.md stage 7: tiny self-contained shared object for testing
+# dlopen / dlsym end-to-end.  No DT_NEEDED, just two exported functions
+# and one RELATIVE-relocated string pointer.
+DLTEST_BUILD := build/dltest
+DLTEST_SO    := $(DLTEST_BUILD)/libdltest.so
+
+$(DLTEST_BUILD):
+	mkdir -p $@
+
+$(DLTEST_BUILD)/dltest.o: lib/libdltest/dltest.c | $(DLTEST_BUILD)
+	$(USER_CC) -Wall -Wextra -Werror -std=gnu11 \
+	           -ffreestanding -nostdlib -nostartfiles \
+	           -fno-stack-protector -fPIC \
+	           -mcpu=cortex-a53 -mgeneral-regs-only \
+	           -O2 -g \
+	           -I$(LIBC_DIR)/include \
+	           -c $< -o $@
+
+# libdltest.so DT_NEEDED's libc.so so its printf / strlen calls go
+# through the dlopen resolver's cross-DSO path.
+$(DLTEST_SO): $(DLTEST_BUILD)/dltest.o $(LIBC_SO)
+	$(USER_LD) -shared -nostdlib -soname libdltest.so \
+	           -z max-page-size=4096 -s \
+	           --no-dynamic-linker \
+	           -o $@ $< -L$(CMD_BUILD)/libc -l:libc.so
+
+# ---- INDIE.md stage 1: publishable SDK ------------------------------
+# Collect the artefacts an external build needs (libc.so, crt0.o,
+# headers, linker scripts, the kappara-cc wrapper) into build/sdk/
+# so people can build cmd-shaped binaries without checking out uts/.
+SDK_BUILD := build/sdk
+
+$(SDK_BUILD)/.stamp: $(LIBC_SO) $(LIBC_CRT0) $(LDK_ELF) \
+                    tools/kappara-cc.in user/prog_linker.ld
+	rm -rf $(SDK_BUILD)
+	mkdir -p $(SDK_BUILD)/sysroot/include
+	mkdir -p $(SDK_BUILD)/sysroot/lib
+	mkdir -p $(SDK_BUILD)/bin
+	# libc headers
+	cp -r $(LIBC_DIR)/include/. $(SDK_BUILD)/sysroot/include/
+	# selected kernel ABI headers (syscall numbers, ELF types)
+	mkdir -p $(SDK_BUILD)/sysroot/include/kappara/abi
+	cp include/kappara/abi/syscall.h $(SDK_BUILD)/sysroot/include/kappara/abi/
+	cp include/kappara/abi/elf.h     $(SDK_BUILD)/sysroot/include/kappara/abi/
+	# libc.so + crt0
+	cp $(LIBC_SO)   $(SDK_BUILD)/sysroot/lib/libc.so
+	cp $(LIBC_CRT0) $(SDK_BUILD)/sysroot/lib/crt0.o
+	cp user/prog_linker.ld $(SDK_BUILD)/sysroot/lib/prog_linker.ld
+	# ld-kappara.so for completeness (kernel currently embeds its own
+	# copy, but binaries that ship via PT_INTERP -> /lib/ld-kappara.so
+	# would reference this artefact).
+	cp $(LDK_ELF) $(SDK_BUILD)/sysroot/lib/ld-kappara.so
+	# kappara-cc wrapper.  SDK_ROOT is filled in at install time
+	# (or pointed at $(SDK_BUILD) when used in-tree).
+	sed 's,@SDK_ROOT@,$(abspath $(SDK_BUILD)),g' \
+	    tools/kappara-cc.in > $(SDK_BUILD)/bin/kappara-cc
+	chmod +x $(SDK_BUILD)/bin/kappara-cc
+	touch $@
+
+sdk: $(SDK_BUILD)/.stamp
+	@echo "==> SDK ready: $(SDK_BUILD)"
+	@echo "    kappara-cc: $(SDK_BUILD)/bin/kappara-cc"
+	@echo "    sysroot:    $(SDK_BUILD)/sysroot"
+
+sdk-tarball: sdk
+	tar -C $(SDK_BUILD) -czf $(SDK_BUILD)/../kappara-sdk.tar.gz .
+	@echo "==> SDK tarball: build/kappara-sdk.tar.gz ($$(du -h build/kappara-sdk.tar.gz | cut -f1))"
+
+.PHONY: sdk sdk-tarball
 
 # ---- /usr/bin standalone ELF programs --------------------------------
 CMD_BUILD  := build/cmd
-CMD_NAMES  := ps ping ifconfig netstat test tcpconnect ftpd
+CMD_NAMES  := ps ping ifconfig netstat test tcpconnect ftpd \
+              ls ll cat cp mv rm head tail wc grep echo uptime \
+              nm ldd objdump
 CMD_ELFS   := $(addprefix $(CMD_BUILD)/, $(addsuffix .elf, $(CMD_NAMES)))
 
 CMD_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
               -ffreestanding -nostdlib -nostartfiles \
-              -fno-stack-protector -fno-pie -fno-pic \
+              -fno-stack-protector -fPIE \
               -mcpu=cortex-a53 -mgeneral-regs-only \
               -O2 -g \
               -I$(LIBC_DIR)/include \
@@ -505,14 +665,16 @@ CMD_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \
 $(CMD_BUILD)/%.o: cmd/%.c | $(CMD_BUILD)
 	$(USER_CC) $(CMD_CFLAGS) -c $< -o $@
 
-$(CMD_BUILD)/%.elf: $(CMD_BUILD)/%.o $(LIBC_CRT0) $(LIBC_A) user/prog_linker.ld
-	$(USER_LD) -nostdlib -static -s -z max-page-size=4096 \
-	           -T user/prog_linker.ld -o $@ $(LIBC_CRT0) $< $(LIBC_A)
+$(CMD_BUILD)/%.elf: $(CMD_BUILD)/%.o $(LIBC_CRT0) $(LIBC_SO) user/prog_linker.ld
+	$(USER_LD) -nostdlib -pie -s -z max-page-size=4096 \
+	           --no-dynamic-linker \
+	           -T user/prog_linker.ld -o $@ $(LIBC_CRT0) $< \
+	           -L$(CMD_BUILD)/libc -l:libc.so
 
 $(CMD_BUILD):
 	mkdir -p $@
 
-$(BUILD)/uts/aarch64/usrblobs.o: $(CMD_ELFS) uts/aarch64/usrblobs.S
+$(BUILD)/uts/aarch64/usrblobs.o: $(CMD_ELFS) $(LDK_ELF) $(LIBC_SO) $(DLTEST_SO) uts/aarch64/usrblobs.S
 	$(CC) $(ASFLAGS) -c uts/aarch64/usrblobs.S -o $@
 
 # Tell make that userblob.o / helloblob.o depend on the files they incbin.

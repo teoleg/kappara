@@ -144,11 +144,92 @@ static void tty4_to_tcp(int minor, const void *buf, unsigned len, void *arg)
 	send_data(tcp_sd, buf, len);
 }
 
+/* ---- Telnet option negotiation (RFC 854 / 855 / 857 / 858) -------
+ *
+ * The Unix `telnet` client local-echoes by default; if the server
+ * doesn't speak the option-negotiation handshake to claim ECHO,
+ * every typed character shows twice (once from the client's local
+ * echo, once from the kappara shell's ldterm ECHO).  Send the
+ * standard three-message "I'll handle echo, no Go-Ahead nonsense"
+ * sequence right after the banner so plain `telnet host 2323`
+ * Just Works without the user having to type `mode character`.
+ *
+ * We don't bother responding to the client's reciprocal WILL/DO
+ * volleys; the client-side state machine accepts our offers and
+ * the connection runs in char-at-a-time + no-echo mode. */
+#define TIAC	0xFF	/* "Interpret As Command" lead byte */
+#define TWILL	0xFB
+#define TWONT	0xFC
+#define TDO	0xFD
+#define TDONT	0xFE
+#define TSB	0xFA	/* subnegotiation begin */
+#define TSE	0xF0	/* subnegotiation end   */
+#define TOPT_ECHO	0x01
+#define TOPT_SUPPGA	0x03	/* suppress go-ahead */
+
+static const uint8_t telnet_iac_init[] = {
+	TIAC, TWILL, TOPT_ECHO,		/* "I'll echo for you, client" */
+	TIAC, TWILL, TOPT_SUPPGA,	/* "Suppress Go-Ahead from me" */
+	TIAC, TDO,   TOPT_SUPPGA,	/* "Please don't send GA" */
+};
+
+/* Strip telnet IAC sequences from the incoming byte stream so the
+ * shell only sees real characters.  We don't honour any negotiation
+ * the client returns; we just skip the bytes so `IAC DO ECHO` etc.
+ * aren't typed into the shell as garbage.
+ *
+ * Returns number of payload bytes filled into out[]; reads len bytes
+ * out of in[].  iac_state carries across calls so a multi-call
+ * sequence like  IAC | DO | ECHO  doesn't get mishandled when split
+ * across two TCP segments. */
+struct iac_filter {
+	enum { IAC_NORMAL, IAC_SAW_IAC, IAC_SAW_VERB, IAC_IN_SB } state;
+};
+
+static int iac_strip(struct iac_filter *f, const char *in, int len,
+                     char *out)
+{
+	int op = 0;
+	for (int i = 0; i < len; i++) {
+		uint8_t c = (uint8_t)in[i];
+		switch (f->state) {
+		case IAC_NORMAL:
+			if (c == TIAC) { f->state = IAC_SAW_IAC; break; }
+			out[op++] = (char)c;
+			break;
+		case IAC_SAW_IAC:
+			if (c == TIAC) {		/* IAC IAC -> literal 0xFF */
+				out[op++] = (char)0xFF;
+				f->state = IAC_NORMAL;
+			} else if (c == TSB) {
+				f->state = IAC_IN_SB;
+			} else if (c == TWILL || c == TWONT
+			        || c == TDO   || c == TDONT) {
+				f->state = IAC_SAW_VERB;
+			} else {
+				/* IAC <single-byte command>: just drop it. */
+				f->state = IAC_NORMAL;
+			}
+			break;
+		case IAC_SAW_VERB:
+			/* Skip the option byte that follows the verb. */
+			f->state = IAC_NORMAL;
+			break;
+		case IAC_IN_SB:
+			/* Inside a subnegotiation; eat bytes until IAC SE. */
+			if (c == TIAC) f->state = IAC_SAW_IAC;
+			break;
+		}
+	}
+	return op;
+}
+
 /* ---- Per-connection session ------------------------------------ */
 
 static void telnet_session(struct stdata *R)
 {
 	send_data(R, TELNET_BANNER, kstrlen(TELNET_BANNER));
+	send_data(R, (const char *)telnet_iac_init, sizeof(telnet_iac_init));
 
 	/* Install the output bridge.  From now until we clear the hook,
 	 * every byte tty4 writes lands in R's TCP send buffer. */
@@ -159,13 +240,16 @@ static void telnet_session(struct stdata *R)
 	 * no-op on empty input and it re-prints "kappara:/# ". */
 	tty_remote_feed_byte(TELNET_REMOTE_TTY, '\r');
 
+	struct iac_filter iacf = { .state = IAC_NORMAL };
 	for (;;) {
 		char buf[64];
+		char clean[64];
 		int n = wait_data(R, buf, sizeof(buf));
 		if (n <= 0) break;
-		for (int i = 0; i < n; i++)
+		int m = iac_strip(&iacf, buf, n, clean);
+		for (int i = 0; i < m; i++)
 			tty_remote_feed_byte(TELNET_REMOTE_TTY,
-			                     (unsigned char)buf[i]);
+			                     (unsigned char)clean[i]);
 	}
 
 	tty_set_output_hook(TELNET_REMOTE_TTY, 0, 0);
