@@ -1,167 +1,86 @@
-ARCH    ?= aarch64
-BUILD   := build/$(ARCH)
+# Single-arch build: QEMU `virt` (generic aarch64) -- the on-ramp to
+# AWS EC2 Graviton (see docs/AWS.md).  Pi-specific drivers used to
+# live alongside this in arch/aarch64/; they're now in attic/raspi3b/
+# for history.  Reinstating them means copying the files back and
+# restoring the aarch64 ARCH branch that was here.
+BUILD   := build
 
-ifeq ($(ARCH),aarch64)
-    CROSS         ?= aarch64-linux-gnu-
-    ARCH_CFLAGS   := -mcpu=cortex-a53 -mgeneral-regs-only -Iuts/aarch64
-    LINKER_LD     := uts/aarch64/linker.ld
-    ARCH_OBJS     := \
-        $(BUILD)/uts/aarch64/boot.o \
-        $(BUILD)/uts/aarch64/uart.o \
-        $(BUILD)/uts/aarch64/miniuart.o \
-        $(BUILD)/uts/aarch64/vectors.o \
-        $(BUILD)/uts/aarch64/trap.o \
-        $(BUILD)/uts/aarch64/mmu.o \
-        $(BUILD)/uts/aarch64/timer.o \
-        $(BUILD)/uts/aarch64/ipi.o \
-        $(BUILD)/uts/aarch64/switch.o \
-        $(BUILD)/uts/aarch64/thread.o \
-        $(BUILD)/uts/aarch64/mailbox.o \
-        $(BUILD)/uts/aarch64/framebuffer.o \
-        $(BUILD)/uts/aarch64/font8x8.o \
-        $(BUILD)/uts/aarch64/fbcon.o \
-        $(BUILD)/uts/aarch64/userblob.o \
-        $(BUILD)/uts/aarch64/helloblob.o \
-        $(BUILD)/uts/aarch64/usrblobs.o
-    # User-side init binary, linked at VA 0x10000000 and incbin'd
-    # into userblob.S so the kernel ELF carries the raw bytes.
-    USER_BUILD    := build/user
-    USER_BIN      := $(USER_BUILD)/init.bin
-    USERBLOB_EXTRA_DEP := $(USER_BIN)
-    KERNEL_OBJS   := \
-        $(BUILD)/uts/os/core/printk.o \
-        $(BUILD)/uts/os/core/pmm.o \
-        $(BUILD)/uts/os/core/string.o \
-        $(BUILD)/uts/os/core/kmem.o \
-        $(BUILD)/uts/os/core/klog.o \
-        $(BUILD)/uts/os/core/uaccess.o \
-        $(BUILD)/uts/os/core/kallsyms.o \
-        $(BUILD)/uts/os/core/ftrace.o \
-        $(BUILD)/uts/os/proc/process.o \
-        $(BUILD)/uts/os/proc/sched.o \
-        $(BUILD)/uts/os/proc/signal.o \
-        $(BUILD)/uts/os/proc/syscall.o \
-        $(BUILD)/uts/os/fs/vfs.o \
-        $(BUILD)/uts/os/fs/ramdisk.o \
-        $(BUILD)/uts/os/fs/kfs.o \
-        $(BUILD)/uts/os/fs/procfs.o \
-        $(BUILD)/uts/os/io/streams.o \
-        $(BUILD)/uts/os/io/cdevsw.o \
-        $(BUILD)/uts/os/io/bdevsw.o \
-        $(BUILD)/uts/os/io/buf.o \
-        $(BUILD)/uts/os/io/bram.o \
-        $(BUILD)/uts/os/io/stream_head.o \
-        $(BUILD)/uts/os/io/vt.o \
-        $(BUILD)/uts/os/io/ldterm.o \
-        $(BUILD)/uts/os/io/tty.o \
-        $(BUILD)/uts/os/net/netif.o \
-        $(BUILD)/uts/os/net/ipv4.o \
-        $(BUILD)/uts/os/net/icmp.o \
-        $(BUILD)/uts/os/net/udp.o \
-        $(BUILD)/uts/os/net/tcp.o \
-        $(BUILD)/uts/os/net/pktfilter.o \
-        $(BUILD)/uts/os/net/slip.o \
-        $(BUILD)/uts/os/net/lo.o \
-        $(BUILD)/uts/os/user/user.o \
-        $(BUILD)/uts/os/main.o
-    KSYM_STUB_OBJ := $(BUILD)/uts/aarch64/kallsyms_stub.o
-    KSYM_OBJ      := $(BUILD)/uts/aarch64/kallsyms.o
-    KSYM_SRC      := $(BUILD)/uts/aarch64/kallsyms.S
-    ELF           := $(BUILD)/kernel8.elf
-    KERNEL        := $(BUILD)/kernel8.img
-    QEMU          := qemu-system-aarch64
-    QEMU_ARGS     := -M raspi3b -serial mon:stdio -serial null -display none
-else ifeq ($(ARCH),virt)
-    # QEMU `virt` machine (generic aarch64).  Reuses the aarch64
-    # toolchain + shared PL011 driver via PLAT_PL011_BASE; brings its
-    # own boot.S, GIC-based timer/ipi, and stubs for the Pi-only
-    # drivers (framebuffer, mailbox, mini-UART) so the same main.c
-    # boots through to the shell prompt.
-    #
-    # Phase 2 (current): full kernel bring-up, single-core.  Boots to
-    # the same /usr/bin shell as raspi3b.
-    # Phase 3: virtio-mmio probe + virtio-net driver (eth0 netif).
-    # Phase 4: TCP integration vs Linux.
-    # Phase 5: telnet server + hostfwd for external access.
-    CROSS         ?= aarch64-linux-gnu-
-    ARCH_CFLAGS   := -mcpu=cortex-a72 -mgeneral-regs-only \
-                     -Iuts/aarch64 -DPLATFORM_VIRT
-    LINKER_LD     := uts/virt/linker.ld
-    USER_BUILD    := build/user
-    USER_BIN      := $(USER_BUILD)/init.bin
-    USERBLOB_EXTRA_DEP := $(USER_BIN)
-    ARCH_OBJS     := \
-        $(BUILD)/uts/virt/boot.o \
-        $(BUILD)/uts/aarch64/uart.o \
-        $(BUILD)/uts/aarch64/vectors.o \
-        $(BUILD)/uts/aarch64/trap.o \
-        $(BUILD)/uts/aarch64/mmu.o \
-        $(BUILD)/uts/aarch64/switch.o \
-        $(BUILD)/uts/aarch64/thread.o \
-        $(BUILD)/uts/virt/timer.o \
-        $(BUILD)/uts/virt/ipi.o \
-        $(BUILD)/uts/virt/gic.o \
-        $(BUILD)/uts/virt/framebuffer.o \
-        $(BUILD)/uts/virt/fbcon.o \
-        $(BUILD)/uts/virt/mailbox.o \
-        $(BUILD)/uts/virt/miniuart.o \
-        $(BUILD)/uts/virt/slip-stubs.o \
-        $(BUILD)/uts/virt/virtio_net.o \
-        $(BUILD)/uts/virt/telnetd.o \
-        $(BUILD)/uts/aarch64/userblob.o \
-        $(BUILD)/uts/aarch64/helloblob.o \
-        $(BUILD)/uts/aarch64/usrblobs.o
-    KERNEL_OBJS   := \
-        $(BUILD)/uts/os/core/printk.o \
-        $(BUILD)/uts/os/core/pmm.o \
-        $(BUILD)/uts/os/core/string.o \
-        $(BUILD)/uts/os/core/kmem.o \
-        $(BUILD)/uts/os/core/klog.o \
-        $(BUILD)/uts/os/core/uaccess.o \
-        $(BUILD)/uts/os/core/kallsyms.o \
-        $(BUILD)/uts/os/core/ftrace.o \
-        $(BUILD)/uts/os/proc/process.o \
-        $(BUILD)/uts/os/proc/sched.o \
-        $(BUILD)/uts/os/proc/signal.o \
-        $(BUILD)/uts/os/proc/syscall.o \
-        $(BUILD)/uts/os/fs/vfs.o \
-        $(BUILD)/uts/os/fs/ramdisk.o \
-        $(BUILD)/uts/os/fs/kfs.o \
-        $(BUILD)/uts/os/fs/procfs.o \
-        $(BUILD)/uts/os/io/streams.o \
-        $(BUILD)/uts/os/io/cdevsw.o \
-        $(BUILD)/uts/os/io/bdevsw.o \
-        $(BUILD)/uts/os/io/buf.o \
-        $(BUILD)/uts/os/io/bram.o \
-        $(BUILD)/uts/os/io/stream_head.o \
-        $(BUILD)/uts/os/io/vt.o \
-        $(BUILD)/uts/os/io/ldterm.o \
-        $(BUILD)/uts/os/io/tty.o \
-        $(BUILD)/uts/os/net/netif.o \
-        $(BUILD)/uts/os/net/ipv4.o \
-        $(BUILD)/uts/os/net/icmp.o \
-        $(BUILD)/uts/os/net/udp.o \
-        $(BUILD)/uts/os/net/tcp.o \
-        $(BUILD)/uts/os/net/pktfilter.o \
-        $(BUILD)/uts/os/net/lo.o \
-        $(BUILD)/uts/os/user/user.o \
-        $(BUILD)/uts/os/main.o
-    KSYM_STUB_OBJ := $(BUILD)/uts/aarch64/kallsyms_stub.o
-    KSYM_OBJ      := $(BUILD)/uts/aarch64/kallsyms.o
-    KSYM_SRC      := $(BUILD)/uts/aarch64/kallsyms.S
-    ELF           := $(BUILD)/kernel.elf
-    KERNEL        := $(BUILD)/kernel.img
-    QEMU          := qemu-system-aarch64
-    # FTP needs the control port (21 -> host 2121) plus a small range
-    # of data ports (30000..30007 -> host 30000..30007) for PASV.  The
-    # range must match cmd/ftpd.c's PASV_BASE / PASV_N.
-    QEMU_ARGS     := -M virt,gic-version=3 -cpu cortex-a72 -nographic -m 256 \
-                     -global virtio-mmio.force-legacy=false \
-                     -netdev user,id=n0,hostfwd=tcp::2323-:23,hostfwd=tcp::2121-:21,hostfwd=tcp::30000-:30000,hostfwd=tcp::30001-:30001,hostfwd=tcp::30002-:30002,hostfwd=tcp::30003-:30003,hostfwd=tcp::30004-:30004,hostfwd=tcp::30005-:30005,hostfwd=tcp::30006-:30006,hostfwd=tcp::30007-:30007 \
-                     -device virtio-net-device,netdev=n0
-else
-    $(error Unknown ARCH=$(ARCH); use ARCH=aarch64 or ARCH=virt)
-endif
+CROSS   ?= aarch64-linux-gnu-
+ARCH_CFLAGS := -mcpu=cortex-a72 -mgeneral-regs-only \
+               -Iuts/aarch64 -DPLATFORM_VIRT
+LINKER_LD   := uts/virt/linker.ld
+USER_BUILD  := build/user
+USER_BIN    := $(USER_BUILD)/init.bin
+USERBLOB_EXTRA_DEP := $(USER_BIN)
+ARCH_OBJS   := \
+    $(BUILD)/uts/virt/boot.o \
+    $(BUILD)/uts/aarch64/uart.o \
+    $(BUILD)/uts/aarch64/vectors.o \
+    $(BUILD)/uts/aarch64/trap.o \
+    $(BUILD)/uts/aarch64/mmu.o \
+    $(BUILD)/uts/aarch64/switch.o \
+    $(BUILD)/uts/aarch64/thread.o \
+    $(BUILD)/uts/virt/timer.o \
+    $(BUILD)/uts/virt/ipi.o \
+    $(BUILD)/uts/virt/gic.o \
+    $(BUILD)/uts/virt/framebuffer.o \
+    $(BUILD)/uts/virt/fbcon.o \
+    $(BUILD)/uts/virt/mailbox.o \
+    $(BUILD)/uts/virt/miniuart.o \
+    $(BUILD)/uts/virt/slip-stubs.o \
+    $(BUILD)/uts/virt/virtio_net.o \
+    $(BUILD)/uts/virt/telnetd.o \
+    $(BUILD)/uts/aarch64/userblob.o \
+    $(BUILD)/uts/aarch64/helloblob.o \
+    $(BUILD)/uts/aarch64/usrblobs.o
+KERNEL_OBJS := \
+    $(BUILD)/uts/os/core/printk.o \
+    $(BUILD)/uts/os/core/pmm.o \
+    $(BUILD)/uts/os/core/string.o \
+    $(BUILD)/uts/os/core/kmem.o \
+    $(BUILD)/uts/os/core/klog.o \
+    $(BUILD)/uts/os/core/uaccess.o \
+    $(BUILD)/uts/os/core/kallsyms.o \
+    $(BUILD)/uts/os/core/ftrace.o \
+    $(BUILD)/uts/os/proc/process.o \
+    $(BUILD)/uts/os/proc/sched.o \
+    $(BUILD)/uts/os/proc/signal.o \
+    $(BUILD)/uts/os/proc/syscall.o \
+    $(BUILD)/uts/os/fs/vfs.o \
+    $(BUILD)/uts/os/fs/ramdisk.o \
+    $(BUILD)/uts/os/fs/kfs.o \
+    $(BUILD)/uts/os/fs/procfs.o \
+    $(BUILD)/uts/os/io/streams.o \
+    $(BUILD)/uts/os/io/cdevsw.o \
+    $(BUILD)/uts/os/io/bdevsw.o \
+    $(BUILD)/uts/os/io/buf.o \
+    $(BUILD)/uts/os/io/bram.o \
+    $(BUILD)/uts/os/io/stream_head.o \
+    $(BUILD)/uts/os/io/vt.o \
+    $(BUILD)/uts/os/io/ldterm.o \
+    $(BUILD)/uts/os/io/tty.o \
+    $(BUILD)/uts/os/net/netif.o \
+    $(BUILD)/uts/os/net/ipv4.o \
+    $(BUILD)/uts/os/net/icmp.o \
+    $(BUILD)/uts/os/net/udp.o \
+    $(BUILD)/uts/os/net/tcp.o \
+    $(BUILD)/uts/os/net/pktfilter.o \
+    $(BUILD)/uts/os/net/lo.o \
+    $(BUILD)/uts/os/user/user.o \
+    $(BUILD)/uts/os/main.o
+KSYM_STUB_OBJ := $(BUILD)/uts/aarch64/kallsyms_stub.o
+KSYM_OBJ      := $(BUILD)/uts/aarch64/kallsyms.o
+KSYM_SRC      := $(BUILD)/uts/aarch64/kallsyms.S
+ELF           := $(BUILD)/kernel.elf
+KERNEL        := $(BUILD)/kernel.img
+QEMU          := qemu-system-aarch64
+# FTP needs the control port (21 -> host 2121) plus a small range
+# of data ports (30000..30007 -> host 30000..30007) for PASV.  The
+# range must match cmd/ftpd.c's PASV_BASE / PASV_N.
+QEMU_ARGS     := -M virt,gic-version=3 -cpu cortex-a72 -nographic -m 256 \
+                 -global virtio-mmio.force-legacy=false \
+                 -netdev user,id=n0,hostfwd=tcp::2323-:23,hostfwd=tcp::2121-:21,hostfwd=tcp::30000-:30000,hostfwd=tcp::30001-:30001,hostfwd=tcp::30002-:30002,hostfwd=tcp::30003-:30003,hostfwd=tcp::30004-:30004,hostfwd=tcp::30005-:30005,hostfwd=tcp::30006-:30006,hostfwd=tcp::30007-:30007 \
+                 -device virtio-net-device,netdev=n0
 
 CC      := $(CROSS)gcc
 LD      := $(CROSS)ld
@@ -228,8 +147,6 @@ $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-ifneq ($(filter $(ARCH),aarch64 virt),)
-
 # Two-pass link for kallsyms.  Pass 1 uses the stub (empty table) so
 # we have an ELF to nm; tools/gen_kallsyms.sh emits the populated
 # table; pass 2 relinks with the real .kallsyms object.  The .kallsyms
@@ -249,13 +166,6 @@ $(KSYM_OBJ): $(KSYM_SRC)
 
 $(ELF): $(OBJS) $(KSYM_OBJ) $(LINKER_LD)
 	$(LD) $(LDFLAGS) -T $(LINKER_LD) -o $@ $(OBJS) $(KSYM_OBJ) $(LIBGCC)
-
-else
-
-$(ELF): $(OBJS) $(LINKER_LD)
-	$(LD) $(LDFLAGS) -T $(LINKER_LD) -o $@ $(OBJS) $(LIBGCC)
-
-endif
 
 $(KERNEL): $(ELF)
 	$(OBJCOPY) -O binary $< $@
@@ -279,8 +189,7 @@ run: $(KERNEL)
 # Use this when you want to drive the shell over telnet -- the kernel
 # splash + boot trace go to /tmp/kappara-virt.log instead of stdout,
 # and stdin/stdout belong to the telnet session on tty4.
-ifeq ($(ARCH),virt)
-.PHONY: run-telnet run-ftp smoke-ftp smoke-sdk smoke-linux smoke-linux-mmap
+.PHONY: run-telnet run-ftp smoke-ftp smoke-sdk smoke-linux smoke-linux-mmap test
 run-telnet: $(KERNEL)
 	@command -v nc >/dev/null 2>&1 || { \
 		echo "run-telnet: need 'nc' on PATH (apt install netcat-openbsd)"; \
@@ -493,27 +402,23 @@ smoke-linux-mmap: $(KERNEL)
 	     || { echo "smoke-linux-mmap: mmap roundtrip failed"; \
 	          echo "$$OUT"; exit 1; }; \
 	 echo "==> smoke-linux-mmap PASS"
-endif
 
-# Pi/Debian host friendly defaults: no display window, single-thread
-# TCG so QEMU can't spin more than one host CPU even when WFI on the
-# raspi3b model doesn't properly idle the vCPU threads.  Wrap in
-# taskset -c 0 if you also want to cap that one core's wall usage.
-ifeq ($(ARCH),aarch64)
-.PHONY: run-thrifty run-gui
-run-thrifty: $(KERNEL)
-	$(QEMU) -M raspi3b -display none -accel tcg,thread=single \
-	        -semihosting-config enable=on,target=native \
-	        -serial stdio -serial null -kernel $(KERNEL)
-
-# Boot with the splash window.  Only safe where QEMU's display
-# backend works (X / Wayland with the right libs); on some headless
-# / Pi setups the GTK init segfaults the QEMU process.  Ctrl-C from
-# the host terminal still kills QEMU (signal=on default on stdio).
-run-gui: $(KERNEL)
-	$(QEMU) -M raspi3b -semihosting-config enable=on,target=native \
-	        -serial stdio -kernel $(KERNEL)
-endif
+# Unified test runner.  Runs every smoke target in sequence + cmd/test
+# all under QEMU.  This is the canonical "is HEAD healthy?" check.
+test: smoke-ftp smoke-sdk smoke-linux smoke-linux-mmap
+	@TMPDIR=$$(mktemp -d); \
+	 trap "rm -rf $$TMPDIR" EXIT; \
+	 printf '#!/bin/sh\nsleep 5\necho "test all"\nsleep 14\n' \
+	     > $$TMPDIR/in.sh; \
+	 chmod +x $$TMPDIR/in.sh; \
+	 echo "==> cmd/test all under QEMU"; \
+	 OUT=$$($$TMPDIR/in.sh | timeout 24 $(QEMU) $(QEMU_ARGS) \
+	         -kernel $(KERNEL) 2>&1); \
+	 echo "$$OUT" | grep -E '^test:' | tail -1; \
+	 echo "$$OUT" | grep -q 'test: 14 passed, 0 failed' \
+	     || { echo "test: cmd/test all did not pass 14/14"; \
+	          echo "$$OUT" | tail -20; exit 1; }; \
+	 echo "==> ALL TESTS PASS"
 
 clean:
 	rm -rf build
@@ -532,8 +437,6 @@ stop:
 # Compile user/init.c with the same cross toolchain as the kernel,
 # link with user/linker.ld at VA 0x10000000, objcopy to a raw .bin,
 # then uts/aarch64/userblob.S incbin's the result into the kernel.
-
-ifneq ($(filter $(ARCH),aarch64 virt),)
 
 USER_CC     := $(CROSS)gcc
 USER_LD     := $(CROSS)ld
@@ -756,8 +659,6 @@ $(BUILD)/uts/aarch64/usrblobs.o: $(CMD_ELFS) $(LDK_ELF) $(LIBC_SO) $(DLTEST_SO) 
 # Tell make that userblob.o / helloblob.o depend on the files they incbin.
 $(BUILD)/uts/aarch64/userblob.o:  $(USER_BIN)
 $(BUILD)/uts/aarch64/helloblob.o: $(HELLO_ELF)
-
-endif
 
 # Pull in compiler-emitted header deps so editing a header forces a
 # rebuild of every .o that includes it.  Placed at the very end so

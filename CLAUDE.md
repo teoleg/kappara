@@ -29,7 +29,10 @@
 
 ## Build invariants
 
-- `make ARCH=aarch64` produces `build/aarch64/kernel8.img`.
+- `make` produces `build/kernel.img`.  Single ARCH (QEMU `virt`,
+  which is also the AWS Graviton on-ramp -- see `docs/AWS.md`).
+  Pi-specific drivers moved to `attic/raspi3b/` and the
+  `ARCH=aarch64` build path is retired.
 - Two-pass link populates `.kallsyms` for backtraces.  Don't reorder
   the linker script around `.kallsyms` — its position **after** BSS
   is what makes the two-pass scheme work.
@@ -40,15 +43,20 @@
 
 ## Testing convention
 
-- Default test rig:
+- Canonical "is HEAD healthy?": `make test`.  Runs `smoke-ftp +
+  smoke-sdk + smoke-linux + smoke-linux-mmap` plus `cmd/test all
+  14/14` and reports a single "ALL TESTS PASS" line.
+- Run interactively: `make run` (Ctrl-A x to quit QEMU).
+- Drive specific shell commands:
   ```
-  /tmp/test_in.sh | timeout NN qemu-system-aarch64 -M raspi3b \
-      -serial mon:stdio -serial null -display none \
-      -kernel build/aarch64/kernel8.img 2>&1 | tail -N
+  /tmp/test_in.sh | timeout NN qemu-system-aarch64 \
+      -M virt,gic-version=3 -cpu cortex-a72 -nographic -m 256 \
+      -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
+      -kernel build/kernel.img 2>&1 | tail -N
   ```
 - For input-driven tests, the script does `sleep N; echo "command"`
-  pairs — fbcon is disabled by default so the boot is fast enough
-  that 3-4 second sleeps are plenty before the first command.
+  pairs — boot is fast enough that 3-4 second sleeps are plenty
+  before the first command.
 - Boot to prompt: ~3 seconds in QEMU TCG.
 
 ## Hot bug-class reminders

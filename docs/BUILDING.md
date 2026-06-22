@@ -15,11 +15,14 @@
 ## Build
 
 ```
-make                 # build/aarch64/kernel8.img
-make ARCH=aarch64    # same, explicit
+make                 # build/kernel.img (QEMU virt; the AWS Graviton on-ramp)
 make TRACE=1         # build with gcc -finstrument-functions for ftrace
 make clean
 ```
+
+Single-arch since the raspi3b retirement -- Pi-specific drivers live
+in `attic/raspi3b/`.  The kernel image targets QEMU `virt` today and
+boots on AWS EC2 Graviton once `docs/AWS.md` stages A-G land.
 
 ### `TRACE=1` — function tracing
 
@@ -51,13 +54,11 @@ includes it — no more silent ABI mismatches across stale .o files
 
 | Target          | Behavior                                                      |
 |-----------------|---------------------------------------------------------------|
-| `make run`      | Default args from each arch's `QEMU_ARGS`                     |
-| `make run-thrifty` | `-display none -accel tcg,thread=single` — caps host CPU at one core |
-| `make run-gui`  | With the splash window; needs working QEMU display backend    |
+| `make run`      | Boots `build/kernel.img` in QEMU `virt`, networking forwarded (FTP 2121, telnet 2323, FTP-PASV 30000-30007) |
+| `make test`     | Full health check: smoke-ftp + smoke-sdk + smoke-linux + smoke-linux-mmap + `cmd/test all 14/14` |
 | `make stop`     | `pkill` any running QEMU                                      |
-
-`make run-thrifty` is the right default on a Raspberry Pi host (or
-any laptop where you don't want QEMU TCG to spin all cores).
+| `make run-telnet` | Boot headless + drive a foreground `nc localhost 2323` |
+| `make run-ftp`  | Boot headless + an interactive `ftp 127.0.0.1 2121` session |
 
 ## Quitting QEMU
 
