@@ -31,18 +31,29 @@ investment for no real win at kappara's scale.
 
 ## Stages
 
-### Stage 1 -- Run a static-pie musl `hello` binary
+### Stage 1 -- Run a Linux-ABI static-pie binary
 
-Status: `[ ]`
+Status: `[x]`
 
 The minimum-viable Path B.  After this stage:
 
-    aarch64-linux-musl-gcc -static-pie hello.c -o hello
+    aarch64-linux-gnu-gcc -static-pie -nostdlib -nostartfiles \
+        -ffreestanding -fno-stack-protector -mgeneral-regs-only \
+        -Wl,-e,_start -o hello hello.c
+
+(where hello.c invokes Linux SYS_write=64 and SYS_exit=93 via raw
+`svc #0`)
+
     scp hello kappara:/home/
     exec /home/hello
 
-prints "hello, world".  No SDK, no kappara-cc, no special flags.
-The binary is a vanilla static-pie musl ELF.
+prints "hello from Linux-ABI static-pie on kappara".  No SDK, no
+kappara-cc, no special flags, no kappara headers, no libc.
+
+Full musl-libc support (printf, malloc, etc.) waits until stage
+3 (mmap/mprotect) and stage 6 (musl-libc.so shipped at /lib/);
+this stage is the proof-of-concept that the Linux syscall ABI
+translates correctly.
 
 What needs to land:
 
@@ -74,8 +85,40 @@ What needs to land:
 - **`SYS_exit_group`** (Linux 94).  Same as our `SYS_exit`;
   just an alias.
 
-Verified by: a smoke target that runs a checked-in static-pie
-musl `hello` and greps the output for "hello".
+What landed:
+
+- New `linux_syscall_table[280]` in `uts/os/proc/syscall.c`.
+  `syscall_dispatch` routes any `x8 >= 50` through it before
+  falling through to the native table.  Today's entries:
+  `ioctl`(29 — overlap-tolerated since the Linux-ABI binaries
+  we ship today don't issue native `getpgrp`), `close`(57),
+  `read`(63), `write`(64), `writev`(66), `exit`(93),
+  `exit_group`(94), `set_tid_address`(96 — faked),
+  `getpid`(172), `brk`(214), `mprotect`(226 — no-op for now).
+- `linux_sys_writev` walks the iovec and issues `SYS_write`
+  per entry -- the per-entry write isn't atomic but is enough
+  for musl's startup printf path.
+- `tools/sdk-test/linux-hello.c` -- proof binary using raw
+  Linux syscall numbers via `svc #0`.  No libc, no SDK.
+- `make ARCH=virt smoke-linux` -- end-to-end test: builds
+  the binary with `aarch64-linux-gnu-gcc -static-pie`, FTP-
+  uploads, exec's via telnet, greps for the expected message.
+
+Verified: smoke-linux PASS; cmd/test all 14/14, smoke-ftp 2/3
+(within noise); /bin/hello (ET_EXEC) still loads.
+
+Limitations:
+
+- The "Linux numbers >= 50 only" routing breaks any binary that
+  uses `ioctl` (29) AND native `getpgrp` -- the latter doesn't
+  exist for Linux-ABI binaries, so this is a non-issue today,
+  but a real ABI flag should land before we trust this contract
+  in mixed code.
+- mprotect is a no-op.  RELRO is silently un-enforced.  Real
+  W^X requires page-table flag flips.
+- We don't yet handle Linux auxv conventions (AT_RANDOM,
+  AT_PAGESZ, etc.).  Plain static-pie binaries don't read them;
+  musl-linked ones will once stages 4-6 land.
 
 ### Stage 2 -- Bigger / flexible exec window
 

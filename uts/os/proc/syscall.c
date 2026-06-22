@@ -642,9 +642,110 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_getcwd]      = sys_getcwd,
 };
 
+/* INDIE.md Path B: Linux syscall translation.
+ *
+ * Maps Linux aarch64 syscall numbers (asm-generic/unistd.h) to our
+ * native handlers when the calling binary uses the Linux ABI.  Today
+ * we route any `x8 >= 50` through the Linux table -- our native
+ * syscalls all sit below 42 and the Linux numbers we care about for
+ * static-musl programs (write=64, exit=93, brk=214, mmap=222,
+ * mprotect=226, exit_group=94, writev=66) all start at 50+.
+ *
+ * The handful of overlapping low numbers (Linux ioctl=29 vs SYS_getpgrp)
+ * stays on the native table for now; binaries using those won't work
+ * until a real per-process ABI flag lands. */
+#define LINUX_NR_MAX 280
+
+static long linux_sys_write(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return syscall_table[SYS_write](a0, a1, a2, a3, a4, a5);
+}
+static long linux_sys_read(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return syscall_table[SYS_read](a0, a1, a2, a3, a4, a5);
+}
+static long linux_sys_close(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return syscall_table[SYS_close](a0, a1, a2, a3, a4, a5);
+}
+static long linux_sys_exit(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return syscall_table[SYS_exit](a0, a1, a2, a3, a4, a5);
+}
+static long linux_sys_brk(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return syscall_table[SYS_brk](a0, a1, a2, a3, a4, a5);
+}
+static long linux_sys_getpid(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return syscall_table[SYS_getpid](a0, a1, a2, a3, a4, a5);
+}
+static long linux_sys_set_tid_address(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	/* Linux set_tid_address(int *tid_addr): musl uses it for thread
+	 * cancellation.  We have no concept; pretend we set it and return
+	 * the current tid so musl is happy. */
+	(void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return syscall_table[SYS_getpid](0, 0, 0, 0, 0, 0);
+}
+static long linux_sys_mprotect(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	/* RELRO write-protect on startup.  Static-pie binaries call it;
+	 * we don't enforce W^X yet, so report success. */
+	(void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return 0;
+}
+static long linux_sys_ioctl(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return syscall_table[SYS_ioctl](a0, a1, a2, a3, a4, a5);
+}
+static long linux_sys_writev(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	/* writev(fd, iovec[], niov).  iovec = {void *base; size_t len;}.
+	 * Pasted-together by walking the iovec and issuing SYS_write per
+	 * entry.  Not atomic, but musl's startup printf only uses 1-elt
+	 * iovecs in practice. */
+	(void)a3; (void)a4; (void)a5;
+	int fd = (int)a0;
+	const long *iov = (const long *)(uintptr_t)a1;
+	int niov = (int)a2;
+	if (!iov || niov <= 0) return 0;
+	long total = 0;
+	for (int i = 0; i < niov; i++) {
+		long base = iov[i * 2];
+		long len  = iov[i * 2 + 1];
+		if (len == 0) continue;
+		long w = syscall_table[SYS_write](fd, base, len, 0, 0, 0);
+		if (w < 0) return w;
+		total += w;
+		if (w < len) break;
+	}
+	return total;
+}
+
+static const syscall_fn linux_syscall_table[LINUX_NR_MAX] = {
+	[29]  = linux_sys_ioctl,
+	[57]  = linux_sys_close,
+	[63]  = linux_sys_read,
+	[64]  = linux_sys_write,
+	[66]  = linux_sys_writev,
+	[93]  = linux_sys_exit,
+	[94]  = linux_sys_exit,	/* exit_group */
+	[96]  = linux_sys_set_tid_address,
+	[172] = linux_sys_getpid,
+	[214] = linux_sys_brk,
+	[226] = linux_sys_mprotect,
+};
+
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5)
 {
+	/* Linux-ABI dispatch first: any number >= 50 with a Linux entry
+	 * routes through the translation table. */
+	if ((unsigned long)num >= 50 && (unsigned long)num < LINUX_NR_MAX &&
+	    linux_syscall_table[num]) {
+		return linux_syscall_table[num](a0, a1, a2, a3, a4, a5);
+	}
 	if ((unsigned long)num >= SYS_MAX || !syscall_table[num]) {
 		kprintf("syscall: bad number %ld\n", num);
 		return -1;

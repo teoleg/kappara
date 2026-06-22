@@ -417,6 +417,48 @@ smoke-sdk: $(KERNEL) sdk
 	     || { echo "smoke-sdk: argv/atoi didn't work"; \
 	          echo "$$OUT"; exit 1; }; \
 	 echo "==> smoke-sdk PASS"
+
+# INDIE.md Path B stage 1: run a Linux-ABI static-pie binary.  Builds
+# a tiny C file that uses raw Linux syscall numbers (write=64,
+# exit=93) -- no kappara headers, no libc.  Uploads via FTP, exec's,
+# checks the binary printed its "hello".
+smoke-linux: $(KERNEL)
+	@command -v ftp >/dev/null 2>&1 || { \
+		echo "smoke-linux: need 'ftp' on PATH"; exit 1; }
+	@command -v nc >/dev/null 2>&1 || { \
+		echo "smoke-linux: need 'nc' on PATH"; exit 1; }
+	@TMPDIR=$$(mktemp -d); \
+	 LOG=/tmp/kappara-linux.log; \
+	 trap "rm -rf $$TMPDIR" EXIT INT TERM; \
+	 echo "==> build linux-abi hello.c using raw aarch64 syscalls"; \
+	 cp tools/sdk-test/linux-hello.c $$TMPDIR/hello.c; \
+	 aarch64-linux-gnu-gcc -static-pie -nostdlib -nostartfiles \
+	     -ffreestanding -fno-stack-protector -mgeneral-regs-only \
+	     -Wl,-e,_start \
+	     -o $$TMPDIR/hello $$TMPDIR/hello.c 2>&1 | grep -v "^$$" || true; \
+	 test -f $$TMPDIR/hello || { echo "smoke-linux: build failed"; exit 1; }; \
+	 echo "==> boot kappara virt"; \
+	 rm -f $$LOG; \
+	 $(QEMU) $(QEMU_ARGS) -kernel $(KERNEL) > $$LOG 2>&1 & \
+	 QPID=$$!; \
+	 trap "kill $$QPID 2>/dev/null; rm -rf $$TMPDIR; wait 2>/dev/null" EXIT INT TERM; \
+	 for i in 1 2 3 4 5 6 7 8 9 10; do \
+	     sleep 1; \
+	     grep -q 'ftpd: listening' $$LOG 2>/dev/null && break; \
+	 done; \
+	 grep -q 'ftpd: listening' $$LOG 2>/dev/null || { \
+	     echo "smoke-linux: ftpd did not come up"; tail -20 $$LOG; exit 1; }; \
+	 echo "==> upload Linux-ABI binary to /home"; \
+	 printf 'user anonymous any\nbinary\ncd /home\nput %s/hello hello\nquit\n' $$TMPDIR \
+	     | HOME=/tmp ftp -pinv 127.0.0.1 2121 > /dev/null 2>&1 \
+	     || { echo "smoke-linux: ftp upload failed"; exit 1; }; \
+	 echo "==> exec /home/hello over telnet"; \
+	 OUT=$$( ( sleep 1; printf 'exec /home/hello\r'; sleep 5 ) \
+	          | timeout 10 nc localhost 2323 2>&1 ); \
+	 echo "$$OUT" | grep -q 'hello from Linux-ABI' \
+	     || { echo "smoke-linux: expected hello not seen"; \
+	          echo "$$OUT"; exit 1; }; \
+	 echo "==> smoke-linux PASS"
 endif
 
 # Pi/Debian host friendly defaults: no display window, single-thread
