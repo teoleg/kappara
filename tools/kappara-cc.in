@@ -1,0 +1,76 @@
+#!/bin/sh
+# kappara-cc -- cross-compiler wrapper for the kappara SDK.
+#
+# Invokes the host's aarch64-linux-gnu-gcc with the SDK's sysroot
+# (headers + libc.so + crt0.o + linker script) so external code can
+# build cmd-shaped kappara binaries without checking out the source
+# tree.
+#
+# Usage:
+#   kappara-cc [-c]      hello.c                    -- compile only
+#   kappara-cc           hello.c -o hello           -- compile + link
+#   kappara-cc -shared   foo.c   -o /lib/libfoo.so  -- shared object
+#
+# The wrapper picks compile-vs-link based on whether `-c` or
+# `-shared` appears in the argument list.
+
+set -e
+
+SDK_ROOT="@SDK_ROOT@"
+HOST_CC="${KAPPARA_CC:-aarch64-linux-gnu-gcc}"
+HOST_LD="${KAPPARA_LD:-aarch64-linux-gnu-ld}"
+
+if [ ! -d "$SDK_ROOT/sysroot" ]; then
+    echo "kappara-cc: sysroot not found at $SDK_ROOT/sysroot" >&2
+    exit 1
+fi
+
+# Shared compile flags.  -mgeneral-regs-only matches the kernel and
+# libc.so's ABI -- the kernel doesn't enable FP at EL0, so anything
+# touching d-regs faults.
+COMMON_CFLAGS="
+    --sysroot=$SDK_ROOT/sysroot
+    -isystem $SDK_ROOT/sysroot/include
+    -ffreestanding -nostdlib -nostartfiles
+    -fno-stack-protector
+    -mcpu=cortex-a53 -mgeneral-regs-only
+    -O2 -g
+"
+
+# Parse mode out of args.
+mode=link
+for a in "$@"; do
+    case "$a" in
+        -c)      mode=compile-only ;;
+        -shared) mode=shared ;;
+    esac
+done
+
+case "$mode" in
+compile-only)
+    exec "$HOST_CC" $COMMON_CFLAGS -fPIE "$@"
+    ;;
+shared)
+    exec "$HOST_CC" $COMMON_CFLAGS -fPIC \
+                    -Wl,-z,max-page-size=4096 \
+                    -Wl,--no-dynamic-linker \
+                    "$@"
+    ;;
+link)
+    # PIE executable.  We link against libc.so via DT_NEEDED and use
+    # our crt0 for _start.  Drop --no-dynamic-linker so the resulting
+    # binary carries PT_INTERP=/lib/ld-kappara.so once stage 2 lands;
+    # for stage 1 the kernel doesn't read PT_INTERP yet, so it's
+    # harmless either way.
+    exec "$HOST_CC" $COMMON_CFLAGS -fPIE \
+                    -Wl,-z,max-page-size=4096 \
+                    -Wl,--no-dynamic-linker \
+                    -Wl,-T,$SDK_ROOT/sysroot/lib/prog_linker.ld \
+                    -pie \
+                    -nostartfiles \
+                    "$SDK_ROOT/sysroot/lib/crt0.o" \
+                    "$@" \
+                    -L"$SDK_ROOT/sysroot/lib" \
+                    -l:libc.so
+    ;;
+esac
