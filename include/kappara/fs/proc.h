@@ -26,6 +26,8 @@
  *                    (bdf, vid:did, class, hdr, MSI-X cap, BARs)
  *   /proc/efi        AWS.md stage B: EFI memory map
  *                    (type, start, pages, end)
+ *   /proc/nvme       AWS.md stage F: NVMe controller summary
+ *                    (vid, model, serial, firmware, ns1 size)
  */
 
 #ifndef KAPPARA_PROC_H

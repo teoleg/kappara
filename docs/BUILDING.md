@@ -60,6 +60,24 @@ includes it — no more silent ABI mismatches across stale .o files
 | `make run-telnet` | Boot headless + drive a foreground `nc localhost 2323` |
 | `make run-ftp`  | Boot headless + an interactive `ftp 127.0.0.1 2121` session |
 
+### Exercising the UEFI / AWS path
+
+The same `build/kernel.img` is a PE32+ EFI Application (AWS.md
+stages A-D); to actually take that path under QEMU you need
+AAVMF as the firmware and an ESP partition holding the kernel
+as `\EFI\BOOT\BOOTAA64.EFI`.  The scratch-pad script the agent
+runs is the canonical recipe.  Once you're under AAVMF, drop in
+extra PCIe devices to exercise stage D-F:
+
+```
+-device nvme,drive=nvm,serial=foo \
+-drive id=nvm,format=raw,if=none,file=nvme.img
+```
+
+`nvme.img` can be any pre-created raw disk file; the driver
+self-test in `nvme_init` writes a known pattern to LBA 0 and
+reads it back, leaving the pattern persisted on the host file.
+
 ## Quitting QEMU
 
 The `make run-thrifty` and `make run-gui` targets use **plain

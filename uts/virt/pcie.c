@@ -185,3 +185,32 @@ void pcie_init(void)
 	kprintf("pcie: enumeration complete -- %u device%s\n",
 		pci_nr_devs, pci_nr_devs == 1 ? "" : "s");
 }
+
+/* ---- BAR decoders -------------------------------------------------- */
+/* 32-bit memory BAR: type bits [2:1] = 00, addr = bar[i] & ~0xf.
+ * 64-bit memory BAR: type bits [2:1] = 10, occupies bar[i] + bar[i+1].
+ * I/O BAR (bit 0 = 1) we don't care about -- AArch64 has no PIO space
+ * and modern PCIe assigns memory-mapped BARs to everything we need. */
+
+int pcie_bar_is_64(const struct pci_device *p, unsigned idx)
+{
+	if (idx >= 6) return 0;
+	uint32_t b = p->bar[idx];
+	if (b & 0x1) return 0;			/* I/O BAR */
+	return ((b >> 1) & 0x3) == 0x2;
+}
+
+uint64_t pcie_bar_addr(const struct pci_device *p, unsigned idx)
+{
+	if (idx >= 6) return 0;
+	uint32_t b = p->bar[idx];
+	if (b & 0x1) return 0;			/* I/O BAR */
+
+	uint64_t lo = (uint64_t)(b & ~0xfu);
+	if (((b >> 1) & 0x3) == 0x2) {
+		if (idx + 1 >= 6) return 0;	/* malformed */
+		uint64_t hi = (uint64_t)p->bar[idx + 1];
+		return (hi << 32) | lo;
+	}
+	return lo;
+}

@@ -256,32 +256,57 @@ void mmu_map_user_2mb(uint64_t va, uint64_t pa)
 }
 
 /*
- * Identity-map a 1 GB Device block via L1 (kernel-only RW, no exec).
- * The address is rounded down to the 1 GB boundary; on return the
+ * Identity-map a 1 GB Device block (kernel-only RW, no exec).  The
+ * address is rounded down to the 1 GB boundary; on return the
  * containing 1 GB window is reachable from EL1 as MMIO.
  *
  * Used for high-mem MMIO regions that fall outside the 0..2 GB chunk
  * build_identity_map covers via L1[0] (low 1 GB through L2) and L1[1]
- * (RAM at 0x40000000): e.g. QEMU virt's high-mem PCIe ECAM at
- * 0x4010000000, or any AWS Graviton MCFG entry above 2 GB.
+ * (RAM at 0x40000000): e.g. QEMU virt's PCIe ECAM at 0x4010000000,
+ * NVMe BAR0 at 0x8000000000 (= 512 GB = the very start of L0[1]),
+ * or any AWS Graviton MCFG entry above 2 GB.
  *
- * L1 has 512 entries; we use whatever index `va >> 30` lands on.
- * No overlap check -- callers must know they're not stomping the
- * RAM mapping at L1[1].  TLBI vmalle1is is the broadest invalidate;
- * cheap since this only runs at platform init time.
+ * Walks the table tree to whatever L1 the VA wants.  L0[0] reuses
+ * the static l1_table that build_identity_map already wired in;
+ * L0[1+] entries lazily allocate a fresh L1 page from the PMM
+ * (callers run mmu_map_device_1gb AFTER pmm_init -- pcie_init and
+ * nvme_init both do).  TLBI vmalle1is is the broadest invalidate;
+ * cheap because this only runs at platform init time.
  */
 #define BLOCK_1G_SHIFT		30
 #define BLOCK_1G_SIZE		(1UL << BLOCK_1G_SHIFT)
 #define BLOCK_1G_MASK		(BLOCK_1G_SIZE - 1)
+#define BLOCK_512G_SHIFT	39
 
 void mmu_map_device_1gb(uint64_t va)
 {
-	uint64_t base = va & ~BLOCK_1G_MASK;
-	unsigned idx  = (unsigned)(base >> BLOCK_1G_SHIFT) & 0x1ff;
+	uint64_t base    = va & ~BLOCK_1G_MASK;
+	unsigned l0_idx  = (unsigned)(base >> BLOCK_512G_SHIFT) & 0x1ff;
+	unsigned l1_idx  = (unsigned)(base >> BLOCK_1G_SHIFT)   & 0x1ff;
 
-	l1_table[idx] = base | D_VALID |
-			D_ATTRIDX(ATTR_DEVICE_IDX) |
-			D_AP_RW_EL1 | D_SH_NONE | D_AF | D_PXN | D_UXN;
+	uint64_t *l1;
+	if (l0_idx == 0) {
+		l1 = l1_table;
+	} else {
+		uint64_t l0_desc = l0_table[l0_idx];
+		if (l0_desc & D_VALID) {
+			/* Reuse existing L1 attached to this L0 entry.
+			 * Mask off the descriptor's attribute bits to
+			 * recover the L1 phys (= VA, identity). */
+			l1 = (uint64_t *)(uintptr_t)(l0_desc & ~0xfffUL);
+		} else {
+			l1 = pmm_alloc();
+			if (!l1) return;
+			for (int i = 0; i < ENTRIES_PER_TABLE; i++)
+				l1[i] = 0;
+			l0_table[l0_idx] = (uint64_t)(uintptr_t)l1
+			                   | D_VALID | D_TABLE;
+		}
+	}
+
+	l1[l1_idx] = base | D_VALID |
+		     D_ATTRIDX(ATTR_DEVICE_IDX) |
+		     D_AP_RW_EL1 | D_SH_NONE | D_AF | D_PXN | D_UXN;
 
 	__asm__ volatile (
 		"dsb	ishst\n"

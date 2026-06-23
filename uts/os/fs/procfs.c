@@ -29,6 +29,7 @@
 
 #include "kappara/arch/acpi.h"
 #include "kappara/arch/efi.h"
+#include "kappara/arch/nvme.h"
 #include "kappara/arch/pcie.h"
 #include "kappara/io/cdevsw.h"
 #include "kappara/core/ftrace.h"
@@ -652,6 +653,58 @@ static int proc_efi_qopen(queue_t *q)
 	return 0;
 }
 
+/* ---- /proc/nvme -- AWS.md stage F: NVMe controller summary ---------- */
+
+static struct procbuf nvme_pb;
+
+static int proc_nvme_qopen(queue_t *q)
+{
+	struct nvme_info info;
+	nvme_get_info(&info);
+
+	pb_reset(&nvme_pb);
+	if (!info.present) {
+		pb_str(&nvme_pb,
+		       "nvme: no controller (no PCI class 0x0108 found)\n");
+		pb_flush_to_q(&nvme_pb, q);
+		return 0;
+	}
+	pb_str(&nvme_pb, "version:     ");
+	pb_pad_dec(&nvme_pb, info.major, 0); pb_putc(&nvme_pb, '.');
+	pb_pad_dec(&nvme_pb, info.minor, 0); pb_putc(&nvme_pb, '.');
+	pb_pad_dec(&nvme_pb, info.tertiary, 0);
+	pb_putc(&nvme_pb, '\n');
+
+	pb_str(&nvme_pb, "bar0:        0x");
+	pb_hex(&nvme_pb, info.bar0, 0);
+	pb_putc(&nvme_pb, '\n');
+
+	pb_str(&nvme_pb, "vid:         0x");
+	pb_hex(&nvme_pb, info.vid, 4);
+	pb_putc(&nvme_pb, '\n');
+
+	pb_str(&nvme_pb, "model:       "); pb_str(&nvme_pb, info.model);
+	pb_putc(&nvme_pb, '\n');
+	pb_str(&nvme_pb, "serial:      "); pb_str(&nvme_pb, info.serial);
+	pb_putc(&nvme_pb, '\n');
+	pb_str(&nvme_pb, "firmware:    "); pb_str(&nvme_pb, info.firmware);
+	pb_putc(&nvme_pb, '\n');
+
+	pb_str(&nvme_pb, "ns1_blocks:  ");
+	pb_pad_dec(&nvme_pb, info.ns1_blocks, 0);
+	pb_putc(&nvme_pb, '\n');
+	pb_str(&nvme_pb, "ns1_lba:     ");
+	pb_pad_dec(&nvme_pb, info.ns1_lba_bytes, 0);
+	pb_str(&nvme_pb, " bytes\n");
+	pb_str(&nvme_pb, "ns1_size:    ");
+	pb_pad_dec(&nvme_pb,
+		   (info.ns1_blocks * info.ns1_lba_bytes) >> 20, 0);
+	pb_str(&nvme_pb, " MB\n");
+
+	pb_flush_to_q(&nvme_pb, q);
+	return 0;
+}
+
 /* ---- Read-side put: the head queues data; we never see reverse traffic. */
 
 static int proc_rq_putp(queue_t *q, mblk_t *mp)
@@ -701,6 +754,7 @@ PROC_DRIVER(proctcp,  proc_tcp_qopen);
 PROC_DRIVER(procacpi, proc_acpi_qopen);
 PROC_DRIVER(procpci,  proc_pci_qopen);
 PROC_DRIVER(procefi,  proc_efi_qopen);
+PROC_DRIVER(procnvme, proc_nvme_qopen);
 
 /* ---- /proc/ftrace --------------------------------------------------- */
 
@@ -784,6 +838,7 @@ void proc_init(void)
 	cdev_register(CDEV_MAJ_PROC_ACPI,   "proc-acpi",   &procacpi_streamtab);
 	cdev_register(CDEV_MAJ_PROC_PCI,    "proc-pci",    &procpci_streamtab);
 	cdev_register(CDEV_MAJ_PROC_EFI,    "proc-efi",    &procefi_streamtab);
+	cdev_register(CDEV_MAJ_PROC_NVME,   "proc-nvme",   &procnvme_streamtab);
 
 	struct dentry *proc = vfs_mkdir(vfs_root(), "proc");
 	vfs_mknod_chrdev(proc, "ps",       MKDEV(CDEV_MAJ_PROC_PS,     0));
@@ -798,4 +853,5 @@ void proc_init(void)
 	vfs_mknod_chrdev(proc, "acpi",     MKDEV(CDEV_MAJ_PROC_ACPI,   0));
 	vfs_mknod_chrdev(proc, "pci",      MKDEV(CDEV_MAJ_PROC_PCI,    0));
 	vfs_mknod_chrdev(proc, "efi",      MKDEV(CDEV_MAJ_PROC_EFI,    0));
+	vfs_mknod_chrdev(proc, "nvme",     MKDEV(CDEV_MAJ_PROC_NVME,   0));
 }

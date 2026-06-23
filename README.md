@@ -96,6 +96,7 @@ make test       # smoke-ftp + smoke-sdk + smoke-linux + smoke-linux-mmap
 | `uts/virt/efi_main.c`          | UEFI entry: ACPI 2.0 RSDP lookup + ExitBootServices               |
 | `uts/virt/acpi.c`              | Walk RSDP → XSDT → MADT/MCFG/GTDT/FADT (AWS.md stage C)           |
 | `uts/virt/pcie.c`              | ECAM bus enumeration; identifies AWS ENA + NVMe (AWS.md stage D)  |
+| `uts/virt/nvme.c`              | NVMe 1.4 block driver (polled, 512 B LBAs) (AWS.md stage F)       |
 | `tools/pad_pe.py`              | Pad `kernel.img` to PE SizeOfImage so EDK II accepts the load     |
 | `uts/os/core/pmm.c`            | 4 KB-page freelist allocator (spinlocked for SMP)                 |
 | `uts/os/core/kmem.c`           | Slab allocator + `kmalloc` size caches (lock order: kmem → pmm)   |
@@ -144,8 +145,9 @@ make test       # smoke-ftp + smoke-sdk + smoke-linux + smoke-linux-mmap
 | `/proc/acpi`      | ACPI RSDP / GIC bases / CPU MPIDRs / PCIe ECAM / timer GSIVs   |
 | `/proc/pci`       | PCIe enumeration: BDF, vid:did, class, header, MSI-X cap, BARs |
 | `/proc/efi`       | EFI memory map: type, physical_start, pages, end               |
+| `/proc/nvme`      | NVMe controller summary: vid, model, sn, fw, ns1 size          |
 
-The last three are populated only under the UEFI boot path; on
+The last four are populated only under the UEFI boot path; on
 `-kernel` they print a one-line "not present" stub.
 
 ## Docs

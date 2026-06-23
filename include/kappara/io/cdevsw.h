@@ -74,6 +74,7 @@ typedef uint32_t dev_t;
 #define CDEV_MAJ_PROC_ACPI	22	/* /proc/acpi -- ACPI table summary  */
 #define CDEV_MAJ_PROC_PCI	23	/* /proc/pci  -- PCIe device list    */
 #define CDEV_MAJ_PROC_EFI	24	/* /proc/efi  -- EFI memory map      */
+#define CDEV_MAJ_PROC_NVME	25	/* /proc/nvme -- NVMe controller info */
 
 #define CDEV_MAX		32
 

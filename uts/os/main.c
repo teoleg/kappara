@@ -29,6 +29,7 @@
 #include "kappara/arch/framebuffer.h"
 #include "kappara/arch/ipi.h"
 #include "kappara/arch/mmu.h"
+#include "kappara/arch/nvme.h"
 #include "kappara/arch/pcie.h"
 #include "kappara/arch/timer.h"
 #include "kappara/arch/trap.h"
@@ -414,6 +415,11 @@ void kmain(void)
 	 * the same reason -- exec_space_init mkimage's it empty. */
 	ramdisk_init();
 	ramdisk_home_init();
+	/* AWS.md stage F: NVMe probe.  No-op when no PCI-class-0x0108
+	 * controller is present (everything but UEFI on virt with
+	 * `-device nvme`).  Runs after kmem_init because the driver
+	 * pmm_alloc()s queue pages from a primed PMM. */
+	nvme_init();
 	exec_space_init();
 
 	/* Draw the boot splash now that everything else is up.  The FB

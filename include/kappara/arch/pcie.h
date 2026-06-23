@@ -56,4 +56,17 @@ extern uint8_t  pcie_bus_end;
  * code.  Logs one line per found device, plus a summary. */
 void pcie_init(void);
 
+/* Compute the 64-bit physical base address of a BAR.  Hides the
+ * "64-bit BAR = two adjacent 32-bit entries" wrinkle: returns
+ * `bar[i+1]<<32 | (bar[i] & ~0xf)` when bar[i] is the low half of
+ * a 64-bit memory BAR (type bits 2:1 == 10), or `bar[i] & ~0xf`
+ * for 32-bit memory BARs.  Returns 0 if `idx` doesn't point at a
+ * memory BAR (I/O BAR or unused slot). */
+uint64_t pcie_bar_addr(const struct pci_device *p, unsigned idx);
+
+/* True if `bar[idx]` is the low half of a 64-bit BAR (caller
+ * should skip idx+1 when walking).  Cheap helper so the driver
+ * doesn't have to remember the BAR encoding. */
+int      pcie_bar_is_64(const struct pci_device *p, unsigned idx);
+
 #endif /* KAPPARA_ARCH_PCIE_H */

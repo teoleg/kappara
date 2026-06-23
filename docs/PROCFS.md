@@ -348,6 +348,29 @@ PMM starts above `__kernel_end` so the question doesn't arise;
 when stage D consumes the EFI memory map directly it'll filter
 this type explicitly.
 
+### /proc/nvme
+
+NVMe controller summary populated by `nvme_init()` (AWS.md stage F)
+after Identify Controller + Identify Namespace land.  Useful for
+confirming the model + namespace size match what we booted with.
+
+```
+kappara:/# cat /proc/nvme
+version:     1.4.0
+bar0:        0x8000000000
+vid:         0x1b36
+model:       QEMU NVMe Ctrl
+serial:      kapparanvme
+firmware:    8.2.2
+ns1_blocks:  32768
+ns1_lba:     512 bytes
+ns1_size:    16 MB
+```
+
+Empty / "no controller" line when no PCI device with class
+0x0108 (Mass Storage / NVM controller) was found -- the usual
+`-kernel` case.
+
 ## How to add a new /proc entry
 
 Three steps:

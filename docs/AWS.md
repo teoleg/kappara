@@ -278,17 +278,91 @@ above (`ip_attach_stream` etc) stays unchanged.
 After this stage `make ARCH=aws64 run-telnet` works for a real
 EC2 instance with a public IP.
 
-### Stage F -- NVMe block driver + EBS root
+### Stage F -- NVMe block driver
+
+Status: `[x]` (driver live; kfs-on-NVMe mount comes later)
+
+Polled NVMe 1.4 driver.  Lives in `uts/virt/nvme.[ch]`; entry
+point `nvme_init()` called from kmain after `ramdisk_*_init` and
+before `exec_space_init`.  Detects the controller by PCI class
+0x0108 (Mass Storage / NVM controller), not by vendor:device --
+QEMU's NVMe is `1b36:0010`, Amazon EBS is `1d0f:8061`, both match.
+
+What landed:
+
+- Controller bring-up follows NVMe 1.4 §3.5.1: disable, wait
+  CSTS.RDY=0, allocate Admin SQ/CQ from PMM, program AQA/ASQ/ACQ,
+  set CC (IOSQES=6, IOCQES=4, CSS=NVM, MPS=4KB, EN=1), wait
+  CSTS.RDY=1.
+- PCI Command register Memory-Space + Bus-Master bits set
+  explicitly before any MMIO -- UEFI's PCI bus driver leaves
+  those clear on devices it didn't drive itself, and without
+  them the BAR window reads back all-ones.
+- Identify Controller + Identify Namespace (NSID=1); model,
+  serial, firmware, namespace LBA count + size recorded into
+  `nvme_singleton_info` for `/proc/nvme`.
+- One I/O queue pair created (admin opc 0x05 + 0x01), depth 32.
+- `struct block_device` adapter named `nvme0n1` wired with
+  bd_read / bd_write that submit a single NVM Read (0x02) or
+  Write (0x01) per call (NLB=0), polled.  Only 512-byte LBAs
+  are accepted -- 4 KB namespaces would need translation.
+- Built-in self-test runs at the end of nvme_init: writes a
+  known pattern to LBA 0, reads it back, byte-compares.  Logs
+  `nvme: selftest PASS` -- catches regressions in the entire
+  bring-up + queue path the moment they happen.
+
+Two infrastructure pieces landed alongside:
+
+- `mmu_map_device_1gb()` now walks L0 too and lazily allocates
+  a fresh L1 page from the PMM for L0[1+] entries.  Required:
+  QEMU virt's highmem PCIe MMIO sits at 0x8000000000 (= 512 GB,
+  the very start of L0[1]).  Previous version masked the L1
+  index to 9 bits and would have stomped L1[0] (the low 1 GB
+  identity map).
+- `pcie_bar_addr()` + `pcie_bar_is_64()` helpers in
+  `kappara/arch/pcie.h` -- decode 32 vs 64-bit memory BARs
+  (low/high split) so drivers don't repeat the bit-twiddling.
+
+Verified end-to-end under AAVMF + QEMU virt with
+`-device nvme,drive=nvm,serial=...`:
+  - probe + Identify works
+  - 512 B selftest passes
+  - host-side `nvme.img` file contains the kernel-written pattern
+    (byte[i] = 0xA5 ^ i) -- persistence proven across qemu
+    process boundary
+  - `/proc/nvme` returns the controller summary (version, vid,
+    model, serial, firmware, namespace size)
+
+`make test` still ALL TESTS PASS (14/14) on the `-kernel` path
+where there's no NVMe device (driver is a no-op).
+
+What's still missing (next iteration, not blocking stage G):
+
+- kfs-on-nvme mount (boot `/usr/bin` + `/home` off EBS instead
+  of in-RAM ramdisks).  The block_device is registered; it
+  just isn't wired into `kfs_mount` yet.
+- MSI-X interrupts.  We poll today; on a real Graviton workload
+  we'd want to sleep on completion via a per-queue wait queue.
+- Multi-block transfers + PRP2 / SGL.  Today's bd_read/write
+  is one LBA per call.
+
+### Stage F.1 -- kfs root on NVMe / EBS
 
 Status: `[ ]`
 
-NVMe is industry standard.  Single namespace (NSID=1), 4 KB
-blocks, polled completion to start (MSI-X later if needed).
+Mount kfs on top of `nvme0n1` (or whichever namespace EBS hands
+us on Graviton) instead of the in-RAM `ramdisk0`.  Two pieces:
 
-We wire NVMe under the existing `struct block_device` shape so
-kfs mounts it the same way it mounts our ramdisks today.  Big
-deal: `/usr/bin` and `/home` come off EBS instead of being baked
-into the kernel image.  Survives reboots.
+- `kfs_mount` already takes any `struct block_device` -- swap
+  the source from `ramdisk_get()` to `nvme_get()` for the
+  `/usr/bin` (and possibly `/home`) mount.
+- Hand-roll a tiny mkfs that writes a fresh kfs image to the
+  raw EBS namespace when AMI build time, so the first boot
+  finds populated content rather than zeros.
+
+After this, `/usr/bin` and `/home` survive reboots.  Big deal:
+the kernel image stops embedding `userblob.o` / `helloblob.o`,
+which trims it.
 
 ### Stage G -- Polish + sample AMI build
 
