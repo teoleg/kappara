@@ -156,24 +156,45 @@ is unchanged.
 
 ### Stage C -- ACPI parser
 
-Status: `[ ]`
+Status: `[x]`
 
-Minimal ACPI table walker.  We don't need a full AML interpreter
-(that's a different order of magnitude); we only need the static
-tables:
+Minimal ACPI table walker -- no AML.  Driven by the RSDP pointer
+that stage B stashed when efi_main walked the EFI Configuration
+Table.  Lives in `uts/virt/acpi.[ch]`; entry point is
+`acpi_init()`, called from kmain right after `mmu_init`.
 
-- **RSDP** -- root pointer, we already have it from EFI config table.
-- **XSDT** -- table of pointers to other tables, walked by name.
-- **MADT** -- GIC v3 distributor base, redistributor base,
-  per-CPU info.  Today's `virt` uses hardcoded constants; here
-  we read them.
-- **MCFG** -- PCIe ECAM base address (config space lives at
-  ECAM_base + (bus<<20) + (dev<<15) + (fn<<12)).
-- **GTDT** -- generic timer info (CNTFRQ, IRQ numbers).
-- **FADT** -- random platform flags + IO ports we mostly ignore.
+What landed:
 
-After this stage we can wire up GIC + timer dynamically.  No new
-device drivers yet.
+- **RSDP**: validated against "RSD PTR " signature, ACPI 2.0+
+  revision, and BOTH the 20-byte (1.0 compat) and full-length
+  checksums.  Failures log and bail rather than wire later stages
+  off bogus data.
+- **XSDT**: signature + checksum validated; entries iterated by
+  4-char signature lookup.
+- **MADT** ("APIC"): sub-entries walked by type.
+    - GICC (0x0B) per CPU -- arm_mpidr + Enabled flag, recorded
+      into `acpi_cpu_mpidr[]`/`acpi_nr_cpus` (cap ACPI_MAX_CPUS=32).
+    - GICD (0x0C) -- `acpi_gicd_base`, `acpi_gic_version`.
+    - GICR (0x0E) -- `acpi_gicr_base`/`acpi_gicr_length`.
+    - MSI/ITS skipped for now; stage E reads them.
+- **MCFG**: first allocation's ECAM base + bus range recorded
+  (`acpi_pcie_ecam_base`, `acpi_pcie_bus_start/end`).
+- **GTDT**: non-secure EL1 + virtual EL1 timer GSIVs recorded
+  for stage D's dynamic timer wire-up.
+- **FADT** ("FACP"): flags word stashed; rest deferred.
+
+Stage C only reads + prints (one `acpi:` line per table).
+Hardcoded `PLAT_GIC_*` constants in `uts/aarch64/platform/virt.h`
+still drive the running kernel.  Stage D will swap those for the
+discovered values + walk MCFG to enumerate PCIe.
+
+Boot path coverage:
+
+- UEFI boot: full parse; logs RSDP/XSDT addresses, GIC version,
+  CPU MPIDRs, ECAM base + bus range, timer GSIVs.
+- `-kernel`: `efi_acpi_rsdp` is NULL; `acpi_init` logs one
+  "no RSDP" line and returns.  Verified -- `make test` still
+  reports ALL TESTS PASS.
 
 ### Stage D -- PCIe ECAM bus enumeration
 

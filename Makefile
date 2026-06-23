@@ -31,6 +31,7 @@ ARCH_OBJS   := \
     $(BUILD)/uts/virt/virtio_net.o \
     $(BUILD)/uts/virt/telnetd.o \
     $(BUILD)/uts/virt/efi_main.o \
+    $(BUILD)/uts/virt/acpi.o \
     $(BUILD)/uts/aarch64/userblob.o \
     $(BUILD)/uts/aarch64/helloblob.o \
     $(BUILD)/uts/aarch64/usrblobs.o
