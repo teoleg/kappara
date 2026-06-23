@@ -348,7 +348,9 @@ void kmain(void)
 	 * acpi_init only reads + prints; stage D consumes its globals. */
 	{
 		extern void acpi_init(void);
+		extern void pcie_init(void);
 		acpi_init();
+		pcie_init();
 	}
 
 	/* framebuffer_init must run before pmm_init so we can exclude

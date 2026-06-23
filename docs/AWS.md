@@ -198,18 +198,66 @@ Boot path coverage:
 
 ### Stage D -- PCIe ECAM bus enumeration
 
-Status: `[ ]`
+Status: `[x]`
 
 Walk PCIe bus 0..255 / dev 0..31 / fn 0..7 using the ECAM base
-from MCFG.  For each visible device:
+from MCFG.  Lives in `uts/virt/pcie.[ch]`; entry point
+`pcie_init()` called from kmain right after `acpi_init`.
 
-- Read Vendor ID / Device ID; recognise:
-  - 0x1d0f / 0xec20 -- AWS ENA
-  - 0x1d0f / 0x8061 -- AWS NVMe (EBS)
-- Read BARs, MSI-X capability, configure interrupt vectors.
+What landed:
 
-After this stage we print "PCIe: found 2 devices" -- nothing's
-driving them yet.
+- ECAM math: `ecam_base + (bus<<20) + (dev<<15) + (fn<<12)` for
+  each function's 4 KB config window.  Endpoint records go into
+  `pci_devs[]` (cap `PCI_MAX_DEVS=32`): vendor/device IDs,
+  class+subclass, prog-if, revision, header type, all 6 BAR
+  values (raw, not sized), and the MSI-X capability offset (0
+  if absent).
+- Capability list walked from offset 0x34 looking for cap id
+  0x11 (MSI-X); cap chain bounded to 48 hops to defend against
+  malformed devices.
+- AWS hardware IDs called out by name in the per-device log line
+  (Amazon vendor `0x1d0f`: ENA `0xec20`, NVMe `0x8061`).
+- Multi-function devices probed by checking header-type bit 7
+  on fn 0.
+
+Two non-obvious things this stage needed before ECAM reads
+could even land:
+
+- `uts/aarch64/mmu.c` TCR_EL1.IPS bumped from 36-bit (64 GB) to
+  44-bit (16 TB) PA.  QEMU virt's highmem PCIe ECAM sits at
+  `0x4010000000` -- well above 36 bits -- and tried to MMIO-read
+  it caused an Address Size Fault at L1 (ESR DFSC = 0x01).
+- New `mmu_map_device_1gb(va)` helper (mmu.h + mmu.c) writes a
+  1 GB Device-nGnRE L1 block for the ECAM base; `pcie_init`
+  calls it before any config-space load so the 1 GB window is
+  reachable.  Boot identity map alone only covers 0..2 GB.
+
+Boot-path coverage:
+
+- UEFI (AAVMF): real ACPI MCFG present, full enumeration runs.
+  Verified with `-device virtio-blk-pci`: finds host bridge
+  (`1b36:0008` class 0x0600) and the virtio-blk endpoint
+  (`1af4:1001` class 0x0100).
+- `-kernel`: no MCFG, one-line skip and return.  We do NOT
+  fall back to QEMU virt's static ECAM base (0x3F000000) -- the
+  region is reserved in the memory map but gpex returns
+  synchronous external aborts for unmapped buses, breaking the
+  walk.  Trade-off accepted: dev exercise runs through ACPI;
+  raw `-kernel` developers can still iterate on the rest of
+  the kernel without PCI.
+
+Two parallel boot.S corrections lived alongside Stage D because
+they had to ship together to actually exercise the UEFI path:
+
+- PE section characteristics changed from RX (`0x60000020`) to
+  RWX (`0xE0000020`).  BSS lives in this single section and
+  efi_main's first stack push faulted inside EFI's mapping.
+- Boot path after a successful `efi_main` now jumps to a new
+  `.Lpost_bss` label, skipping the BSS-clear loop that was
+  wiping `efi_acpi_rsdp` / `efi_memmap_*` between efi_main
+  finishing and kmain starting.  BSS is already zero in the
+  loaded image because `objcopy -O binary` + `tools/pad_pe.py`
+  zero-fill the on-disk file out to SizeOfImage.
 
 ### Stage E -- ENA network driver
 

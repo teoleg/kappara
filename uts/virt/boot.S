@@ -145,11 +145,16 @@ extra_header_fields:
 section_table:
 	/* .text -- covers everything past the PE headers (file offset
 	 * 0x1000 onward).  Pre-0x1000 bytes are the headers themselves,
-	 * which UEFI maps separately via SizeOfHeaders.  EFI maps the
-	 * section as RX; the kernel's BSS lives in this section too,
-	 * which means we technically declare BSS as RX -- harmless since
-	 * by the time anything writes to BSS we've already brought up
-	 * our own MMU tables. */
+	 * which UEFI maps separately via SizeOfHeaders.  Declared RWX,
+	 * not RX: BSS (including stack_top) lives in this single
+	 * section, and efi_pe_entry's `stp x29,x30,[sp,#-..]!` writes
+	 * to stack before mmu_init has rebuilt the page tables.  A
+	 * read-only PE section made that store fault inside EFI's
+	 * mapping (synchronous exception at efi_main+4).  Linux's
+	 * arm64 kernel splits the image into multiple PE sections
+	 * with their own protections; we keep one section for
+	 * simplicity and rely on mmu_init to set the right kernel-
+	 * mode protections in our own tables once we own the MMU. */
 	.ascii	".text\0\0\0"			/* Name (8 bytes) */
 	.long	_text_section_size_lo32		/* VirtualSize */
 	.long	_text_rva			/* VirtualAddress (= 0x1000) */
@@ -159,10 +164,12 @@ section_table:
 	.long	0				/* PointerToLinenumbers */
 	.short	0				/* NumberOfRelocations */
 	.short	0				/* NumberOfLineNumbers */
-	.long	0x60000020			/* Characteristics:
+	.long	0xE0000020			/* Characteristics:
 						 *   IMAGE_SCN_CNT_CODE (0x00000020)
 						 * + IMAGE_SCN_MEM_EXECUTE (0x20000000)
-						 * + IMAGE_SCN_MEM_READ (0x40000000) */
+						 * + IMAGE_SCN_MEM_READ (0x40000000)
+						 * + IMAGE_SCN_MEM_WRITE (0x80000000)
+						 * -- BSS lives here, EFI must map RW. */
 section_table_end:
 
 	/* The PE header must occupy at most SizeOfHeaders bytes, and the
@@ -203,10 +210,26 @@ efi_pe_entry:
 	mov	x1, x20
 	bl	efi_main
 
-	/* On success, fall through to the regular kernel boot path.
-	 * x0 holds efi_main's return value (EFI_SUCCESS = 0). */
+	/* On success, jump directly to kmain via the post-BSS-clear
+	 * label.  We MUST NOT run the regular .Lreal_start path: its
+	 * .Lin_el1 epilogue zeros BSS, which would wipe the
+	 * efi_acpi_rsdp / efi_memmap_* fields efi_main just wrote.
+	 * BSS is already zero on entry under EFI because objcopy -O
+	 * binary zero-fills NOBITS and tools/pad_pe.py extends the
+	 * file to SizeOfImage, so EDK II loads zero bytes into the
+	 * BSS portion of our single PE section.  We also know
+	 * UEFI/AArch64 always hands off at EL1, so the EL3/EL2
+	 * lowering dance in .Lreal_start is unnecessary -- the
+	 * sctlr/cnthctl/hcr setup happens later in mmu_init. */
 	cbnz	x0, .Lefi_halt
-	b	.Lreal_start
+
+	/* Re-anchor sp on stack_top: efi_main's callee-saved prologue
+	 * adjusted sp, and we want kmain to enter with the same
+	 * pointer the `-kernel` path uses. */
+	adrp	x0, stack_top
+	add	x0, x0, :lo12:stack_top
+	mov	sp, x0
+	b	.Lpost_bss
 .Lefi_halt:
 	wfi
 	b	.Lefi_halt
@@ -296,6 +319,7 @@ efi_pe_entry:
 	str	xzr, [x0], #8
 	b	1b
 2:
+.Lpost_bss:
 	bl	kmain
 
 	/* kmain should never return.  If it does, halt. */

@@ -137,13 +137,24 @@ path acquires them in the reverse order, so deadlock is impossible.
 
 ### MMU
 
-Single TTBR0 covering 0..1 GiB.  L0/L1/L2 with the L2 split into 2 MB
-blocks.  Most blocks are Normal cacheable inner-shareable.  The
-peripheral window (0x3F000000..0x40000000 on Pi 3) is Device-nGnRE.
+Single TTBR0 covering 0..2 GiB by default (L1[0] through L2 covers
+0..1 GiB; L1[1] covers the 1 GiB block at 0x40000000 -- Normal cacheable
+on virt where it holds RAM, Device on the retired Pi path where it held
+local peripherals).  L0/L1/L2 with the L2 split into 2 MB blocks.  Most
+L2 blocks are Normal cacheable inner-shareable; the peripheral window
+(`PLAT_PERIPH_BASE`..`PLAT_PERIPH_END`, 0x08000000..0x40000000 on
+virt) is Device-nGnRE.
 
 `mmu_map_user_2mb(va, pa)` overrides one L2 block with user-accessible
 attributes (AP[2:1] = 01).  That's the userspace 2 MB at VA
 0x10000000.
+
+`mmu_map_device_1gb(va)` installs a 1 GB Device-nGnRE L1 block for
+high-mem MMIO outside the default 0..2 GB window -- e.g. QEMU virt's
+highmem PCIe ECAM at 0x4010000000, or any AWS Graviton MCFG entry
+above 2 GB.  AWS.md stage D's `pcie_init` uses it before the first
+ECAM read.  TCR_EL1.IPS is 44-bit (16 TB PA) so addresses that high
+don't trip an Address Size Fault at the L1 walk.
 
 ### User address space layout
 
