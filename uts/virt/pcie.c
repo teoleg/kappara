@@ -25,8 +25,8 @@
  * bar[i+1] but skip past i+1 when walking the rest.
  */
 
-#include "pcie.h"
-#include "acpi.h"
+#include "kappara/arch/pcie.h"
+#include "kappara/arch/acpi.h"
 #include "kappara/arch/mmu.h"
 #include "kappara/core/printk.h"
 

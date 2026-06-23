@@ -1,5 +1,5 @@
 /*
- * uts/virt/pcie.h -- AWS.md stage D: PCIe ECAM enumeration.
+ * include/kappara/arch/pcie.h -- AWS.md stage D: PCIe ECAM enumeration.
  *
  * Walks the PCIe configuration space via ECAM (PCIe-specific
  * memory-mapped config window).  ECAM math:
@@ -10,8 +10,8 @@
  * present device (vendor != 0xFFFF) into pci_devs[]; stage E (ENA)
  * and stage F (NVMe) iterate this list to find their hardware.
  */
-#ifndef UTS_VIRT_PCIE_H
-#define UTS_VIRT_PCIE_H
+#ifndef KAPPARA_ARCH_PCIE_H
+#define KAPPARA_ARCH_PCIE_H
 
 #include <stdint.h>
 
@@ -56,4 +56,4 @@ extern uint8_t  pcie_bus_end;
  * code.  Logs one line per found device, plus a summary. */
 void pcie_init(void);
 
-#endif /* UTS_VIRT_PCIE_H */
+#endif /* KAPPARA_ARCH_PCIE_H */

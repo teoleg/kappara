@@ -1,5 +1,5 @@
 /*
- * uts/virt/acpi.h -- ACPI static-table layouts + discovery API.
+ * include/kappara/arch/acpi.h -- ACPI static-table layouts + discovery API.
  *
  * AWS.md stage C.  We only consume the data tables; no AML.  All
  * structs match the ACPI 6.4 spec exactly, packed to 1 byte
@@ -8,8 +8,8 @@
  * fields).  Field widths are explicit-size types so the layout is
  * fixed across builds.
  */
-#ifndef UTS_VIRT_ACPI_H
-#define UTS_VIRT_ACPI_H
+#ifndef KAPPARA_ARCH_ACPI_H
+#define KAPPARA_ARCH_ACPI_H
 
 #include <stdint.h>
 
@@ -213,4 +213,4 @@ extern uint32_t  acpi_timer_ns_el1_gsiv;	/* GTDT */
 extern uint32_t  acpi_timer_virt_el1_gsiv;	/* GTDT */
 extern uint64_t  acpi_fadt_flags;	/* FADT flags, 32 bits zero-extended */
 
-#endif /* UTS_VIRT_ACPI_H */
+#endif /* KAPPARA_ARCH_ACPI_H */

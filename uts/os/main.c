@@ -25,9 +25,11 @@
 #include <stdint.h>
 
 #include "kappara/abi/syscall.h"
+#include "kappara/arch/acpi.h"
 #include "kappara/arch/framebuffer.h"
 #include "kappara/arch/ipi.h"
 #include "kappara/arch/mmu.h"
+#include "kappara/arch/pcie.h"
 #include "kappara/arch/timer.h"
 #include "kappara/arch/trap.h"
 #include "kappara/arch/uart.h"
@@ -340,18 +342,14 @@ void kmain(void)
 
 	mmu_init();
 
-	/* AWS.md stage C: walk the ACPI static tables (if booted via
-	 * UEFI -- skipped silently on `-kernel`).  Must run after
-	 * mmu_init so any cross-mapping the firmware left behind is
-	 * stable, and before pmm_init so future stages can subtract
-	 * ACPI_RECLAIM regions before they get enrolled.  Today
-	 * acpi_init only reads + prints; stage D consumes its globals. */
-	{
-		extern void acpi_init(void);
-		extern void pcie_init(void);
-		acpi_init();
-		pcie_init();
-	}
+	/* AWS.md stage C+D: walk the ACPI static tables and the PCIe
+	 * ECAM bus (only meaningful under UEFI -- skipped silently on
+	 * `-kernel`).  Must run after mmu_init so any cross-mapping
+	 * the firmware left behind is stable, and before pmm_init so
+	 * future stages can subtract ACPI_RECLAIM regions before they
+	 * get enrolled. */
+	acpi_init();
+	pcie_init();
 
 	/* framebuffer_init must run before pmm_init so we can exclude
 	 * the GPU's reserved region from the freelist.  See the comment

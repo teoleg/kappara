@@ -55,15 +55,12 @@ typedef struct {
 	uint32_t           reserved;
 } efi_table_header_t;
 
-/* EFI memory descriptor, as returned by GetMemoryMap. */
-typedef struct {
-	uint32_t type;
-	uint32_t pad;
-	uint64_t physical_start;
-	uint64_t virtual_start;
-	uint64_t number_of_pages;
-	uint64_t attribute;
-} efi_memory_descriptor_t;
+/* EFI memory descriptor, as returned by GetMemoryMap.  The struct
+ * definition lives in the public header so /proc/efi can walk the
+ * map; here we just create the typedef alias the EFI Boot Services
+ * call shape expects. */
+#include "kappara/arch/efi.h"
+typedef struct efi_memory_descriptor efi_memory_descriptor_t;
 
 /* Boot Services -- a fat dispatch table of function pointers we
  * call into.  Only the entries we need are typed; the rest are

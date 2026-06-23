@@ -1,24 +1,40 @@
 # kappara
 
-A small SVR4-flavored Unix-like operating system for AArch64 (Raspberry Pi 3
-on QEMU today, eventually real Pi 4 hardware).  All four cores boot and
-run an SVR4-style per-CPU dispatcher — each core has its own dispq, idle
-thread, and `cpu_thread`; cross-CPU steal works.
+A small SVR4-flavored Unix-like operating system for AArch64.  Develops on
+QEMU `virt` (`qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72`)
+and is on the runway to boot on AWS Graviton (EC2 EFI / UEFI) via the
+staged transition described in `docs/AWS.md`.
+
+The same `build/kernel.img` boots two ways:
+
+- `qemu-system-aarch64 -kernel build/kernel.img` (dev loop, fast): QEMU
+  consumes the Linux ARM64 Image header at offset 0.
+- UEFI / AAVMF (Graviton, AAVMF in QEMU): the same 64 bytes double as a
+  PE32+ DOS header (`MZ` is an AArch64 `add x13, x18, #0x16`), the rest
+  of the PE/COFF + section table is laid out by `uts/virt/boot.S`, and
+  EDK II jumps to our `efi_pe_entry`.
 
 The kernel uses SVR4 STREAMS for all character I/O — pipes, ttys, /dev/loop,
 /dev/klog, /proc/*, the network stack — with module push/pop, queues, and
 message blocks matching the AT&T conventions (mblk_t / qinit / streamtab).
-Modules are discovered via `cdevsw[major]`.  Inode lifecycle follows vnode
+Drivers are discovered via `cdevsw[major]`.  Inode lifecycle follows vnode
 `v_count` and `vop_inactive`.  Signals are reliable (DEC/BSD-style:
-persistent handlers, sigmask, sigaction).  Numbering is POSIX (SIGTERM=15,
-SIGKILL=9, ...).
+persistent handlers, sigmask, sigaction).  Numbering is POSIX
+(SIGTERM=15, SIGKILL=9, ...).
 
-Networking is a STREAMS multiplexor: `/dev/ip` is the mux, ICMP / UDP / TCP
-are pushable modules above it, lo0 / slip0 are stream drivers underneath.
-TCP is the RFC 793 full state graph (LISTEN through TIME_WAIT) with a
-multi-accept backlog, RFC 6298 RTT estimation, exponential-backoff
-retransmit, and real receive-window advertisement driven by STREAMS
-backpressure.  See `docs/ARCHITECTURE.md` for the TCP phase table.
+Networking is a STREAMS multiplexor: `/dev/ip` is the mux, ICMP / UDP /
+TCP are pushable modules above it, lo0 / virtio-net / SLIP are stream
+drivers underneath.  TCP is the RFC 793 full state graph (LISTEN through
+TIME_WAIT) with a multi-accept backlog, RFC 6298 RTT estimation,
+exponential-backoff retransmit, and real receive-window advertisement
+driven by STREAMS backpressure.  See `docs/ARCHITECTURE.md` for the TCP
+phase table.
+
+Userspace boots through a small freestanding libc (`lib/libc/`) and an
+in-tree dynamic linker (`lib/ld-kappara/`) — `cmd/*` programs run from
+the in-RAM kfs as PIE ELFs, dlopen works against `lib/libdltest`, and
+Linux-ABI static-pie binaries built with raw aarch64 syscalls run
+unmodified on top of the syscall shim.
 
 No soup for you.
 
@@ -30,13 +46,15 @@ Install cross toolchain + QEMU:
 sudo apt-get install gcc-aarch64-linux-gnu qemu-system-aarch64
 ```
 
-Build and run (headless, gentle on host CPU):
+Build and run:
 
 ```
-make run-thrifty
+make            # produces build/kernel.img
+make run        # boot under QEMU virt, headless, on stdio
 ```
 
-You'll get the `kappara:/#` shell.  Type `help` to see commands.
+You'll get the `kappara:/#` shell.  Type `help` to see commands.  Boot
+to prompt is ~3 seconds on QEMU TCG.
 
 To quit:
 - **QEMU stdio escape:** `Ctrl-A` then `x` — note that if you're in
@@ -44,30 +62,41 @@ To quit:
   in screen, or the tmux prefix to escape it.
 - **Last resort:** `make stop` from another terminal kills any running QEMU.
 
+To verify the tree is healthy:
+
+```
+make test       # smoke-ftp + smoke-sdk + smoke-linux + smoke-linux-mmap
+                # + cmd/test all 14/14.  ~1 minute, all from one make.
+```
+
 ## Targets
 
 | Target            | What it does                                                       |
 |-------------------|--------------------------------------------------------------------|
-| `make`            | Build `build/aarch64/kernel8.img`                                  |
-| `make run`        | Boot under default QEMU args                                       |
-| `make run-thrifty`| Boot with `-display none -accel tcg,thread=single` (caps host CPU) |
-| `make run-gui`    | Boot with the splash window; needs working QEMU display backend    |
+| `make`            | Build `build/kernel.img` (single arch: QEMU virt → AWS Graviton)   |
+| `make run`        | Boot under default QEMU args (virt, gic v3, cortex-a72, headless)  |
+| `make run-telnet` | Boot with telnetd reachable on `localhost:2323`                    |
+| `make test`       | Full regression: 4 smoke binaries + `cmd/test` (14 cases)          |
 | `make stop`       | `pkill` any running QEMU process                                   |
 | `make clean`      | Remove `build/`                                                    |
+| `make TRACE=1 ...`| Build with the ftrace cyg-profile hooks enabled                    |
 
 ## What's inside
 
 | File / dir                     | Role                                                              |
 |--------------------------------|-------------------------------------------------------------------|
-| `uts/aarch64/boot.S`          | Reset vector, EL3/EL2 → EL1 transition, secondary-core park       |
-| `uts/aarch64/vectors.S`       | Exception vector table + KERNEL_ENTRY/EXIT macros                 |
-| `uts/aarch64/trap.c`          | Trap dispatch, register dump, EL0-fault → SIGSEGV                 |
-| `uts/aarch64/mmu.c`           | Identity-map page tables, MMU enable                              |
-| `uts/aarch64/switch.S`        | `context_switch` with per-thread DAIF save/restore                |
-| `uts/aarch64/timer.c`         | Generic timer @ 100 Hz                                            |
-| `uts/aarch64/framebuffer.c`   | VC mailbox framebuffer + drawing primitives                       |
-| `uts/aarch64/fbcon.c`         | Framebuffer text console (kprintf-tee off by default)             |
-| `uts/aarch64/kallsyms_stub.S` | Pass-1 placeholder for the symbol-table link                      |
+| `uts/virt/boot.S`              | Reset vector + PE32+ EFI Application header + EL2 → EL1 transition |
+| `uts/aarch64/vectors.S`        | Exception vector table + KERNEL_ENTRY/EXIT macros                 |
+| `uts/aarch64/trap.c`           | Trap dispatch, register dump, EL0-fault → SIGSEGV                 |
+| `uts/aarch64/mmu.c`            | Identity-map page tables (44-bit PA), MMU enable, vmap_*          |
+| `uts/aarch64/switch.S`         | `context_switch` with per-thread DAIF save/restore                |
+| `uts/virt/timer.c`             | Generic timer @ 100 Hz                                            |
+| `uts/virt/gic.c`               | GIC v3 distributor + redistributor + sysreg CPU interface         |
+| `uts/virt/virtio_net.c`        | virtio-mmio network driver                                        |
+| `uts/virt/efi_main.c`          | UEFI entry: ACPI 2.0 RSDP lookup + ExitBootServices               |
+| `uts/virt/acpi.c`              | Walk RSDP → XSDT → MADT/MCFG/GTDT/FADT (AWS.md stage C)           |
+| `uts/virt/pcie.c`              | ECAM bus enumeration; identifies AWS ENA + NVMe (AWS.md stage D)  |
+| `tools/pad_pe.py`              | Pad `kernel.img` to PE SizeOfImage so EDK II accepts the load     |
 | `uts/os/core/pmm.c`            | 4 KB-page freelist allocator (spinlocked for SMP)                 |
 | `uts/os/core/kmem.c`           | Slab allocator + `kmalloc` size caches (lock order: kmem → pmm)   |
 | `uts/os/proc/sched.c`          | Per-CPU dispatcher, wait queues, reap path                        |
@@ -79,7 +108,7 @@ To quit:
 | `uts/os/fs/vfs.c`              | In-memory dentry/inode tree, fd table, vnode v_count              |
 | `uts/os/fs/kfs.c`              | "kappara filesystem" — superblock + bitmap + dirent table         |
 | `uts/os/fs/ramdisk.c`          | Block device backing kfs                                          |
-| `uts/os/fs/procfs.c`           | `/proc/{ps,meminfo,slabinfo,streams,ftrace,netif,slip,tcp,cpuload}` |
+| `uts/os/fs/procfs.c`           | `/proc/*` STREAMS chrdevs (see list below)                        |
 | `uts/os/net/ipv4.c`            | IP multiplexor (`/dev/ip`), per-proto fan-out                     |
 | `uts/os/net/{icmp,udp,tcp}.c`  | Pushable TPI modules above IP                                     |
 | `uts/os/net/{lo,slip}.c`       | Stream drivers underneath IP (loopback, mini-UART SLIP)           |
@@ -90,10 +119,34 @@ To quit:
 | `uts/os/main.c`                | `kmain` orchestration                                             |
 | `user/init.c`                  | Userspace shell (ksh) — runs at EL0                               |
 | `user/syscall.h`               | User-side syscall numbers + inline asm wrappers                   |
-| `cmd/`                         | `/usr/bin` programs: `ps`, `ping`, `ifconfig`, `netstat`, `test`  |
+| `cmd/`                         | `/usr/bin` programs: `ps`, `ping`, `ifconfig`, `netstat`, `test`, `nm`, `ldd`, `objdump`, ... |
 | `lib/libc/`                    | Freestanding libc: crt0, printf, malloc, FILE*, string, io        |
+| `lib/ld-kappara/`              | User-space dynamic linker (relocates DT_NEEDED + DT_HASH)         |
+| `lib/libdltest/`               | Sample shared library exercised by `cmd/dltest`                   |
+| `attic/raspi3b/`               | Retired Raspberry Pi 3 sources (kept for history)                 |
 | `tools/gen_kallsyms.sh`        | nm + awk producing the symbol-table .S after pass-1 link          |
+| `tools/kappara-cc.in`          | SDK wrapper compiler used by `smoke-sdk`                          |
 | `docs/`                        | Reference documentation                                            |
+
+### `/proc` entries
+
+| File              | What it shows                                                  |
+|-------------------|----------------------------------------------------------------|
+| `/proc/ps`        | Threads: tid, state, priority, sched class, name               |
+| `/proc/meminfo`   | pmm free pages + slab totals                                   |
+| `/proc/slabinfo`  | Per-size-cache: name, obj_size, free / total                   |
+| `/proc/streams`   | Registered STREAMS modules and drivers                         |
+| `/proc/ftrace`    | Ring dump (read); `on`/`off`/`reset` (write)                   |
+| `/proc/cpuload`   | Per-CPU load + idle ratio                                      |
+| `/proc/netif`     | Registered network interfaces + IP/netmask                     |
+| `/proc/slip`      | slip0 byte/frame counters                                      |
+| `/proc/tcp`       | TCB table: state, ports, srtt, cwnd, ...                       |
+| `/proc/acpi`      | ACPI RSDP / GIC bases / CPU MPIDRs / PCIe ECAM / timer GSIVs   |
+| `/proc/pci`       | PCIe enumeration: BDF, vid:did, class, header, MSI-X cap, BARs |
+| `/proc/efi`       | EFI memory map: type, physical_start, pages, end               |
+
+The last three are populated only under the UEFI boot path; on
+`-kernel` they print a one-line "not present" stub.
 
 ## Docs
 
@@ -106,6 +159,9 @@ To quit:
 | `docs/ARCHITECTURE.md`   | Kernel internals: boot, MMU, scheduler, STREAMS, VFS, signals |
 | `docs/BUILDING.md`       | Toolchain, build flags, run modes, QEMU quirks            |
 | `docs/FTRACE.md`         | Per-CPU function tracer (`make TRACE=1`)                  |
+| `docs/AWS.md`            | Staged path from QEMU virt to AWS EC2 Graviton via UEFI   |
+| `docs/DYNAMIC.md`        | Dynamic linking roadmap (libc PIC → ld-kappara → dlopen)  |
+| `docs/INDIE.md`          | "Run independently-built Linux-ABI binaries" roadmap      |
 
 ## License
 

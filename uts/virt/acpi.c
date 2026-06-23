@@ -28,7 +28,7 @@
  *     is fine for development; AWS Graviton boots through UEFI.
  */
 
-#include "acpi.h"
+#include "kappara/arch/acpi.h"
 #include "kappara/core/printk.h"
 
 /* ---- Globals (see acpi.h for what's exported) ---- */
