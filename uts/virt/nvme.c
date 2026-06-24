@@ -559,33 +559,54 @@ void nvme_init(void)
 	kprintf("nvme: ready -- nvme0n1 = %u blocks of %u bytes\n",
 		d->bd.bd_nblocks, (unsigned)BLK_SIZE);
 
-	/* Self-test: write a known pattern to LBA 0, read it back, compare.
+	/* Self-test: round-trip a known pattern through the LAST LBA.
 	 * Picks up controller-bring-up / queue-creation / PRP regressions
-	 * the moment they happen, with no userland test rig needed. */
-	void *buf = pmm_alloc();
-	if (buf) {
+	 * the moment they happen, with no userland test rig needed.
+	 *
+	 * Pre-read the LBA before overwriting and restore the original
+	 * contents on the way out: stage F.1 wires /home on top of this
+	 * namespace and the kfs superblock cannot tolerate the selftest
+	 * pattern landing on LBA 0.  We use the highest LBA partly so
+	 * kfs's growing bitmap won't reach it in normal use, but also
+	 * write-then-restore so even a tightly-packed namespace stays
+	 * byte-identical across boots. */
+	void *buf  = pmm_alloc();
+	void *save = pmm_alloc();
+	uint32_t test_lba = d->bd.bd_nblocks - 1;
+	if (buf && save) {
+		int ok = 0;
 		uint8_t *p = buf;
-		for (int i = 0; i < BLK_SIZE; i++)
-			p[i] = (uint8_t)(0xA5 ^ i);
-		if (nvme_bd_write(&d->bd, 0, buf) < 0) {
-			kprintf("nvme: selftest write FAIL\n");
+		if (nvme_bd_read(&d->bd, test_lba, save) < 0) {
+			kprintf("nvme: selftest pre-read FAIL\n");
 		} else {
-			kmemset(buf, 0, BLK_SIZE);
-			if (nvme_bd_read(&d->bd, 0, buf) < 0) {
-				kprintf("nvme: selftest read FAIL\n");
+			for (int i = 0; i < BLK_SIZE; i++)
+				p[i] = (uint8_t)(0xA5 ^ i);
+			if (nvme_bd_write(&d->bd, test_lba, buf) < 0) {
+				kprintf("nvme: selftest write FAIL\n");
 			} else {
-				int ok = 1;
-				for (int i = 0; i < BLK_SIZE; i++) {
-					if (p[i] != (uint8_t)(0xA5 ^ i)) {
-						ok = 0; break;
+				kmemset(buf, 0, BLK_SIZE);
+				if (nvme_bd_read(&d->bd, test_lba, buf) < 0) {
+					kprintf("nvme: selftest read FAIL\n");
+				} else {
+					ok = 1;
+					for (int i = 0; i < BLK_SIZE; i++) {
+						if (p[i] != (uint8_t)(0xA5 ^ i)) {
+							ok = 0; break;
+						}
 					}
 				}
-				kprintf("nvme: selftest %s\n",
-					ok ? "PASS" : "FAIL (data mismatch)");
+				/* Always try to put the original bytes back,
+				 * even on a data mismatch -- otherwise a
+				 * single selftest failure permanently corrupts
+				 * the disk. */
+				(void)nvme_bd_write(&d->bd, test_lba, save);
 			}
 		}
-		pmm_free(buf);
+		kprintf("nvme: selftest %s\n",
+			ok ? "PASS" : "FAIL (data mismatch)");
 	}
+	if (buf)  pmm_free(buf);
+	if (save) pmm_free(save);
 }
 
 struct block_device *nvme_get(void)

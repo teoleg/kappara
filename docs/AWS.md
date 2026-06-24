@@ -346,23 +346,52 @@ What's still missing (next iteration, not blocking stage G):
 - Multi-block transfers + PRP2 / SGL.  Today's bd_read/write
   is one LBA per call.
 
-### Stage F.1 -- kfs root on NVMe / EBS
+### Stage F.1 -- kfs `/home` on NVMe / EBS
 
-Status: `[ ]`
+Status: `[x]` (mount + first-boot mkimage; persistent across reboots)
 
-Mount kfs on top of `nvme0n1` (or whichever namespace EBS hands
-us on Graviton) instead of the in-RAM `ramdisk0`.  Two pieces:
+Mount kfs on top of `nvme0n1` for `/home`.  Stays on the in-RAM
+`ramdisk0` for `/usr/bin` (those are immutable kernel-embedded
+ELFs; persistence there is meaningless until we move the build
+to "ship binaries via AMI" in stage G).
 
-- `kfs_mount` already takes any `struct block_device` -- swap
-  the source from `ramdisk_get()` to `nvme_get()` for the
-  `/usr/bin` (and possibly `/home`) mount.
-- Hand-roll a tiny mkfs that writes a fresh kfs image to the
-  raw EBS namespace when AMI build time, so the first boot
-  finds populated content rather than zeros.
+What landed in `uts/os/user/user.c::exec_space_init`:
 
-After this, `/usr/bin` and `/home` survive reboots.  Big deal:
-the kernel image stops embedding `userblob.o` / `helloblob.o`,
-which trims it.
+- If `nvme_get()` returns a block_device, use it for `/home`;
+  otherwise fall back to `ramdisk_home_get()`.
+- First-boot logic: try `kfs_mount` straight away.  If it
+  reports bad magic (= raw / freshly created namespace),
+  `kfs_mkimage` it as an empty kfs, then mount.  On a
+  reboot with a populated disk the first mount succeeds
+  and no mkimage runs -- preserving everything.
+
+Two bugs landed alongside, both regressed by stage F:
+
+- `mmu_vmap_create` now copies every populated `l0_table[1+]`
+  entry into per-process L0s, not just the kernel L1[1].  Stage
+  F's `mmu_map_device_1gb` for the NVMe BAR at 0x8000000000
+  populates `l0_table[1]`; without inheriting that, the first
+  exec'd user thread doing kfs I/O page-faults inside
+  `nvme_io_submit_and_wait`'s doorbell write.
+
+- `nvme_init`'s selftest no longer clobbers LBA 0.  It now
+  pre-reads the LAST LBA, writes the pattern there, reads
+  back, then restores the original bytes -- so the round-trip
+  is byte-neutral on the disk and the kfs superblock (block 0)
+  survives.
+
+End-to-end persistence verified under AAVMF + virt + a real
+`nvme.img`:
+
+```
+phase 1 (fresh disk): touch /home/hello; echo /home/hello text; halt
+phase 2 (same img):   cat /home/hello   -> "text"
+```
+
+The phase-2 log shows `exec: /home mounted from nvme0n1
+(persistent)` rather than `formatted + mounted` -- proving the
+on-disk superblock is recognised and we skipped the mkimage
+fallback.
 
 ### Stage G -- Polish + sample AMI build
 
