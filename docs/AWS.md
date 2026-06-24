@@ -48,87 +48,216 @@ lands.
 
 ### Stage A -- Linux ARM64 Image header
 
-Status: `[ ]`
+Status: `[x]`
 
 Boot stub written in asm: 64 bytes prefixed to our raw binary
-with the right magic at offset 56 (`ARM\x64`), the text offset,
-the image size, flags (4 KB pages, little-endian, no swap), and
-a `b _start` at offset 0.  No real code.  GRUB only needs the
-header to load us.
+with the right magic at offset 56 (`ARM\x64`), text_offset,
+image_size, flags (4 KB pages, anywhere placement), and a `b _start`
+at offset 4.
+
+What landed:
+
+- `uts/virt/boot.S` already carried a placeholder Image header
+  (QEMU's `-kernel` checks for the "ARM\x64" magic at offset 0x38
+  to identify the image).  Stage A fills in the rest of the
+  fields: `text_offset = 0x80000` (Linux convention),
+  `image_size = __kernel_end - __kernel_start`, `flags = 0x0A`
+  (bit 1 = 4K pages, bit 3 = "anywhere" placement).
+- `uts/virt/linker.ld` exports `_kernel_image_size_lo32` and
+  `_kernel_image_size_hi32` via `ABSOLUTE(...)`.  The assembler
+  can't compute the linker-time difference, so we emit two
+  `.long` references the linker resolves into the right
+  little-endian 64-bit field.  Same trick Linux head.S uses.
+- code0 is still `add x13, x18, #0x16` which encodes as bytes
+  `4d 5a 00 91` -- "MZ\x00\x91".  The first two bytes are the
+  MS-DOS PE magic so EFI accepts us; the AArch64 instruction
+  itself is a harmless no-op (writes to scratch x13 we never
+  read).  PE COFF offset at byte 60 stays 0 until stage B
+  points it at the EFI PE header.
+
+Header bytes (`od -An -tx1 -N64 build/kernel.img`):
+
+    4d 5a 00 91 0f 00 00 14 00 00 08 00 00 00 00 00
+    00 40 78 00 00 00 00 00 0a 00 00 00 00 00 00 00
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    00 00 00 00 00 00 00 00 41 52 4d 64 00 00 00 00
+                                        ^^ "ARM\x64"
 
 This stage does NOT yet add EFI parsing.  After this stage we
-still don't boot on AWS -- but we can produce a binary that
-GRUB-style loaders are willing to drop into RAM at the right
-address, which is the prerequisite for everything below.
+still don't boot on AWS -- but we produce a binary that GRUB
+and other Linux-aware loaders are willing to drop into RAM at
+the right address, the prerequisite for stage B.
 
-Build target: `build/aws64/kernel.img` (raw bytes) gets a header
-prefix; downstream targets get a `.efi` variant separately.
+Verified: `make test` ALL TESTS PASS.  The same kernel image
+QEMU has been booting via `-kernel` is unchanged in behaviour;
+the header metadata fields now carry real values.
 
 ### Stage B -- EFI app + ExitBootServices
 
-Status: `[ ]`
+Status: `[x]`
 
 Make `kernel.img` actually be a valid PE32+ executable.  The
 Linux trick is to use the same 64-byte header as both the ARM64
 Image header AND the start of an MZ-flavoured PE32+ header (the
 magic overlap is real; PE's first two bytes "MZ" coincide with
-the start of the `b _start` AArch64 jump instruction at the
-right opcode pattern).
+the AArch64 `add x13, x18, #0x16` instruction, encoded as
+`4d 5a 00 91`).
 
-What this entails:
+What landed:
 
-- Linker script grows a `.text` section for the PE header
-  literals (just bytes).
-- A small `efi_main(EFI_HANDLE, EFI_SYSTEM_TABLE *)` C function
-  that:
-  1. Walks the EFI Configuration Table looking for an ACPI 2.0
-     entry (UUID `8868e871-e4f1-11d3-bc22-0080c73c8881`); stashes
-     the RSDP.
-  2. Calls `BootServices->GetMemoryMap` to learn the physical
-     ranges.
-  3. Calls `BootServices->ExitBootServices`.
-  4. Disables the EFI MMU mapping (or trusts it) and hands
-     control to the kappara `kmain` -- but with the ACPI pointer
-     and the memory map preserved.
+- `uts/virt/boot.S` grew a PE32+ header block immediately after
+  the 64-byte Linux Image header: PE signature, COFF header
+  (Machine=0xAA64, Characteristics=0x0207 = RELOCS_STRIPPED |
+  EXECUTABLE_IMAGE | LINE_NUMS_STRIPPED | DEBUG_STRIPPED), PE32+
+  optional header (Magic=0x020B, ImageBase=0x40080000,
+  SectionAlignment=0x1000, FileAlignment=0x200, Subsystem=0x0A
+  EFI_APPLICATION, NumberOfRvaAndSizes=16), and a single `.text`
+  section descriptor.  `.balign 0x1000` after the section table
+  pads the header region to SizeOfHeaders so the .text section
+  starts at file offset 0x1000.
+- `uts/virt/linker.ld` exposes `_text_rva`, `_pe_size_of_headers`,
+  and `_text_section_size_lo32` for those header fields.  EDK II
+  requires the full 16-entry DataDirectory even though we leave
+  all entries zero.
+- `uts/virt/efi.h` + `uts/virt/efi_main.c` implement
+  `efi_main(handle, system_table)`:
+  1. Walks `system_table->tables` (the EFI Configuration Table)
+     for ACPI 2.0 GUID `8868e871-e4f1-11d3-bc22-0080c73c8881`,
+     stashing the RSDP in `efi_acpi_rsdp` (BSS, read by kmain).
+  2. Calls `BootServices->GetMemoryMap` into a 4 KB BSS buffer
+     (`efi_memmap_storage`); records size, descriptor_size,
+     and descriptor_version for stage C.
+  3. Calls `BootServices->ExitBootServices` with the returned
+     map key.  After this we own the machine.
+- `boot.S` adds an `efi_pe_entry` stub at the start of the .text
+  section (so its RVA is inside a section per the PE spec).
+  It saves x0/x1 (image handle, system table) to x19/x20, sets
+  sp to `stack_top`, calls `efi_main`, then on success branches
+  to the regular Linux Image entry path (`.Lreal_start`); on
+  failure spins in WFI.
+- `tools/pad_pe.py` post-processes `kernel.img` after `objcopy
+  -O binary` to zero-pad the file out to SizeOfImage.  Without
+  this EDK II's PE loader sees SizeOfRawData reaching past
+  end-of-file and rejects the image with
+  "Script Error Status: Unsupported".
 
-What this does NOT do: any device discovery.  We get to kmain,
-print "ACPI at 0x..., usable RAM at 0x..-0x..", spin.
+What this does NOT do: anything device-specific.  Stage C will
+walk the ACPI pointer + EFI memory map we stashed; for now
+under UEFI we hand off to `.Lreal_start` and rely on the
+pre-existing identity-mapped early-MMU state (cleanup is on
+the stage C TODO).
+
+Verified: under AAVMF + QEMU virt the kernel loads and the
+firmware jumps to it (synchronous exception fires in our RX
+region at the expected handover point, as expected without
+stage C's ACPI/MMU rework).  `make test` still reports ALL
+TESTS PASS via the `-kernel` path -- the regular dev workflow
+is unchanged.
 
 ### Stage C -- ACPI parser
 
-Status: `[ ]`
+Status: `[x]`
 
-Minimal ACPI table walker.  We don't need a full AML interpreter
-(that's a different order of magnitude); we only need the static
-tables:
+Minimal ACPI table walker -- no AML.  Driven by the RSDP pointer
+that stage B stashed when efi_main walked the EFI Configuration
+Table.  Lives in `uts/virt/acpi.[ch]`; entry point is
+`acpi_init()`, called from kmain right after `mmu_init`.
 
-- **RSDP** -- root pointer, we already have it from EFI config table.
-- **XSDT** -- table of pointers to other tables, walked by name.
-- **MADT** -- GIC v3 distributor base, redistributor base,
-  per-CPU info.  Today's `virt` uses hardcoded constants; here
-  we read them.
-- **MCFG** -- PCIe ECAM base address (config space lives at
-  ECAM_base + (bus<<20) + (dev<<15) + (fn<<12)).
-- **GTDT** -- generic timer info (CNTFRQ, IRQ numbers).
-- **FADT** -- random platform flags + IO ports we mostly ignore.
+What landed:
 
-After this stage we can wire up GIC + timer dynamically.  No new
-device drivers yet.
+- **RSDP**: validated against "RSD PTR " signature, ACPI 2.0+
+  revision, and BOTH the 20-byte (1.0 compat) and full-length
+  checksums.  Failures log and bail rather than wire later stages
+  off bogus data.
+- **XSDT**: signature + checksum validated; entries iterated by
+  4-char signature lookup.
+- **MADT** ("APIC"): sub-entries walked by type.
+    - GICC (0x0B) per CPU -- arm_mpidr + Enabled flag, recorded
+      into `acpi_cpu_mpidr[]`/`acpi_nr_cpus` (cap ACPI_MAX_CPUS=32).
+    - GICD (0x0C) -- `acpi_gicd_base`, `acpi_gic_version`.
+    - GICR (0x0E) -- `acpi_gicr_base`/`acpi_gicr_length`.
+    - MSI/ITS skipped for now; stage E reads them.
+- **MCFG**: first allocation's ECAM base + bus range recorded
+  (`acpi_pcie_ecam_base`, `acpi_pcie_bus_start/end`).
+- **GTDT**: non-secure EL1 + virtual EL1 timer GSIVs recorded
+  for stage D's dynamic timer wire-up.
+- **FADT** ("FACP"): flags word stashed; rest deferred.
+
+Stage C only reads + prints (one `acpi:` line per table).
+Hardcoded `PLAT_GIC_*` constants in `uts/aarch64/platform/virt.h`
+still drive the running kernel.  Stage D will swap those for the
+discovered values + walk MCFG to enumerate PCIe.
+
+Boot path coverage:
+
+- UEFI boot: full parse; logs RSDP/XSDT addresses, GIC version,
+  CPU MPIDRs, ECAM base + bus range, timer GSIVs.
+- `-kernel`: `efi_acpi_rsdp` is NULL; `acpi_init` logs one
+  "no RSDP" line and returns.  Verified -- `make test` still
+  reports ALL TESTS PASS.
 
 ### Stage D -- PCIe ECAM bus enumeration
 
-Status: `[ ]`
+Status: `[x]`
 
 Walk PCIe bus 0..255 / dev 0..31 / fn 0..7 using the ECAM base
-from MCFG.  For each visible device:
+from MCFG.  Lives in `uts/virt/pcie.[ch]`; entry point
+`pcie_init()` called from kmain right after `acpi_init`.
 
-- Read Vendor ID / Device ID; recognise:
-  - 0x1d0f / 0xec20 -- AWS ENA
-  - 0x1d0f / 0x8061 -- AWS NVMe (EBS)
-- Read BARs, MSI-X capability, configure interrupt vectors.
+What landed:
 
-After this stage we print "PCIe: found 2 devices" -- nothing's
-driving them yet.
+- ECAM math: `ecam_base + (bus<<20) + (dev<<15) + (fn<<12)` for
+  each function's 4 KB config window.  Endpoint records go into
+  `pci_devs[]` (cap `PCI_MAX_DEVS=32`): vendor/device IDs,
+  class+subclass, prog-if, revision, header type, all 6 BAR
+  values (raw, not sized), and the MSI-X capability offset (0
+  if absent).
+- Capability list walked from offset 0x34 looking for cap id
+  0x11 (MSI-X); cap chain bounded to 48 hops to defend against
+  malformed devices.
+- AWS hardware IDs called out by name in the per-device log line
+  (Amazon vendor `0x1d0f`: ENA `0xec20`, NVMe `0x8061`).
+- Multi-function devices probed by checking header-type bit 7
+  on fn 0.
+
+Two non-obvious things this stage needed before ECAM reads
+could even land:
+
+- `uts/aarch64/mmu.c` TCR_EL1.IPS bumped from 36-bit (64 GB) to
+  44-bit (16 TB) PA.  QEMU virt's highmem PCIe ECAM sits at
+  `0x4010000000` -- well above 36 bits -- and tried to MMIO-read
+  it caused an Address Size Fault at L1 (ESR DFSC = 0x01).
+- New `mmu_map_device_1gb(va)` helper (mmu.h + mmu.c) writes a
+  1 GB Device-nGnRE L1 block for the ECAM base; `pcie_init`
+  calls it before any config-space load so the 1 GB window is
+  reachable.  Boot identity map alone only covers 0..2 GB.
+
+Boot-path coverage:
+
+- UEFI (AAVMF): real ACPI MCFG present, full enumeration runs.
+  Verified with `-device virtio-blk-pci`: finds host bridge
+  (`1b36:0008` class 0x0600) and the virtio-blk endpoint
+  (`1af4:1001` class 0x0100).
+- `-kernel`: no MCFG, one-line skip and return.  We do NOT
+  fall back to QEMU virt's static ECAM base (0x3F000000) -- the
+  region is reserved in the memory map but gpex returns
+  synchronous external aborts for unmapped buses, breaking the
+  walk.  Trade-off accepted: dev exercise runs through ACPI;
+  raw `-kernel` developers can still iterate on the rest of
+  the kernel without PCI.
+
+Two parallel boot.S corrections lived alongside Stage D because
+they had to ship together to actually exercise the UEFI path:
+
+- PE section characteristics changed from RX (`0x60000020`) to
+  RWX (`0xE0000020`).  BSS lives in this single section and
+  efi_main's first stack push faulted inside EFI's mapping.
+- Boot path after a successful `efi_main` now jumps to a new
+  `.Lpost_bss` label, skipping the BSS-clear loop that was
+  wiping `efi_acpi_rsdp` / `efi_memmap_*` between efi_main
+  finishing and kmain starting.  BSS is already zero in the
+  loaded image because `objcopy -O binary` + `tools/pad_pe.py`
+  zero-fill the on-disk file out to SizeOfImage.
 
 ### Stage E -- ENA network driver
 
@@ -149,17 +278,91 @@ above (`ip_attach_stream` etc) stays unchanged.
 After this stage `make ARCH=aws64 run-telnet` works for a real
 EC2 instance with a public IP.
 
-### Stage F -- NVMe block driver + EBS root
+### Stage F -- NVMe block driver
+
+Status: `[x]` (driver live; kfs-on-NVMe mount comes later)
+
+Polled NVMe 1.4 driver.  Lives in `uts/virt/nvme.[ch]`; entry
+point `nvme_init()` called from kmain after `ramdisk_*_init` and
+before `exec_space_init`.  Detects the controller by PCI class
+0x0108 (Mass Storage / NVM controller), not by vendor:device --
+QEMU's NVMe is `1b36:0010`, Amazon EBS is `1d0f:8061`, both match.
+
+What landed:
+
+- Controller bring-up follows NVMe 1.4 §3.5.1: disable, wait
+  CSTS.RDY=0, allocate Admin SQ/CQ from PMM, program AQA/ASQ/ACQ,
+  set CC (IOSQES=6, IOCQES=4, CSS=NVM, MPS=4KB, EN=1), wait
+  CSTS.RDY=1.
+- PCI Command register Memory-Space + Bus-Master bits set
+  explicitly before any MMIO -- UEFI's PCI bus driver leaves
+  those clear on devices it didn't drive itself, and without
+  them the BAR window reads back all-ones.
+- Identify Controller + Identify Namespace (NSID=1); model,
+  serial, firmware, namespace LBA count + size recorded into
+  `nvme_singleton_info` for `/proc/nvme`.
+- One I/O queue pair created (admin opc 0x05 + 0x01), depth 32.
+- `struct block_device` adapter named `nvme0n1` wired with
+  bd_read / bd_write that submit a single NVM Read (0x02) or
+  Write (0x01) per call (NLB=0), polled.  Only 512-byte LBAs
+  are accepted -- 4 KB namespaces would need translation.
+- Built-in self-test runs at the end of nvme_init: writes a
+  known pattern to LBA 0, reads it back, byte-compares.  Logs
+  `nvme: selftest PASS` -- catches regressions in the entire
+  bring-up + queue path the moment they happen.
+
+Two infrastructure pieces landed alongside:
+
+- `mmu_map_device_1gb()` now walks L0 too and lazily allocates
+  a fresh L1 page from the PMM for L0[1+] entries.  Required:
+  QEMU virt's highmem PCIe MMIO sits at 0x8000000000 (= 512 GB,
+  the very start of L0[1]).  Previous version masked the L1
+  index to 9 bits and would have stomped L1[0] (the low 1 GB
+  identity map).
+- `pcie_bar_addr()` + `pcie_bar_is_64()` helpers in
+  `kappara/arch/pcie.h` -- decode 32 vs 64-bit memory BARs
+  (low/high split) so drivers don't repeat the bit-twiddling.
+
+Verified end-to-end under AAVMF + QEMU virt with
+`-device nvme,drive=nvm,serial=...`:
+  - probe + Identify works
+  - 512 B selftest passes
+  - host-side `nvme.img` file contains the kernel-written pattern
+    (byte[i] = 0xA5 ^ i) -- persistence proven across qemu
+    process boundary
+  - `/proc/nvme` returns the controller summary (version, vid,
+    model, serial, firmware, namespace size)
+
+`make test` still ALL TESTS PASS (14/14) on the `-kernel` path
+where there's no NVMe device (driver is a no-op).
+
+What's still missing (next iteration, not blocking stage G):
+
+- kfs-on-nvme mount (boot `/usr/bin` + `/home` off EBS instead
+  of in-RAM ramdisks).  The block_device is registered; it
+  just isn't wired into `kfs_mount` yet.
+- MSI-X interrupts.  We poll today; on a real Graviton workload
+  we'd want to sleep on completion via a per-queue wait queue.
+- Multi-block transfers + PRP2 / SGL.  Today's bd_read/write
+  is one LBA per call.
+
+### Stage F.1 -- kfs root on NVMe / EBS
 
 Status: `[ ]`
 
-NVMe is industry standard.  Single namespace (NSID=1), 4 KB
-blocks, polled completion to start (MSI-X later if needed).
+Mount kfs on top of `nvme0n1` (or whichever namespace EBS hands
+us on Graviton) instead of the in-RAM `ramdisk0`.  Two pieces:
 
-We wire NVMe under the existing `struct block_device` shape so
-kfs mounts it the same way it mounts our ramdisks today.  Big
-deal: `/usr/bin` and `/home` come off EBS instead of being baked
-into the kernel image.  Survives reboots.
+- `kfs_mount` already takes any `struct block_device` -- swap
+  the source from `ramdisk_get()` to `nvme_get()` for the
+  `/usr/bin` (and possibly `/home`) mount.
+- Hand-roll a tiny mkfs that writes a fresh kfs image to the
+  raw EBS namespace when AMI build time, so the first boot
+  finds populated content rather than zeros.
+
+After this, `/usr/bin` and `/home` survive reboots.  Big deal:
+the kernel image stops embedding `userblob.o` / `helloblob.o`,
+which trims it.
 
 ### Stage G -- Polish + sample AMI build
 

@@ -24,6 +24,14 @@ void mmu_enable_this_cpu(void);
  * Used to publish a user code/data page so EL0 can read+execute it. */
 void mmu_map_user_2mb(unsigned long va, unsigned long pa);
 
+/* Identity-map a 1 GB Device block via L1 (kernel-only RW, no exec).
+ * The argument is rounded down to 1 GB; on return the containing 1 GB
+ * window is reachable from EL1 as MMIO.  Used for high-mem MMIO
+ * regions (e.g. PCIe ECAM at 0x4010000000 on QEMU virt with
+ * highmem=on or on AWS Graviton) that fall outside the 0..2 GB
+ * window the boot identity map already covers. */
+void mmu_map_device_1gb(unsigned long va);
+
 /* Phase R1: physical address of the boot-time L0 page table.  init
  * process's vm_map wraps this -- TTBR0_EL1 is loaded from it on every
  * CPU's MMU enable.  Future per-process L0s are independent

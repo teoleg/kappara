@@ -15,6 +15,19 @@
  *   /proc/slabinfo   one line per size-cache: name, obj_size,
  *                    free / total objects
  *   /proc/streams    one line per registered STREAMS module/driver
+ *   /proc/cpuload    per-CPU load + idle ratio (smp-aware)
+ *   /proc/ftrace     ftrace ring dump (read) + on/off/reset (write)
+ *   /proc/netif      registered interfaces + IP/netmask
+ *   /proc/slip       slip0 byte / frame counters
+ *   /proc/tcp        TCB table: state, ports, rtt, cwnd, ...
+ *   /proc/acpi       AWS.md stage A-C: ACPI table summary
+ *                    (RSDP, GIC base, CPU MPIDRs, ECAM, timer GSIVs)
+ *   /proc/pci        AWS.md stage D: enumerated PCIe devices
+ *                    (bdf, vid:did, class, hdr, MSI-X cap, BARs)
+ *   /proc/efi        AWS.md stage B: EFI memory map
+ *                    (type, start, pages, end)
+ *   /proc/nvme       AWS.md stage F: NVMe controller summary
+ *                    (vid, model, serial, firmware, ns1 size)
  */
 
 #ifndef KAPPARA_PROC_H

@@ -133,10 +133,17 @@
 #define TCR_EPD1		(1UL << 23)	/* disable TTBR1 walks */
 #define TCR_TG1_4K		(2UL << 30)
 #define TCR_IPS_36BIT		(1UL << 32)
+#define TCR_IPS_40BIT		(2UL << 32)	/* 40 bits = 1 TB PA */
+#define TCR_IPS_44BIT		(4UL << 32)	/* 44 bits = 16 TB PA;
+						 * QEMU virt with highmem
+						 * PCIe puts ECAM at
+						 * 0x4010000000 (>256 GB)
+						 * which a 36-bit PA window
+						 * cannot reach. */
 
 #define TCR_VALUE \
 	(TCR_T0SZ(16) | TCR_IRGN0_WBWA | TCR_ORGN0_WBWA | TCR_SH0_INNER | \
-	 TCR_TG0_4K | TCR_EPD1 | TCR_TG1_4K | TCR_IPS_36BIT)
+	 TCR_TG0_4K | TCR_EPD1 | TCR_TG1_4K | TCR_IPS_44BIT)
 
 /* Stage 1 descriptor bits (block / table at any level). */
 #define D_VALID			(1UL << 0)
@@ -246,6 +253,67 @@ void mmu_map_user_2mb(uint64_t va, uint64_t pa)
 		"dsb	ish\n"
 		"isb\n"
 		: : "r"(va >> 12) : "memory");
+}
+
+/*
+ * Identity-map a 1 GB Device block (kernel-only RW, no exec).  The
+ * address is rounded down to the 1 GB boundary; on return the
+ * containing 1 GB window is reachable from EL1 as MMIO.
+ *
+ * Used for high-mem MMIO regions that fall outside the 0..2 GB chunk
+ * build_identity_map covers via L1[0] (low 1 GB through L2) and L1[1]
+ * (RAM at 0x40000000): e.g. QEMU virt's PCIe ECAM at 0x4010000000,
+ * NVMe BAR0 at 0x8000000000 (= 512 GB = the very start of L0[1]),
+ * or any AWS Graviton MCFG entry above 2 GB.
+ *
+ * Walks the table tree to whatever L1 the VA wants.  L0[0] reuses
+ * the static l1_table that build_identity_map already wired in;
+ * L0[1+] entries lazily allocate a fresh L1 page from the PMM
+ * (callers run mmu_map_device_1gb AFTER pmm_init -- pcie_init and
+ * nvme_init both do).  TLBI vmalle1is is the broadest invalidate;
+ * cheap because this only runs at platform init time.
+ */
+#define BLOCK_1G_SHIFT		30
+#define BLOCK_1G_SIZE		(1UL << BLOCK_1G_SHIFT)
+#define BLOCK_1G_MASK		(BLOCK_1G_SIZE - 1)
+#define BLOCK_512G_SHIFT	39
+
+void mmu_map_device_1gb(uint64_t va)
+{
+	uint64_t base    = va & ~BLOCK_1G_MASK;
+	unsigned l0_idx  = (unsigned)(base >> BLOCK_512G_SHIFT) & 0x1ff;
+	unsigned l1_idx  = (unsigned)(base >> BLOCK_1G_SHIFT)   & 0x1ff;
+
+	uint64_t *l1;
+	if (l0_idx == 0) {
+		l1 = l1_table;
+	} else {
+		uint64_t l0_desc = l0_table[l0_idx];
+		if (l0_desc & D_VALID) {
+			/* Reuse existing L1 attached to this L0 entry.
+			 * Mask off the descriptor's attribute bits to
+			 * recover the L1 phys (= VA, identity). */
+			l1 = (uint64_t *)(uintptr_t)(l0_desc & ~0xfffUL);
+		} else {
+			l1 = pmm_alloc();
+			if (!l1) return;
+			for (int i = 0; i < ENTRIES_PER_TABLE; i++)
+				l1[i] = 0;
+			l0_table[l0_idx] = (uint64_t)(uintptr_t)l1
+			                   | D_VALID | D_TABLE;
+		}
+	}
+
+	l1[l1_idx] = base | D_VALID |
+		     D_ATTRIDX(ATTR_DEVICE_IDX) |
+		     D_AP_RW_EL1 | D_SH_NONE | D_AF | D_PXN | D_UXN;
+
+	__asm__ volatile (
+		"dsb	ishst\n"
+		"tlbi	vmalle1is\n"
+		"dsb	ish\n"
+		"isb\n"
+		::: "memory");
 }
 
 /* Per-CPU MMU enable: program the SYSREGs from the same shared

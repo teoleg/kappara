@@ -25,9 +25,12 @@
 #include <stdint.h>
 
 #include "kappara/abi/syscall.h"
+#include "kappara/arch/acpi.h"
 #include "kappara/arch/framebuffer.h"
 #include "kappara/arch/ipi.h"
 #include "kappara/arch/mmu.h"
+#include "kappara/arch/nvme.h"
+#include "kappara/arch/pcie.h"
 #include "kappara/arch/timer.h"
 #include "kappara/arch/trap.h"
 #include "kappara/arch/uart.h"
@@ -340,6 +343,15 @@ void kmain(void)
 
 	mmu_init();
 
+	/* AWS.md stage C+D: walk the ACPI static tables and the PCIe
+	 * ECAM bus (only meaningful under UEFI -- skipped silently on
+	 * `-kernel`).  Must run after mmu_init so any cross-mapping
+	 * the firmware left behind is stable, and before pmm_init so
+	 * future stages can subtract ACPI_RECLAIM regions before they
+	 * get enrolled. */
+	acpi_init();
+	pcie_init();
+
 	/* framebuffer_init must run before pmm_init so we can exclude
 	 * the GPU's reserved region from the freelist.  See the comment
 	 * on discover_gpu_reserve(). */
@@ -403,6 +415,11 @@ void kmain(void)
 	 * the same reason -- exec_space_init mkimage's it empty. */
 	ramdisk_init();
 	ramdisk_home_init();
+	/* AWS.md stage F: NVMe probe.  No-op when no PCI-class-0x0108
+	 * controller is present (everything but UEFI on virt with
+	 * `-device nvme`).  Runs after kmem_init because the driver
+	 * pmm_alloc()s queue pages from a primed PMM. */
+	nvme_init();
 	exec_space_init();
 
 	/* Draw the boot splash now that everything else is up.  The FB

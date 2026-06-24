@@ -54,3 +54,31 @@ SECTIONS
 
 	/DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }
+
+/* AWS.md stage A: split image_size into 32-bit halves for the
+ * little-endian quad field in boot.S's Linux Image header.  The
+ * assembler can't compute __kernel_end - __kernel_start, but ABSOLUTE
+ * here turns the expression into a symbol whose VALUE is the result --
+ * boot.S then emits two .long entries that the linker resolves into
+ * the right 64-bit value. */
+_kernel_image_size_lo32 = ABSOLUTE((__kernel_end - __kernel_start) & 0xffffffff);
+_kernel_image_size_hi32 = ABSOLUTE(((__kernel_end - __kernel_start) >> 32) & 0xffffffff);
+
+/* AWS.md stage B: PE32+ EFI Application header constants.
+ *
+ *   _text_rva            where .text starts in the PE file image.
+ *                        UEFI requires the section to start at
+ *                        VirtualAddress >= SizeOfHeaders and aligned
+ *                        to SectionAlignment, so we pad boot.S out
+ *                        to 0x1000 and the section begins there.
+ *   _text_section_size_lo32 size of the .text section (= image_size
+ *                        minus the 0x1000 of headers).  Single
+ *                        section that covers all real code + data
+ *                        + bss.
+ *   _pe_size_of_headers  SizeOfHeaders field, page-aligned per PE
+ *                        spec.  4 KB matches the .balign 0x1000 in
+ *                        boot.S that splits header bytes from
+ *                        section bytes. */
+_text_rva               = ABSOLUTE(0x1000);
+_pe_size_of_headers     = ABSOLUTE(0x1000);
+_text_section_size_lo32 = ABSOLUTE((__kernel_end - __kernel_start - 0x1000) & 0xffffffff);

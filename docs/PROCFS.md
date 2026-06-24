@@ -269,6 +269,108 @@ The user-facing tool is `cmd/netstat`, which concatenates
 Per-line counters for `slip0`: total UART bytes received, plus SLIP
 framing counters (rx_frames, rx_runts, rx_overflow, tx_frames).
 
+### /proc/acpi
+
+Summary of what `acpi_init()` (AWS.md stage C) pulled out of the
+ACPI static tables.  Empty / "not present" line when booted via
+`-kernel` (no EFI Configuration Table to walk).
+
+```
+kappara:/# cat /proc/acpi
+rsdp:        0x4c760018
+gic_version: 3
+gicd_base:   0x8000000
+gicr_base:   0x80a0000  len 0xf60000
+cpus:        1
+  cpu0 mpidr 0x0
+pcie_ecam:   0x4010000000  bus 0..255
+timer_ns_el1_gsiv:   30
+timer_virt_el1_gsiv: 27
+fadt_flags:  0x100000
+```
+
+Fields come from the MADT (GIC + per-CPU), MCFG (PCIe ECAM), GTDT
+(timer GSIVs), and FADT (flags) tables.  Useful for confirming we
+agree with the firmware before stage D's `pcie_init` consumes the
+ECAM base.
+
+### /proc/pci
+
+PCIe device list produced by `pcie_init()` (AWS.md stage D) walking
+the ECAM window.  Each row covers one (bus, dev, fn) endpoint.
+
+```
+kappara:/# cat /proc/pci
+BDF      VID:DID    CLASS  HDR  MSI-X  BARs
+00:00.0  1b36:0008  0600   00   -
+00:01.0  1af4:1001  0100   00   0x98   00000001 10000000 0000000c 00000080
+```
+
+Columns:
+- **BDF**: bus:device.function
+- **VID:DID**: vendor / device ID.  Amazon vendor 0x1d0f's ENA
+  (0xec20) and NVMe (0x8061) are called out by name in the boot
+  log; here they're shown by raw hex.
+- **CLASS**: class+subclass (0x0600 = host bridge, 0x0100 = mass
+  storage SCSI controller, ...).
+- **HDR**: header type (00 = endpoint, 01 = bridge).
+- **MSI-X**: capability offset (or `-` if the cap isn't present).
+- **BARs**: raw BAR values (unsized -- sizing requires a write/read
+  cycle that's the driver's job).
+
+Empty when MCFG isn't present (no UEFI / no ACPI).
+
+### /proc/efi
+
+EFI memory map snapshot captured by `efi_main` before
+`ExitBootServices` (AWS.md stage B).  One row per descriptor.
+
+```
+kappara:/# cat /proc/efi
+TYPE          START              PAGES     END
+Conventional  0x0000000040000000      128  0x0000000040080000
+LoaderCode    0x0000000040080000     1925  0x0000000040805000
+Conventional  0x0000000040805000    14331  0x0000000044000000
+BootData      0x0000000044000000       32  0x0000000044020000
+...
+ACPIReclaim   0x000000004c760000       16  0x000000004c770000
+```
+
+Type names follow the UEFI spec (Reserved, LoaderCode/Data,
+BootCode/Data, RuntimeCode/Data, Conventional, Unusable,
+ACPIReclaim, ACPINVS, MMIO, MMIOPort, PalCode, Persistent);
+unknown types print as `?`.  Empty when booted via `-kernel`.
+
+`ACPIReclaim` is where the firmware-installed static tables live
+(RSDP / XSDT / MADT / ...); the kernel must NOT hand those pages
+to the PMM until acpi_init has finished walking them.  Today the
+PMM starts above `__kernel_end` so the question doesn't arise;
+when stage D consumes the EFI memory map directly it'll filter
+this type explicitly.
+
+### /proc/nvme
+
+NVMe controller summary populated by `nvme_init()` (AWS.md stage F)
+after Identify Controller + Identify Namespace land.  Useful for
+confirming the model + namespace size match what we booted with.
+
+```
+kappara:/# cat /proc/nvme
+version:     1.4.0
+bar0:        0x8000000000
+vid:         0x1b36
+model:       QEMU NVMe Ctrl
+serial:      kapparanvme
+firmware:    8.2.2
+ns1_blocks:  32768
+ns1_lba:     512 bytes
+ns1_size:    16 MB
+```
+
+Empty / "no controller" line when no PCI device with class
+0x0108 (Mass Storage / NVM controller) was found -- the usual
+`-kernel` case.
+
 ## How to add a new /proc entry
 
 Three steps:

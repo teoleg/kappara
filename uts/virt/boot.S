@@ -1,44 +1,240 @@
 /*
- * uts/virt/boot.S -- QEMU `virt` machine entry point
+ * uts/virt/boot.S -- QEMU `virt` / AWS Graviton entry point
  *
- * The virt machine is much simpler than raspi3b at boot time:
+ * Same image now boots via two paths:
  *
- *   - QEMU loads the kernel at the start of RAM (PLAT_RAM_BASE
- *     = 0x40000000); -kernel does an in-place load and jumps to it.
- *   - We enter at EL2 (default for `-M virt -cpu cortex-a72`); EL3
- *     possible with -machine virtualization=on.  We drop to EL1
- *     either way.
- *   - Secondaries are NOT started by the firmware -- they sit in PSCI
- *     WFI until the kernel makes the CPU_ON HVC call.  No spin-table.
- *     SMP wiring is a separate later step; for now CPU 0 runs alone.
+ *   - QEMU `-kernel build/kernel.img` (development): the Linux ARM64
+ *     Image protocol.  `_start`'s first instruction is `add x13, ...`
+ *     which the assembler encodes as `4d 5a 00 91` -- "MZ\x00\x91".
+ *     QEMU sees `add`, executes it as a harmless no-op, then `b
+ *     .Lreal_start` skips the rest of the header.
  *
- * Same shape as uts/aarch64/boot.S core-0 path otherwise: branch on
- * CurrentEL, set up SCTLR_EL1's RES1 bits with MMU/caches off, point
- * sp_el1 at our BSS-allocated kernel stack, eret to .Lin_el1, zero
- * the BSS, call kmain().
+ *   - UEFI (AAVMF in QEMU, AWS Nitro EC2): PE32+ EFI Application.
+ *     EFI reads the "MZ" magic at offset 0, follows e_lfanew (byte 60
+ *     of the DOS header) to the PE signature, parses the COFF +
+ *     optional headers, loads the section data to ImageBase, jumps
+ *     to AddressOfEntryPoint = efi_pe_entry.  We stash x0/x1 (image
+ *     handle, system table), call efi_main (C), and on return jump
+ *     to the regular `.Lreal_start` post-ExitBootServices.
+ *
+ * Layout (offsets in the produced kernel.img):
+ *
+ *   0x000  _start          ARM64 Image header (64 bytes) -- doubles
+ *                          as the PE DOS header; byte 60 is e_lfanew
+ *                          and points at 0x040.
+ *   0x040  pe_header       PE signature + COFF header + PE32+
+ *                          optional header + section table.
+ *                          Sized to fit in the first 4 KB so
+ *                          SizeOfHeaders=0x1000 is valid.
+ *   0x1000 .text           Real code (where `-kernel` jumps into
+ *                          .text.boot first).
+ *
+ * The hairy part: aarch64 UEFI on AAVMF / AWS Nitro hands us off
+ * with MMU enabled in identity mode.  Our `.Lreal_start` does
+ * `mmu_init` which turns the MMU off, reconfigures, then turns it
+ * back on.  As long as identity covers our load address (it does
+ * for any 1 GB-aligned RAM placement on virt/Graviton) this works
+ * out -- a cleaner approach is on the stage C+ TODO list.
  */
 
 .section ".text.boot"
 .global _start
 
-/* Linux ARM64 boot protocol header (Documentation/arm64/booting.rst).
- * QEMU's -kernel loader on aarch64 looks at offset 0x38 for the
- * "ARM\x64" magic to identify the image; without the header it can't
- * tell where to place us, so we copy the header layout Linux's
- * arch/arm64/kernel/head.S uses.  The first 4 bytes "MZ" are the
- * MS-DOS magic so EFI can also boot us as a PE/COFF binary (we
- * skip the PE COFF body since QEMU doesn't need it). */
+/* ---- 64-byte Linux ARM64 Image header + DOS header overlap ---- */
+
 _start:
-	add	x13, x18, #0x16		/* encodes as "MZ" little-endian: PE magic */
-	b	.Lreal_start
-	.quad	0			/* image_load_offset_le */
-	.quad	0			/* image_size_le (0 = inherit from -kernel) */
-	.quad	0			/* image_flags_le */
+	add	x13, x18, #0x16		/* code0: "MZ\x00\x91" -- DOS magic */
+	b	.Lreal_start		/* code1: skip past header */
+	.quad	0x80000			/* text_offset = 0x80000 */
+	.long	_kernel_image_size_lo32	/* image_size (lo32) */
+	.long	_kernel_image_size_hi32	/* image_size (hi32) */
+	.quad	0x0A			/* flags: 4K pages, anywhere */
 	.quad	0
 	.quad	0
 	.quad	0
-	.ascii	"ARM\x64"		/* magic at offset 0x38 */
-	.long	0			/* PE COFF offset (0 = none) */
+	.ascii	"ARM\x64"		/* ARM64 Image magic at 0x38 */
+	.long	pe_header - _start	/* e_lfanew / PE offset at 0x3C */
+
+/* ---- PE32+ EFI Application header ---- */
+
+	.align 3
+pe_header:
+	.long	0x00004550			/* "PE\0\0" signature */
+
+coff_header:
+	.short	0xAA64				/* Machine: IMAGE_FILE_MACHINE_ARM64 */
+	.short	(section_table_end - section_table) / 40 /* NumberOfSections */
+	.long	0				/* TimeDateStamp */
+	.long	0				/* PointerToSymbolTable */
+	.long	0				/* NumberOfSymbols */
+	.short	section_table - optional_header	/* SizeOfOptionalHeader */
+	.short	0x0207				/* Characteristics:
+						 *   IMAGE_FILE_RELOCS_STRIPPED (0x0001)
+						 * + IMAGE_FILE_EXECUTABLE_IMAGE (0x0002)
+						 * + IMAGE_FILE_LINE_NUMS_STRIPPED (0x0004)
+						 * + IMAGE_FILE_DEBUG_STRIPPED (0x0200)
+						 *
+						 * RELOCS_STRIPPED: we have no .reloc
+						 * section and ImageBase=0 only works
+						 * because EFI maps us at any addr and
+						 * our early code is PC-relative.  Bit
+						 * tells the loader not to look. */
+
+optional_header:
+	.short	0x020B				/* Magic: PE32+ */
+	.byte	0x02				/* MajorLinkerVersion */
+	.byte	0x14				/* MinorLinkerVersion */
+	.long	_text_section_size_lo32		/* SizeOfCode (= .text size) */
+	.long	0				/* SizeOfInitializedData */
+	.long	0				/* SizeOfUninitializedData */
+	.long	efi_pe_entry - _start		/* AddressOfEntryPoint (RVA) */
+	.long	_text_rva			/* BaseOfCode (RVA of .text) */
+
+extra_header_fields:
+	.quad	0x40080000			/* ImageBase = our linker's fixed
+						 * load address.  Combined with
+						 * RELOCS_STRIPPED above, EFI must
+						 * load us here verbatim; if firmware
+						 * insists on relocating elsewhere it
+						 * fails the load.  Works on QEMU virt
+						 * and AWS Graviton because RAM there
+						 * starts at 0x40000000 and 0x80000
+						 * is free. */
+	.long	0x1000				/* SectionAlignment (4 KB) */
+	.long	0x0200				/* FileAlignment (512 B) */
+	.short	0				/* MajorOperatingSystemVersion */
+	.short	0				/* MinorOperatingSystemVersion */
+	.short	0				/* MajorImageVersion */
+	.short	0				/* MinorImageVersion */
+	.short	0				/* MajorSubsystemVersion */
+	.short	0				/* MinorSubsystemVersion */
+	.long	0				/* Win32VersionValue */
+	.long	_kernel_image_size_lo32		/* SizeOfImage */
+	.long	_pe_size_of_headers		/* SizeOfHeaders */
+	.long	0				/* CheckSum */
+	.short	0x0A				/* Subsystem: EFI_APPLICATION */
+	.short	0				/* DllCharacteristics */
+	.quad	0x10000				/* SizeOfStackReserve */
+	.quad	0x10000				/* SizeOfStackCommit */
+	.quad	0x10000				/* SizeOfHeapReserve */
+	.quad	0x10000				/* SizeOfHeapCommit */
+	.long	0				/* LoaderFlags */
+	.long	16				/* NumberOfRvaAndSizes -- spec
+						 * allows fewer but EDK II's PE
+						 * loader requires the full set. */
+
+	/* DataDirectory[16] -- all zero; EFI doesn't read these for an
+	 * EFI app with no exports/imports/relocs. */
+	.quad	0	/* Export Table */
+	.quad	0	/* Import Table */
+	.quad	0	/* Resource Table */
+	.quad	0	/* Exception Table */
+	.quad	0	/* Certificate Table */
+	.quad	0	/* Base Relocation Table */
+	.quad	0	/* Debug */
+	.quad	0	/* Architecture */
+	.quad	0	/* Global Ptr */
+	.quad	0	/* TLS Table */
+	.quad	0	/* Load Config Table */
+	.quad	0	/* Bound Import */
+	.quad	0	/* IAT */
+	.quad	0	/* Delay Import Descriptor */
+	.quad	0	/* CLR Runtime Header */
+	.quad	0	/* Reserved */
+
+section_table:
+	/* .text -- covers everything past the PE headers (file offset
+	 * 0x1000 onward).  Pre-0x1000 bytes are the headers themselves,
+	 * which UEFI maps separately via SizeOfHeaders.  Declared RWX,
+	 * not RX: BSS (including stack_top) lives in this single
+	 * section, and efi_pe_entry's `stp x29,x30,[sp,#-..]!` writes
+	 * to stack before mmu_init has rebuilt the page tables.  A
+	 * read-only PE section made that store fault inside EFI's
+	 * mapping (synchronous exception at efi_main+4).  Linux's
+	 * arm64 kernel splits the image into multiple PE sections
+	 * with their own protections; we keep one section for
+	 * simplicity and rely on mmu_init to set the right kernel-
+	 * mode protections in our own tables once we own the MMU. */
+	.ascii	".text\0\0\0"			/* Name (8 bytes) */
+	.long	_text_section_size_lo32		/* VirtualSize */
+	.long	_text_rva			/* VirtualAddress (= 0x1000) */
+	.long	_text_section_size_lo32		/* SizeOfRawData */
+	.long	_text_rva			/* PointerToRawData (= 0x1000) */
+	.long	0				/* PointerToRelocations */
+	.long	0				/* PointerToLinenumbers */
+	.short	0				/* NumberOfRelocations */
+	.short	0				/* NumberOfLineNumbers */
+	.long	0xE0000020			/* Characteristics:
+						 *   IMAGE_SCN_CNT_CODE (0x00000020)
+						 * + IMAGE_SCN_MEM_EXECUTE (0x20000000)
+						 * + IMAGE_SCN_MEM_READ (0x40000000)
+						 * + IMAGE_SCN_MEM_WRITE (0x80000000)
+						 * -- BSS lives here, EFI must map RW. */
+section_table_end:
+
+	/* The PE header must occupy at most SizeOfHeaders bytes, and the
+	 * single .text section starts at PointerToRawData = SizeOfHeaders.
+	 * UEFI requires section.VirtualAddress >= SizeOfHeaders so the
+	 * loader doesn't smear the section over the header region; pad
+	 * to a 4 KB boundary so the section lands at the SectionAlignment
+	 * line. */
+	.balign 0x1000
+
+/* ---- end of PE headers; .text section content starts here ----------
+ *
+ * Everything below is bytes 0x1000+ of the kernel image, which is
+ * what we declared as the PE .text section.  efi_pe_entry's RVA
+ * (= 0x1000 - 0 = 0x1000+offset) sits in this section, satisfying
+ * the PE spec rule that entry must be inside a section. */
+
+/* ---- EFI entry stub.  Called by UEFI with x0=image_handle and
+ * x1=system_table_ptr.  Stack pointer is EFI's; we keep it.  Set up
+ * x29/x30 minimally, call efi_main, on return either jump into the
+ * Linux Image entry (`.Lreal_start`) or halt on failure. */
+.global efi_pe_entry
+efi_pe_entry:
+	/* Save EFI's image handle + system table in callee-saved regs
+	 * across the C call. */
+	mov	x19, x0
+	mov	x20, x1
+
+	/* Switch to our kernel stack.  efi_main only needs a small
+	 * stack and we're guaranteed not to clobber EFI's because we
+	 * never return to the EFI loader. */
+	adrp	x0, stack_top
+	add	x0, x0, :lo12:stack_top
+	mov	sp, x0
+
+	/* Call efi_main(handle, system_table). */
+	mov	x0, x19
+	mov	x1, x20
+	bl	efi_main
+
+	/* On success, jump directly to kmain via the post-BSS-clear
+	 * label.  We MUST NOT run the regular .Lreal_start path: its
+	 * .Lin_el1 epilogue zeros BSS, which would wipe the
+	 * efi_acpi_rsdp / efi_memmap_* fields efi_main just wrote.
+	 * BSS is already zero on entry under EFI because objcopy -O
+	 * binary zero-fills NOBITS and tools/pad_pe.py extends the
+	 * file to SizeOfImage, so EDK II loads zero bytes into the
+	 * BSS portion of our single PE section.  We also know
+	 * UEFI/AArch64 always hands off at EL1, so the EL3/EL2
+	 * lowering dance in .Lreal_start is unnecessary -- the
+	 * sctlr/cnthctl/hcr setup happens later in mmu_init. */
+	cbnz	x0, .Lefi_halt
+
+	/* Re-anchor sp on stack_top: efi_main's callee-saved prologue
+	 * adjusted sp, and we want kmain to enter with the same
+	 * pointer the `-kernel` path uses. */
+	adrp	x0, stack_top
+	add	x0, x0, :lo12:stack_top
+	mov	sp, x0
+	b	.Lpost_bss
+.Lefi_halt:
+	wfi
+	b	.Lefi_halt
+
+/* ---- existing -kernel boot path ---- */
 
 .Lreal_start:
 	/* Only core 0 of cluster 0 proceeds.  Should be the only one
@@ -123,6 +319,7 @@ _start:
 	str	xzr, [x0], #8
 	b	1b
 2:
+.Lpost_bss:
 	bl	kmain
 
 	/* kmain should never return.  If it does, halt. */

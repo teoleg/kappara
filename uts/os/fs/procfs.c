@@ -27,6 +27,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kappara/arch/acpi.h"
+#include "kappara/arch/efi.h"
+#include "kappara/arch/nvme.h"
+#include "kappara/arch/pcie.h"
 #include "kappara/io/cdevsw.h"
 #include "kappara/core/ftrace.h"
 #include "kappara/core/kmem.h"
@@ -44,7 +48,7 @@
 
 /* ---- Tiny text formatter into a fixed buffer ------------------------ */
 
-#define PB_SIZE	2048
+#define PB_SIZE	4096
 
 struct procbuf {
 	char	buf[PB_SIZE];
@@ -84,6 +88,22 @@ static void pb_pad_dec(struct procbuf *b, unsigned long v, int width)
 	while (i--) pb_putc(b, tmp[i]);
 }
 
+/* Lowercase hex, zero-padded to `width` digits (use 0 for compact).
+ * `width` 0 means "as many digits as needed, minimum 1". */
+static void pb_hex(struct procbuf *b, unsigned long v, int width)
+{
+	char tmp[20];
+	int  i = 0;
+	if (v == 0) tmp[i++] = '0';
+	while (v) {
+		unsigned d = v & 0xf;
+		tmp[i++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+		v >>= 4;
+	}
+	while (i < width) { pb_putc(b, '0'); width--; }
+	while (i--) pb_putc(b, tmp[i]);
+}
+
 /* Hand the formatted buffer up to the stream head as a single mblk
  * (assumes the snapshot fits in PB_SIZE, which is < kmalloc's
  * 2 KB cap so allocb is happy), then send M_HANGUP so the next
@@ -91,13 +111,20 @@ static void pb_pad_dec(struct procbuf *b, unsigned long v, int width)
  * forever -- procfs entries are one-shot snapshots, not streams. */
 static void pb_flush_to_q(struct procbuf *b, queue_t *q)
 {
-	if (b->len > 0) {
-		mblk_t *mp = allocb(b->len, 0);
-		if (mp) {
-			kmemcpy(mp->b_wptr, b->buf, b->len);
-			mp->b_wptr += b->len;
-			putnext(q, mp);
-		}
+	/* allocb chains through kmalloc, whose largest size-cache is
+	 * 2 KB.  Chunk the buffer into <=PB_FLUSH_CHUNK mblks so any
+	 * caller can use the full PB_SIZE without hitting that cap. */
+#define PB_FLUSH_CHUNK 1024
+	size_t off = 0;
+	while (off < b->len) {
+		size_t n = b->len - off;
+		if (n > PB_FLUSH_CHUNK) n = PB_FLUSH_CHUNK;
+		mblk_t *mp = allocb(n, 0);
+		if (!mp) break;
+		kmemcpy(mp->b_wptr, b->buf + off, n);
+		mp->b_wptr += n;
+		putnext(q, mp);
+		off += n;
 	}
 	/* The hangup is a metadata mblk -- size 1 just because some
 	 * older allocb variants reject size 0; the buffer is unused. */
@@ -447,6 +474,237 @@ static int proc_slip_qopen(queue_t *q)
 	return 0;
 }
 
+/* ---- /proc/acpi, /proc/pci, /proc/efi -- AWS.md stage A-D ---------- */
+/*
+ * Snapshots of the firmware discovery state populated during early
+ * boot (efi_main, acpi_init, pcie_init).  Under the `-kernel` boot
+ * path /proc/acpi and /proc/pci report "not present"; /proc/efi is
+ * only meaningful under UEFI.  Cheap to query and useful for
+ * confirming what we found on AWS Graviton (or AAVMF in QEMU).
+ *
+ * The backing globals live in <kappara/arch/{acpi,efi,pcie}.h>.
+ */
+
+static struct procbuf acpi_pb;
+
+static int proc_acpi_qopen(queue_t *q)
+{
+	pb_reset(&acpi_pb);
+	if (!acpi_present) {
+		pb_str(&acpi_pb, "acpi: not present (booted via -kernel)\n");
+		pb_flush_to_q(&acpi_pb, q);
+		return 0;
+	}
+	pb_str(&acpi_pb, "rsdp:        0x");
+	pb_hex(&acpi_pb, (unsigned long)(uintptr_t)efi_acpi_rsdp, 0);
+	pb_putc(&acpi_pb, '\n');
+
+	pb_str(&acpi_pb, "gic_version: ");
+	pb_pad_dec(&acpi_pb, acpi_gic_version, 0);
+	pb_putc(&acpi_pb, '\n');
+	pb_str(&acpi_pb, "gicd_base:   0x");
+	pb_hex(&acpi_pb, acpi_gicd_base, 0);
+	pb_putc(&acpi_pb, '\n');
+	pb_str(&acpi_pb, "gicr_base:   0x");
+	pb_hex(&acpi_pb, acpi_gicr_base, 0);
+	pb_str(&acpi_pb, "  len 0x");
+	pb_hex(&acpi_pb, acpi_gicr_length, 0);
+	pb_putc(&acpi_pb, '\n');
+
+	pb_str(&acpi_pb, "cpus:        ");
+	pb_pad_dec(&acpi_pb, acpi_nr_cpus, 0);
+	pb_putc(&acpi_pb, '\n');
+	for (uint32_t i = 0; i < acpi_nr_cpus; i++) {
+		pb_str(&acpi_pb, "  cpu");
+		pb_pad_dec(&acpi_pb, i, 0);
+		pb_str(&acpi_pb, " mpidr 0x");
+		pb_hex(&acpi_pb, acpi_cpu_mpidr[i], 0);
+		pb_putc(&acpi_pb, '\n');
+	}
+
+	pb_str(&acpi_pb, "pcie_ecam:   0x");
+	pb_hex(&acpi_pb, acpi_pcie_ecam_base, 0);
+	pb_str(&acpi_pb, "  bus ");
+	pb_pad_dec(&acpi_pb, acpi_pcie_bus_start, 0);
+	pb_str(&acpi_pb, "..");
+	pb_pad_dec(&acpi_pb, acpi_pcie_bus_end, 0);
+	pb_putc(&acpi_pb, '\n');
+
+	pb_str(&acpi_pb, "timer_ns_el1_gsiv:   ");
+	pb_pad_dec(&acpi_pb, acpi_timer_ns_el1_gsiv, 0);
+	pb_putc(&acpi_pb, '\n');
+	pb_str(&acpi_pb, "timer_virt_el1_gsiv: ");
+	pb_pad_dec(&acpi_pb, acpi_timer_virt_el1_gsiv, 0);
+	pb_putc(&acpi_pb, '\n');
+
+	pb_str(&acpi_pb, "fadt_flags:  0x");
+	pb_hex(&acpi_pb, acpi_fadt_flags, 0);
+	pb_putc(&acpi_pb, '\n');
+
+	pb_flush_to_q(&acpi_pb, q);
+	return 0;
+}
+
+static struct procbuf pci_pb;
+
+static int proc_pci_qopen(queue_t *q)
+{
+	pb_reset(&pci_pb);
+	if (pci_nr_devs == 0) {
+		pb_str(&pci_pb,
+		       "pcie: no devices enumerated "
+		       "(no ACPI MCFG -- booted via -kernel?)\n");
+		pb_flush_to_q(&pci_pb, q);
+		return 0;
+	}
+	pb_str(&pci_pb,
+	       "BDF      VID:DID    CLASS  HDR  MSI-X  BARs\n");
+	for (uint32_t i = 0; i < pci_nr_devs; i++) {
+		struct pci_device *p = &pci_devs[i];
+		pb_hex(&pci_pb, p->bus, 2); pb_putc(&pci_pb, ':');
+		pb_hex(&pci_pb, p->dev, 2); pb_putc(&pci_pb, '.');
+		pb_pad_dec(&pci_pb, p->fn, 0);
+		pb_str(&pci_pb, "   ");
+		pb_hex(&pci_pb, p->vendor_id, 4); pb_putc(&pci_pb, ':');
+		pb_hex(&pci_pb, p->device_id, 4);
+		pb_str(&pci_pb, "  ");
+		pb_hex(&pci_pb, p->class_subclass, 4);
+		pb_str(&pci_pb, "  ");
+		pb_hex(&pci_pb, p->header_type, 2);
+		pb_str(&pci_pb, "   ");
+		if (p->msix_cap) {
+			pb_str(&pci_pb, "0x");
+			pb_hex(&pci_pb, p->msix_cap, 2);
+		} else {
+			pb_str(&pci_pb, "-   ");
+		}
+		pb_str(&pci_pb, "   ");
+		for (int j = 0; j < 6; j++) {
+			if (p->bar[j]) {
+				pb_hex(&pci_pb, p->bar[j], 8);
+				if (j < 5) pb_putc(&pci_pb, ' ');
+			}
+		}
+		pb_putc(&pci_pb, '\n');
+	}
+	pb_flush_to_q(&pci_pb, q);
+	return 0;
+}
+
+/* EFI memory descriptor `type` field decode -- only the ones that
+ * actually show up under AAVMF + Graviton are named; others print
+ * as a number. */
+static const char *efi_mem_type_name(uint32_t t)
+{
+	switch (t) {
+	case 0:  return "Reserved";
+	case 1:  return "LoaderCode";
+	case 2:  return "LoaderData";
+	case 3:  return "BootCode";
+	case 4:  return "BootData";
+	case 5:  return "RuntimeCode";
+	case 6:  return "RuntimeData";
+	case 7:  return "Conventional";
+	case 8:  return "Unusable";
+	case 9:  return "ACPIReclaim";
+	case 10: return "ACPINVS";
+	case 11: return "MMIO";
+	case 12: return "MMIOPort";
+	case 13: return "PalCode";
+	case 14: return "Persistent";
+	default: return "?";
+	}
+}
+
+static struct procbuf efi_pb;
+
+static int proc_efi_qopen(queue_t *q)
+{
+	pb_reset(&efi_pb);
+	if (!efi_memmap_buf || !efi_memmap_size ||
+	    !efi_memmap_descriptor_size) {
+		pb_str(&efi_pb,
+		       "efi: no memory map (booted via -kernel)\n");
+		pb_flush_to_q(&efi_pb, q);
+		return 0;
+	}
+	pb_str(&efi_pb, "TYPE          START              PAGES     END\n");
+
+	const uint8_t *p   = (const uint8_t *)efi_memmap_buf;
+	const uint8_t *end = p + efi_memmap_size;
+	uint64_t       step = efi_memmap_descriptor_size;
+	while (p + step <= end) {
+		const struct efi_memory_descriptor *d =
+			(const struct efi_memory_descriptor *)p;
+		uint64_t bytes = d->number_of_pages * 4096;
+		pb_pad_str(&efi_pb, efi_mem_type_name(d->type), 13);
+		pb_putc(&efi_pb, ' ');
+		pb_str(&efi_pb, "0x");
+		pb_hex(&efi_pb, d->physical_start, 16);
+		pb_str(&efi_pb, " ");
+		pb_pad_dec(&efi_pb, d->number_of_pages, 8);
+		pb_str(&efi_pb, "  0x");
+		pb_hex(&efi_pb, d->physical_start + bytes, 16);
+		pb_putc(&efi_pb, '\n');
+		p += step;
+	}
+
+	pb_flush_to_q(&efi_pb, q);
+	return 0;
+}
+
+/* ---- /proc/nvme -- AWS.md stage F: NVMe controller summary ---------- */
+
+static struct procbuf nvme_pb;
+
+static int proc_nvme_qopen(queue_t *q)
+{
+	struct nvme_info info;
+	nvme_get_info(&info);
+
+	pb_reset(&nvme_pb);
+	if (!info.present) {
+		pb_str(&nvme_pb,
+		       "nvme: no controller (no PCI class 0x0108 found)\n");
+		pb_flush_to_q(&nvme_pb, q);
+		return 0;
+	}
+	pb_str(&nvme_pb, "version:     ");
+	pb_pad_dec(&nvme_pb, info.major, 0); pb_putc(&nvme_pb, '.');
+	pb_pad_dec(&nvme_pb, info.minor, 0); pb_putc(&nvme_pb, '.');
+	pb_pad_dec(&nvme_pb, info.tertiary, 0);
+	pb_putc(&nvme_pb, '\n');
+
+	pb_str(&nvme_pb, "bar0:        0x");
+	pb_hex(&nvme_pb, info.bar0, 0);
+	pb_putc(&nvme_pb, '\n');
+
+	pb_str(&nvme_pb, "vid:         0x");
+	pb_hex(&nvme_pb, info.vid, 4);
+	pb_putc(&nvme_pb, '\n');
+
+	pb_str(&nvme_pb, "model:       "); pb_str(&nvme_pb, info.model);
+	pb_putc(&nvme_pb, '\n');
+	pb_str(&nvme_pb, "serial:      "); pb_str(&nvme_pb, info.serial);
+	pb_putc(&nvme_pb, '\n');
+	pb_str(&nvme_pb, "firmware:    "); pb_str(&nvme_pb, info.firmware);
+	pb_putc(&nvme_pb, '\n');
+
+	pb_str(&nvme_pb, "ns1_blocks:  ");
+	pb_pad_dec(&nvme_pb, info.ns1_blocks, 0);
+	pb_putc(&nvme_pb, '\n');
+	pb_str(&nvme_pb, "ns1_lba:     ");
+	pb_pad_dec(&nvme_pb, info.ns1_lba_bytes, 0);
+	pb_str(&nvme_pb, " bytes\n");
+	pb_str(&nvme_pb, "ns1_size:    ");
+	pb_pad_dec(&nvme_pb,
+		   (info.ns1_blocks * info.ns1_lba_bytes) >> 20, 0);
+	pb_str(&nvme_pb, " MB\n");
+
+	pb_flush_to_q(&nvme_pb, q);
+	return 0;
+}
+
 /* ---- Read-side put: the head queues data; we never see reverse traffic. */
 
 static int proc_rq_putp(queue_t *q, mblk_t *mp)
@@ -493,6 +751,10 @@ PROC_DRIVER(cpu,    proc_cpu_qopen);
 PROC_DRIVER(netif,  proc_netif_qopen);
 PROC_DRIVER(procslip, proc_slip_qopen);
 PROC_DRIVER(proctcp,  proc_tcp_qopen);
+PROC_DRIVER(procacpi, proc_acpi_qopen);
+PROC_DRIVER(procpci,  proc_pci_qopen);
+PROC_DRIVER(procefi,  proc_efi_qopen);
+PROC_DRIVER(procnvme, proc_nvme_qopen);
 
 /* ---- /proc/ftrace --------------------------------------------------- */
 
@@ -573,6 +835,10 @@ void proc_init(void)
 	cdev_register(CDEV_MAJ_PROC_NETIF,  "proc-netif",  &netif_streamtab);
 	cdev_register(CDEV_MAJ_PROC_SLIP,   "proc-slip",   &procslip_streamtab);
 	cdev_register(CDEV_MAJ_PROC_TCP,    "proc-tcp",    &proctcp_streamtab);
+	cdev_register(CDEV_MAJ_PROC_ACPI,   "proc-acpi",   &procacpi_streamtab);
+	cdev_register(CDEV_MAJ_PROC_PCI,    "proc-pci",    &procpci_streamtab);
+	cdev_register(CDEV_MAJ_PROC_EFI,    "proc-efi",    &procefi_streamtab);
+	cdev_register(CDEV_MAJ_PROC_NVME,   "proc-nvme",   &procnvme_streamtab);
 
 	struct dentry *proc = vfs_mkdir(vfs_root(), "proc");
 	vfs_mknod_chrdev(proc, "ps",       MKDEV(CDEV_MAJ_PROC_PS,     0));
@@ -584,4 +850,8 @@ void proc_init(void)
 	vfs_mknod_chrdev(proc, "netif",    MKDEV(CDEV_MAJ_PROC_NETIF,  0));
 	vfs_mknod_chrdev(proc, "slip",     MKDEV(CDEV_MAJ_PROC_SLIP,   0));
 	vfs_mknod_chrdev(proc, "tcp",      MKDEV(CDEV_MAJ_PROC_TCP,    0));
+	vfs_mknod_chrdev(proc, "acpi",     MKDEV(CDEV_MAJ_PROC_ACPI,   0));
+	vfs_mknod_chrdev(proc, "pci",      MKDEV(CDEV_MAJ_PROC_PCI,    0));
+	vfs_mknod_chrdev(proc, "efi",      MKDEV(CDEV_MAJ_PROC_EFI,    0));
+	vfs_mknod_chrdev(proc, "nvme",     MKDEV(CDEV_MAJ_PROC_NVME,   0));
 }
