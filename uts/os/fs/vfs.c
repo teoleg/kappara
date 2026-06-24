@@ -440,6 +440,17 @@ int sys_open_impl(const char *path, int flags)
 			return -1;
 		p = path;
 	}
+	/* Resolve "." / "nvme" / "./foo" against the calling process's
+	 * cwd before vfs_lookup, which only understands absolute
+	 * paths.  Kernel-internal callers passing "/dev/tty0" et al
+	 * are absolute and pass through unchanged. */
+	char resolved[128];
+	const char *rp = resolve_path_kva(p, resolved, sizeof(resolved));
+	if (!rp) {
+		kprintf("sys_open: path too long after cwd join: '%s'\n", p);
+		return -1;
+	}
+	p = rp;
 	struct dentry *d = vfs_lookup(p);
 	if (!d) {
 		kprintf("sys_open: ENOENT '%s'\n", p);

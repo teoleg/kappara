@@ -212,6 +212,13 @@ void          vfs_drain_fds(struct kthread *t);
 int   sys_open_impl(const char *path, int flags);
 int   sys_mkdir_impl(const char *path);
 int   sys_unlink_impl(const char *path);
+
+/* Resolve a path (absolute or relative) against the current
+ * thread's vm_map->cwd into the supplied buffer.  Returns `out`
+ * on success, or NULL if the result wouldn't fit.  Defined in
+ * uts/os/proc/syscall.c.  Kernel-internal callers passing
+ * absolute paths ("/dev/tty0") get them back unchanged. */
+const char *resolve_path_kva(const char *path, char *out, size_t cap);
 int   sys_rmdir_impl(const char *path);
 
 /* VFS-level helper: remove the dentry named `name` from `parent`'s
