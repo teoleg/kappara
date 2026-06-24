@@ -181,15 +181,13 @@ $(KERNEL): $(ELF)
 	@# with EFI_UNSUPPORTED.
 	@./tools/pad_pe.py $@
 
-# Trap INT/TERM and reap the qemu pid on the way out -- otherwise a
-# Ctrl-C in `-nographic` mode leaves a zombie QEMU holding the
-# hostfwd ports, and the next `make run` fails with "Could not set
-# up host forwarding rule".  Same pattern run-telnet / run-ftp use.
+# Foreground exec so QEMU owns the controlling TTY -- otherwise
+# `-nographic` shows the boot splash + shell prompt but stdin
+# keystrokes never reach QEMU (they go to whatever's in the
+# terminal's foreground process group, which would be `wait`,
+# not us).  Quit with Ctrl-A x (QEMU's `-nographic` escape).
 run: $(KERNEL)
-	@$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL) & \
-	  QPID=$$!; \
-	  trap "kill $$QPID 2>/dev/null; wait 2>/dev/null" EXIT INT TERM; \
-	  wait $$QPID
+	@exec $(QEMU) $(QEMU_ARGS) -kernel $(KERNEL)
 
 # ARCH=virt only: boot QEMU virt headless in the background, wait
 # for the in-kernel telnetd to come up on hostfwd port 2323, then
