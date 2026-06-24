@@ -576,8 +576,6 @@ void kthread_dispatch(struct kthread *t)
 {
 	if (!t) return;
 	dispq_push(curcpu(), t);
-	kprintf("sched: created tid=%u name=%s stack=%p\n",
-		t->tid, t->name, t->stack_base);
 }
 
 struct kthread *kthread_create_no_dispatch(const char *name,
@@ -1265,7 +1263,6 @@ void kthread_exit(int status)
 	 * inherited from the parent get their refcount dropped here so
 	 * the pipe goes away naturally when both ends are closed. */
 	vfs_drain_fds(me);
-	kprintf("kthread: tid=%u (%s) exited\n", me->tid, me->name);
 
 	/*
 	 * Lock acquisition order:
