@@ -80,19 +80,18 @@ reads it back, leaving the pattern persisted on the host file.
 
 ## Quitting QEMU
 
-The `make run-thrifty` and `make run-gui` targets use **plain
-`-serial stdio`** (no `mon:` prefix), so:
+`make run` execs QEMU in the foreground with `-nographic`, which
+multiplexes monitor + serial onto stdio:
 
-| What you type     | What happens                                       |
-|-------------------|----------------------------------------------------|
-| `Ctrl-C`          | Sends SIGINT to QEMU -- QEMU exits immediately     |
-| `halt` in the shell | Runs `sys_halt`, which triggers ARM semihosting SYS_EXIT; QEMU exits with status 0 |
-| `make stop` (other terminal) | `pkill -x` any running QEMU                  |
+| What you type                | What happens                                |
+|------------------------------|---------------------------------------------|
+| `Ctrl-A x`                   | QEMU `-nographic` escape -- exits cleanly   |
+| `make stop` (other terminal) | `pkill -x` any running QEMU                 |
 
-Both `Ctrl-C` and the `halt` shell command work from the same
-terminal QEMU is running in, so you don't need a second window.
-`halt` requires `-semihosting-config enable=on,target=native`,
-which both run targets already pass.
+Note: `Ctrl-C` is interpreted by the kernel's tty as a SIGINT to
+the foreground shell process (kappara's `init`), NOT as a quit
+signal to QEMU.  If you really want a hard QEMU kill, use
+`make stop` from another window.
 
 ### What changed from earlier versions
 
