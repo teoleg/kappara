@@ -1062,8 +1062,6 @@ static void exec_thread_main(void *p)
 {
 	struct exec_args a = *(struct exec_args *)p;
 	kfree(p);
-	kprintf("exec: EL0 entry=0x%lx sp=0x%lx\n",
-		(unsigned long)a.entry, (unsigned long)a.sp);
 	aarch64_enter_userspace(a.entry, a.sp, 0);
 	/* unreachable */
 }
