@@ -56,6 +56,8 @@ includes it — no more silent ABI mismatches across stale .o files
 |-----------------|---------------------------------------------------------------|
 | `make run`      | Boots `build/kernel.img` in QEMU `virt`, networking forwarded (FTP 2121, telnet 2323, FTP-PASV 30000-30007) |
 | `make test`     | Full health check: smoke-ftp + smoke-sdk + smoke-linux + smoke-linux-mmap + `cmd/test all 14/14` |
+| `make ami`      | Build a GPT+ESP raw disk image at `build/kappara-ami.img` (AWS.md stage G) -- requires `parted`, `dosfstools`, `mtools` |
+| `make ami-run`  | Smoke-boot that image under QEMU + AAVMF -- requires `qemu-efi-aarch64` |
 | `make stop`     | `pkill` any running QEMU                                      |
 | `make run-telnet` | Boot headless + drive a foreground `nc localhost 2323` |
 | `make run-ftp`  | Boot headless + an interactive `ftp 127.0.0.1 2121` session |

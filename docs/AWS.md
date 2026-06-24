@@ -261,22 +261,71 @@ they had to ship together to actually exercise the UEFI path:
 
 ### Stage E -- ENA network driver
 
-Status: `[ ]`
+Status: `[~]` (skeleton in tree; structural shape complete, byte-
+level constants UNVERIFIED -- see the "blind implementation
+caveat" below).
 
-ENA is documented in the Amazon Linux source tree (Apache 2.0).
-Protocol shape:
+ENA = AWS Elastic Network Adapter; PCI vendor 0x1d0f, device
+0xec20 (or 0xec21 on some VFs), class 0x0200.  Lives in
+`uts/virt/ena.c`; entry point `ena_init()` runs from kmain right
+after `nvme_init()`.
 
-- Admin queue for management commands.
-- Per-direction (Tx / Rx) queue pairs, each with a submission
-  ring + completion ring.
-- MSI-X vector per queue.
+Structural shape (matches the upstream Linux driver in
+`drivers/net/ethernet/amazon/ena/`):
 
-We wire ENA up under the existing `struct netif` shape -- it
-takes the same `tx` / `rx` slot virtio_net.c provides; everything
-above (`ip_attach_stream` etc) stays unchanged.
+1. PCI probe for the Amazon vendor + class-network pair.
+2. PCI Command register: enable Memory Space + Bus Master
+   (same dance nvme.c does -- UEFI leaves those clear).
+3. Map BAR0 (registers) via `mmu_map_device_1gb`.
+4. Reset: write DEV_CTL.RESET, poll DEV_STS.RESET_FINISHED,
+   clear DEV_CTL.RESET, wait DEV_STS.READY.
+5. Allocate Admin SQ + Admin CQ + AENQ pages from the PMM;
+   program AQ_BASE / CAPS, ACQ_BASE / CAPS, AENQ_BASE / CAPS.
+6. Mask all interrupts (polled driver).
+7. `GET_FEATURE(DEVICE_ATTRIBUTES)` admin command -> MAC, MTU,
+   max queue counts.
+8. `CREATE_CQ` + `CREATE_SQ` for one TX pair and one RX pair.
+9. Pre-fill the RX SQ with PMM-backed buffers; ring the RX
+   doorbell.
+10. Register a `struct netif` named `eth0` so the IP layer sees us.
 
-After this stage `make ARCH=aws64 run-telnet` works for a real
-EC2 instance with a public IP.
+What WORKS (mechanically -- not tested on hardware):
+- Probe + reset + admin queue + GET_FEATURE + queue creation
+  paths all compile + run on the non-ENA fallback path (init
+  is a no-op when the device is absent).
+- `-kernel` boot under QEMU virt is unchanged; ENA never
+  matches because QEMU has no ENA emulation.
+
+#### Blind-implementation caveat
+
+This stage was written without ENA hardware or QEMU emulation
+to test against.  Every register offset, bitfield mask, and
+admin-command structure was reconstructed from training-data
+memory of the upstream Linux ena driver and the public ENA
+spec.  Every site in `uts/virt/ena.c` flagged
+`XXX-verify-against-ena_regs_defs.h` or
+`XXX-verify-against-ena_admin_defs.h` must be cross-checked
+against amzn-drivers' canonical headers
+(<https://github.com/amzn/amzn-drivers/tree/master/kernel/linux/ena>)
+before this code boots on real Graviton.
+
+Expected debugging on first AWS boot:
+- Wrong reset bit -> reset spins forever; need to check
+  `DEV_CTL` / `DEV_STS` masks.
+- Wrong feature ID layout in admin command payloads ->
+  GET_FEATURE returns an error status; need to compare the
+  command-payload encoding to `ena_admin_aq_get_feature_cmd`.
+- Wrong queue-create payload offsets -> CREATE_CQ returns
+  a non-zero status.
+
+Once the offsets are pinned, what remains for "real packet
+I/O" (not just queue creation):
+- RX kthread that drains the CQ, hands each completion's
+  buffer up to the IP stack as an mblk, refills the SQ.
+- TX path: build TX descriptor from an mblk's b_rptr/b_wptr,
+  ring the doorbell, free the mblk on completion.
+- DHCP wire-up (currently `ip = 0` -- DHCP discovery runs in
+  the virtio-net path; needs lifting into a shared helper).
 
 ### Stage F -- NVMe block driver
 
@@ -346,31 +395,134 @@ What's still missing (next iteration, not blocking stage G):
 - Multi-block transfers + PRP2 / SGL.  Today's bd_read/write
   is one LBA per call.
 
-### Stage F.1 -- kfs root on NVMe / EBS
+### Stage F.1 -- kfs `/home` on NVMe / EBS
 
-Status: `[ ]`
+Status: `[x]` (mount + first-boot mkimage; persistent across reboots)
 
-Mount kfs on top of `nvme0n1` (or whichever namespace EBS hands
-us on Graviton) instead of the in-RAM `ramdisk0`.  Two pieces:
+Mount kfs on top of `nvme0n1` for `/home`.  Stays on the in-RAM
+`ramdisk0` for `/usr/bin` (those are immutable kernel-embedded
+ELFs; persistence there is meaningless until we move the build
+to "ship binaries via AMI" in stage G).
 
-- `kfs_mount` already takes any `struct block_device` -- swap
-  the source from `ramdisk_get()` to `nvme_get()` for the
-  `/usr/bin` (and possibly `/home`) mount.
-- Hand-roll a tiny mkfs that writes a fresh kfs image to the
-  raw EBS namespace when AMI build time, so the first boot
-  finds populated content rather than zeros.
+What landed in `uts/os/user/user.c::exec_space_init`:
 
-After this, `/usr/bin` and `/home` survive reboots.  Big deal:
-the kernel image stops embedding `userblob.o` / `helloblob.o`,
-which trims it.
+- If `nvme_get()` returns a block_device, use it for `/home`;
+  otherwise fall back to `ramdisk_home_get()`.
+- First-boot logic: try `kfs_mount` straight away.  If it
+  reports bad magic (= raw / freshly created namespace),
+  `kfs_mkimage` it as an empty kfs, then mount.  On a
+  reboot with a populated disk the first mount succeeds
+  and no mkimage runs -- preserving everything.
 
-### Stage G -- Polish + sample AMI build
+Two bugs landed alongside, both regressed by stage F:
 
-Status: `[ ]` (optional)
+- `mmu_vmap_create` now copies every populated `l0_table[1+]`
+  entry into per-process L0s, not just the kernel L1[1].  Stage
+  F's `mmu_map_device_1gb` for the NVMe BAR at 0x8000000000
+  populates `l0_table[1]`; without inheriting that, the first
+  exec'd user thread doing kfs I/O page-faults inside
+  `nvme_io_submit_and_wait`'s doorbell write.
 
-`make ARCH=aws64 ami` produces a raw disk image with our kernel
-+ a FAT EFI System Partition + a kfs root.  Upload to S3, register
-as an AMI, launch.
+- `nvme_init`'s selftest no longer clobbers LBA 0.  It now
+  pre-reads the LAST LBA, writes the pattern there, reads
+  back, then restores the original bytes -- so the round-trip
+  is byte-neutral on the disk and the kfs superblock (block 0)
+  survives.
+
+End-to-end persistence verified under AAVMF + virt + a real
+`nvme.img`:
+
+```
+phase 1 (fresh disk): touch /home/hello; echo /home/hello text; halt
+phase 2 (same img):   cat /home/hello   -> "text"
+```
+
+The phase-2 log shows `exec: /home mounted from nvme0n1
+(persistent)` rather than `formatted + mounted` -- proving the
+on-disk superblock is recognised and we skipped the mkimage
+fallback.
+
+### Stage G -- Sample AMI build
+
+Status: `[x]`
+
+`make ami` (after the single-arch collapse, no more `ARCH=`)
+produces `build/kappara-ami.img`: a 130 MiB raw disk with a GPT
+partition table and one EFI System Partition (FAT32, ~128 MiB)
+containing `\EFI\BOOT\BOOTAA64.EFI` = our kernel.img.
+
+Layout:
+
+```
+GPT header  +  ESP partition (FAT32, labelled "KAPPARA")
+1 MiB          ^ \EFI\BOOT\BOOTAA64.EFI = kernel.img
+               | (PE32+ EFI app w/ embedded ARM64 Image header)
+```
+
+The kernel is the same `build/kernel.img` that QEMU `-kernel`
+boots; UEFI uses its PE32+ header (stage B), QEMU uses its
+Linux ARM64 Image header (stage A).  No code duplication.
+
+`/home` (stage F.1) is NOT carved into this image -- on AWS,
+mutable data goes on a separate EBS volume so the root volume
+stays immutable.  At instance launch:
+
+1. Boot volume: this AMI (read-only most of the time).
+2. Data volume: a second EBS volume, attached as NVMe.  Empty
+   on first boot; stage F.1's "kfs_mount or kfs_mkimage"
+   handler formats it.  Subsequent reboots preserve files.
+
+Local smoke-boot under QEMU + AAVMF (drop-in equivalent of how
+EC2 fires the AMI): `make ami-run`.  Brings up the AMI image as
+the boot disk + a small blank file as the second NVMe volume;
+verified to reach the `kappara:/#` prompt and persist a write
+to `/home`.
+
+The tool that builds the image is `tools/make-ami.sh`; it uses
+`parted` + `dosfstools` + `mtools`.  None of these run during a
+normal `make`; only when you explicitly ask for an AMI.
+
+#### Pushing to AWS
+
+The repo doesn't automate this end-to-end yet -- the assumption
+is you'd run these by hand once per release.  Pseudo-recipe:
+
+```
+# 1. Build the disk image
+make ami
+
+# 2. Upload the raw image to an S3 bucket
+aws s3 cp build/kappara-ami.img s3://YOUR_BUCKET/kappara-ami.img
+
+# 3. Tell EC2 to import it as a snapshot (creates an EBS-backed
+#    snapshot from the raw blob).  Needs an IAM role granting
+#    VMIE access; see AWS's "vmimport" service-role docs.
+TASK=$(aws ec2 import-snapshot --description "kappara root" \
+       --disk-container file://<(printf '%s' \
+         '{"Format":"raw","UserBucket":{"S3Bucket":"YOUR_BUCKET",'\
+         '"S3Key":"kappara-ami.img"}}') \
+       --query ImportTaskId --output text)
+
+# 4. Poll until completed; grab the resulting SnapshotId
+aws ec2 describe-import-snapshot-tasks --import-task-ids $TASK
+
+# 5. Register the snapshot as an AMI (aarch64, UEFI boot)
+aws ec2 register-image --name kappara-r0 --architecture arm64 \
+    --boot-mode uefi --root-device-name /dev/sda1 \
+    --block-device-mappings 'DeviceName=/dev/sda1,Ebs={SnapshotId=snap-XXX}'
+
+# 6. Launch on a c7g / t4g (Graviton) instance.  Attach an extra
+#    EBS volume for /home; kappara will format + mount it.
+```
+
+What's intentionally left for later:
+
+- A real `boot-mode=uefi-preferred` story so the AMI also works
+  on instance types that allow legacy fallback (unlikely to
+  matter -- Graviton is UEFI-native).
+- ENA driver (stage E) -- without it the AMI runs but has no
+  network on the instance.  QEMU virt papers over this with
+  virtio-net; EC2 doesn't.
 
 ## Dependency chain
 

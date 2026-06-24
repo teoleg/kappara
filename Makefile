@@ -34,6 +34,7 @@ ARCH_OBJS   := \
     $(BUILD)/uts/virt/acpi.o \
     $(BUILD)/uts/virt/pcie.o \
     $(BUILD)/uts/virt/nvme.o \
+    $(BUILD)/uts/virt/ena.o \
     $(BUILD)/uts/aarch64/userblob.o \
     $(BUILD)/uts/aarch64/helloblob.o \
     $(BUILD)/uts/aarch64/usrblobs.o
@@ -82,6 +83,7 @@ QEMU          := qemu-system-aarch64
 # of data ports (30000..30007 -> host 30000..30007) for PASV.  The
 # range must match cmd/ftpd.c's PASV_BASE / PASV_N.
 QEMU_ARGS     := -M virt,gic-version=3 -cpu cortex-a72 -nographic -m 256 \
+                 -semihosting-config enable=on,target=native \
                  -global virtio-mmio.force-legacy=false \
                  -netdev user,id=n0,hostfwd=tcp::2323-:23,hostfwd=tcp::2121-:21,hostfwd=tcp::30000-:30000,hostfwd=tcp::30001-:30001,hostfwd=tcp::30002-:30002,hostfwd=tcp::30003-:30003,hostfwd=tcp::30004-:30004,hostfwd=tcp::30005-:30005,hostfwd=tcp::30006-:30006,hostfwd=tcp::30007-:30007 \
                  -device virtio-net-device,netdev=n0
@@ -188,6 +190,41 @@ $(KERNEL): $(ELF)
 # not us).  Quit with Ctrl-A x (QEMU's `-nographic` escape).
 run: $(KERNEL)
 	@exec $(QEMU) $(QEMU_ARGS) -kernel $(KERNEL)
+
+# AWS.md stage G: produce a single GPT-partitioned raw image with an
+# ESP (FAT32) carrying our kernel as \EFI\BOOT\BOOTAA64.EFI.  Upload
+# the result to S3 and import as an AMI on EC2.  Locally the same
+# image boots under QEMU + AAVMF -- see `make ami-run`.
+AMI_IMG := $(BUILD)/kappara-ami.img
+
+.PHONY: ami ami-run
+ami: $(AMI_IMG)
+$(AMI_IMG): $(KERNEL) tools/make-ami.sh
+	@./tools/make-ami.sh $(KERNEL) $@
+
+# Smoke-boot the AMI under AAVMF.  Needs qemu-efi-aarch64 +
+# parted/dosfstools/mtools installed.  Brings up a second NVMe
+# namespace as /home so kappara's stage F.1 mount finds it; a
+# real EC2 instance would attach this as a second EBS volume.
+AMI_HOME    := $(BUILD)/kappara-ami-home.img
+AMI_VARS    := $(BUILD)/kappara-ami-vars.fd
+AAVMF_CODE  := /usr/share/AAVMF/AAVMF_CODE.fd
+AAVMF_VARS  := /usr/share/AAVMF/AAVMF_VARS.fd
+
+ami-run: $(AMI_IMG)
+	@cp $(AAVMF_VARS) $(AMI_VARS)
+	@[ -f $(AMI_HOME) ] || truncate -s 64M $(AMI_HOME)
+	@exec $(QEMU) -M virt,gic-version=3 -cpu cortex-a72 -nographic -m 256 \
+	    -semihosting-config enable=on,target=native \
+	    -global virtio-mmio.force-legacy=false \
+	    -drive if=pflash,format=raw,readonly=on,file=$(AAVMF_CODE) \
+	    -drive if=pflash,format=raw,file=$(AMI_VARS) \
+	    -drive id=ami,format=raw,if=none,file=$(AMI_IMG) \
+	    -device virtio-blk-device,drive=ami,bootindex=1 \
+	    -drive id=home,format=raw,if=none,file=$(AMI_HOME) \
+	    -device nvme,drive=home,serial=kappara-home \
+	    -netdev user,id=n0 \
+	    -device virtio-net-device,netdev=n0
 
 # ARCH=virt only: boot QEMU virt headless in the background, wait
 # for the in-kernel telnetd to come up on hostfwd port 2323, then

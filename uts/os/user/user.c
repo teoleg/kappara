@@ -67,6 +67,7 @@
 
 #include "kappara/fs/blkdev.h"
 #include "kappara/abi/elf.h"
+#include "kappara/arch/nvme.h"
 #include "kappara/fs/kfs.h"
 #include "kappara/core/kmem.h"
 #include "kappara/arch/mmu.h"
@@ -1004,16 +1005,43 @@ void exec_space_init(void)
 		kprintf("exec: /usr/bin mounted from ramdisk (%u files)\n",
 		        n_usrbin);
 
-	/* Step 2 of the FTPD plan: empty kfs ramdisk mounted at /home.
-	 * This is where future FTP STORs land -- separate from /usr/bin
-	 * so a STOR can't overwrite a binary mid-exec.  Pass NULL/0 for
-	 * an empty payload table; the on-disk root dirent stays empty. */
-	kfs_mkimage(ramdisk_home_get(), NULL, 0);
+	/* /home: writable kfs separate from /usr/bin so an FTP STOR can't
+	 * overwrite a binary mid-exec.  Prefer the NVMe namespace when
+	 * one was discovered at boot (AWS.md stage F/F.1 -- EBS or
+	 * QEMU's -device nvme), so files survive reboots.  Falls back to
+	 * a fresh in-RAM ramdisk1 when there's no NVMe.
+	 *
+	 * NVMe path is "mount if a valid kfs is already on disk; format
+	 * + mount otherwise".  kfs_mount fails on bad magic (e.g. fresh
+	 * raw EBS volume / freshly-created qemu nvme.img); we then
+	 * mkimage and retry. */
+	struct block_device *home_bd  = nvme_get();
+	const char          *home_src = "nvme0n1 (persistent)";
+	if (!home_bd) {
+		home_bd  = ramdisk_home_get();
+		home_src = "ramdisk1 (volatile)";
+		kfs_mkimage(home_bd, NULL, 0);
+	}
 	struct dentry *home = vfs_mkdir(vfs_root(), "home");
-	if (kfs_mount(ramdisk_home_get(), home) < 0)
-		kprintf("exec: kfs_mount /home failed\n");
-	else
-		kprintf("exec: /home mounted from ramdisk1 (writable)\n");
+	if (kfs_mount(home_bd, home) < 0) {
+		/* Likely a fresh NVMe namespace with no superblock yet --
+		 * format it and try once more.  Any persistent /home
+		 * content from a previous boot gets wiped here, which is
+		 * the right behavior for "first ever launch on this disk"
+		 * but would NOT be what we want once we ship to AWS -- a
+		 * future kfsck-style "is this our format?" probe will
+		 * keep us from clobbering a kfs that's just a different
+		 * version. */
+		kfs_mkimage(home_bd, NULL, 0);
+		if (kfs_mount(home_bd, home) < 0)
+			kprintf("exec: kfs_mount /home failed even after "
+				"mkimage\n");
+		else
+			kprintf("exec: /home formatted + mounted from %s\n",
+				home_src);
+	} else {
+		kprintf("exec: /home mounted from %s\n", home_src);
+	}
 }
 
 /* ---- ELF loader ---- */

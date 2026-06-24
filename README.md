@@ -80,6 +80,8 @@ make test       # smoke-ftp + smoke-sdk + smoke-linux + smoke-linux-mmap
 | `make stop`       | `pkill` any running QEMU process                                   |
 | `make clean`      | Remove `build/`                                                    |
 | `make TRACE=1 ...`| Build with the ftrace cyg-profile hooks enabled                    |
+| `make ami`        | Produce `build/kappara-ami.img` -- a GPT+ESP raw disk suitable for EC2 Graviton AMI import (AWS.md stage G) |
+| `make ami-run`    | Smoke-boot the AMI image under QEMU + AAVMF (UEFI), with a blank `/home` NVMe namespace attached |
 
 ## What's inside
 
@@ -97,6 +99,8 @@ make test       # smoke-ftp + smoke-sdk + smoke-linux + smoke-linux-mmap
 | `uts/virt/acpi.c`              | Walk RSDP → XSDT → MADT/MCFG/GTDT/FADT (AWS.md stage C)           |
 | `uts/virt/pcie.c`              | ECAM bus enumeration; identifies AWS ENA + NVMe (AWS.md stage D)  |
 | `uts/virt/nvme.c`              | NVMe 1.4 block driver (polled, 512 B LBAs) (AWS.md stage F)       |
+| `uts/virt/ena.c`               | ENA network driver skeleton (AWS.md stage E, **byte-level constants unverified**) |
+| `/home` on NVMe                | When a controller is present, `/home` is mounted off `nvme0n1` and persists across reboots (AWS.md stage F.1) |
 | `tools/pad_pe.py`              | Pad `kernel.img` to PE SizeOfImage so EDK II accepts the load     |
 | `uts/os/core/pmm.c`            | 4 KB-page freelist allocator (spinlocked for SMP)                 |
 | `uts/os/core/kmem.c`           | Slab allocator + `kmalloc` size caches (lock order: kmem → pmm)   |

@@ -423,6 +423,18 @@ int mmu_vmap_create(struct vm_map *vm)
 	 * here and would fault on switch otherwise. */
 	l1_va[1] = l1_table[1];
 
+	/* Inherit every high-mem L0[1+] entry the boot tables grew at
+	 * platform-init time (mmu_map_device_1gb populates these for
+	 * NVMe BAR0 at 0x8000000000 and any other peripheral above
+	 * 512 GB).  Without this, kernel code reached via syscall from
+	 * an exec'd thread translates through the per-process L0
+	 * we just built and hits an invalid descriptor when poking
+	 * those MMIO registers -- canonical symptom: data abort in
+	 * nvme_io_submit_and_wait's doorbell write the first time the
+	 * user runs `cat /home/<file>`. */
+	for (int i = 1; i < ENTRIES_PER_TABLE; i++)
+		l0_va[i] = l0_table[i];
+
 	vmap_dup_kernel_l2(l2_va);
 
 	vm->l0_phys = (uint64_t)(uintptr_t)l0;

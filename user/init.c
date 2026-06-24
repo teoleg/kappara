@@ -245,12 +245,22 @@ static void replace_line(char *buf, size_t *i_inout, const char *new_line)
  */
 static volatile int sigint_pending;
 
+/* tid of the child currently sitting in sys_wait below us; 0 when
+ * the shell is just at its prompt.  Tracked so the SIGINT handler
+ * can forward the interrupt -- ldterm signals the foreground tty
+ * reader (the shell), but our running command (e.g. a hung `host`
+ * waiting on a UDP reply) needs to die too. */
+static volatile long sigint_child_tid;
+
 __attribute__((used))
 static void sigint_handler(int sig)
 {
 	(void)sig;
 	cwrite("^C\r\n");
 	sigint_pending = 1;
+	long t = sigint_child_tid;
+	if (t > 0)
+		(void)sys_kill((int)t, SIGINT);
 }
 
 /*
@@ -1447,7 +1457,9 @@ static void cmd_exec(int argc, char *argv[])
 		cwrite("exec: failed to load '"); cwrite(path); cwrite("'\r\n");
 		return;
 	}
+	sigint_child_tid = tid;
 	sys_wait((int)tid);
+	sigint_child_tid = 0;
 }
 
 /* ftrace <on|off|reset|dump>  -- control the per-CPU function tracer.
@@ -1567,7 +1579,9 @@ static void dispatch(char *line)
 		if (tid < 0) {
 			cwrite(argv[0]); cwrite(": command not found\r\n");
 		} else {
+			sigint_child_tid = tid;
 			sys_wait((int)tid);
+			sigint_child_tid = 0;
 		}
 	}
 }
