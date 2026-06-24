@@ -48,19 +48,20 @@ struct kfs_super {
 };
 
 /* Filesystem-wide name limit and per-dir-block entry cap.  Each
- * kfs_dirent is `KFS_NAME_MAX + 12` bytes (name + start_block + size
+ * kfs_dirent is `KFS_NAME_MAX + 9` bytes (name + start_block + size
  * + type).  We pack as many as fit in one 512 B block, so the two
- * constants move together: 11 / 22 give 11*22 + 12*22 = 506 B used.
- * History: 24/14 → 16/18 → 12/21 → 11/22 as /usr/bin grew.  Longest
- * name shipped is "tcpconnect" (10 chars + NUL = 11). */
+ * constants move together: 11 / 25 give 11*25 + 9*25 = 500 B used.
+ * History: 24/14 → 16/18 → 12/21 → 11/22 → 11/25 as /usr/bin grew
+ * (last bump shrank `type` from u32 to u8 since only one bit is
+ * meaningful).  Longest name shipped is "tcpconnect" (10 + NUL). */
 #define KFS_NAME_MAX	11
-#define KFS_DIRENTS	22
+#define KFS_DIRENTS	25
 
 #define KFS_TYPE_FILE	0
 #define KFS_TYPE_DIR	1
 
 /* Packed because KFS_NAME_MAX no longer needs to be 4-byte aligned --
- * the struct's on-disk layout is fixed at exactly KFS_NAME_MAX + 12
+ * the struct's on-disk layout is fixed at exactly KFS_NAME_MAX + 9
  * bytes so that the DIRENTS-per-block math matches the comments above. */
 struct kfs_dirent {
 	char		name[KFS_NAME_MAX];
@@ -68,7 +69,7 @@ struct kfs_dirent {
 					/* for dirs:  block of the subdir's */
 					/*            own dirent table       */
 	uint32_t	size_bytes;	/* file size in bytes; 0 for dirs   */
-	uint32_t	type;		/* KFS_TYPE_FILE / _DIR             */
+	uint8_t		type;		/* KFS_TYPE_FILE / _DIR             */
 } __attribute__((packed));
 
 /* Each file is given a fixed number of contiguous blocks at mkimage
