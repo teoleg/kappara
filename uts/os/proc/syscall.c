@@ -244,11 +244,13 @@ static long sys_ll(long a0, long a1, long a2, long a3, long a4, long a5)
 		path = "/";
 	}
 
-	struct dentry *d = vfs_lookup(path);
-	if (!d) {
-		kprintf("sys_lsl: ENOENT '%s'\n", path);
-		return -1;
-	}
+	/* Resolve "." / "foo" / "./foo" against the process's cwd
+	 * before vfs_lookup, same as sys_ls / sys_open. */
+	char resolved[128];
+	const char *p = resolve_path_kva(path, resolved, sizeof(resolved));
+	if (!p) return -1;
+	struct dentry *d = vfs_lookup(p);
+	if (!d) return -1;	/* ENOENT -- normal control flow, no kprintf */
 	return vfs_listdir_long(d, out, cap);
 }
 
