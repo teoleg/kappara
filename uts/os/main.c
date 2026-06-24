@@ -28,6 +28,7 @@
 #include "kappara/arch/acpi.h"
 #include "kappara/arch/framebuffer.h"
 #include "kappara/arch/ipi.h"
+#include "kappara/arch/ena.h"
 #include "kappara/arch/mmu.h"
 #include "kappara/arch/nvme.h"
 #include "kappara/arch/pcie.h"
@@ -420,6 +421,11 @@ void kmain(void)
 	 * `-device nvme`).  Runs after kmem_init because the driver
 	 * pmm_alloc()s queue pages from a primed PMM. */
 	nvme_init();
+	/* AWS.md stage E: ENA network adapter.  No-op when no PCI
+	 * vendor 0x1d0f device 0xec20 is present (everything except
+	 * AWS Graviton).  BLIND IMPLEMENTATION -- see
+	 * include/kappara/arch/ena.h for the spec-verification caveat. */
+	ena_init();
 	exec_space_init();
 
 	/* Draw the boot splash now that everything else is up.  The FB

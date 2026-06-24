@@ -34,6 +34,7 @@ ARCH_OBJS   := \
     $(BUILD)/uts/virt/acpi.o \
     $(BUILD)/uts/virt/pcie.o \
     $(BUILD)/uts/virt/nvme.o \
+    $(BUILD)/uts/virt/ena.o \
     $(BUILD)/uts/aarch64/userblob.o \
     $(BUILD)/uts/aarch64/helloblob.o \
     $(BUILD)/uts/aarch64/usrblobs.o

@@ -99,6 +99,7 @@ make test       # smoke-ftp + smoke-sdk + smoke-linux + smoke-linux-mmap
 | `uts/virt/acpi.c`              | Walk RSDP → XSDT → MADT/MCFG/GTDT/FADT (AWS.md stage C)           |
 | `uts/virt/pcie.c`              | ECAM bus enumeration; identifies AWS ENA + NVMe (AWS.md stage D)  |
 | `uts/virt/nvme.c`              | NVMe 1.4 block driver (polled, 512 B LBAs) (AWS.md stage F)       |
+| `uts/virt/ena.c`               | ENA network driver skeleton (AWS.md stage E, **byte-level constants unverified**) |
 | `/home` on NVMe                | When a controller is present, `/home` is mounted off `nvme0n1` and persists across reboots (AWS.md stage F.1) |
 | `tools/pad_pe.py`              | Pad `kernel.img` to PE SizeOfImage so EDK II accepts the load     |
 | `uts/os/core/pmm.c`            | 4 KB-page freelist allocator (spinlocked for SMP)                 |

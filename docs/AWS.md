@@ -261,22 +261,71 @@ they had to ship together to actually exercise the UEFI path:
 
 ### Stage E -- ENA network driver
 
-Status: `[ ]`
+Status: `[~]` (skeleton in tree; structural shape complete, byte-
+level constants UNVERIFIED -- see the "blind implementation
+caveat" below).
 
-ENA is documented in the Amazon Linux source tree (Apache 2.0).
-Protocol shape:
+ENA = AWS Elastic Network Adapter; PCI vendor 0x1d0f, device
+0xec20 (or 0xec21 on some VFs), class 0x0200.  Lives in
+`uts/virt/ena.c`; entry point `ena_init()` runs from kmain right
+after `nvme_init()`.
 
-- Admin queue for management commands.
-- Per-direction (Tx / Rx) queue pairs, each with a submission
-  ring + completion ring.
-- MSI-X vector per queue.
+Structural shape (matches the upstream Linux driver in
+`drivers/net/ethernet/amazon/ena/`):
 
-We wire ENA up under the existing `struct netif` shape -- it
-takes the same `tx` / `rx` slot virtio_net.c provides; everything
-above (`ip_attach_stream` etc) stays unchanged.
+1. PCI probe for the Amazon vendor + class-network pair.
+2. PCI Command register: enable Memory Space + Bus Master
+   (same dance nvme.c does -- UEFI leaves those clear).
+3. Map BAR0 (registers) via `mmu_map_device_1gb`.
+4. Reset: write DEV_CTL.RESET, poll DEV_STS.RESET_FINISHED,
+   clear DEV_CTL.RESET, wait DEV_STS.READY.
+5. Allocate Admin SQ + Admin CQ + AENQ pages from the PMM;
+   program AQ_BASE / CAPS, ACQ_BASE / CAPS, AENQ_BASE / CAPS.
+6. Mask all interrupts (polled driver).
+7. `GET_FEATURE(DEVICE_ATTRIBUTES)` admin command -> MAC, MTU,
+   max queue counts.
+8. `CREATE_CQ` + `CREATE_SQ` for one TX pair and one RX pair.
+9. Pre-fill the RX SQ with PMM-backed buffers; ring the RX
+   doorbell.
+10. Register a `struct netif` named `eth0` so the IP layer sees us.
 
-After this stage `make ARCH=aws64 run-telnet` works for a real
-EC2 instance with a public IP.
+What WORKS (mechanically -- not tested on hardware):
+- Probe + reset + admin queue + GET_FEATURE + queue creation
+  paths all compile + run on the non-ENA fallback path (init
+  is a no-op when the device is absent).
+- `-kernel` boot under QEMU virt is unchanged; ENA never
+  matches because QEMU has no ENA emulation.
+
+#### Blind-implementation caveat
+
+This stage was written without ENA hardware or QEMU emulation
+to test against.  Every register offset, bitfield mask, and
+admin-command structure was reconstructed from training-data
+memory of the upstream Linux ena driver and the public ENA
+spec.  Every site in `uts/virt/ena.c` flagged
+`XXX-verify-against-ena_regs_defs.h` or
+`XXX-verify-against-ena_admin_defs.h` must be cross-checked
+against amzn-drivers' canonical headers
+(<https://github.com/amzn/amzn-drivers/tree/master/kernel/linux/ena>)
+before this code boots on real Graviton.
+
+Expected debugging on first AWS boot:
+- Wrong reset bit -> reset spins forever; need to check
+  `DEV_CTL` / `DEV_STS` masks.
+- Wrong feature ID layout in admin command payloads ->
+  GET_FEATURE returns an error status; need to compare the
+  command-payload encoding to `ena_admin_aq_get_feature_cmd`.
+- Wrong queue-create payload offsets -> CREATE_CQ returns
+  a non-zero status.
+
+Once the offsets are pinned, what remains for "real packet
+I/O" (not just queue creation):
+- RX kthread that drains the CQ, hands each completion's
+  buffer up to the IP stack as an mblk, refills the SQ.
+- TX path: build TX descriptor from an mblk's b_rptr/b_wptr,
+  ring the doorbell, free the mblk on completion.
+- DHCP wire-up (currently `ip = 0` -- DHCP discovery runs in
+  the virtio-net path; needs lifting into a shared helper).
 
 ### Stage F -- NVMe block driver
 
