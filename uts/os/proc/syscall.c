@@ -68,7 +68,7 @@ typedef long (*syscall_fn)(long, long, long, long, long, long);
  * `path` is a kernel-side string (caller has already copy_from_user'd
  * any user pointer).  `out` is a kernel buffer of `cap` bytes.  Returns
  * `out` on success, or NULL if the result wouldn't fit. */
-static const char *resolve_path_kva(const char *path, char *out, size_t cap)
+const char *resolve_path_kva(const char *path, char *out, size_t cap)
 {
 	if (!path || !out || cap < 2) return NULL;
 
