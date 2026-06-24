@@ -82,6 +82,7 @@ QEMU          := qemu-system-aarch64
 # of data ports (30000..30007 -> host 30000..30007) for PASV.  The
 # range must match cmd/ftpd.c's PASV_BASE / PASV_N.
 QEMU_ARGS     := -M virt,gic-version=3 -cpu cortex-a72 -nographic -m 256 \
+                 -semihosting-config enable=on,target=native \
                  -global virtio-mmio.force-legacy=false \
                  -netdev user,id=n0,hostfwd=tcp::2323-:23,hostfwd=tcp::2121-:21,hostfwd=tcp::30000-:30000,hostfwd=tcp::30001-:30001,hostfwd=tcp::30002-:30002,hostfwd=tcp::30003-:30003,hostfwd=tcp::30004-:30004,hostfwd=tcp::30005-:30005,hostfwd=tcp::30006-:30006,hostfwd=tcp::30007-:30007 \
                  -device virtio-net-device,netdev=n0
