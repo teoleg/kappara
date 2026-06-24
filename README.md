@@ -80,6 +80,8 @@ make test       # smoke-ftp + smoke-sdk + smoke-linux + smoke-linux-mmap
 | `make stop`       | `pkill` any running QEMU process                                   |
 | `make clean`      | Remove `build/`                                                    |
 | `make TRACE=1 ...`| Build with the ftrace cyg-profile hooks enabled                    |
+| `make ami`        | Produce `build/kappara-ami.img` -- a GPT+ESP raw disk suitable for EC2 Graviton AMI import (AWS.md stage G) |
+| `make ami-run`    | Smoke-boot the AMI image under QEMU + AAVMF (UEFI), with a blank `/home` NVMe namespace attached |
 
 ## What's inside
 

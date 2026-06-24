@@ -393,13 +393,87 @@ The phase-2 log shows `exec: /home mounted from nvme0n1
 on-disk superblock is recognised and we skipped the mkimage
 fallback.
 
-### Stage G -- Polish + sample AMI build
+### Stage G -- Sample AMI build
 
-Status: `[ ]` (optional)
+Status: `[x]`
 
-`make ARCH=aws64 ami` produces a raw disk image with our kernel
-+ a FAT EFI System Partition + a kfs root.  Upload to S3, register
-as an AMI, launch.
+`make ami` (after the single-arch collapse, no more `ARCH=`)
+produces `build/kappara-ami.img`: a 130 MiB raw disk with a GPT
+partition table and one EFI System Partition (FAT32, ~128 MiB)
+containing `\EFI\BOOT\BOOTAA64.EFI` = our kernel.img.
+
+Layout:
+
+```
+GPT header  +  ESP partition (FAT32, labelled "KAPPARA")
+1 MiB          ^ \EFI\BOOT\BOOTAA64.EFI = kernel.img
+               | (PE32+ EFI app w/ embedded ARM64 Image header)
+```
+
+The kernel is the same `build/kernel.img` that QEMU `-kernel`
+boots; UEFI uses its PE32+ header (stage B), QEMU uses its
+Linux ARM64 Image header (stage A).  No code duplication.
+
+`/home` (stage F.1) is NOT carved into this image -- on AWS,
+mutable data goes on a separate EBS volume so the root volume
+stays immutable.  At instance launch:
+
+1. Boot volume: this AMI (read-only most of the time).
+2. Data volume: a second EBS volume, attached as NVMe.  Empty
+   on first boot; stage F.1's "kfs_mount or kfs_mkimage"
+   handler formats it.  Subsequent reboots preserve files.
+
+Local smoke-boot under QEMU + AAVMF (drop-in equivalent of how
+EC2 fires the AMI): `make ami-run`.  Brings up the AMI image as
+the boot disk + a small blank file as the second NVMe volume;
+verified to reach the `kappara:/#` prompt and persist a write
+to `/home`.
+
+The tool that builds the image is `tools/make-ami.sh`; it uses
+`parted` + `dosfstools` + `mtools`.  None of these run during a
+normal `make`; only when you explicitly ask for an AMI.
+
+#### Pushing to AWS
+
+The repo doesn't automate this end-to-end yet -- the assumption
+is you'd run these by hand once per release.  Pseudo-recipe:
+
+```
+# 1. Build the disk image
+make ami
+
+# 2. Upload the raw image to an S3 bucket
+aws s3 cp build/kappara-ami.img s3://YOUR_BUCKET/kappara-ami.img
+
+# 3. Tell EC2 to import it as a snapshot (creates an EBS-backed
+#    snapshot from the raw blob).  Needs an IAM role granting
+#    VMIE access; see AWS's "vmimport" service-role docs.
+TASK=$(aws ec2 import-snapshot --description "kappara root" \
+       --disk-container file://<(printf '%s' \
+         '{"Format":"raw","UserBucket":{"S3Bucket":"YOUR_BUCKET",'\
+         '"S3Key":"kappara-ami.img"}}') \
+       --query ImportTaskId --output text)
+
+# 4. Poll until completed; grab the resulting SnapshotId
+aws ec2 describe-import-snapshot-tasks --import-task-ids $TASK
+
+# 5. Register the snapshot as an AMI (aarch64, UEFI boot)
+aws ec2 register-image --name kappara-r0 --architecture arm64 \
+    --boot-mode uefi --root-device-name /dev/sda1 \
+    --block-device-mappings 'DeviceName=/dev/sda1,Ebs={SnapshotId=snap-XXX}'
+
+# 6. Launch on a c7g / t4g (Graviton) instance.  Attach an extra
+#    EBS volume for /home; kappara will format + mount it.
+```
+
+What's intentionally left for later:
+
+- A real `boot-mode=uefi-preferred` story so the AMI also works
+  on instance types that allow legacy fallback (unlikely to
+  matter -- Graviton is UEFI-native).
+- ENA driver (stage E) -- without it the AMI runs but has no
+  network on the instance.  QEMU virt papers over this with
+  virtio-net; EC2 doesn't.
 
 ## Dependency chain
 
