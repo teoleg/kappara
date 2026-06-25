@@ -50,6 +50,7 @@
 #include "kappara/fs/bdevsw.h"
 #include "kappara/fs/blkdev.h"
 #include "kappara/fs/buf.h"
+#include "kappara/fs/vfs.h"
 
 /* ---- Register offsets (NVMe 1.4 §3.1) ---- */
 #define NVME_REG_CAP	0x00	/* 64-bit Capabilities */
@@ -588,6 +589,10 @@ void nvme_init(void)
 	d->bd.bd_nblocks = (uint32_t)d->nsze;	/* truncated for now */
 	d->bd.bd_dev     = MKDEV(BDEV_MAJ_NVME, 0);
 	(void)bdev_register(BDEV_MAJ_NVME, &nvme_bdev_entry);
+	{
+		struct dentry *dev = vfs_lookup("/dev");
+		if (dev) vfs_mknod_blkdev(dev, "nvme0n1", d->bd.bd_dev);
+	}
 
 	nvme_singleton_init = 1;
 	nvme_singleton_info.present = 1;
