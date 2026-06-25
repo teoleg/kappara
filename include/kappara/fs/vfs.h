@@ -233,6 +233,8 @@ int   sys_rmdir_impl(const char *path);
  * just unlinks from the tree so lookups fail. */
 int   vfs_remove_child(struct dentry *parent, const char *name);
 int   sys_close_impl(int fd);
+int   sys_dup_impl  (int oldfd);
+int   sys_dup2_impl (int oldfd, int newfd);
 long  sys_read_impl(int fd, void *buf, size_t len);
 long  sys_write_impl(int fd, const void *buf, size_t len);
 long  sys_ioctl_impl(int fd, int cmd, long arg);

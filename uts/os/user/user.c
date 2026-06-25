@@ -864,6 +864,8 @@ extern char host_blob_start[];
 extern char host_blob_end[];
 extern char mount_blob_start[];
 extern char mount_blob_end[];
+extern char more_blob_start[];
+extern char more_blob_end[];
 
 /* DYNAMIC.md stage 5: ld-kappara.so is referenced directly by the
  * exec loader; it doesn't go through VFS for the bootstrap.  Once
@@ -994,6 +996,7 @@ void exec_space_init(void)
 		PAY("objdump",    objdump_blob_start,    objdump_blob_end),
 		PAY("host",       host_blob_start,       host_blob_end),
 		PAY("mount",      mount_blob_start,      mount_blob_end),
+		PAY("more",       more_blob_start,       more_blob_end),
 	};
 #undef PAY
 	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);
