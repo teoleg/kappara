@@ -6,20 +6,38 @@
 #                    all 15/15) under QEMU TCG.  ZERO AWS secrets
 #                    needed.
 #
-#   ami            : runs only on tagged releases.  Builds the
-#                    GPT+ESP raw image (AWS.md stage G), uploads to
-#                    S3, imports as an EBS snapshot, registers as
-#                    an AMI in the user's AWS account.  Silently
-#                    skipped when the AWS_ACCESS_KEY_ID secret
-#                    isn't set, so the workflow lands green on
-#                    repos without AWS yet.
+#   ami            : runs ONLY on pushes to main, which means
+#                    "after a PR was reviewed + approved + merged"
+#                    when paired with branch protection (Settings
+#                    -> Branches -> Add rule -> Require PR + 1
+#                    approving review before merge).  Direct pushes
+#                    to main are blocked by the rule so the only
+#                    way this job ever runs is through an approved
+#                    PR.  Second-gate safety net: the job runs in
+#                    the `aws-prod` environment, which can have
+#                    required reviewers configured (Settings ->
+#                    Environments -> aws-prod).  Silently skipped
+#                    when the AWS deploy isn't configured.
 #
-# Required secrets (only for the ami job; set in Settings ->
-# Secrets and variables -> Actions):
-#   AWS_ACCESS_KEY_ID
-#   AWS_SECRET_ACCESS_KEY
-#   AWS_REGION              e.g. us-east-1
-#   KAPPARA_S3_BUCKET       bucket the vmimport role can read
+# Required for the ami job (only when you're ready to deploy):
+#
+#   Repository variables (Settings -> Secrets and variables ->
+#                         Actions -> Variables):
+#     HAS_AWS_DEPLOY = "true"
+#
+#   Secrets (Settings -> Secrets and variables -> Actions -> Secrets):
+#     AWS_ACCESS_KEY_ID
+#     AWS_SECRET_ACCESS_KEY
+#     AWS_REGION              e.g. us-east-1
+#     KAPPARA_S3_BUCKET       bucket the vmimport role can read
+#
+#   Branch protection (Settings -> Branches -> main):
+#     [x] Require a pull request before merging
+#     [x] Require approvals: 1
+#     [x] Do not allow bypassing the above settings
+#
+#   Environment (Settings -> Environments -> New environment "aws-prod"):
+#     [x] Required reviewers: <yourself>  (optional but recommended)
 #
 # The vmimport IAM service role itself is a one-time AWS-side
 # setup; see docs/AWS.md.
@@ -30,9 +48,7 @@ on:
   push:
     branches: ['**']
   pull_request:
-  release:
-    types: [published]
-  workflow_dispatch:  # also let you trigger AMI builds manually
+  workflow_dispatch:  # manual trigger from the Actions tab
 
 jobs:
   build-and-test:
@@ -67,13 +83,22 @@ jobs:
 
   ami:
     needs: build-and-test
-    # Only run on tagged releases AND when AWS secrets are present.
-    # Untagged builds and forks without secrets fall through silently
-    # so the workflow stays green for everyone.
+    # Two-gate filter:
+    #   (1) Only on pushes to main (which require an approved PR
+    #       when branch protection is enabled).
+    #   (2) Only when the repo opted in via the HAS_AWS_DEPLOY
+    #       variable.  Repos / forks without AWS set up fall
+    #       through silently so the workflow stays green for
+    #       everyone.
     if: |
-      github.event_name == 'release' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
       vars.HAS_AWS_DEPLOY == 'true'
     runs-on: ubuntu-latest
+    # GitHub Environment -- can be configured to require manual
+    # approval in Settings -> Environments -> aws-prod, even if
+    # branch protection wasn't set up.  Belt-and-suspenders.
+    environment: aws-prod
     steps:
       - uses: actions/checkout@v4
 
@@ -97,26 +122,24 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
+      # AMI name embeds the commit SHA so every merge to main
+      # produces a uniquely-named AMI -- AWS rejects duplicates.
       - name: Upload AMI to S3 + register
         run: |
+          SHORT_SHA=${GITHUB_SHA:0:7}
           ./tools/upload-ami.sh \
             --bucket "${{ secrets.KAPPARA_S3_BUCKET }}" \
-            --name   "kappara-${{ github.ref_name }}"
+            --name   "kappara-main-${SHORT_SHA}"
 
-      # Surface the AMI ID as a release asset comment so it's
-      # one click away from the release page.
-      - name: Comment on release
+      # Surface the AMI ID on the merged commit so it's easy to
+      # find later via the Actions tab or commit history.
+      - name: Annotate run summary
         if: success()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            if (!fs.existsSync('build/last-ami-id.txt')) return;
-            const ami = fs.readFileSync('build/last-ami-id.txt', 'utf8').trim();
-            github.rest.repos.updateRelease({
-              owner: context.repo.owner,
-              repo:  context.repo.repo,
-              release_id: context.payload.release.id,
-              body: (context.payload.release.body || '') +
-                    '\n\nAMI: `' + ami + '`'
-            });
+        run: |
+          if [[ -f build/last-ami-id.txt ]]; then
+            AMI=$(cat build/last-ami-id.txt)
+            echo "### Deployed AMI" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "\`$AMI\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
