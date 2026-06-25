@@ -49,6 +49,7 @@
 
 #include "kappara/io/cdevsw.h"
 #include "kappara/io/fbcon.h"
+#include "kappara/core/kallsyms.h"
 #include "kappara/core/klog.h"
 #include "kappara/core/kmem.h"
 #include "kappara/net/icmp.h"
@@ -1684,6 +1685,122 @@ static struct qinit klog_winit = {
 	.qi_putp = klog_wq_putp, .qi_minfo = &klog_minfo
 };
 
+/* ---- /dev/ksyms -- kernel symbol table dump ---------------------------
+ *
+ * Solaris-shaped char device: read(2) returns the kernel symbol
+ * table.  We emit nm(1)-compatible text rows rather than the full
+ * Solaris ELF image -- text is what shells eat (`cat`, `grep`,
+ * `awk`) and what the kappara cmd/nm tool already knows how to
+ * parse.  The ELF semantics are a separate piece of work; the
+ * data is identical, just wrapped differently.
+ *
+ * Each line:  "<16-hex addr> T <name>\n"
+ * Only text symbols are exposed (the only kind kallsyms records),
+ * so the type column is always 'T'.
+ *
+ * Like the /proc dump streams, this is snapshot-and-hangup: qopen formats
+ * the whole table into the read queue, sends M_HANGUP, never sees
+ * an event again.
+ */
+
+#define KSYMS_CHUNK	1024
+
+struct ksyms_emit {
+	queue_t *q;
+	mblk_t  *cur;	/* in-flight buffer, NULL when empty */
+};
+
+static void ksyms_emit_byte(struct ksyms_emit *e, char c)
+{
+	if (!e->cur) {
+		e->cur = allocb(KSYMS_CHUNK, 0);
+		if (!e->cur) return;
+	}
+	if (e->cur->b_wptr >= e->cur->b_datap->db_lim) {
+		putnext(e->q, e->cur);
+		e->cur = allocb(KSYMS_CHUNK, 0);
+		if (!e->cur) return;
+	}
+	*e->cur->b_wptr++ = (uint8_t)c;
+}
+
+static void ksyms_emit_str(struct ksyms_emit *e, const char *s)
+{
+	while (*s) ksyms_emit_byte(e, *s++);
+}
+
+static void ksyms_emit_hex16(struct ksyms_emit *e, uint64_t v)
+{
+	for (int i = 60; i >= 0; i -= 4) {
+		unsigned d = (unsigned)(v >> i) & 0xfu;
+		ksyms_emit_byte(e, (char)(d < 10 ? '0' + d : 'a' + d - 10));
+	}
+}
+
+static int ksyms_row(uint64_t addr, const char *name, void *arg)
+{
+	struct ksyms_emit *e = arg;
+	ksyms_emit_hex16(e, addr);
+	ksyms_emit_str(e, " T ");
+	ksyms_emit_str(e, name);
+	ksyms_emit_byte(e, '\n');
+	return 0;
+}
+
+static int ksyms_rq_qopen(queue_t *q)
+{
+	struct ksyms_emit e = { .q = q, .cur = NULL };
+	ksym_for_each(ksyms_row, &e);
+	if (e.cur) {
+		if (e.cur->b_wptr > e.cur->b_rptr)
+			putnext(q, e.cur);
+		else
+			freemsg(e.cur);
+	}
+	mblk_t *hup = allocb(1, 0);
+	if (hup) {
+		hup->b_datap->db_type = M_HANGUP;
+		putnext(q, hup);
+	}
+	return 0;
+}
+
+static int ksyms_rq_putp(queue_t *q, mblk_t *mp)
+{
+	return putnext(q, mp);
+}
+
+static int ksyms_wq_putp(queue_t *q, mblk_t *mp)
+{
+	(void)q;
+	freemsg(mp);	/* read-only device */
+	return 0;
+}
+
+static struct module_info ksyms_minfo = {
+	.mi_idnum  = 202,
+	.mi_idname = "ksyms",
+	.mi_minpsz = 0,
+	.mi_maxpsz = 4096,
+	.mi_hiwat  = 16384,
+	.mi_lowat  = 8192,
+};
+
+static struct qinit ksyms_rinit = {
+	.qi_putp   = ksyms_rq_putp,
+	.qi_qopen  = ksyms_rq_qopen,
+	.qi_minfo  = &ksyms_minfo,
+};
+static struct qinit ksyms_winit = {
+	.qi_putp   = ksyms_wq_putp,
+	.qi_minfo  = &ksyms_minfo,
+};
+
+static struct streamtab ksyms_streamtab = {
+	.st_rdinit = &ksyms_rinit,
+	.st_wrinit = &ksyms_winit,
+};
+
 static struct streamtab klog_streamtab = {
 	.st_rdinit = &klog_rinit,
 	.st_wrinit = &klog_winit,
@@ -1971,6 +2088,7 @@ void streams_head_init(void)
 	cdev_register(CDEV_MAJ_NULL,    "null",    &null_streamtab);
 	cdev_register(CDEV_MAJ_CONSOLE, "console", &console_streamtab);
 	cdev_register(CDEV_MAJ_KLOG,    "klog",    &klog_streamtab);
+	cdev_register(CDEV_MAJ_KSYMS,   "ksyms",   &ksyms_streamtab);
 	cdev_register(CDEV_MAJ_UPPER,   "upper",   &upper_streamtab);
 	cdev_register(CDEV_MAJ_DELAY,   "delay",   &delay_streamtab);
 #ifdef __aarch64__
@@ -1985,6 +2103,7 @@ void streams_head_init(void)
 	vfs_mknod_chrdev(dev, "null",    MKDEV(CDEV_MAJ_NULL,    0));
 	vfs_mknod_chrdev(dev, "console", MKDEV(CDEV_MAJ_CONSOLE, 0));
 	vfs_mknod_chrdev(dev, "klog",    MKDEV(CDEV_MAJ_KLOG,    0));
+	vfs_mknod_chrdev(dev, "ksyms",   MKDEV(CDEV_MAJ_KSYMS,   0));
 #ifdef __aarch64__
 	vfs_mknod_chrdev(dev, "fbcon",   MKDEV(CDEV_MAJ_FBCON,   0));
 #endif

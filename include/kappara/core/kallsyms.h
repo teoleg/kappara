@@ -37,4 +37,13 @@ void        kernel_backtrace(void);
  * cover the faulting context instead of the trap handler. */
 void        kernel_backtrace_from(uint64_t fp, uint64_t lr);
 
+/* Walk every (addr, name) pair in registration order.  Backs
+ * /dev/ksyms.  `cb` returns non-zero to stop iteration;
+ * ksym_for_each returns that value (or 0 when it ran to the end).
+ * Returns 0 immediately when the symbol table isn't populated
+ * (e.g. between linker passes, or on a stripped build). */
+int         ksym_for_each(int (*cb)(uint64_t addr, const char *name,
+				    void *arg),
+			  void *arg);
+
 #endif
