@@ -31,6 +31,7 @@
 #include "kappara/arch/efi.h"
 #include "kappara/arch/nvme.h"
 #include "kappara/arch/pcie.h"
+#include "kappara/fs/kfs.h"
 #include "kappara/io/cdevsw.h"
 #include "kappara/core/ftrace.h"
 #include "kappara/core/kmem.h"
@@ -44,6 +45,7 @@
 #include "kappara/io/stream_head.h"
 #include "kappara/io/streams.h"
 #include "kappara/core/string.h"
+#include "kappara/fs/blkdev.h"
 #include "kappara/fs/vfs.h"
 
 /* ---- Tiny text formatter into a fixed buffer ------------------------ */
@@ -705,6 +707,53 @@ static int proc_nvme_qopen(queue_t *q)
 	return 0;
 }
 
+/* ---- /proc/mounts -- live kfs mount table -------------------------- */
+
+static struct procbuf mounts_pb;
+
+/* Render an absolute path by walking d_parent up to the root, then
+ * writing the names back out forward.  Root prints as "/".
+ * Mountpoints are siblings of /, /usr/bin etc. so the depth is
+ * bounded -- a 16-deep stack is wildly safe. */
+static void pb_dentry_path(struct procbuf *b, struct dentry *d)
+{
+	if (!d) { pb_str(b, "?"); return; }
+	if (d == vfs_root()) { pb_putc(b, '/'); return; }
+
+	struct dentry *stack[16];
+	int n = 0;
+	struct dentry *p = d;
+	while (p && p != vfs_root() && n < 16) {
+		stack[n++] = p;
+		p = p->d_parent;
+	}
+	for (int i = n - 1; i >= 0; i--) {
+		pb_putc(b, '/');
+		const char *name = stack[i]->d_name;
+		if (!name) { pb_str(b, "?"); continue; }
+		while (*name) pb_putc(b, *name++);
+	}
+}
+
+static int mount_row(struct block_device *bd, struct dentry *mp, void *arg)
+{
+	struct procbuf *b = arg;
+	pb_str(b, bd->bd_name ? bd->bd_name : "?");
+	pb_str(b, "  on  ");
+	pb_dentry_path(b, mp);
+	pb_str(b, "  type kfs\n");
+	return 0;
+}
+
+static int proc_mounts_qopen(queue_t *q)
+{
+	pb_reset(&mounts_pb);
+	pb_str(&mounts_pb, "DEVICE     MOUNTPOINT     FSTYPE\n");
+	kfs_for_each_mount(mount_row, &mounts_pb);
+	pb_flush_to_q(&mounts_pb, q);
+	return 0;
+}
+
 /* ---- Read-side put: the head queues data; we never see reverse traffic. */
 
 static int proc_rq_putp(queue_t *q, mblk_t *mp)
@@ -754,7 +803,8 @@ PROC_DRIVER(proctcp,  proc_tcp_qopen);
 PROC_DRIVER(procacpi, proc_acpi_qopen);
 PROC_DRIVER(procpci,  proc_pci_qopen);
 PROC_DRIVER(procefi,  proc_efi_qopen);
-PROC_DRIVER(procnvme, proc_nvme_qopen);
+PROC_DRIVER(procnvme,   proc_nvme_qopen);
+PROC_DRIVER(procmounts, proc_mounts_qopen);
 
 /* ---- /proc/ftrace --------------------------------------------------- */
 
@@ -839,6 +889,7 @@ void proc_init(void)
 	cdev_register(CDEV_MAJ_PROC_PCI,    "proc-pci",    &procpci_streamtab);
 	cdev_register(CDEV_MAJ_PROC_EFI,    "proc-efi",    &procefi_streamtab);
 	cdev_register(CDEV_MAJ_PROC_NVME,   "proc-nvme",   &procnvme_streamtab);
+	cdev_register(CDEV_MAJ_PROC_MOUNTS, "proc-mounts", &procmounts_streamtab);
 
 	struct dentry *proc = vfs_mkdir(vfs_root(), "proc");
 	vfs_mknod_chrdev(proc, "ps",       MKDEV(CDEV_MAJ_PROC_PS,     0));
@@ -854,4 +905,5 @@ void proc_init(void)
 	vfs_mknod_chrdev(proc, "pci",      MKDEV(CDEV_MAJ_PROC_PCI,    0));
 	vfs_mknod_chrdev(proc, "efi",      MKDEV(CDEV_MAJ_PROC_EFI,    0));
 	vfs_mknod_chrdev(proc, "nvme",     MKDEV(CDEV_MAJ_PROC_NVME,   0));
+	vfs_mknod_chrdev(proc, "mounts",   MKDEV(CDEV_MAJ_PROC_MOUNTS, 0));
 }

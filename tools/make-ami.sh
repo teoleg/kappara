@@ -48,12 +48,44 @@ fi
 # Locate tools that may live in /sbin -- coreutils PATH on some
 # distros doesn't include them.
 PATH=$PATH:/sbin:/usr/sbin
+
+# Map each tool back to the package providing it, so the error
+# message tells the user the actual `apt`/`dnf`/`brew` command
+# to run instead of just "install something".
+declare -A PKG=(
+    [parted]=parted
+    [mkfs.fat]=dosfstools
+    [mcopy]=mtools
+    [mmd]=mtools
+)
+
+MISSING=()
 for t in parted mkfs.fat mcopy mmd; do
-    command -v "$t" >/dev/null 2>&1 || {
-        echo "make-ami: missing tool '$t' (install parted dosfstools mtools)" >&2
-        exit 1
-    }
+    command -v "$t" >/dev/null 2>&1 || MISSING+=("$t")
 done
+
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+    # Dedup the package list so "mcopy + mmd both missing" -> "mtools"
+    # rather than "mtools mtools".
+    declare -A SEEN
+    PKGS=()
+    for t in "${MISSING[@]}"; do
+        p=${PKG[$t]}
+        if [[ -z ${SEEN[$p]+x} ]]; then
+            SEEN[$p]=1
+            PKGS+=("$p")
+        fi
+    done
+    {
+        echo "make-ami: missing tool(s): ${MISSING[*]}"
+        echo "make-ami: install with one of:"
+        echo "    sudo apt-get install ${PKGS[*]}        # Debian / Ubuntu"
+        echo "    sudo dnf install ${PKGS[*]}            # Fedora / RHEL"
+        echo "    sudo pacman -S ${PKGS[*]}              # Arch"
+        echo "    brew install ${PKGS[*]}                # macOS"
+    } >&2
+    exit 1
+fi
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

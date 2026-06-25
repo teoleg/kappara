@@ -193,6 +193,14 @@ host_blob_start:
 	.incbin "build/cmd/host.elf"
 host_blob_end:
 
+	.section ".rodata.mount_blob","a",%progbits
+	.balign 8
+	.global mount_blob_start
+	.global mount_blob_end
+mount_blob_start:
+	.incbin "build/cmd/mount.elf"
+mount_blob_end:
+
 /* ld-kappara.so -- stage 5 dynamic linker.  Not a /usr/bin entry;
  * the kernel reads it directly via ld_kappara_blob_{start,end}
  * during exec to load it into the user vm_map at LD_VA. */

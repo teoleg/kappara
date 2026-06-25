@@ -228,6 +228,7 @@ static struct file_ops regfile_fops = {
 
 struct kfs_mnt {
 	struct block_device *bd;	/* NULL = slot free */
+	struct dentry       *mountpoint;	/* for /proc/mounts walks */
 	uint8_t              bitmap[BLK_SIZE];
 };
 
@@ -703,6 +704,7 @@ int kfs_mount(struct block_device *bd, struct dentry *mountpoint)
 		kprintf("kfs_mount: bitmap read failed\n");
 		return -1;
 	}
+	m->mountpoint = mountpoint;
 
 	/* Publish creat/mkdir on the mountpoint's inode and stash a
 	 * kfs_dir so kfs_dir_creat / kfs_dir_mkdir know which dir
@@ -719,5 +721,19 @@ int kfs_mount(struct block_device *bd, struct dentry *mountpoint)
 
 	kprintf("kfs: mounted '%s' at mountpoint '%s'\n",
 		bd->bd_name, mountpoint->d_name);
+	return 0;
+}
+
+/* Walk the static mount table; cheap (N <= MAX_KFS_MOUNTS).  Used
+ * by /proc/mounts. */
+int kfs_for_each_mount(int (*cb)(struct block_device *,
+				 struct dentry *, void *),
+		       void *arg)
+{
+	for (unsigned i = 0; i < MAX_KFS_MOUNTS; i++) {
+		if (!kfs_mnts[i].bd) continue;
+		int r = cb(kfs_mnts[i].bd, kfs_mnts[i].mountpoint, arg);
+		if (r) return r;
+	}
 	return 0;
 }
