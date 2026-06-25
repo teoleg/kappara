@@ -1,10 +1,11 @@
 /*
- * include/kappara/blkdev.h -- block device abstraction
+ * include/kappara/blkdev.h -- block device handle (SVR4-style)
  *
- * The thinnest plausible interface for "something I can read 512-byte
- * blocks out of and write 512-byte blocks into".  Filesystem drivers
- * (kfs today; future ext2/fat32) talk to storage through this; real
- * drivers (today: ramdisk; future: virtio-blk, SDHCI) implement it.
+ * `struct block_device` is the high-level handle filesystems carry
+ * around: a name + size + dev_t.  Actual I/O goes through the
+ * buffer cache and the bdevsw[] switch -- this struct does NOT
+ * hold function pointers anymore.  It's the analog of a vnode for
+ * a disk: identity + size, not behaviour.
  *
  *   user/syscall
  *       |
@@ -12,11 +13,17 @@
  *   VFS  +-- INODE_REG -> regfile_fops -> kfs_read --+
  *        \-- INODE_DIR                               |
  *                                                    v
- *                                          struct block_device
- *                                          (read_block / write_block)
+ *                                          bread / bwrite (fs/buf.h)
  *                                                    |
  *                                                    v
- *                                            ramdisk / virtio-blk / ...
+ *                                          bdevsw[major].d_strategy(buf*)
+ *                                                    |
+ *                                                    v
+ *                                            ramdisk / nvme / ...
+ *
+ * Filesystem code never touches the driver directly; it asks the
+ * buffer cache for a buf and either reads it (B_VALID set after
+ * the strategy returns) or dirties it and bwrites.
  *
  * Sector size is fixed at 512 bytes -- the de facto block-device
  * granularity since the floppy era.  Real SDHCI/NVMe/USB are happy
@@ -29,15 +36,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kappara/io/cdevsw.h"	/* dev_t / MAJOR / MINOR / MKDEV */
+
 #define BLK_SIZE	512
 
 struct block_device {
-	const char	*bd_name;
-	uint32_t	 bd_nblocks;
-	int		(*bd_read )(struct block_device *bd,
-				    uint32_t blkno, void *buf);
-	int		(*bd_write)(struct block_device *bd,
-				    uint32_t blkno, const void *buf);
+	const char *bd_name;	/* "ramdisk0", "nvme0n1", ... */
+	uint32_t    bd_nblocks;	/* device capacity in BLK_SIZE units */
+	dev_t       bd_dev;	/* MKDEV(bdevsw major, minor) */
 };
 
 void                  ramdisk_init(void);

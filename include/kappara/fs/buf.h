@@ -43,24 +43,36 @@
 #include "kappara/proc/sched.h"
 #include "kappara/core/spinlock.h"
 
-#define BUF_BLOCK_SIZE	4096		/* bytes per cache slot       */
-#define BUF_POOL_SIZE	32		/* total cache slots          */
+/* Cache slot size = device logical sector size.  512 B matches
+ * kfs's on-disk layout and every block device we ship today
+ * (ramdisk, nvme); the 4096 B legacy value pre-dated the kfs/nvme
+ * shape and only made sense when the bram test driver was the
+ * sole consumer. */
+#define BUF_BLOCK_SIZE	512
+#define BUF_POOL_SIZE	64		/* total cache slots          */
 #define BUF_HASH_BUCKETS 16
 
-#define B_READ		0x0001
-#define B_WRITE		0x0002
-#define B_DONE		0x0004
-#define B_ERROR		0x0008
-#define B_BUSY		0x0010
-#define B_DELWRI	0x0020
-#define B_VALID		0x0040
+#define B_READ		0x0001	/* direction: device -> b_addr  */
+#define B_WRITE		0x0002	/* direction: b_addr -> device  */
+#define B_DONE		0x0004	/* I/O completed (any outcome)  */
+#define B_ERROR		0x0008	/* B_DONE + transfer failed     */
+#define B_BUSY		0x0010	/* owned by a thread, in flight */
+#define B_DELWRI	0x0020	/* dirty, deferred write-back   */
+#define B_VALID		0x0040	/* b_addr reflects on-disk data */
+#define B_ASYNC		0x0080	/* don't wait -- iodone brelses */
 
 struct buf {
 	dev_t      b_dev;
 	uint64_t   b_blkno;
-	unsigned   b_size;	/* bytes in b_data (== BUF_BLOCK_SIZE) */
-	unsigned   b_flags;
-	void      *b_data;	/* BUF_BLOCK_SIZE bytes, page-aligned   */
+	uint32_t   b_bcount;	/* bytes the driver should transfer */
+	uint32_t   b_resid;	/* bytes NOT transferred (error only) */
+	uint32_t   b_flags;
+	int        b_error;	/* errno-ish code when B_ERROR is set */
+	void      *b_addr;	/* read INTO / write FROM this buffer */
+	void      *b_data;	/* owned cache page (alias of b_addr
+				 * for buffer-cache flow) */
+	void     (*b_iodone)(struct buf *);
+	void      *b_private;
 
 	/* LRU + hash linkage */
 	struct buf *lru_prev;
@@ -89,7 +101,7 @@ void brelse(struct buf *bp);
  * busy buf, or NULL on driver error. */
 struct buf *bread(dev_t dev, uint64_t blkno);
 
-/* Synchronous write: pushes b_data to the device, marks B_VALID,
+/* Synchronous write: pushes b_addr to the device, marks B_VALID,
  * clears B_DELWRI.  Returns 0 on success, -1 on driver error. */
 int  bwrite(struct buf *bp);
 
@@ -99,6 +111,18 @@ void bdwrite(struct buf *bp);
 /* Optional callback: hint that this buf is unlikely to be reused
  * soon.  Just brelse for now -- the LRU does the work. */
 void bawrite(struct buf *bp);
+
+/* Driver-side completion call.  Sets B_DONE (and B_ERROR if the
+ * transfer failed -- which the driver signals by storing
+ * b_resid > 0 + setting b_error), wakes anyone waiting, and runs
+ * b_iodone.  Sync drivers call this from inside d_strategy before
+ * returning; async drivers call it from the completion IRQ. */
+void biodone(struct buf *bp);
+
+/* Wait until B_DONE is set.  Sync drivers complete inside
+ * d_strategy so this is usually a no-op; the call exists for the
+ * async path. */
+int  biowait(struct buf *bp);
 
 /* Diagnostic: dump cache stats via kprintf. */
 void buf_stats(void);

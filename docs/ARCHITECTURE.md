@@ -599,6 +599,49 @@ The discipline: refcounts are ONLY touched through chokepoint helpers
 stores at struct-creation time are plain because no other CPU has
 the pointer yet.
 
+## Block I/O (SVR4 bdevsw + buffer cache)
+
+Block devices flow through the canonical SVR4 path:
+
+```
+   filesystem code (kfs)
+        |
+   bread(dev, blkno)   -- buffer cache (uts/os/io/buf.c)
+   bwrite(buf)
+        |  on a cache miss
+        v
+   bdevsw[major].d_strategy(minor, struct buf *bp)
+        |
+        v
+   ramdisk_strategy / nvme_strategy / bram_strategy
+        |
+   biodone(bp)  -- sync drivers call inline before returning;
+                   async drivers call from a completion IRQ
+```
+
+Driver entry is `d_strategy(unsigned minor, struct buf *bp)`,
+registered via `bdev_register(major, &entry)`.  `struct buf`
+carries the request: `b_dev`, `b_blkno`, `b_bcount`, `b_addr`,
+direction (`B_READ` / `B_WRITE`), and `b_iodone` for async
+completion.  Sync drivers set `B_DONE` + (on failure) `B_ERROR`
+and call `biodone(bp)` before returning from strategy; the
+sync-vs-async distinction never leaks above the buffer cache.
+
+The buffer cache is a fixed `BUF_POOL_SIZE`-slot LRU keyed by
+`(dev, blkno)` hash.  `getblk` returns a buf marked `B_BUSY`;
+`brelse` puts it back on the LRU.  `bdwrite` marks a dirty buf
+for delayed write-back (no bdflush yet -- next refactor).
+
+`struct block_device` (in `kappara/fs/blkdev.h`) is the
+high-level handle filesystems carry: name + nblocks + dev_t.
+It has no function pointers.  All I/O goes through the buffer
+cache and bdevsw -- the analog of a vnode for a disk.
+
+Majors:
+- `BDEV_MAJ_RAM` (1) -- bram, the buffer-cache selftest disk
+- `BDEV_MAJ_RAMDISK` (3) -- ramdisk minors 0 (/usr/bin), 1 (/home)
+- `BDEV_MAJ_NVME` (4) -- nvme namespace 1
+
 ## kfs
 
 Simple disk layout:
