@@ -97,8 +97,19 @@
 				 * (silently ignoring close errors), then  *
 				 * install a fresh ref to oldfd's file at  *
 				 * slot newfd.  Backs shell pipe + redir.  */
+#define SYS_mmap	44	/* (addr, len, prot, flags, fd, off)       *
+				 * -> mapped VA / -1.  MAP_ANONYMOUS works *
+				 * from ANON_VA.  MAP_PRIVATE + fd reads   *
+				 * the file's [off, off+len) into fresh    *
+				 * PMM pages mapped at the same VA -- the  *
+				 * eager-load shape llama-class weights    *
+				 * want.  Caller-provided addr ignored.    */
+#define SYS_munmap	45	/* (addr, len) -> 0 / -1                    *
+				 * Unmap + pmm_free the pages covering     *
+				 * [addr, addr+len).  No VA reclamation    *
+				 * yet -- anon_next bump never rewinds.    */
 
-#define SYS_MAX		44
+#define SYS_MAX		46
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

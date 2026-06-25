@@ -461,8 +461,8 @@ test: smoke-ftp smoke-sdk smoke-linux smoke-linux-mmap
 	 OUT=$$($$TMPDIR/in.sh | timeout 24 $(QEMU) $(QEMU_ARGS) \
 	         -kernel $(KERNEL) 2>&1); \
 	 echo "$$OUT" | grep -E '^test:' | tail -1; \
-	 echo "$$OUT" | grep -q 'test: 14 passed, 0 failed' \
-	     || { echo "test: cmd/test all did not pass 14/14"; \
+	 echo "$$OUT" | grep -q 'test: 15 passed, 0 failed' \
+	     || { echo "test: cmd/test all did not pass 15/15"; \
 	          echo "$$OUT" | tail -20; exit 1; }; \
 	 echo "==> ALL TESTS PASS"
 

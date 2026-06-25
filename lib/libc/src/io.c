@@ -39,6 +39,24 @@ int dup2(int oldfd, int newfd)
     return (int)__syscall2(__NR_dup2, (long)oldfd, (long)newfd);
 }
 
+#include <sys/mman.h>
+
+void *mmap(void *addr, size_t length, int prot, int flags,
+           int fd, long offset)
+{
+    long r = __syscall6(__NR_mmap, (long)(unsigned long)addr,
+                        (long)length, (long)prot, (long)flags,
+                        (long)fd, (long)offset);
+    if (r < 0) return MAP_FAILED;
+    return (void *)(unsigned long)r;
+}
+
+int munmap(void *addr, size_t length)
+{
+    return (int)__syscall2(__NR_munmap, (long)(unsigned long)addr,
+                           (long)length);
+}
+
 pid_t getpid(void)
 {
     return (pid_t)__syscall1(__NR_getpid, 0);

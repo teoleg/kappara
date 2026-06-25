@@ -272,6 +272,25 @@ static long sys_dup2(long a0, long a1, long a2, long a3, long a4, long a5)
 	return (long)sys_dup2_impl((int)a0, (int)a1);
 }
 
+/* Native kappara mmap.  Linux-ABI processes go through linux_sys_mmap
+ * at syscall 222 (translated calling convention); native ones hit
+ * SYS_mmap directly with the same 6-arg shape. */
+extern long sys_mmap_impl  (uint64_t addr, uint64_t length, int prot,
+                            int flags, int fd, uint64_t offset);
+extern long sys_munmap_impl(uint64_t addr, uint64_t length);
+
+static long sys_mmap(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	return sys_mmap_impl((uint64_t)a0, (uint64_t)a1, (int)a2,
+	                     (int)a3, (int)a4, (uint64_t)a5);
+}
+
+static long sys_munmap(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	return sys_munmap_impl((uint64_t)a0, (uint64_t)a1);
+}
+
 static long sys_read(long a0, long a1, long a2, long a3, long a4, long a5)
 {
 	(void)a3; (void)a4; (void)a5;
@@ -656,6 +675,8 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_getcwd]      = sys_getcwd,
 	[SYS_dup]         = sys_dup,
 	[SYS_dup2]        = sys_dup2,
+	[SYS_mmap]        = sys_mmap,
+	[SYS_munmap]      = sys_munmap,
 };
 
 /* INDIE.md Path B: Linux syscall translation.
