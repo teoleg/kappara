@@ -1512,6 +1512,95 @@ static void cmd_kill(int argc, char *argv[])
 
 /* -------- dispatch -------- */
 
+/* Build "/usr/bin/<name>" (or the verbatim path if `name` is
+ * absolute) into `out`.  Shared between the default-dispatch
+ * path and the pipeline executor. */
+static void resolve_cmd_path(const char *name, char *out, size_t cap)
+{
+	size_t i = 0;
+	if (name[0] == '/') {
+		while (*name && i + 1 < cap) out[i++] = *name++;
+	} else {
+		const char *prefix = "/usr/bin/";
+		while (prefix[i] && i + 1 < cap) { out[i] = prefix[i]; i++; }
+		const char *n = name;
+		while (*n && i + 1 < cap) out[i++] = *n++;
+	}
+	out[i] = '\0';
+}
+
+/* Two-stage pipeline:  <argv_l ...> | <argv_r ...>
+ *
+ * SVR4 pipe(2) + dup2(2) dance.  Shell mutates its OWN fd table
+ * around each sys_execve so the child inherits the right view:
+ *   - left  child: fd 1 (stdout) -> pipe write end
+ *   - right child: fd 0 (stdin)  -> pipe read end
+ * Both children run in parallel.  Shell holds the original
+ * stdin/stdout in saved fds and restores them between the two
+ * execves.  Both pipe ends are closed in the shell after the
+ * spawns so the right child sees EOF when the left one exits.
+ *
+ * Single pipe only -- `a | b | c` is a future extension; the
+ * iterative version of this same dance generalises trivially.
+ */
+static void run_pipeline(int argc_l, char **argv_l,
+			 int argc_r, char **argv_r)
+{
+	(void)argc_l; (void)argc_r;	/* argv is NULL-terminated for execve */
+
+	char lpath[128], rpath[128];
+	resolve_cmd_path(argv_l[0], lpath, sizeof(lpath));
+	resolve_cmd_path(argv_r[0], rpath, sizeof(rpath));
+
+	int fds[2];
+	if (sys_pipe(fds) < 0) {
+		cwrite("pipe: failed\r\n");
+		return;
+	}
+
+	/* Stage left: stdout -> pipe write end (fds[1]). */
+	long saved_out = sys_dup(1);
+	sys_dup2(fds[1], 1);
+	long tid_l = sys_execve(lpath, (const char *const *)argv_l);
+	sys_dup2((int)saved_out, 1);
+	sys_close((int)saved_out);
+	if (tid_l < 0) {
+		cwrite(argv_l[0]); cwrite(": command not found\r\n");
+		sys_close(fds[0]); sys_close(fds[1]);
+		return;
+	}
+
+	/* Stage right: stdin -> pipe read end (fds[0]). */
+	long saved_in = sys_dup(0);
+	sys_dup2(fds[0], 0);
+	long tid_r = sys_execve(rpath, (const char *const *)argv_r);
+	sys_dup2((int)saved_in, 0);
+	sys_close((int)saved_in);
+	if (tid_r < 0) {
+		cwrite(argv_r[0]); cwrite(": command not found\r\n");
+		sys_close(fds[0]); sys_close(fds[1]);
+		sys_kill((int)tid_l, SIGTERM);
+		sys_wait((int)tid_l);
+		return;
+	}
+
+	/* Close the shell's copies of the pipe ends.  Critical for
+	 * right-child EOF semantics: with the shell still holding
+	 * fds[1], even after left exits the write side stays open
+	 * and the reader would block forever. */
+	sys_close(fds[0]);
+	sys_close(fds[1]);
+
+	/* Wait for both.  Ctrl-C still forwards to whichever the
+	 * sigint handler last latched (left); right will die when
+	 * left's EOF reaches it.  Good enough. */
+	sigint_child_tid = tid_l;
+	sys_wait((int)tid_l);
+	sigint_child_tid = tid_r;
+	sys_wait((int)tid_r);
+	sigint_child_tid = 0;
+}
+
 static void dispatch(char *line)
 {
 	/* +1 so we always have room for a NULL sentinel even when the
@@ -1520,6 +1609,20 @@ static void dispatch(char *line)
 	int argc = tokenize(line, argv, TOK_MAX);
 	argv[argc] = 0;
 	if (argc == 0) return;
+
+	/* Pipe detection: scan for a "|" token.  Single pipe only --
+	 * splits argv into left ([0..pipe)) and right ((pipe..argc)).
+	 * Hands off to run_pipeline; never touches the builtin
+	 * dispatch below (builtins in pipes wouldn't compose with the
+	 * fd-redirection dance anyway). */
+	for (int i = 1; i < argc - 1; i++) {
+		if (argv[i][0] == '|' && argv[i][1] == '\0') {
+			argv[i] = 0;	/* terminate left stage's argv */
+			run_pipeline(i, argv,
+				     argc - i - 1, &argv[i + 1]);
+			return;
+		}
+	}
 
 	/* The basic file operators (ls, ll, cat, cp, mv, rm) live in
 	 * /usr/bin as standalone ELFs now; the dispatcher's default
@@ -1554,24 +1657,10 @@ static void dispatch(char *line)
 	else if (!ustrcmp(argv[0], "ftrace")) cmd_ftrace(argc, argv);
 	else {
 		/* Absolute path -> use as-is; bare name -> prepend
-		 * `/usr/bin/`.  Without this guard, typing
-		 * `/usr/bin/echo` would resolve to
-		 * `/usr/bin//usr/bin/echo`, which obviously doesn't
-		 * exist. */
+		 * `/usr/bin/`.  Shared with the pipeline executor;
+		 * see resolve_cmd_path above. */
 		char path[128];
-		size_t i = 0;
-		if (argv[0][0] == '/') {
-			const char *n = argv[0];
-			while (*n && i + 1 < sizeof(path)) path[i++] = *n++;
-		} else {
-			const char *prefix = "/usr/bin/";
-			while (prefix[i] && i + 1 < sizeof(path)) {
-				path[i] = prefix[i]; i++;
-			}
-			const char *n = argv[0];
-			while (*n && i + 1 < sizeof(path)) path[i++] = *n++;
-		}
-		path[i] = '\0';
+		resolve_cmd_path(argv[0], path, sizeof(path));
 		/* pass argv so child's argv[0] = command name; argv is
 		 * NULL-terminated at the top of dispatch() so the kernel
 		 * doesn't read past the real argument list. */

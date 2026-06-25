@@ -48,6 +48,8 @@
 #define SYS_fork	34
 #define SYS_chdir	40
 #define SYS_getcwd	41
+#define SYS_dup		42
+#define SYS_dup2	43
 
 #define SIG_BLOCK	0
 #define SIG_UNBLOCK	1
@@ -191,6 +193,16 @@ static inline long sys_kill(int tid, int sig)
 static inline long sys_close(int fd)
 {
 	return _syscall1(SYS_close, fd);
+}
+
+static inline long sys_dup(int oldfd)
+{
+	return _syscall1(SYS_dup, oldfd);
+}
+
+static inline long sys_dup2(int oldfd, int newfd)
+{
+	return _syscall2(SYS_dup2, oldfd, newfd);
 }
 
 static inline long sys_read(int fd, void *buf, size_t n)

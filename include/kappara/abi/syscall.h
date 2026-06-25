@@ -89,8 +89,16 @@
 				 * a directory.                            */
 #define SYS_getcwd	41	/* (char *buf, size_t cap) -> bytes / -1   *
 				 * Copy cwd to user buffer.                */
+#define SYS_dup		42	/* (int oldfd) -> new lowest fd / -1       *
+				 * SVR4 dup: install a fresh ref to the    *
+				 * file at the lowest-free fd slot.        */
+#define SYS_dup2	43	/* (int oldfd, int newfd) -> newfd / -1    *
+				 * If newfd != oldfd, close newfd first    *
+				 * (silently ignoring close errors), then  *
+				 * install a fresh ref to oldfd's file at  *
+				 * slot newfd.  Backs shell pipe + redir.  */
 
-#define SYS_MAX		42
+#define SYS_MAX		44
 
 long syscall_dispatch(long num, long a0, long a1, long a2,
 		      long a3, long a4, long a5);

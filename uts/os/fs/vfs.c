@@ -790,6 +790,52 @@ int sys_close_impl(int fd)
 	return 0;
 }
 
+/*
+ * SVR4 dup: install a fresh reference to oldfd's file at the
+ * lowest free fd slot.  file_get bumps the shared refcount; the
+ * eventual close on either fd drops one ref.  Returns the new fd
+ * or -1 on bad input / no free slot.
+ */
+int sys_dup_impl(int oldfd)
+{
+	struct file *f = fd_get(oldfd);
+	if (!f) return -1;
+	int newfd = fd_alloc(f);
+	if (newfd < 0) return -1;
+	file_get(f);
+	return newfd;
+}
+
+/*
+ * SVR4 dup2: replace newfd with a fresh ref to oldfd's file.
+ *   - oldfd must reference a valid file
+ *   - newfd must be in range [0, KT_FD_MAX)
+ *   - newfd == oldfd is a no-op (return newfd)
+ *   - if newfd was open, it is silently closed first
+ *
+ * Backs shell pipe redirection: shell builds a pipe(), then
+ * dup2(pipe_end, 0 or 1) before sys_execve so the child
+ * inherits the right stdin/stdout.
+ */
+int sys_dup2_impl(int oldfd, int newfd)
+{
+	if (newfd < 0 || newfd >= KT_FD_MAX) return -1;
+	struct file *f = fd_get(oldfd);
+	if (!f) return -1;
+	if (oldfd == newfd) return newfd;
+
+	struct file *old = fd_get(newfd);
+	if (old) {
+		fd_free(newfd);
+		file_put(old);
+	}
+	struct kthread *me = curthread;
+	if (!me) return -1;
+	me->fdt[newfd] = f;
+	file_get(f);
+	return newfd;
+}
+
 long sys_read_impl(int fd, void *buf, size_t len)
 {
 	if (syscall_from_user && !user_ptr_ok(buf, len)) {

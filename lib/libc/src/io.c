@@ -29,6 +29,16 @@ int close(int fd)
     return (int)__syscall1(__NR_close, (long)fd);
 }
 
+int dup(int oldfd)
+{
+    return (int)__syscall1(__NR_dup, (long)oldfd);
+}
+
+int dup2(int oldfd, int newfd)
+{
+    return (int)__syscall2(__NR_dup2, (long)oldfd, (long)newfd);
+}
+
 pid_t getpid(void)
 {
     return (pid_t)__syscall1(__NR_getpid, 0);

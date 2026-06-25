@@ -260,6 +260,18 @@ static long sys_close(long a0, long a1, long a2, long a3, long a4, long a5)
 	return (long)sys_close_impl((int)a0);
 }
 
+static long sys_dup(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+	return (long)sys_dup_impl((int)a0);
+}
+
+static long sys_dup2(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	(void)a2; (void)a3; (void)a4; (void)a5;
+	return (long)sys_dup2_impl((int)a0, (int)a1);
+}
+
 static long sys_read(long a0, long a1, long a2, long a3, long a4, long a5)
 {
 	(void)a3; (void)a4; (void)a5;
@@ -642,6 +654,8 @@ static const syscall_fn syscall_table[SYS_MAX] = {
 	[SYS_dlerror]     = sys_dlerror,
 	[SYS_chdir]       = sys_chdir,
 	[SYS_getcwd]      = sys_getcwd,
+	[SYS_dup]         = sys_dup,
+	[SYS_dup2]        = sys_dup2,
 };
 
 /* INDIE.md Path B: Linux syscall translation.

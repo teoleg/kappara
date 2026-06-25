@@ -9,6 +9,8 @@ pid_t   getpid(void);
 pid_t   fork (void);
 int     wait (int tid);
 int     pipe (int fds[2]);
+int     dup  (int oldfd);
+int     dup2 (int oldfd, int newfd);
 int     creat(const char *path);
 int     mkdir(const char *path);
 int     rmdir(const char *path);

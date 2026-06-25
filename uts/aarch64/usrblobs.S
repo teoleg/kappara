@@ -234,3 +234,11 @@ libc_so_blob_end:
 libdltest_blob_start:
 	.incbin "build/dltest/libdltest.so"
 libdltest_blob_end:
+
+	.section ".rodata.more_blob","a",%progbits
+	.balign 8
+	.global more_blob_start
+	.global more_blob_end
+more_blob_start:
+	.incbin "build/cmd/more.elf"
+more_blob_end:

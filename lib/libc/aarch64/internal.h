@@ -35,6 +35,8 @@
 #define __NR_dlerror     39
 #define __NR_chdir       40
 #define __NR_getcwd      41
+#define __NR_dup         42
+#define __NR_dup2        43
 
 static inline long __syscall0(long nr) {
     register long x0 __asm__("x0");
@@ -47,6 +49,14 @@ static inline long __syscall1(long nr, long a0) {
     register long x0 __asm__("x0") = a0;
     register long x8 __asm__("x8") = nr;
     __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory", "cc");
+    return x0;
+}
+
+static inline long __syscall2(long nr, long a0, long a1) {
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x8 __asm__("x8") = nr;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory", "cc");
     return x0;
 }
 
