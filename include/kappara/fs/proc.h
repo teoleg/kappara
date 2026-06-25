@@ -28,6 +28,7 @@
  *                    (type, start, pages, end)
  *   /proc/nvme       AWS.md stage F: NVMe controller summary
  *                    (vid, model, serial, firmware, ns1 size)
+ *   /proc/mounts     live kfs mount table (device, mountpoint, fstype)
  */
 
 #ifndef KAPPARA_PROC_H

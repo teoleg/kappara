@@ -371,6 +371,25 @@ Empty / "no controller" line when no PCI device with class
 0x0108 (Mass Storage / NVM controller) was found -- the usual
 `-kernel` case.
 
+### /proc/mounts
+
+Live kfs mount table.  One row per mounted block_device with its
+mountpoint path and filesystem type.  Backs the `mount` userspace
+command.
+
+```
+kappara:/# mount
+DEVICE     MOUNTPOINT     FSTYPE
+ramdisk0  on  /usr/bin  type kfs
+nvme0n1   on  /home     type kfs
+```
+
+`nvme0n1` only shows up under UEFI boot when an NVMe controller
+is present (AWS.md stage F.1); the `-kernel` path falls back to
+`ramdisk1` for `/home`.  Runtime `mount` / `umount` (taking
+device + path arguments) isn't wired yet -- the kernel's
+`kfs_mount` is only called from `exec_space_init` at boot.
+
 ## How to add a new /proc entry
 
 Three steps:

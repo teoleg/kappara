@@ -676,7 +676,7 @@ sdk-tarball: sdk
 CMD_BUILD  := build/cmd
 CMD_NAMES  := ps ping ifconfig netstat test tcpconnect ftpd \
               ls ll cat cp mv rm head tail wc grep echo uptime \
-              nm ldd objdump host
+              nm ldd objdump host mount
 CMD_ELFS   := $(addprefix $(CMD_BUILD)/, $(addsuffix .elf, $(CMD_NAMES)))
 
 CMD_CFLAGS := -Wall -Wextra -Werror -std=gnu11 \

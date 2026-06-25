@@ -118,4 +118,12 @@ void kfs_mkimage(struct block_device *bd,
 		 const struct kfs_payload *payloads, unsigned n);
 int  kfs_mount  (struct block_device *bd, struct dentry *mountpoint);
 
+/* Walk the live kfs mount table.  `cb` is invoked once per
+ * mounted slot with the block_device and the mountpoint dentry;
+ * non-zero return stops the iteration.  Backs /proc/mounts. */
+int  kfs_for_each_mount(int (*cb)(struct block_device *bd,
+				  struct dentry *mountpoint,
+				  void *arg),
+			void *arg);
+
 #endif
