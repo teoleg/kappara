@@ -98,3 +98,19 @@ void kernel_backtrace(void)
 	__asm__ volatile ("mov %0, x30" : "=r"(lr));
 	kernel_backtrace_from(fp, lr);
 }
+
+/* Public iterator over the symbol table.  Calls `cb` once per
+ * (addr, name) pair in the order they appear in __kallsyms_table
+ * (sorted by address, the gen_kallsyms.sh post-pass guarantees
+ * that).  Backs /dev/ksyms. */
+int ksym_for_each(int (*cb)(uint64_t addr, const char *name, void *arg),
+		  void *arg)
+{
+	if (!kallsyms_ok()) return 0;
+	for (uint32_t i = 0; i < __kallsyms_count; i++) {
+		const char *name = &__kallsyms_strings[__kallsyms_table[i].str_off];
+		int r = cb(__kallsyms_table[i].addr, name, arg);
+		if (r) return r;
+	}
+	return 0;
+}
