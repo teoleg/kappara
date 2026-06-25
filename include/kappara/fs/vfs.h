@@ -57,10 +57,10 @@
 #include "kappara/io/stream_head.h"	/* struct strbuf */
 
 enum inode_type {
-	INODE_DIR    = 1,
-	INODE_CHRDEV = 2,
-	INODE_REG    = 3,	/* regular file backed by a filesystem driver */
-	/* INODE_BLOCKDEV, INODE_SYMLINK ... later */
+	INODE_DIR     = 1,
+	INODE_CHRDEV  = 2,
+	INODE_REG     = 3,	/* regular file backed by a filesystem driver */
+	INODE_BLOCKDEV = 4,	/* dev_t in i_rdev -> bdevsw[major]            */
 };
 
 struct file;
@@ -160,6 +160,13 @@ struct dentry *vfs_mkdir(struct dentry *parent, const char *name);
  * open hook cares.  The inode's i_fops is set to a stock chrdev
  * vtable that funnels through STREAMS. */
 struct dentry *vfs_mknod_chrdev(struct dentry *parent, const char *name,
+				uint32_t rdev);
+
+/* Drop a block-device node into the VFS tree.  `rdev` is the
+ * bdevsw (major, minor) the inode resolves to; reads/writes flow
+ * through bread/bwrite + bdevsw[major].d_strategy.  Errors out if
+ * the major isn't registered. */
+struct dentry *vfs_mknod_blkdev(struct dentry *parent, const char *name,
 				uint32_t rdev);
 
 /* Same shape as mknod_chrdev but creates an INODE_REG -- used by

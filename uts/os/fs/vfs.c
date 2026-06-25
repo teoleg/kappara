@@ -56,6 +56,9 @@
 #include <stdint.h>
 
 #include "kappara/core/atomic.h"
+#include "kappara/fs/bdevsw.h"
+#include "kappara/fs/blkdev.h"
+#include "kappara/fs/buf.h"
 #include "kappara/io/cdevsw.h"
 #include "kappara/core/kmem.h"
 #include "kappara/core/printk.h"
@@ -193,6 +196,130 @@ struct dentry *vfs_mknod_chrdev(struct dentry *parent, const char *name,
 	return new_dentry(name, i, parent);
 }
 
+/* ---- block-device file_ops -- read/write through the buffer cache --- */
+
+/* Per-open cursor: a single byte offset that read/write/seek share. */
+struct blkdev_cursor {
+	uint64_t pos;
+};
+
+static int blkdev_open(struct file *f)
+{
+	struct blkdev_cursor *c = kmalloc(sizeof(*c));
+	if (!c) return -1;
+	c->pos = 0;
+	f->f_private = c;
+	return 0;
+}
+
+static int blkdev_close(struct file *f)
+{
+	if (f->f_private) kfree(f->f_private);
+	f->f_private = NULL;
+	return 0;
+}
+
+/* Walk arbitrary byte ranges by going block-at-a-time through
+ * bread.  No alignment assumptions on the user buffer: we copy
+ * partial leading/trailing blocks through bp->b_data.  Tail-EOF
+ * is signalled by returning 0; partial-success returns the bytes
+ * actually transferred. */
+static long blkdev_read(struct file *f, void *buf, size_t len)
+{
+	struct blkdev_cursor *c = f->f_private;
+	dev_t dev = f->f_inode->i_rdev;
+
+	size_t done = 0;
+	uint8_t *out = buf;
+	while (done < len) {
+		uint64_t blkno  = c->pos / BLK_SIZE;
+		uint32_t inblk  = (uint32_t)(c->pos % BLK_SIZE);
+		struct buf *bp = bread(dev, blkno);
+		if (!bp) {
+			/* Driver bounce -- treat as EOF rather than -1 so
+			 * `cat` walks off the end cleanly. */
+			break;
+		}
+		size_t n = BLK_SIZE - inblk;
+		if (n > len - done) n = len - done;
+		kmemcpy(out + done, (uint8_t *)bp->b_data + inblk, n);
+		brelse(bp);
+		done   += n;
+		c->pos += n;
+	}
+	return (long)done;
+}
+
+static long blkdev_write(struct file *f, const void *buf, size_t len)
+{
+	struct blkdev_cursor *c = f->f_private;
+	dev_t dev = f->f_inode->i_rdev;
+
+	size_t done = 0;
+	const uint8_t *in = buf;
+	while (done < len) {
+		uint64_t blkno  = c->pos / BLK_SIZE;
+		uint32_t inblk  = (uint32_t)(c->pos % BLK_SIZE);
+		size_t n = BLK_SIZE - inblk;
+		if (n > len - done) n = len - done;
+
+		struct buf *bp;
+		if (inblk == 0 && n == BLK_SIZE) {
+			/* Full-block overwrite: skip the read; just stamp
+			 * the cache slot and bwrite it. */
+			bp = getblk(dev, blkno);
+			if (!bp) break;
+			kmemcpy(bp->b_data, in + done, BLK_SIZE);
+			bp->b_flags |= B_VALID;
+		} else {
+			/* Read-modify-write for partial blocks. */
+			bp = bread(dev, blkno);
+			if (!bp) break;
+			kmemcpy((uint8_t *)bp->b_data + inblk, in + done, n);
+		}
+		if (bwrite(bp) < 0) break;
+		done   += n;
+		c->pos += n;
+	}
+	return (long)done;
+}
+
+static long blkdev_seek(struct file *f, long offset, int whence)
+{
+	struct blkdev_cursor *c = f->f_private;
+	long newpos;
+	switch (whence) {
+	case 0: newpos = offset; break;			/* SEEK_SET */
+	case 1: newpos = (long)c->pos + offset; break;	/* SEEK_CUR */
+	default: return -1;	/* SEEK_END needs a size; later */
+	}
+	if (newpos < 0) return -1;
+	c->pos = (uint64_t)newpos;
+	return newpos;
+}
+
+static struct file_ops blkdev_fops = {
+	.open  = blkdev_open,
+	.close = blkdev_close,
+	.read  = blkdev_read,
+	.write = blkdev_write,
+	.seek  = blkdev_seek,
+};
+
+struct dentry *vfs_mknod_blkdev(struct dentry *parent, const char *name,
+				uint32_t rdev)
+{
+	if (!bdev_lookup(MAJOR(rdev))) {
+		kprintf("vfs_mknod_blkdev: '%s': no driver at major %u\n",
+			name, MAJOR(rdev));
+		return NULL;
+	}
+	struct inode *i = new_inode(INODE_BLOCKDEV, &blkdev_fops, NULL);
+	if (!i) return NULL;
+	i->i_rdev = rdev;
+	return new_dentry(name, i, parent);
+}
+
 struct dentry *vfs_mknod_regfile(struct dentry *parent, const char *name,
 				 struct file_ops *fops, void *priv)
 {
@@ -207,7 +334,8 @@ static const char *type_tag(enum inode_type t)
 	switch (t) {
 	case INODE_DIR:    return "dir";
 	case INODE_CHRDEV: return "chr";
-	case INODE_REG:    return "reg";
+	case INODE_REG:     return "reg";
+	case INODE_BLOCKDEV: return "blk";
 	default:           return "?";
 	}
 }
@@ -260,7 +388,8 @@ static const char *type_tag_short(enum inode_type t)
 	switch (t) {
 	case INODE_DIR:    return "dir";
 	case INODE_CHRDEV: return "chr";
-	case INODE_REG:    return "reg";
+	case INODE_REG:     return "reg";
+	case INODE_BLOCKDEV: return "blk";
 	}
 	return "?";
 }
@@ -298,7 +427,8 @@ long vfs_listdir_long(struct dentry *dir, char *out, size_t cap)
 		/* Real Unix ls -l replaces the size column with "M, N"
 		 * for character special files -- the major+minor dev_t
 		 * tuple that selects the driver in cdevsw[].  Same here. */
-		if (ino && ino->i_type == INODE_CHRDEV) {
+		if (ino && (ino->i_type == INODE_CHRDEV ||
+			    ino->i_type == INODE_BLOCKDEV)) {
 			off = append_dec(out, off, cap, MAJOR(ino->i_rdev), 4);
 			out[off++] = ',';
 			off = append_dec(out, off, cap, MINOR(ino->i_rdev), 3);

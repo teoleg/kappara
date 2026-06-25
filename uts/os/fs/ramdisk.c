@@ -24,6 +24,7 @@
 #include "kappara/fs/bdevsw.h"
 #include "kappara/fs/blkdev.h"
 #include "kappara/fs/buf.h"
+#include "kappara/fs/vfs.h"
 #include "kappara/core/printk.h"
 #include "kappara/core/string.h"
 
@@ -102,6 +103,10 @@ void ramdisk_init(void)
 	ramdisk_bd.bd_dev = MKDEV(BDEV_MAJ_RAMDISK, RAMDISK_MINOR_USRBIN);
 	/* One bdev_register per major -- both minors share strategy. */
 	(void)bdev_register(BDEV_MAJ_RAMDISK, &ramdisk_entry);
+	/* Drop /dev/ramdisk0 -- vfs lookup of /dev exists already (built
+	 * in streams_head_init, which runs before us in kmain). */
+	struct dentry *dev = vfs_lookup("/dev");
+	if (dev) vfs_mknod_blkdev(dev, "ramdisk0", ramdisk_bd.bd_dev);
 	kprintf("ramdisk: %u blocks of %u bytes (%u KB)\n",
 		(unsigned)RAMDISK0_BLOCKS, (unsigned)BLK_SIZE,
 		(unsigned)(RAMDISK0_BLOCKS * BLK_SIZE / 1024));
@@ -116,6 +121,8 @@ void ramdisk_home_init(void)
 {
 	kmemset(ramdisk1_storage, 0, sizeof(ramdisk1_storage));
 	ramdisk_home_bd.bd_dev = MKDEV(BDEV_MAJ_RAMDISK, RAMDISK_MINOR_HOME);
+	struct dentry *dev = vfs_lookup("/dev");
+	if (dev) vfs_mknod_blkdev(dev, "ramdisk1", ramdisk_home_bd.bd_dev);
 	kprintf("ramdisk: home %u blocks of %u bytes (%u KB)\n",
 		(unsigned)RAMDISK1_BLOCKS, (unsigned)BLK_SIZE,
 		(unsigned)(RAMDISK1_BLOCKS * BLK_SIZE / 1024));
