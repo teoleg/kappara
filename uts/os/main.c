@@ -405,6 +405,12 @@ void kmain(void)
 #endif
 	kmem_init();
 
+	/* Bring up the SVR4 buffer cache before any filesystem touches
+	 * a block device: kfs_mkimage / kfs_mount call bread/bwrite,
+	 * which go through bdevsw[major].d_strategy + a cache slot.
+	 * Depends only on kmem (slab) being primed. */
+	buf_init();
+
 	vfs_init();
 	streams_head_init();
 	proc_init();
@@ -497,9 +503,10 @@ void kmain(void)
 	ldterm_mioctl_selftest();
 	process_selftest();
 
-	/* S1: bring up the buffer cache + an in-memory test block
-	 * device, then exercise the round-trip. */
-	buf_init();
+	/* S1: bram is the in-memory test block device for the buffer
+	 * cache.  buf_init runs much earlier (just after kmem) so kfs
+	 * can use the cache; this selftest verifies the round-trip
+	 * once the rest of the kernel is up. */
 	bram_init();
 	buf_selftest();
 	mux_selftest();

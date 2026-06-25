@@ -1,77 +1,110 @@
 /*
- * kernel/ramdisk.c -- in-memory block device
- * ==========================================
+ * uts/os/fs/ramdisk.c -- in-memory block devices
+ * ==============================================
  *
- * The simplest possible struct block_device implementation: a static
- * BSS array of bytes, read/write = kmemcpy in or out.  Non-persistent
- * (contents reset every boot) but exercises the entire filesystem
- * layer cake above it (kfs -> blkdev -> ramdisk).
+ * Two in-RAM disks behind a single bdevsw[BDEV_MAJ_RAMDISK] entry:
  *
- * Replacing ramdisk with a real driver later (virtio-blk on QEMU,
- * SDHCI on Pi 3, etc.) means slotting in a different struct
- * block_device behind the same ramdisk_get() call site -- the kfs
- * layer doesn't see the difference.
+ *   minor 0  ramdisk0 (2048 * 512 = 1 MiB)   <- backs /usr/bin
+ *   minor 1  ramdisk1 (1024 * 512 = 512 KiB) <- backs /home (when no NVMe)
  *
- *   ramdisk_init     allocate + zero the storage; ready for use
- *   ramdisk_get      returns the singleton struct block_device *
+ * Both are SVR4-style: the only entry the rest of the kernel can
+ * reach is d_strategy(minor, struct buf *), which fulfils the I/O
+ * inline and calls biodone() before returning.  Filesystems never
+ * touch ramdisk_* directly; they hold a `struct block_device`
+ * handle (name + nblocks + dev_t) and go through the buffer cache.
  *
- * Storage size
- * ------------
- * RAMDISK_BLOCKS is the count of 512 B sectors.  Sized to fit the
- * cmd ELF programs (each ~12 KB) that R0 boots from kfs instead
- * of in-kernel blob registration.  1024 blocks = 512 KB which is
- * plenty for the 9 programs we ship today plus headroom.
+ * Replacing a ramdisk with a real driver later means slotting in
+ * a different d_strategy under a different major -- the kfs layer
+ * doesn't see the difference.
  */
 
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kappara/fs/bdevsw.h"
 #include "kappara/fs/blkdev.h"
+#include "kappara/fs/buf.h"
 #include "kappara/core/printk.h"
 #include "kappara/core/string.h"
 
-/* RAMDISK_BLOCKS = 2048 blocks * 512 B = 1 MB.  Bumped from 1024
- * once /usr/bin grew past 15 ELFs -- the kfs slot scheme reserves
- * KFS_BLOCKS_PER_FILE = 64 blocks per file regardless of actual size,
- * so the ceiling is (RAMDISK_BLOCKS - 3) / 64 files.  1024 blocks
- * caps at 15; 2048 gets us to 31 with room to spare. */
-#define RAMDISK_BLOCKS	2048
+/* RAMDISK0_BLOCKS = 2048 blocks * 512 B = 1 MiB.  Sized so the
+ * cmd ELF programs all fit; KFS_BLOCKS_PER_FILE = 64 means the
+ * ceiling is (RAMDISK0_BLOCKS - 3) / 64 files. */
+#define RAMDISK0_BLOCKS	2048
+#define RAMDISK1_BLOCKS	1024	/* /home when no NVMe -- 512 KiB */
 
-static unsigned char ramdisk_storage[RAMDISK_BLOCKS * BLK_SIZE];
+#define RAMDISK_MINOR_USRBIN	0
+#define RAMDISK_MINOR_HOME	1
 
-static int ramdisk_read(struct block_device *bd,
-			uint32_t blkno, void *buf)
+static unsigned char ramdisk0_storage[RAMDISK0_BLOCKS * BLK_SIZE];
+static unsigned char ramdisk1_storage[RAMDISK1_BLOCKS * BLK_SIZE];
+
+/* d_strategy: pick the storage by minor, copy one sector, biodone.
+ * Sync inline -- the SVR4 contract is "complete via biodone before
+ * returning OR async via an iodone IRQ"; for an in-memory disk the
+ * sync path is the obvious one. */
+static void ramdisk_strategy(unsigned minor, struct buf *bp)
 {
-	(void)bd;
-	if (blkno >= RAMDISK_BLOCKS)
-		return -1;
-	kmemcpy(buf, ramdisk_storage + (size_t)blkno * BLK_SIZE, BLK_SIZE);
-	return 0;
+	unsigned char *base = NULL;
+	uint32_t       cap  = 0;
+
+	switch (minor) {
+	case RAMDISK_MINOR_USRBIN: base = ramdisk0_storage; cap = RAMDISK0_BLOCKS; break;
+	case RAMDISK_MINOR_HOME:   base = ramdisk1_storage; cap = RAMDISK1_BLOCKS; break;
+	default:
+		bp->b_flags |= B_ERROR;
+		bp->b_error = -1;
+		bp->b_resid = bp->b_bcount;
+		biodone(bp);
+		return;
+	}
+
+	if (bp->b_blkno >= cap || bp->b_bcount != BLK_SIZE) {
+		bp->b_flags |= B_ERROR;
+		bp->b_error = -1;
+		bp->b_resid = bp->b_bcount;
+		biodone(bp);
+		return;
+	}
+
+	unsigned char *sector = base + (size_t)bp->b_blkno * BLK_SIZE;
+	if (bp->b_flags & B_READ)
+		kmemcpy(bp->b_addr, sector, BLK_SIZE);
+	else
+		kmemcpy(sector, bp->b_addr, BLK_SIZE);
+	bp->b_resid = 0;
+	biodone(bp);
 }
 
-static int ramdisk_write(struct block_device *bd,
-			 uint32_t blkno, const void *buf)
-{
-	(void)bd;
-	if (blkno >= RAMDISK_BLOCKS)
-		return -1;
-	kmemcpy(ramdisk_storage + (size_t)blkno * BLK_SIZE, buf, BLK_SIZE);
-	return 0;
-}
+static struct bdev_entry ramdisk_entry = {
+	.name       = "ramdisk",
+	.d_strategy = ramdisk_strategy,
+	.block_size = BLK_SIZE,
+};
 
+/* Public block_device handles -- (name, nblocks, dev_t).  No
+ * function pointers: bread/bwrite + bdevsw[major].d_strategy do
+ * all the work. */
 static struct block_device ramdisk_bd = {
 	.bd_name    = "ramdisk0",
-	.bd_nblocks = RAMDISK_BLOCKS,
-	.bd_read    = ramdisk_read,
-	.bd_write   = ramdisk_write,
+	.bd_nblocks = RAMDISK0_BLOCKS,
+	/* bd_dev set at init time so dev_t == MKDEV(...) macro can
+	 * expand against the real BDEV_MAJ_RAMDISK constant. */
+};
+static struct block_device ramdisk_home_bd = {
+	.bd_name    = "ramdisk1",
+	.bd_nblocks = RAMDISK1_BLOCKS,
 };
 
 void ramdisk_init(void)
 {
-	kmemset(ramdisk_storage, 0, sizeof(ramdisk_storage));
+	kmemset(ramdisk0_storage, 0, sizeof(ramdisk0_storage));
+	ramdisk_bd.bd_dev = MKDEV(BDEV_MAJ_RAMDISK, RAMDISK_MINOR_USRBIN);
+	/* One bdev_register per major -- both minors share strategy. */
+	(void)bdev_register(BDEV_MAJ_RAMDISK, &ramdisk_entry);
 	kprintf("ramdisk: %u blocks of %u bytes (%u KB)\n",
-		(unsigned)RAMDISK_BLOCKS, (unsigned)BLK_SIZE,
-		(unsigned)(RAMDISK_BLOCKS * BLK_SIZE / 1024));
+		(unsigned)RAMDISK0_BLOCKS, (unsigned)BLK_SIZE,
+		(unsigned)(RAMDISK0_BLOCKS * BLK_SIZE / 1024));
 }
 
 struct block_device *ramdisk_get(void)
@@ -79,50 +112,13 @@ struct block_device *ramdisk_get(void)
 	return &ramdisk_bd;
 }
 
-/* ---- ramdisk1 = /home -------------------------------------------------
- *
- * Second independent ramdisk backing the writable /home mount.  Same
- * shape as ramdisk0; the only difference is its own storage region
- * and bd name so the kfs_mnt_for() lookup in kfs.c picks the right
- * bitmap.  Sized to fit a few uploaded ELFs.
- */
-#define RAMDISK_HOME_BLOCKS	1024
-
-static unsigned char ramdisk_home_storage[RAMDISK_HOME_BLOCKS * BLK_SIZE];
-
-static int ramdisk_home_read(struct block_device *bd,
-			     uint32_t blkno, void *buf)
-{
-	(void)bd;
-	if (blkno >= RAMDISK_HOME_BLOCKS)
-		return -1;
-	kmemcpy(buf, ramdisk_home_storage + (size_t)blkno * BLK_SIZE, BLK_SIZE);
-	return 0;
-}
-
-static int ramdisk_home_write(struct block_device *bd,
-			      uint32_t blkno, const void *buf)
-{
-	(void)bd;
-	if (blkno >= RAMDISK_HOME_BLOCKS)
-		return -1;
-	kmemcpy(ramdisk_home_storage + (size_t)blkno * BLK_SIZE, buf, BLK_SIZE);
-	return 0;
-}
-
-static struct block_device ramdisk_home_bd = {
-	.bd_name    = "ramdisk1",
-	.bd_nblocks = RAMDISK_HOME_BLOCKS,
-	.bd_read    = ramdisk_home_read,
-	.bd_write   = ramdisk_home_write,
-};
-
 void ramdisk_home_init(void)
 {
-	kmemset(ramdisk_home_storage, 0, sizeof(ramdisk_home_storage));
+	kmemset(ramdisk1_storage, 0, sizeof(ramdisk1_storage));
+	ramdisk_home_bd.bd_dev = MKDEV(BDEV_MAJ_RAMDISK, RAMDISK_MINOR_HOME);
 	kprintf("ramdisk: home %u blocks of %u bytes (%u KB)\n",
-		(unsigned)RAMDISK_HOME_BLOCKS, (unsigned)BLK_SIZE,
-		(unsigned)(RAMDISK_HOME_BLOCKS * BLK_SIZE / 1024));
+		(unsigned)RAMDISK1_BLOCKS, (unsigned)BLK_SIZE,
+		(unsigned)(RAMDISK1_BLOCKS * BLK_SIZE / 1024));
 }
 
 struct block_device *ramdisk_home_get(void)

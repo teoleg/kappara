@@ -5,10 +5,28 @@
  * major number; each entry holds the driver's block-I/O entry
  * points.  Block I/O always flows through the buffer cache
  * (kappara/fs/buf.h), so drivers only ever see fully-formed struct
- * buf requests, never raw bytes.
+ * buf requests, never raw byte arguments.
  *
- * Phase S1.  See docs/ARCHITECTURE.md (eventual block-IO section)
- * for the bigger picture once SD/EMMC support lands in S2.
+ * SVR4 driver shape (which we now follow):
+ *
+ *   d_open  (minor)               -- driver bring-up if needed
+ *   d_close (minor)               -- teardown
+ *   d_strategy(minor, struct buf *bp)
+ *                                  -- start the I/O described by bp.
+ *                                     Sync drivers do the work
+ *                                     immediately, set B_DONE +
+ *                                     (on error) B_ERROR, and call
+ *                                     biodone(bp) before returning.
+ *                                     Async drivers enqueue, return,
+ *                                     and call biodone() from the
+ *                                     completion IRQ.
+ *
+ * bp tells the driver:
+ *   bp->b_blkno   block number on the device
+ *   bp->b_bcount  bytes the driver should transfer (multiple of
+ *                 the device's logical sector size)
+ *   bp->b_flags   B_READ or B_WRITE (direction), plus B_DELWRI etc.
+ *   bp->b_addr    where to read INTO or write FROM
  *
  * SVR4 vs Linux:
  *   Linux: gendisk + block_device_operations + bio submission queue.
@@ -16,9 +34,9 @@
  *          enqueues the buf on the driver's IO queue; iodone(bp)
  *          fires when the transfer finishes.
  *
- * v1 ships strategy as a synchronous read_block / write_block pair
- * because we don't yet have async DMA on any backend; the
- * b_iodone callback is reserved for when DMA arrives.
+ * v2 ships strategy as the only entry point.  Sync drivers
+ * complete inline; async drivers can plug iodone in when DMA
+ * lands on a real backend.
  */
 #ifndef KAPPARA_BDEVSW_H
 #define KAPPARA_BDEVSW_H
@@ -30,28 +48,38 @@
 struct buf;	/* fwd; defined in kappara/fs/buf.h */
 
 /* Block-device entry.  Drivers register one of these via
- * bdev_register; the buffer-cache calls into it when a cache miss
- * forces real I/O. */
+ * bdev_register; the buffer cache calls d_strategy on every miss
+ * and every flush. */
 struct bdev_entry {
 	const char *name;
-	int (*read_block) (unsigned minor, uint64_t blkno, void *buf);
-	int (*write_block)(unsigned minor, uint64_t blkno,
-	                   const void *buf);
-	unsigned block_size;	/* bytes per block; typically 512 or 4096 */
+	int  (*d_open)    (unsigned minor);
+	int  (*d_close)   (unsigned minor);
+	void (*d_strategy)(unsigned minor, struct buf *bp);
+	unsigned block_size;	/* logical sector size; 512 or 4096 */
 };
 
 /* Reserved majors -- bumped as new block drivers come up.  Kept
  * disjoint from cdevsw majors so dev_t stays unambiguous: a dev_t
  * tells you whether it's a char or block device by the namespace
  * of its major. */
-#define BDEV_MAJ_RAM		1	/* in-memory test disk      */
-#define BDEV_MAJ_MMC		2	/* SD/EMMC (phase S2)       */
+#define BDEV_MAJ_RAM		1	/* in-memory test disk (bram)     */
+#define BDEV_MAJ_MMC		2	/* SD/EMMC (phase S2)             */
+#define BDEV_MAJ_RAMDISK	3	/* ramdisk.c -- /usr/bin + /home  */
+#define BDEV_MAJ_NVME		4	/* AWS.md stage F -- NVMe ns1     */
 
 #define BDEV_MAX		16
 
 /* Install `e` at bdevsw[major].  Returns 0 on success, -1 if the
  * slot is taken or out of range. */
-int               bdev_register(unsigned major, struct bdev_entry *e);
-struct bdev_entry *bdev_lookup (unsigned major);
+int                bdev_register(unsigned major, struct bdev_entry *e);
+struct bdev_entry *bdev_lookup  (unsigned major);
+
+/* Walk every registered (major, entry) pair.  cb returns non-zero
+ * to stop iteration; bdev_for_each returns that value.  Used by
+ * future /proc/devices and the /dev mknod helpers. */
+int                bdev_for_each(int (*cb)(unsigned major,
+				           struct bdev_entry *e,
+				           void *arg),
+				 void *arg);
 
 #endif

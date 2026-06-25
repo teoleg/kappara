@@ -17,32 +17,36 @@
 #include "kappara/core/printk.h"
 #include "kappara/core/string.h"
 
-#define BRAM_BLOCKS	64
-
-/* 64 blocks * 4 KiB = 256 KiB.  Fits in BSS without complaint. */
+/* 256 KiB total, same as before; just expressed as 512-block units
+ * now that the buffer cache is 512 B per slot. */
+#define BRAM_BLOCKS	512
 static unsigned char bram_data[BRAM_BLOCKS][BUF_BLOCK_SIZE];
 
-static int bram_read(unsigned minor, uint64_t blkno, void *buf)
+/* d_strategy: copy bytes in or out of bram_data, set B_DONE,
+ * complete inline via biodone.  SVR4 sync-driver shape. */
+static void bram_strategy(unsigned minor, struct buf *bp)
 {
 	(void)minor;
-	if (blkno >= BRAM_BLOCKS) return -1;
-	kmemcpy(buf, bram_data[blkno], BUF_BLOCK_SIZE);
-	return 0;
-}
-
-static int bram_write(unsigned minor, uint64_t blkno, const void *buf)
-{
-	(void)minor;
-	if (blkno >= BRAM_BLOCKS) return -1;
-	kmemcpy(bram_data[blkno], buf, BUF_BLOCK_SIZE);
-	return 0;
+	if (bp->b_blkno >= BRAM_BLOCKS ||
+	    bp->b_bcount > BUF_BLOCK_SIZE) {
+		bp->b_flags |= B_ERROR;
+		bp->b_error = -1;
+		bp->b_resid = bp->b_bcount;
+		biodone(bp);
+		return;
+	}
+	if (bp->b_flags & B_READ)
+		kmemcpy(bp->b_addr, bram_data[bp->b_blkno], bp->b_bcount);
+	else
+		kmemcpy(bram_data[bp->b_blkno], bp->b_addr, bp->b_bcount);
+	bp->b_resid = 0;
+	biodone(bp);
 }
 
 static struct bdev_entry bram_entry = {
-	.name        = "ram",
-	.read_block  = bram_read,
-	.write_block = bram_write,
-	.block_size  = BUF_BLOCK_SIZE,
+	.name       = "ram",
+	.d_strategy = bram_strategy,
+	.block_size = BUF_BLOCK_SIZE,
 };
 
 void bram_init(void)

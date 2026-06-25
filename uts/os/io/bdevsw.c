@@ -27,3 +27,14 @@ struct bdev_entry *bdev_lookup(unsigned major)
 	if (major == 0 || major >= BDEV_MAX) return 0;
 	return bdev_table[major];
 }
+
+int bdev_for_each(int (*cb)(unsigned major, struct bdev_entry *e, void *arg),
+		  void *arg)
+{
+	for (unsigned m = 1; m < BDEV_MAX; m++) {
+		if (!bdev_table[m]) continue;
+		int r = cb(m, bdev_table[m], arg);
+		if (r) return r;
+	}
+	return 0;
+}

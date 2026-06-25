@@ -47,7 +47,9 @@
 #include "kappara/core/pmm.h"
 #include "kappara/core/printk.h"
 #include "kappara/core/string.h"
+#include "kappara/fs/bdevsw.h"
 #include "kappara/fs/blkdev.h"
+#include "kappara/fs/buf.h"
 
 /* ---- Register offsets (NVMe 1.4 §3.1) ---- */
 #define NVME_REG_CAP	0x00	/* 64-bit Capabilities */
@@ -283,35 +285,68 @@ static int nvme_io_submit_and_wait(struct nvme_dev *d,
 	}
 }
 
-/* ---- block_device adapters ---- */
-
-static int nvme_bd_read(struct block_device *bd, uint32_t blkno, void *buf)
+/* ---- bdevsw d_strategy ----
+ *
+ * SVR4 contract: take a struct buf, fulfil it, biodone before
+ * returning (sync path).  NVMe is sync-polled today, so we
+ * translate B_READ/B_WRITE into NVM opc 0x02/0x01, submit, poll
+ * the CQ via nvme_io_submit_and_wait, then biodone.
+ *
+ * One LBA per request -- matches the buffer-cache slot size of
+ * BLK_SIZE / BUF_BLOCK_SIZE = 512.  Multi-block transfers would
+ * need to walk the buf's b_addr through PRP1/PRP2 chains; the
+ * fs+buffer-cache layer keeps requests at a single sector for
+ * now so we never see one.
+ */
+static void nvme_strategy(unsigned minor, struct buf *bp)
 {
 	struct nvme_dev *d = &nvme_singleton;
-	if (blkno >= bd->bd_nblocks) return -1;
+	(void)minor;	/* only namespace 1 today */
+
+	if (!nvme_singleton_init || bp->b_blkno >= d->bd.bd_nblocks ||
+	    bp->b_bcount != BLK_SIZE) {
+		bp->b_flags |= B_ERROR;
+		bp->b_error = -1;
+		bp->b_resid = bp->b_bcount;
+		biodone(bp);
+		return;
+	}
 
 	struct nvme_sqe cmd = { 0 };
-	cmd.opc   = 0x02;			/* NVM Read */
+	cmd.opc   = (bp->b_flags & B_READ) ? 0x02 : 0x01;
 	cmd.nsid  = d->nsid;
-	cmd.prp1  = (uint64_t)(uintptr_t)buf;
-	cmd.cdw10 = (uint32_t)blkno;
-	cmd.cdw11 = (uint32_t)((uint64_t)blkno >> 32);
-	cmd.cdw12 = 0;				/* NLB = 0 (=> 1 LBA) */
-	return nvme_io_submit_and_wait(d, &cmd);
+	cmd.prp1  = (uint64_t)(uintptr_t)bp->b_addr;
+	cmd.cdw10 = (uint32_t)bp->b_blkno;
+	cmd.cdw11 = (uint32_t)((uint64_t)bp->b_blkno >> 32);
+	cmd.cdw12 = 0;	/* NLB = 0 (=> 1 LBA) */
+
+	if (nvme_io_submit_and_wait(d, &cmd) < 0) {
+		bp->b_flags |= B_ERROR;
+		bp->b_error = -1;
+		bp->b_resid = bp->b_bcount;
+	} else {
+		bp->b_resid = 0;
+	}
+	biodone(bp);
 }
 
-static int nvme_bd_write(struct block_device *bd,
-                         uint32_t blkno, const void *buf)
+static struct bdev_entry nvme_bdev_entry = {
+	.name       = "nvme",
+	.d_strategy = nvme_strategy,
+	.block_size = BLK_SIZE,
+};
+
+/* ---- selftest helpers: kept block-cache-shaped so the post-bring-up
+ * roundtrip doesn't need to know anything about the SVR4 wrapper. */
+static int nvme_test_io(int is_write, uint32_t lba, void *buf)
 {
 	struct nvme_dev *d = &nvme_singleton;
-	if (blkno >= bd->bd_nblocks) return -1;
-
 	struct nvme_sqe cmd = { 0 };
-	cmd.opc   = 0x01;			/* NVM Write */
+	cmd.opc   = is_write ? 0x01 : 0x02;
 	cmd.nsid  = d->nsid;
 	cmd.prp1  = (uint64_t)(uintptr_t)buf;
-	cmd.cdw10 = (uint32_t)blkno;
-	cmd.cdw11 = (uint32_t)((uint64_t)blkno >> 32);
+	cmd.cdw10 = lba;
+	cmd.cdw11 = 0;
 	cmd.cdw12 = 0;
 	return nvme_io_submit_and_wait(d, &cmd);
 }
@@ -551,8 +586,8 @@ void nvme_init(void)
 
 	d->bd.bd_name    = "nvme0n1";
 	d->bd.bd_nblocks = (uint32_t)d->nsze;	/* truncated for now */
-	d->bd.bd_read    = nvme_bd_read;
-	d->bd.bd_write   = nvme_bd_write;
+	d->bd.bd_dev     = MKDEV(BDEV_MAJ_NVME, 0);
+	(void)bdev_register(BDEV_MAJ_NVME, &nvme_bdev_entry);
 
 	nvme_singleton_init = 1;
 	nvme_singleton_info.present = 1;
@@ -576,16 +611,20 @@ void nvme_init(void)
 	if (buf && save) {
 		int ok = 0;
 		uint8_t *p = buf;
-		if (nvme_bd_read(&d->bd, test_lba, save) < 0) {
+		/* nvme_test_io bypasses the buffer cache -- intentional:
+		 * the cache isn't initialised on this code path (we run
+		 * before any kfs_mount has populated it) and we want the
+		 * round-trip to exercise the raw strategy path. */
+		if (nvme_test_io(0, test_lba, save) < 0) {
 			kprintf("nvme: selftest pre-read FAIL\n");
 		} else {
 			for (int i = 0; i < BLK_SIZE; i++)
 				p[i] = (uint8_t)(0xA5 ^ i);
-			if (nvme_bd_write(&d->bd, test_lba, buf) < 0) {
+			if (nvme_test_io(1, test_lba, buf) < 0) {
 				kprintf("nvme: selftest write FAIL\n");
 			} else {
 				kmemset(buf, 0, BLK_SIZE);
-				if (nvme_bd_read(&d->bd, test_lba, buf) < 0) {
+				if (nvme_test_io(0, test_lba, buf) < 0) {
 					kprintf("nvme: selftest read FAIL\n");
 				} else {
 					ok = 1;
@@ -595,11 +634,10 @@ void nvme_init(void)
 						}
 					}
 				}
-				/* Always try to put the original bytes back,
-				 * even on a data mismatch -- otherwise a
-				 * single selftest failure permanently corrupts
-				 * the disk. */
-				(void)nvme_bd_write(&d->bd, test_lba, save);
+				/* Restore the original bytes even on
+				 * mismatch -- a single failure must not
+				 * permanently corrupt the disk. */
+				(void)nvme_test_io(1, test_lba, save);
 			}
 		}
 		kprintf("nvme: selftest %s\n",

@@ -16,8 +16,9 @@
  *                        each entry (recursively for subdirs).
  *   3. regfile_fops       file_ops for files: open/close manage a
  *                        position cursor; read/write/seek move
- *                        bytes one block at a time via bd_read /
- *                        bd_write; O_TRUNC zeroes size on open.
+ *                        bytes one block at a time via the buffer
+ *                        cache (bread / bwrite -> bdevsw[].d_strategy);
+ *                        O_TRUNC zeroes size on open.
  *   4. kfs_dir_fops       file_ops for directories: creat / mkdir /
  *                        unlink / rmdir allocate or free runs via
  *                        kfs_alloc_block_zero / kfs_free_blocks and
@@ -36,7 +37,6 @@
  * ----------------------
  *   - per-file allocation is fixed at mkimage / creat time
  *     (KFS_BLOCKS_PER_FILE blocks).  Append past that returns EIO.
- *   - no buffer cache: every read/write hits the block device.
  *   - bitmap holds only the first 4096 blocks (one 512 B page).
  */
 
@@ -44,11 +44,43 @@
 #include <stdint.h>
 
 #include "kappara/fs/blkdev.h"
+#include "kappara/fs/buf.h"
 #include "kappara/fs/kfs.h"
+#include "kappara/fs/vfs.h"
 #include "kappara/core/kmem.h"
 #include "kappara/core/printk.h"
 #include "kappara/core/string.h"
-#include "kappara/fs/vfs.h"
+
+/* ---- block-device adapters via the buffer cache ----
+ *
+ * Filesystems don't talk to drivers directly.  Every kfs block read
+ * is `bread(dev, blkno)` (returns a busy buf with B_VALID set on
+ * success); every kfs block write is `getblk` + `kmemcpy` + `bwrite`
+ * (bwrite calls brelse internally).  The buffer cache + bdevsw[]
+ * route the actual I/O to the right driver's d_strategy.
+ *
+ * These two helpers keep the per-site change minimal: one inline
+ * call per former bd->bd_read / bd->bd_write.  Returns 0/-1 to
+ * match the old API. */
+
+static int bd_read_block(struct block_device *bd, uint32_t blkno, void *out)
+{
+	struct buf *bp = bread(bd->bd_dev, (uint64_t)blkno);
+	if (!bp) return -1;
+	kmemcpy(out, bp->b_data, BLK_SIZE);
+	brelse(bp);
+	return 0;
+}
+
+static int bd_write_block(struct block_device *bd, uint32_t blkno,
+			  const void *in)
+{
+	struct buf *bp = getblk(bd->bd_dev, (uint64_t)blkno);
+	if (!bp) return -1;
+	kmemcpy(bp->b_data, in, BLK_SIZE);
+	bp->b_flags |= B_VALID;
+	return bwrite(bp);	/* releases bp on the way out */
+}
 
 /* ---- regular-file file_ops ----------------------------------------- */
 
@@ -73,9 +105,9 @@ static int regfile_open(struct file *f)
 		struct kfs_file *kf = c->kf;
 		kf->size_bytes = 0;
 		struct kfs_dirent dir[KFS_DIRENTS];
-		if (kf->bd->bd_read(kf->bd, kf->dir_block, dir) == 0) {
+		if (bd_read_block(kf->bd, kf->dir_block, dir) == 0) {
 			dir[kf->dirent_idx].size_bytes = 0;
-			kf->bd->bd_write(kf->bd, kf->dir_block, dir);
+			bd_write_block(kf->bd, kf->dir_block, dir);
 		}
 	}
 	return 0;
@@ -100,7 +132,7 @@ static long regfile_read(struct file *f, void *buf, size_t len)
 	uint32_t offblk = c->pos % BLK_SIZE;
 
 	unsigned char tmp[BLK_SIZE];
-	if (kf->bd->bd_read(kf->bd, blk, tmp) < 0)
+	if (bd_read_block(kf->bd, blk, tmp) < 0)
 		return -1;
 
 	size_t avail   = BLK_SIZE - offblk;
@@ -143,7 +175,7 @@ static long regfile_write(struct file *f, const void *buf, size_t len)
 		uint32_t offblk    = off_total % BLK_SIZE;
 
 		unsigned char tmp[BLK_SIZE];
-		if (kf->bd->bd_read(kf->bd, blk, tmp) < 0)
+		if (bd_read_block(kf->bd, blk, tmp) < 0)
 			break;
 
 		size_t n = BLK_SIZE - offblk;
@@ -151,7 +183,7 @@ static long regfile_write(struct file *f, const void *buf, size_t len)
 			n = len - written;
 		kmemcpy(tmp + offblk, src + written, n);
 
-		if (kf->bd->bd_write(kf->bd, blk, tmp) < 0)
+		if (bd_write_block(kf->bd, blk, tmp) < 0)
 			break;
 		written += n;
 	}
@@ -161,9 +193,9 @@ static long regfile_write(struct file *f, const void *buf, size_t len)
 		kf->size_bytes = c->pos;
 		/* Push the new size back to the directory entry on disk. */
 		struct kfs_dirent dir[KFS_DIRENTS];
-		if (kf->bd->bd_read(kf->bd, kf->dir_block, dir) == 0) {
+		if (bd_read_block(kf->bd, kf->dir_block, dir) == 0) {
 			dir[kf->dirent_idx].size_bytes = kf->size_bytes;
-			kf->bd->bd_write(kf->bd, kf->dir_block, dir);
+			bd_write_block(kf->bd, kf->dir_block, dir);
 		}
 	}
 	return (long)written;
@@ -273,7 +305,7 @@ static void kfs_bit_set(struct kfs_mnt *m, uint32_t blk, int val)
 static void kfs_bitmap_save(struct kfs_mnt *m)
 {
 	if (m && m->bd)
-		m->bd->bd_write(m->bd, KFS_BITMAP_BLOCK, m->bitmap);
+		bd_write_block(m->bd, KFS_BITMAP_BLOCK, m->bitmap);
 }
 
 /*
@@ -307,7 +339,7 @@ static uint32_t kfs_alloc_block_zero(struct block_device *bd, uint32_t count)
 		unsigned char zero[BLK_SIZE];
 		for (size_t i = 0; i < BLK_SIZE; i++) zero[i] = 0;
 		for (uint32_t b = 0; b < count; b++)
-			if (bd->bd_write(bd, start + b, zero) < 0) return 0;
+			if (bd_write_block(bd, start + b, zero) < 0) return 0;
 		return start;
 	}
 	kprintf("kfs_alloc: no contiguous %u-block run available\n",
@@ -372,7 +404,7 @@ static int kfs_dir_creat(struct inode *dir, const char *name)
 	struct block_device *bd = d->bd;
 
 	struct kfs_dirent dir_blk[KFS_DIRENTS];
-	if (bd->bd_read(bd, d->dir_block, dir_blk) < 0) return -1;
+	if (bd_read_block(bd, d->dir_block, dir_blk) < 0) return -1;
 
 	int slot = kfs_dir_find_slot(dir_blk, name);
 	if (slot < 0) { kprintf("kfs_creat: full or dup\n"); return -1; }
@@ -386,7 +418,7 @@ static int kfs_dir_creat(struct inode *dir, const char *name)
 	dir_blk[slot].start_block = start;
 	dir_blk[slot].size_bytes  = 0;
 	dir_blk[slot].type        = KFS_TYPE_FILE;
-	if (bd->bd_write(bd, d->dir_block, dir_blk) < 0) return -1;
+	if (bd_write_block(bd, d->dir_block, dir_blk) < 0) return -1;
 
 	struct kfs_file *kf = kmalloc(sizeof(*kf));
 	char *nm = kfs_dup_name(name);
@@ -412,7 +444,7 @@ static int kfs_dir_mkdir(struct inode *dir, const char *name)
 	struct block_device *bd = d->bd;
 
 	struct kfs_dirent dir_blk[KFS_DIRENTS];
-	if (bd->bd_read(bd, d->dir_block, dir_blk) < 0) return -1;
+	if (bd_read_block(bd, d->dir_block, dir_blk) < 0) return -1;
 
 	int slot = kfs_dir_find_slot(dir_blk, name);
 	if (slot < 0) { kprintf("kfs_mkdir: full or dup\n"); return -1; }
@@ -426,7 +458,7 @@ static int kfs_dir_mkdir(struct inode *dir, const char *name)
 	dir_blk[slot].start_block = subblk;
 	dir_blk[slot].size_bytes  = 0;
 	dir_blk[slot].type        = KFS_TYPE_DIR;
-	if (bd->bd_write(bd, d->dir_block, dir_blk) < 0) return -1;
+	if (bd_write_block(bd, d->dir_block, dir_blk) < 0) return -1;
 
 	/* Hook into VFS: a new directory dentry whose i_fops route
 	 * subsequent creat/mkdir back here and whose i_private knows
@@ -476,7 +508,7 @@ static int kfs_dir_unlink(struct inode *dir, const char *name)
 	struct block_device *bd = d->bd;
 
 	struct kfs_dirent dir_blk[KFS_DIRENTS];
-	if (bd->bd_read(bd, d->dir_block, dir_blk) < 0) return -1;
+	if (bd_read_block(bd, d->dir_block, dir_blk) < 0) return -1;
 	int slot = kfs_dir_find_named(dir_blk, name);
 	if (slot < 0) {
 		kprintf("kfs_unlink: '%s' not found in dir_block=%u\n",
@@ -494,7 +526,7 @@ static int kfs_dir_unlink(struct inode *dir, const char *name)
 	dir_blk[slot].start_block = 0;
 	dir_blk[slot].size_bytes  = 0;
 	dir_blk[slot].type        = 0;
-	if (bd->bd_write(bd, d->dir_block, dir_blk) < 0) return -1;
+	if (bd_write_block(bd, d->dir_block, dir_blk) < 0) return -1;
 	if (reclaim_start) kfs_free_blocks(bd, reclaim_start, KFS_BLOCKS_PER_FILE);
 
 	kprintf("kfs_unlink: '%s' from dir_block=%u slot=%d (freed blocks %u..%u)\n",
@@ -510,7 +542,7 @@ static int kfs_dir_rmdir(struct inode *dir, const char *name)
 	struct block_device *bd = d->bd;
 
 	struct kfs_dirent dir_blk[KFS_DIRENTS];
-	if (bd->bd_read(bd, d->dir_block, dir_blk) < 0) return -1;
+	if (bd_read_block(bd, d->dir_block, dir_blk) < 0) return -1;
 	int slot = kfs_dir_find_named(dir_blk, name);
 	if (slot < 0) {
 		kprintf("kfs_rmdir: '%s' not found\n", name);
@@ -523,7 +555,7 @@ static int kfs_dir_rmdir(struct inode *dir, const char *name)
 	/* Refuse to remove a non-empty dir. */
 	struct kfs_dirent sub[KFS_DIRENTS];
 	uint32_t sub_block = dir_blk[slot].start_block;
-	if (bd->bd_read(bd, sub_block, sub) < 0) return -1;
+	if (bd_read_block(bd, sub_block, sub) < 0) return -1;
 	for (unsigned i = 0; i < KFS_DIRENTS; i++) {
 		if (sub[i].name[0] != '\0') {
 			kprintf("kfs_rmdir: '%s' is not empty\n", name);
@@ -535,7 +567,7 @@ static int kfs_dir_rmdir(struct inode *dir, const char *name)
 	dir_blk[slot].start_block = 0;
 	dir_blk[slot].size_bytes  = 0;
 	dir_blk[slot].type        = 0;
-	if (bd->bd_write(bd, d->dir_block, dir_blk) < 0) return -1;
+	if (bd_write_block(bd, d->dir_block, dir_blk) < 0) return -1;
 	kfs_free_blocks(bd, sub_block, 1);
 
 	kprintf("kfs_rmdir: '%s' from dir_block=%u slot=%d (freed block %u)\n",
@@ -585,7 +617,7 @@ void kfs_mkimage(struct block_device *bd,
 	kmemset(&sb, 0, sizeof(sb));
 	sb.magic     = KFS_MAGIC;
 	sb.num_files = n_payloads;
-	bd->bd_write(bd, KFS_SUPER_BLOCK, &sb);
+	bd_write_block(bd, KFS_SUPER_BLOCK, &sb);
 
 	struct kfs_dirent dir[KFS_DIRENTS];
 	kmemset(dir, 0, sizeof(dir));
@@ -621,15 +653,15 @@ void kfs_mkimage(struct block_device *bd,
 				src += n;
 				rem -= n;
 			}
-			bd->bd_write(bd, cur_block + b, buf);
+			bd_write_block(bd, cur_block + b, buf);
 			kfs_bit_set(m, cur_block + b, 1);
 		}
 		cur_block += KFS_BLOCKS_PER_FILE;
 	}
-	bd->bd_write(bd, KFS_ROOT_BLOCK, dir);
+	bd_write_block(bd, KFS_ROOT_BLOCK, dir);
 
 	/* Flush the bitmap. */
-	bd->bd_write(bd, KFS_BITMAP_BLOCK, m->bitmap);
+	bd_write_block(bd, KFS_BITMAP_BLOCK, m->bitmap);
 
 	kprintf("kfs: mkimage wrote %u files (blocks used: 0..%u)\n",
 		n_payloads, (unsigned)(cur_block - 1));
@@ -645,7 +677,7 @@ static void kfs_mount_dir(struct block_device *bd,
 			  struct dentry *vfs_parent)
 {
 	struct kfs_dirent dir[KFS_DIRENTS];
-	if (bd->bd_read(bd, dir_block, dir) < 0)
+	if (bd_read_block(bd, dir_block, dir) < 0)
 		return;
 
 	for (unsigned i = 0; i < KFS_DIRENTS; i++) {
@@ -684,7 +716,7 @@ static void kfs_mount_dir(struct block_device *bd,
 int kfs_mount(struct block_device *bd, struct dentry *mountpoint)
 {
 	struct kfs_super sb;
-	if (bd->bd_read(bd, KFS_SUPER_BLOCK, &sb) < 0) {
+	if (bd_read_block(bd, KFS_SUPER_BLOCK, &sb) < 0) {
 		kprintf("kfs_mount: superblock read failed\n");
 		return -1;
 	}
@@ -700,7 +732,7 @@ int kfs_mount(struct block_device *bd, struct dentry *mountpoint)
 		kprintf("kfs_mount: MAX_KFS_MOUNTS exceeded\n");
 		return -1;
 	}
-	if (bd->bd_read(bd, KFS_BITMAP_BLOCK, m->bitmap) < 0) {
+	if (bd_read_block(bd, KFS_BITMAP_BLOCK, m->bitmap) < 0) {
 		kprintf("kfs_mount: bitmap read failed\n");
 		return -1;
 	}
