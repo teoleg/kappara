@@ -462,30 +462,58 @@ static int vmap_copyin(struct vm_map *vm, uint64_t user_va,
 	return 0;
 }
 
-/* INDIE.md Path B stage 3: anonymous mmap.  Linux SYS_mmap(addr,
- * length, prot, flags, fd, offset) -- we only support MAP_ANONYMOUS
- * (no file mapping yet).  Allocates pages from the ANON_VA window
- * and bumps vm->anon_next.  Returns the new mapping or -1 (which
- * Linux turns into MAP_FAILED at the libc wrapper).
+/* INDIE.md Path B stage 3 + LLM-on-kappara stage 1: SYS_mmap.
  *
- * No coalescing: each mmap reserves a fresh range from anon_next.
- * Real free-range tracking (so munmap reclaims VA) is a follow-on. */
+ * mmap(addr, length, prot, flags, fd, offset) -> user VA or -1
+ *
+ * Two supported flavours:
+ *   MAP_ANONYMOUS: allocate `length` PMM pages, zero them, map at
+ *                  the next free spot in the ANON_VA window.  `fd`
+ *                  and `offset` ignored.  Backs malloc-of-large.
+ *   MAP_PRIVATE + valid fd: same VA + page allocation, but each page
+ *                  is then read out of the file at the matching
+ *                  offset.  Reads beyond EOF zero-fill (POSIX).
+ *                  The file's own seek cursor is NOT moved -- we
+ *                  open an internal struct file with its own cursor,
+ *                  same trick read_file_kernel uses.
+ *
+ * Caller-provided `addr` is ignored (kernel always picks).
+ * `prot` is accepted but every mapping is user-RW currently;
+ * proper PROT_READ-only / PROT_NONE landing is a follow-up that
+ * needs vmap_map_user_4k to take an AP override.
+ *
+ * VA allocation: shared bump cursor (vm->anon_next) walks from
+ * ANON_VA forward.  No free-range tracking yet, no coalescing.
+ * Enough for the LLM-weights case where you mmap once and keep
+ * it for the process lifetime.
+ */
 long sys_mmap_impl(uint64_t addr, uint64_t length, int prot,
 		   int flags, int fd, uint64_t offset)
 {
-	(void)addr; (void)prot; (void)fd; (void)offset;
+	(void)addr; (void)prot;
 	struct kthread *t = curthread;
 	if (!t || !t->t_proc || !t->t_proc->vm) return -1;
 	struct vm_map *vm = t->t_proc->vm;
 	if (length == 0) return -1;
 
-	/* Today we only do anonymous mappings; file mapping needs the
-	 * file-cache plumbing dlopen has, generalized.  Reject explicit
-	 * non-anonymous flags rather than silently doing the wrong thing. */
+	const int MAP_PRIVATE   = 0x02;
 	const int MAP_ANONYMOUS = 0x20;
-	if (!(flags & MAP_ANONYMOUS)) {
-		kprintf("mmap: file mapping not supported (flags=0x%x)\n", flags);
-		return -1;
+	int is_anon = !!(flags & MAP_ANONYMOUS);
+
+	/* File-backed mapping requires MAP_PRIVATE (we don't support
+	 * SHARED yet) and a real fd.  Either it's anon or fd is sane. */
+	struct file *uf = NULL;
+	if (!is_anon) {
+		if (!(flags & MAP_PRIVATE) || fd < 0) {
+			kprintf("mmap: unsupported flags=0x%x fd=%d\n",
+				flags, fd);
+			return -1;
+		}
+		uf = fd_get(fd);
+		if (!uf || !uf->f_inode || !uf->f_ops || !uf->f_ops->read) {
+			kprintf("mmap: bad fd %d\n", fd);
+			return -1;
+		}
 	}
 
 	/* Initialise anon_next on first use.  Pre-stage-3 vm_maps don't
@@ -493,7 +521,7 @@ long sys_mmap_impl(uint64_t addr, uint64_t length, int prot,
 	if (vm->anon_next == 0) vm->anon_next = ANON_VA;
 
 	uint64_t aligned = (length + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
-	uint64_t base = vm->anon_next;
+	uint64_t base    = vm->anon_next;
 	if (base + aligned > ANON_VA + ANON_SIZE) {
 		kprintf("mmap: ANON window exhausted (asking %lu KB)\n",
 			(unsigned long)(aligned / 1024));
@@ -505,6 +533,53 @@ long sys_mmap_impl(uint64_t addr, uint64_t length, int prot,
 			(unsigned long)(aligned / 1024));
 		return -1;
 	}
+
+	/* File-backed: read each page's worth from the file at the
+	 * matching offset.  Use a temporary struct file with its own
+	 * cursor so we don't disturb the user's fd position. */
+	if (uf) {
+		struct file tmp = {
+			.f_ops     = uf->f_ops,
+			.f_inode   = uf->f_inode,
+			.f_private = NULL,
+			.f_refs    = 1,
+			.f_flags   = 0,
+		};
+		vfs_iget(uf->f_inode);
+		if (tmp.f_ops->open && tmp.f_ops->open(&tmp) < 0) {
+			vfs_iput(uf->f_inode);
+			return -1;
+		}
+		/* Seek to the requested offset.  f_ops->seek returns the
+		 * new offset; -1 means the file isn't seekable, in which
+		 * case the partial-page is treated as all-EOF (zero-fill). */
+		int seekable = 1;
+		if (offset > 0) {
+			if (!tmp.f_ops->seek ||
+			    tmp.f_ops->seek(&tmp, (long)offset, 0) < 0) {
+				seekable = 0;
+			}
+		}
+
+		for (unsigned i = 0; i < n_pages && seekable; i++) {
+			uint64_t va = base + (uint64_t)i * PAGE_SIZE;
+			void   *kva = mmu_vmap_user_va_to_kva(vm, va);
+			if (!kva) break;
+			size_t pos = 0;
+			while (pos < PAGE_SIZE) {
+				long n = tmp.f_ops->read(&tmp,
+				                         (char *)kva + pos,
+				                         PAGE_SIZE - pos);
+				if (n <= 0) break;
+				pos += (size_t)n;
+			}
+			/* pmm_alloc/vmap_alloc_pages already zeroed the
+			 * page, so reads past EOF stay zero-filled. */
+		}
+		if (tmp.f_ops->close) tmp.f_ops->close(&tmp);
+		vfs_iput(uf->f_inode);
+	}
+
 	vm->anon_next = base + aligned;
 	return (long)base;
 }

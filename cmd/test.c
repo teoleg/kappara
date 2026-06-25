@@ -804,6 +804,65 @@ static int test_dl(void)
 	return 0;
 }
 
+/* ---- mmap (anonymous + file-backed) -------------------------------- */
+
+#include <sys/mman.h>
+
+static int test_mmap(void)
+{
+	/* (1) MAP_ANON: 16 KB zero-filled.  Write a pattern, verify, munmap. */
+	size_t  sz   = 16 * 1024;
+	uint8_t *a   = mmap(0, sz, PROT_READ | PROT_WRITE,
+			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (a == MAP_FAILED) { puts("mmap: anon FAIL"); return 1; }
+	for (size_t i = 0; i < sz; i++) {
+		if (a[i] != 0) { puts("mmap: anon not zero-filled"); return 1; }
+		a[i] = (uint8_t)(0x5a ^ i);
+	}
+	for (size_t i = 0; i < sz; i++) {
+		if (a[i] != (uint8_t)(0x5a ^ i)) {
+			puts("mmap: anon pattern mismatch"); return 1;
+		}
+	}
+	if (munmap(a, sz) < 0) { puts("mmap: munmap FAIL"); return 1; }
+
+	/* (2) MAP_PRIVATE file-backed.  Make a file in /home, mmap it,
+	 *     verify contents byte-for-byte. */
+	const char *path = "/home/.mmaptest";
+	if (creat(path) < 0) { puts("mmap: creat /home/.mmaptest"); return 1; }
+	int fd = open(path, 0);
+	if (fd < 0) { puts("mmap: open dst FAIL"); return 1; }
+	/* Open with O_TRUNC?  Our regfile_open does it via flag 1; we just
+	 * write fresh bytes. */
+	uint8_t src[2048];
+	for (size_t i = 0; i < sizeof(src); i++)
+		src[i] = (uint8_t)(0xA5 ^ i);
+	if (write(fd, src, sizeof(src)) != (long)sizeof(src)) {
+		puts("mmap: write src FAIL"); close(fd); return 1;
+	}
+	close(fd);
+
+	fd = open(path, 0);
+	if (fd < 0) { puts("mmap: reopen FAIL"); return 1; }
+	uint8_t *m = mmap(0, sizeof(src), PROT_READ,
+			  MAP_PRIVATE, fd, 0);
+	if (m == MAP_FAILED) { puts("mmap: file map FAIL"); close(fd); return 1; }
+	for (size_t i = 0; i < sizeof(src); i++) {
+		if (m[i] != src[i]) {
+			puts("mmap: file content mismatch");
+			munmap(m, sizeof(src)); close(fd); return 1;
+		}
+	}
+	if (munmap(m, sizeof(src)) < 0) {
+		puts("mmap: file munmap FAIL"); close(fd); return 1;
+	}
+	close(fd);
+	unlink(path);
+
+	puts("mmap: PASS");
+	return 0;
+}
+
 static const struct test_entry tests[] = {
 	{ "fork",     test_fork },
 	{ "wait",     test_wait },
@@ -819,6 +878,7 @@ static const struct test_entry tests[] = {
 	{ "tcpmulti", test_tcpmulti },
 	{ "tcpbig",   test_tcpbig },
 	{ "dl",       test_dl },
+	{ "mmap",     test_mmap },
 };
 
 #define N_TESTS (sizeof(tests) / sizeof(tests[0]))
