@@ -1,8 +1,8 @@
 /*
  * cmd/head.c -- print the first N lines of each named file.
  * `head <file>` defaults to 10 lines; `head -n N <file>` overrides
- * the count.  No special handling for stdin yet -- we only have
- * regular files in /usr/bin and /home.
+ * the count.  With no file argument (or `-`), reads stdin -- so
+ * `cat /dev/ksyms | head` works the way the shell pipe expects.
  */
 
 #include <stdio.h>
@@ -16,10 +16,8 @@ static int parse_int(const char *s)
 	return v;
 }
 
-static int dump_head(const char *path, int n)
+static int dump_head_fd(int fd, int n)
 {
-	int fd = open(path, 0);
-	if (fd < 0) { printf("head: cannot open '%s'\n", path); return -1; }
 	char  buf[1024];
 	long  r;
 	int   lines = 0;
@@ -32,8 +30,16 @@ static int dump_head(const char *path, int n)
 		write(1, buf, (size_t)out);
 		if (lines >= n) break;
 	}
-	close(fd);
 	return 0;
+}
+
+static int dump_head_path(const char *path, int n)
+{
+	int fd = open(path, 0);
+	if (fd < 0) { printf("head: cannot open '%s'\n", path); return -1; }
+	int r = dump_head_fd(fd, n);
+	close(fd);
+	return r;
 }
 
 int main(int argc, char **argv)
@@ -44,10 +50,18 @@ int main(int argc, char **argv)
 		n = parse_int(argv[i + 1]);
 		i += 2;
 	}
-	if (i >= argc) { puts("usage: head [-n N] <file> [...]"); return 1; }
+	if (i >= argc) {
+		/* No file argument -- read stdin.  Same as `head -` on
+		 * real Unix; the explicit `-` spelling works too. */
+		return dump_head_fd(0, n) < 0 ? 1 : 0;
+	}
 
 	int err = 0;
-	for (; i < argc; i++)
-		if (dump_head(argv[i], n) < 0) err = 1;
+	for (; i < argc; i++) {
+		int r;
+		if (!strcmp(argv[i], "-")) r = dump_head_fd(0, n);
+		else                        r = dump_head_path(argv[i], n);
+		if (r < 0) err = 1;
+	}
 	return err;
 }
