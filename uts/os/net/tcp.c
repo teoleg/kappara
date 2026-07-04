@@ -887,9 +887,11 @@ static void tcp_try_send_pending(struct tcp_tcb *s)
 	s->in_send = 1;
 	for (;;) {
 		if (!s->snd_buf) break;
-		uint32_t buf_used = (uint32_t)
-		    (s->snd_buf->b_wptr - s->snd_buf->b_rptr);
-		uint32_t sent     = s->snd_nxt - s->snd_buf_seq;
+		/* Count total bytes across the snd_buf chain. */
+		uint32_t buf_used = 0;
+		for (mblk_t *m = s->snd_buf; m; m = m->b_cont)
+			buf_used += (uint32_t)(m->b_wptr - m->b_rptr);
+		uint32_t sent = s->snd_nxt - s->snd_buf_seq;
 		if (sent >= buf_used) break;	/* nothing new to send */
 		uint32_t unsent = buf_used - sent;
 
@@ -903,12 +905,27 @@ static void tcp_try_send_pending(struct tcp_tcb *s)
 
 		uint32_t chunk = unsent < room ? unsent : room;
 		if (chunk > s->mss) chunk = s->mss;
-		const unsigned char *p = s->snd_buf->b_rptr + sent;
+
+		/* Gather `chunk` bytes starting at offset `sent` from chain
+		 * into a flat stack buffer for tcp_emit_segment. */
+		unsigned char seg_data[1500];
+		uint32_t skip = sent;
+		unsigned gathered = 0;
+		for (mblk_t *m = s->snd_buf; m && gathered < chunk; m = m->b_cont) {
+			unsigned n = (unsigned)(m->b_wptr - m->b_rptr);
+			if (skip >= n) { skip -= n; continue; }
+			unsigned from = skip; skip = 0;
+			unsigned avail = n - from;
+			unsigned take = (avail < (chunk - gathered))
+			              ? avail : (chunk - gathered);
+			kmemcpy(seg_data + gathered, m->b_rptr + from, take);
+			gathered += take;
+		}
 
 		if (tcp_emit_segment(s, s->snd_nxt,
-		    TCP_FLAG_ACK | TCP_FLAG_PSH, p, chunk) < 0)
+		    TCP_FLAG_ACK | TCP_FLAG_PSH, seg_data, gathered) < 0)
 			break;
-		s->snd_nxt += chunk;
+		s->snd_nxt += gathered;
 		/* Arm RTO if not already running (first segment of a
 		 * fresh send burst).  ACKs that fully drain snd_buf
 		 * cancel it. */
@@ -1149,8 +1166,9 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 				 * are no unsent bytes left; otherwise reset
 				 * so the remaining data has its own RTO. */
 				if (s->snd_buf) {
-					unsigned buf_len = (unsigned)
-					    (s->snd_buf->b_wptr - s->snd_buf->b_rptr);
+					unsigned buf_len = 0;
+					for (mblk_t *m = s->snd_buf; m; m = m->b_cont)
+						buf_len += (unsigned)(m->b_wptr - m->b_rptr);
 					unsigned sent_left = s->snd_nxt - s->snd_buf_seq;
 					if (acked >= buf_len) {
 						freemsg(s->snd_buf);
@@ -1162,8 +1180,27 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 							    - s->send_tick);
 						tcp_cancel_rto(s);
 					} else {
-						s->snd_buf->b_rptr += acked;
-						s->snd_buf_seq += acked;
+						/* Walk chain, freeing fully-ACK'd mblks;
+						 * partial ACK into the head just advances
+						 * b_rptr. */
+						unsigned to_trim = acked;
+						while (to_trim > 0 && s->snd_buf) {
+							unsigned n = (unsigned)
+							    (s->snd_buf->b_wptr
+							     - s->snd_buf->b_rptr);
+							if (to_trim >= n) {
+								mblk_t *next = s->snd_buf->b_cont;
+								s->snd_buf->b_cont = NULL;
+								freeb(s->snd_buf);
+								s->snd_buf = next;
+								s->snd_buf_seq += n;
+								to_trim -= n;
+							} else {
+								s->snd_buf->b_rptr += to_trim;
+								s->snd_buf_seq += to_trim;
+								to_trim = 0;
+							}
+						}
 						sent_left -= acked;
 						if (sent_left > 0) {
 							/* Partial ACK on
@@ -1628,60 +1665,39 @@ static int handle_data_req(queue_t *q, struct tcp_tcb *s, mblk_t *payload)
 		return 0;	/* zero-byte data: nothing to send */
 	}
 	unsigned plen = (unsigned)msgdsize(payload);
-	unsigned old  = s->snd_buf
-	             ? (unsigned)(s->snd_buf->b_wptr - s->snd_buf->b_rptr) : 0;
-	/* T1j: cap by snd_buf ceiling only.  Flow control by cwnd and
-	 * snd_wnd happens inside tcp_try_send_pending -- bytes queue
-	 * here even when there's no immediate room on the wire, and
-	 * shovel out as ACKs open both windows. */
+
+	/* Mask IRQs: ACK trim in tcp_rput runs from IRQ context and
+	 * walks/mutates the snd_buf chain concurrently. */
+	unsigned long irq_flags;
+	__asm__ volatile ("mrs %0, daif" : "=r"(irq_flags));
+	__asm__ volatile ("msr daifset, #2" ::: "memory");
+
+	/* Count chain to enforce ceiling; walk under IRQ mask so the
+	 * count is consistent with what tcp_try_send_pending sees. */
+	unsigned old = 0;
+	for (mblk_t *m = s->snd_buf; m; m = m->b_cont)
+		old += (unsigned)(m->b_wptr - m->b_rptr);
+
 	if (old + plen > TCP_SND_BUF_MAX) {
+		__asm__ volatile ("msr daif, %0" :: "r"(irq_flags) : "memory");
 		freemsg(payload);
 		reply_discon_ind(OTHERQ(q), TCP_DISCON_REASON_PROTOERR);
 		return -1;
 	}
 
-	/* Append to snd_buf.  T1j: bytes are queued here in their
-	 * entirety, but only MSS-sized chunks go out on the wire per
-	 * tcp_try_send_pending; cwnd and snd_wnd govern how many of
-	 * those chunks fit before we have to wait for an ACK to free
-	 * room.  Single-mblk model keeps trim logic simple (advance
-	 * b_rptr on ACK trims, snd_nxt - snd_buf_seq tracks how much
-	 * is already on the wire).
-	 *
-	 * Mask IRQs across the snd_buf swap.  tcp_rput's ACK trim runs
-	 * from the virtio-net IRQ context and mutates snd_buf->b_rptr
-	 * / b_wptr / snd_buf_seq / snd_una.  Without this fence an ACK
-	 * landing between `old = b_wptr - b_rptr` and the kmemcpy
-	 * advances b_rptr but leaves us reading `old` bytes from the
-	 * new (smaller) position -- which spills past b_wptr into the
-	 * tail of the allocb, often zero.  That zero stretch is what
-	 * the FTP RETR roundtrip saw as "12288 bytes back for an 11776
-	 * file with a 512-byte zero block injected mid-stream". */
-	unsigned long irq_flags;
-	__asm__ volatile ("mrs %0, daif" : "=r"(irq_flags));
-	__asm__ volatile ("msr daifset, #2" ::: "memory");
-
-	mblk_t *new_buf = allocb(old + plen, 0);
-	if (!new_buf) {
-		__asm__ volatile ("msr daif, %0" :: "r"(irq_flags) : "memory");
-		freemsg(payload);
-		return -1;
+	/* Chain-append: link payload onto tail of snd_buf.  No copy, no
+	 * kmalloc ceiling — each payload mblk was already allocated by
+	 * stream_head at whatever size stream_putmsg chose, well within
+	 * the 2048-byte slab max.  tcp_try_send_pending and the ACK trim
+	 * path both walk b_cont chains now. */
+	if (!s->snd_buf) {
+		s->snd_buf_seq = s->snd_nxt;
+		s->snd_buf = payload;
+	} else {
+		mblk_t *tail = s->snd_buf;
+		while (tail->b_cont) tail = tail->b_cont;
+		tail->b_cont = payload;
 	}
-	if (old) {
-		kmemcpy(new_buf->b_wptr, s->snd_buf->b_rptr, old);
-		new_buf->b_wptr += old;
-	}
-	for (mblk_t *m = payload; m; m = m->b_cont) {
-		unsigned n = (unsigned)(m->b_wptr - m->b_rptr);
-		if (n == 0) continue;
-		kmemcpy(new_buf->b_wptr, m->b_rptr, n);
-		new_buf->b_wptr += n;
-	}
-
-	if (!s->snd_buf) s->snd_buf_seq = s->snd_nxt;
-	if (s->snd_buf) freemsg(s->snd_buf);
-	s->snd_buf = new_buf;
-	freemsg(payload);
 
 	tcp_try_send_pending(s);
 
