@@ -177,6 +177,10 @@ unsigned long mmu_boot_l0_phys(void)
 }
 __attribute__((aligned(PAGE_SIZE))) static uint64_t l1_table[ENTRIES_PER_TABLE];
 __attribute__((aligned(PAGE_SIZE))) static uint64_t l2_table[ENTRIES_PER_TABLE];
+/* Static L1 reserved for the UART region on UEFI paths where the
+ * SPCR base is outside the first 512 GB (L0[0]).  Cannot use PMM
+ * here — mmu_init() runs before pmm_init(). */
+__attribute__((aligned(PAGE_SIZE))) static uint64_t l1_table_uart[ENTRIES_PER_TABLE];
 
 static void build_identity_map(void)
 {
@@ -356,6 +360,24 @@ void mmu_enable_this_cpu(void)
 void mmu_init(void)
 {
 	build_identity_map();
+
+	/* If efi_main found a UART base via SPCR that lives outside the
+	 * first 512 GB (L0[0]), wire it up using the static l1_table_uart
+	 * so uart_putc stays valid after the MMU flips to our tables.
+	 * PMM is not yet available here, hence the static fallback. */
+	extern uint64_t efi_uart_base;
+	if (efi_uart_base != 0) {
+		uint64_t base  = efi_uart_base & ~BLOCK_1G_MASK;
+		unsigned l0i   = (unsigned)(base >> BLOCK_512G_SHIFT) & 0x1ff;
+		unsigned l1i   = (unsigned)(base >> BLOCK_1G_SHIFT)   & 0x1ff;
+		uint64_t *l1   = (l0i == 0) ? l1_table : l1_table_uart;
+		if (l0i != 0)
+			l0_table[l0i] = (uint64_t)(uintptr_t)l1_table_uart
+			                | D_VALID | D_TABLE;
+		l1[l1i] = base | D_VALID | D_ATTRIDX(ATTR_DEVICE_IDX)
+		               | D_AP_RW_EL1 | D_SH_NONE | D_AF | D_PXN | D_UXN;
+	}
+
 	mmu_enable_this_cpu();
 	kprintf("mmu: enabled (ttbr0=0x%lx tcr=0x%lx mair=0x%lx)\n",
 		(unsigned long)(uintptr_t)l0_table,

@@ -62,15 +62,18 @@
  */
 static spinlock_t uart_lock = SPINLOCK_INIT;
 
-#define PL011_BASE	PLAT_PL011_BASE
+/* Runtime UART base: PLAT_PL011_BASE on QEMU -kernel; overridden by
+ * the SPCR address that efi_main discovers on UEFI / Nitro paths. */
+extern uint64_t efi_uart_base;
+static uintptr_t pl011_base = PLAT_PL011_BASE;
 
-#define UART_DR		(PL011_BASE + 0x00)
-#define UART_FR		(PL011_BASE + 0x18)
-#define UART_IBRD	(PL011_BASE + 0x24)
-#define UART_FBRD	(PL011_BASE + 0x28)
-#define UART_LCRH	(PL011_BASE + 0x2C)
-#define UART_CR		(PL011_BASE + 0x30)
-#define UART_ICR	(PL011_BASE + 0x44)
+#define UART_DR		(pl011_base + 0x00)
+#define UART_FR		(pl011_base + 0x18)
+#define UART_IBRD	(pl011_base + 0x24)
+#define UART_FBRD	(pl011_base + 0x28)
+#define UART_LCRH	(pl011_base + 0x2C)
+#define UART_CR		(pl011_base + 0x30)
+#define UART_ICR	(pl011_base + 0x44)
 
 #define FR_TXFF		(1u << 5)
 #define FR_RXFE		(1u << 4)
@@ -94,6 +97,8 @@ static inline uint32_t mmio_read(uintptr_t reg)
 
 void uart_init(void)
 {
+	if (efi_uart_base != 0)
+		pl011_base = (uintptr_t)efi_uart_base;
 	mmio_write(UART_CR, 0);
 	mmio_write(UART_ICR, 0x7FF);
 	mmio_write(UART_IBRD, 26);

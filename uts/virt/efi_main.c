@@ -44,11 +44,55 @@ efi_memory_descriptor_t  *efi_memmap_buf;
 uint64_t                  efi_memmap_size;
 uint64_t                  efi_memmap_descriptor_size;
 uint64_t                  efi_memmap_descriptor_version;
+/* UART base from ACPI SPCR.  Zero on the -kernel path (efi_main
+ * never runs); uart_init() falls back to PLAT_PL011_BASE in that
+ * case.  mmu_init() uses this to wire the UART region before PMM
+ * is available. */
+uint64_t                  efi_uart_base;
 
 /* Static scratch buffer for the memory map.  4 KB holds about 80
  * descriptors at the EFI 48-byte size; AAVMF + virt produces 20-40
  * so this is comfortable. */
 static uint8_t            efi_memmap_storage[4096];
+
+/* Walk RSDP -> XSDT -> find "SPCR" -> return UART base from GAS.
+ * SPCR layout (ACPI 6.x): standard 36-byte header, then 1-byte
+ * interface_type, 3 reserved bytes, then a 12-byte Generic Address
+ * Structure whose 8-byte Address field sits at table offset 44.
+ * Called before ExitBootServices while ACPI table pages are mapped. */
+static uint64_t spcr_find_uart(void *rsdp_ptr)
+{
+	if (!rsdp_ptr) return 0;
+	uint8_t *rsdp = (uint8_t *)rsdp_ptr;
+	if (rsdp[15] < 2) return 0;	/* need ACPI 2.0 for XSDT */
+
+	uint64_t xsdt_pa = 0;
+	for (int i = 0; i < 8; i++)
+		xsdt_pa |= (uint64_t)rsdp[24 + i] << (i * 8);
+	if (!xsdt_pa) return 0;
+
+	uint8_t *xsdt = (uint8_t *)(uintptr_t)xsdt_pa;
+	uint32_t xlen = (uint32_t)xsdt[4] | ((uint32_t)xsdt[5] << 8) |
+	                ((uint32_t)xsdt[6] << 16) | ((uint32_t)xsdt[7] << 24);
+	if (xlen < 36) return 0;
+
+	unsigned n = (xlen - 36) / 8;
+	for (unsigned i = 0; i < n; i++) {
+		uint64_t entry = 0;
+		uint8_t *ep = xsdt + 36 + i * 8;
+		for (int j = 0; j < 8; j++)
+			entry |= (uint64_t)ep[j] << (j * 8);
+		if (!entry) continue;
+		uint8_t *tbl = (uint8_t *)(uintptr_t)entry;
+		if (tbl[0]=='S' && tbl[1]=='P' && tbl[2]=='C' && tbl[3]=='R') {
+			uint64_t base = 0;
+			for (int j = 0; j < 8; j++)
+				base |= (uint64_t)tbl[44 + j] << (j * 8);
+			return base;
+		}
+	}
+	return 0;
+}
 
 static int guid_eq(const efi_guid_t *a, const efi_guid_t *b)
 {
@@ -72,6 +116,10 @@ efi_status_t efi_main(efi_handle_t image_handle, efi_system_table_t *st)
 			break;
 		}
 	}
+	/* Extract UART base from SPCR while ACPI pages are still mapped.
+	 * Must happen before ExitBootServices; mmu_init() reads this to
+	 * wire the UART region without needing PMM. */
+	efi_uart_base = spcr_find_uart(efi_acpi_rsdp);
 
 	/* 2: snapshot the memory map.  GetMemoryMap is called twice in
 	 * the typical UEFI dance -- first to learn the size, then to
