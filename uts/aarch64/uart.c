@@ -67,7 +67,19 @@ static spinlock_t uart_lock = SPINLOCK_INIT;
 extern uint64_t efi_uart_base;
 extern uint32_t efi_uart_ibrd;
 extern uint32_t efi_uart_fbrd;
+extern uint8_t  efi_uart_type;   /* SPCR type: 0=16550, 3=PL011, 5=SBSA */
 static uintptr_t pl011_base = PLAT_PL011_BASE;
+static int uart_16550;           /* 1 when using 16550-compatible driver */
+
+/* 16550 register offsets (byte-wide access).
+ * ACPI SPCR type 0x00 = 16550-compatible; Nitro's virtualized serial
+ * console is this type at the SPCR-reported address (0x090a0000). */
+#define U16550_THR	0	/* TX holding register (DLAB=0) */
+#define U16550_IER	1	/* interrupt enable */
+#define U16550_FCR	2	/* FIFO control */
+#define U16550_LCR	3	/* line control */
+#define U16550_LSR	5	/* line status */
+#define U16550_THRE	(1u << 5)	/* LSR: TX holding reg empty */
 
 #define UART_DR		(pl011_base + 0x00)
 #define UART_FR		(pl011_base + 0x18)
@@ -101,34 +113,33 @@ void uart_init(void)
 {
 	if (efi_uart_base != 0) {
 		pl011_base = (uintptr_t)efi_uart_base;
+		if (efi_uart_type == 0) {
+			/*
+			 * 16550-compatible path (SPCR type 0x00).
+			 * AWS Nitro's virtualized serial console is this type
+			 * at the SPCR address (0x090a0000).  The hypervisor
+			 * manages baud rate transparently -- no divisor
+			 * programming needed.  Minimal init: 8N1, FIFO on,
+			 * no interrupts.
+			 */
+			uart_16550 = 1;
+			volatile uint8_t *b =
+				(volatile uint8_t *)(uintptr_t)efi_uart_base;
+			b[U16550_IER] = 0x00;	/* no interrupts */
+			b[U16550_LCR] = 0x03;	/* 8N1, DLAB=0 */
+			b[U16550_FCR] = 0x07;	/* enable+clear FIFOs */
+			return;
+		}
 		/*
-		 * EFI path: re-enable the PL011 using the baud-rate divisors
-		 * that efi_main saved before ExitBootServices.
-		 *
-		 * Older UEFI firmware (e.g. AWS Nitro 2018 build) writes
-		 * CR=0 to the UART as part of EBS cleanup, which disables
-		 * the transmitter.  On some PL011 implementations this also
-		 * resets IBRD/FBRD to zero, so simply re-enabling CR without
-		 * restoring the divisors produces zero baud rate (no output).
-		 *
-		 * We write IBRD/FBRD explicitly from the values snapshotted
-		 * in efi_main (before EBS, while EFI's config was live), then
-		 * latch them with LCRH=8N1+FEN, then re-enable.  This
-		 * tolerates both "firmware left UART enabled" (harmless
-		 * re-init) and "firmware disabled UART" (full restore).
-		 *
-		 * IBRD/FBRD may only be written while the UART is disabled
-		 * (per ARM PL011 TRM §3.3.8), hence the CR=0 first.
+		 * PL011 / SBSA path (type 3 or 5).
+		 * Re-enable using saved or fallback baud-rate divisors.
+		 * Older UEFI (Nitro 2018) writes CR=0 during EBS cleanup.
 		 */
+		uart_16550 = 0;
 		mmio_write(UART_CR, 0);
 		for (volatile unsigned i = 0; i < 1000000u; i++)
 			if (!(mmio_read(UART_FR) & 0x08u)) break; /* !BUSY */
 		mmio_write(UART_ICR, 0x7FFu);
-		/* Use the divisors EFI programmed, falling back to the
-		 * ARM Virt PL011 defaults (24 MHz clock, 115200 baud) when
-		 * the firmware left them at zero.  Nitro's 2018 UEFI relies
-		 * on hypervisor-level baud-rate handling and may not program
-		 * IBRD/FBRD at all; restoring zeros produces no output. */
 		mmio_write(UART_IBRD, efi_uart_ibrd ? efi_uart_ibrd : 13u);
 		mmio_write(UART_FBRD, efi_uart_fbrd ? efi_uart_fbrd : 1u);
 		mmio_write(UART_LCRH, LCRH_FEN | LCRH_WLEN_8);
@@ -165,8 +176,15 @@ void uart_release(unsigned long flags)
 
 void uart_putc_unlocked(char c)
 {
-	while (mmio_read(UART_FR) & FR_TXFF) { }
-	mmio_write(UART_DR, (uint32_t)(unsigned char)c);
+	if (uart_16550) {
+		volatile uint8_t *b = (volatile uint8_t *)(uintptr_t)pl011_base;
+		for (volatile unsigned i = 0; i < 1000000u; i++)
+			if (b[U16550_LSR] & U16550_THRE) break;
+		b[U16550_THR] = (uint8_t)c;
+	} else {
+		while (mmio_read(UART_FR) & FR_TXFF) { }
+		mmio_write(UART_DR, (uint32_t)(unsigned char)c);
+	}
 }
 
 void uart_putc(char c)
@@ -207,6 +225,12 @@ void uart_puts_panic(const char *s)
 
 int uart_getc_nonblock(void)
 {
+	if (uart_16550) {
+		volatile uint8_t *b = (volatile uint8_t *)(uintptr_t)pl011_base;
+		if (!(b[U16550_LSR] & 0x01u)) /* LSR.DR: data ready */
+			return -1;
+		return (int)b[U16550_THR];
+	}
 	if (mmio_read(UART_FR) & FR_RXFE)
 		return -1;
 	return (int)(mmio_read(UART_DR) & 0xFFu);

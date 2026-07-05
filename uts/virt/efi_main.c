@@ -50,13 +50,16 @@ uint64_t                  efi_memmap_descriptor_version;
  * case.  mmu_init() uses this to wire the UART region before PMM
  * is available. */
 uint64_t                  efi_uart_base;
-/* Baud-rate divisors read from the UART *before* ExitBootServices
- * while EFI's configuration is still valid.  Saved so uart_init()
- * can restore them exactly after ExitBootServices: some UEFI
- * implementations (notably older Nitro firmware) write CR=0 to
- * disable the UART as part of EBS cleanup, clearing the divisor
- * shadow registers.  Re-enabling without restoring IBRD/FBRD
- * produces zero baud rate (no output). */
+/* SPCR interface type (ACPI spec §18.3.3):
+ *   0x00 = 16550-compatible
+ *   0x03 = ARM PL011
+ *   0x05 = ARM SBSA Generic UART
+ * Defaults to 3 (PL011) for the -kernel path where efi_main never
+ * runs and PLAT_PL011_BASE is a real PL011. */
+uint8_t                   efi_uart_type = 3;
+/* Baud-rate divisors — meaningful only for PL011/SBSA (type 3/5).
+ * Saved before ExitBootServices so uart_init() can restore them if
+ * the firmware clears them during EBS cleanup. */
 uint32_t                  efi_uart_ibrd;
 uint32_t                  efi_uart_fbrd;
 
@@ -99,6 +102,10 @@ static uint64_t spcr_find_uart(void *rsdp_ptr)
 		if (!entry) continue;
 		uint8_t *tbl = (uint8_t *)(uintptr_t)entry;
 		if (tbl[0]=='S' && tbl[1]=='P' && tbl[2]=='C' && tbl[3]=='R') {
+			/* tbl[36] = InterfaceType (ACPI SPCR spec byte 36,
+			 * immediately after the 36-byte table header). */
+			extern uint8_t efi_uart_type;
+			efi_uart_type = tbl[36];
 			uint64_t base = 0;
 			for (int j = 0; j < 8; j++)
 				base |= (uint64_t)tbl[44 + j] << (j * 8);
@@ -165,44 +172,35 @@ efi_status_t efi_main(efi_handle_t image_handle, efi_system_table_t *st)
 	 * wire the UART region without needing PMM. */
 	efi_uart_base = spcr_find_uart(efi_acpi_rsdp);
 	if (efi_uart_base) {
-		/* Validate the SPCR address by probing the PL011 Flag Register.
-		 * On AWS Nitro, SPCR reports 0x090a0000 but that address has no
-		 * device — reads return 0xFFFFFFFF.  The actual EC2 serial console
-		 * (ttyAMA0) is at the ARM Virt primary PL011 address 0x09000000
-		 * (PLAT_PL011_BASE), which is also what EFI ConOut uses. */
-		uint32_t probe_fr = *(volatile uint32_t *)(uintptr_t)(efi_uart_base + 0x18);
-		if (probe_fr == 0xFFFFFFFFu) {
-			PRINT("kappara: SPCR UART not present, using platform default\r\n");
-			efi_uart_base = PLAT_PL011_BASE;
-		} else {
-			PRINT("kappara: SPCR UART=");
-			if (st->con_out) efi_print_hex(st->con_out, efi_uart_base);
-			PRINT(" FR=");
-			if (st->con_out) efi_print_hex(st->con_out, probe_fr);
-			PRINT("\r\n");
-		}
+		/* Trust the SPCR address and interface type without probing.
+		 * Previous code probed offset 0x18 assuming a PL011 FR register,
+		 * but Nitro's SPCR points to a 16550-compatible device where
+		 * that offset is meaningless — the probe always returned
+		 * 0xFFFFFFFF and we incorrectly discarded the correct address.
+		 * The SPCR InterfaceType field tells us the driver to use. */
+		PRINT("kappara: SPCR UART=");
+		if (st->con_out) efi_print_hex(st->con_out, efi_uart_base);
+		PRINT(" type=");
+		if (st->con_out) efi_print_hex(st->con_out, (uint64_t)efi_uart_type);
+		PRINT("\r\n");
 	} else {
 		PRINT("kappara: no SPCR, using platform default\r\n");
 		efi_uart_base = PLAT_PL011_BASE;
+		efi_uart_type = 3; /* PL011 */
 	}
 
-	/* Save UART baud-rate divisors before ExitBootServices.  EFI has
-	 * already configured IBRD/FBRD for whatever clock and baud rate
-	 * the platform uses.  We read them now (while EFI's UART driver
-	 * is active and the values are known-good) so uart_init() can
-	 * restore them after ExitBootServices in case the firmware resets
-	 * them to zero as part of its EBS cleanup. */
-	efi_uart_ibrd = *(volatile uint32_t *)(uintptr_t)(efi_uart_base + 0x24);
-	efi_uart_fbrd = *(volatile uint32_t *)(uintptr_t)(efi_uart_base + 0x28);
-	/* Diagnostic: print saved divisors so we can see the actual clock
-	 * config on this platform in the system log. */
-	PRINT("kappara: UART base=");
-	if (st->con_out) efi_print_hex(st->con_out, efi_uart_base);
-	PRINT(" IBRD=");
-	if (st->con_out) efi_print_hex(st->con_out, efi_uart_ibrd);
-	PRINT(" FBRD=");
-	if (st->con_out) efi_print_hex(st->con_out, efi_uart_fbrd);
-	PRINT("\r\n");
+	/* Save PL011/SBSA baud-rate divisors before ExitBootServices.
+	 * Irrelevant for 16550 (which uses different divisor registers and
+	 * whose baud rate is managed by the Nitro hypervisor anyway). */
+	if (efi_uart_type == 3 || efi_uart_type == 5) {
+		efi_uart_ibrd = *(volatile uint32_t *)(uintptr_t)(efi_uart_base + 0x24);
+		efi_uart_fbrd = *(volatile uint32_t *)(uintptr_t)(efi_uart_base + 0x28);
+		PRINT("kappara: PL011 IBRD=");
+		if (st->con_out) efi_print_hex(st->con_out, efi_uart_ibrd);
+		PRINT(" FBRD=");
+		if (st->con_out) efi_print_hex(st->con_out, efi_uart_fbrd);
+		PRINT("\r\n");
+	}
 
 	/* 2: snapshot the memory map.  GetMemoryMap is called twice in
 	 * the typical UEFI dance: first to get the required buffer size,
