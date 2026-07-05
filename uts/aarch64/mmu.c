@@ -343,6 +343,11 @@ void mmu_enable_this_cpu(void)
 	uint64_t ttbr0 = (uint64_t)(uintptr_t)l0_table;
 
 	__asm__ volatile (
+		/* ARM DDI0487 §D8.2.3: all page-table stores must be
+		 * observable to the walker before TTBR0_EL1 is written.
+		 * QEMU TCG serialises implicitly; real Graviton N1/V1
+		 * cores have out-of-order L2 write queues that don't. */
+		"dsb	sy\n"
 		"msr	mair_el1,  %0\n"
 		"msr	tcr_el1,   %1\n"
 		"msr	ttbr0_el1, %2\n"
