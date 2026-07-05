@@ -99,11 +99,28 @@ void uart_init(void)
 {
 	if (efi_uart_base != 0) {
 		pl011_base = (uintptr_t)efi_uart_base;
-		/* EFI already configured baud rate and line control for
-		 * this UART.  Reprogramming IBRD/FBRD would corrupt the
-		 * baud rate because we don't know the platform UART clock.
-		 * Just inherit EFI's setup and ensure TX+RX are on. */
-		mmio_write(UART_ICR, 0x7FF);
+		/*
+		 * EFI path: full re-init per ARM PL011 TRM §3.3.8 without
+		 * touching IBRD/FBRD (we don't know the platform UART clock).
+		 *
+		 *   1. Disable UART so reprogramming is safe.
+		 *   2. Wait for any in-progress TX to drain (bounded spin so
+		 *      we never hang if hardware is stuck).
+		 *   3. Clear pending interrupts.
+		 *   4. Write LCRH=0 first to flush/disable FIFOs -- the TRM
+		 *      requires a LCRH write between disabling and re-enabling
+		 *      to "latch" the control registers; writing 0 then the
+		 *      real value also clears any FIFO state EFI left behind.
+		 *   5. Write real LCRH (8N1, FIFOs on) -- this latches IBRD/
+		 *      FBRD which we deliberately leave unchanged.
+		 *   6. Re-enable.
+		 */
+		mmio_write(UART_CR, 0);
+		for (volatile unsigned i = 0; i < 1000000u; i++)
+			if (!(mmio_read(UART_FR) & 0x08u)) break; /* !BUSY */
+		mmio_write(UART_ICR, 0x7FFu);
+		mmio_write(UART_LCRH, 0);
+		mmio_write(UART_LCRH, LCRH_FEN | LCRH_WLEN_8);
 		mmio_write(UART_CR, CR_UARTEN | CR_TXE | CR_RXE);
 		return;
 	}
