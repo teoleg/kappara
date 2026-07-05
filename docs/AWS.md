@@ -261,9 +261,10 @@ they had to ship together to actually exercise the UEFI path:
 
 ### Stage E -- ENA network driver
 
-Status: `[~]` (skeleton in tree; structural shape complete, byte-
-level constants UNVERIFIED -- see the "blind implementation
-caveat" below).
+Status: `[~]` (register offsets and admin protocol verified against
+Linux `ena_regs_defs.h` / `ena_admin_defs.h`; reset + admin queue +
+GET_FEATURE + I/O queue creation should be correct; TX/RX packet
+paths are skeletons -- see "What remains" below).
 
 ENA = AWS Elastic Network Adapter; PCI vendor 0x1d0f, device
 0xec20 (or 0xec21 on some VFs), class 0x0200.  Lives in
@@ -277,8 +278,10 @@ Structural shape (matches the upstream Linux driver in
 2. PCI Command register: enable Memory Space + Bus Master
    (same dance nvme.c does -- UEFI leaves those clear).
 3. Map BAR0 (registers) via `mmu_map_device_1gb`.
-4. Reset: write DEV_CTL.RESET, poll DEV_STS.RESET_FINISHED,
-   clear DEV_CTL.RESET, wait DEV_STS.READY.
+4. Reset: check DEV_STS.READY, write DEV_CTL.RESET twice
+   (spec requirement for RESET_REASON field), poll
+   DEV_STS.RESET_IN_PROGRESS then RESET_FINISHED, clear
+   DEV_CTL, wait DEV_STS.READY.
 5. Allocate Admin SQ + Admin CQ + AENQ pages from the PMM;
    program AQ_BASE / CAPS, ACQ_BASE / CAPS, AENQ_BASE / CAPS.
 6. Mask all interrupts (polled driver).
@@ -289,34 +292,27 @@ Structural shape (matches the upstream Linux driver in
    doorbell.
 10. Register a `struct netif` named `eth0` so the IP layer sees us.
 
-What WORKS (mechanically -- not tested on hardware):
+What WORKS (mechanically -- not tested on hardware yet):
 - Probe + reset + admin queue + GET_FEATURE + queue creation
   paths all compile + run on the non-ENA fallback path (init
   is a no-op when the device is absent).
 - `-kernel` boot under QEMU virt is unchanged; ENA never
   matches because QEMU has no ENA emulation.
 
-#### Blind-implementation caveat
+#### Verified register constants
 
-This stage was written without ENA hardware or QEMU emulation
-to test against.  Every register offset, bitfield mask, and
-admin-command structure was reconstructed from training-data
-memory of the upstream Linux ena driver and the public ENA
-spec.  Every site in `uts/virt/ena.c` flagged
-`XXX-verify-against-ena_regs_defs.h` or
-`XXX-verify-against-ena_admin_defs.h` must be cross-checked
-against amzn-drivers' canonical headers
-(<https://github.com/amzn/amzn-drivers/tree/master/kernel/linux/ena>)
-before this code boots on real Graviton.
+All register offsets and bit definitions were cross-checked
+against `torvalds/linux drivers/net/ethernet/amazon/ena/`:
 
-Expected debugging on first AWS boot:
-- Wrong reset bit -> reset spins forever; need to check
-  `DEV_CTL` / `DEV_STS` masks.
-- Wrong feature ID layout in admin command payloads ->
-  GET_FEATURE returns an error status; need to compare the
-  command-payload encoding to `ena_admin_aq_get_feature_cmd`.
-- Wrong queue-create payload offsets -> CREATE_CQ returns
-  a non-zero status.
+- BAR0 register map: `ENA_REGS_*_OFF` -- all offsets correct,
+  including the `INTR_MASK` at 0x4C and `DEV_CTL`/`DEV_STS` at
+  0x54/0x58 (the original skeleton had these 12 bytes too low).
+- DEV_STS bits: READY=0x01, RESET_IN_PROGRESS=0x08,
+  RESET_FINISHED=0x10, FATAL_ERROR=0x20.
+- Admin queue entry sizes: SQ=64B (4B header), CQ=64B (8B header),
+  AENQ=64B -- all verified.
+- ACQ phase bit: `flags` bit 0 (not `command` bit 12 as the
+  original skeleton assumed).
 
 Once the offsets are pinned, what remains for "real packet
 I/O" (not just queue creation):
