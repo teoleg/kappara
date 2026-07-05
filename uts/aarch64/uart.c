@@ -124,8 +124,13 @@ void uart_init(void)
 		for (volatile unsigned i = 0; i < 1000000u; i++)
 			if (!(mmio_read(UART_FR) & 0x08u)) break; /* !BUSY */
 		mmio_write(UART_ICR, 0x7FFu);
-		mmio_write(UART_IBRD, efi_uart_ibrd);
-		mmio_write(UART_FBRD, efi_uart_fbrd);
+		/* Use the divisors EFI programmed, falling back to the
+		 * ARM Virt PL011 defaults (24 MHz clock, 115200 baud) when
+		 * the firmware left them at zero.  Nitro's 2018 UEFI relies
+		 * on hypervisor-level baud-rate handling and may not program
+		 * IBRD/FBRD at all; restoring zeros produces no output. */
+		mmio_write(UART_IBRD, efi_uart_ibrd ? efi_uart_ibrd : 13u);
+		mmio_write(UART_FBRD, efi_uart_fbrd ? efi_uart_fbrd : 1u);
 		mmio_write(UART_LCRH, LCRH_FEN | LCRH_WLEN_8);
 		mmio_write(UART_CR, CR_UARTEN | CR_TXE | CR_RXE);
 		return;
