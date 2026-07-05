@@ -111,6 +111,18 @@ static void efi_print(efi_simple_text_output_protocol_t *con, const char *s)
 	con->output_string(con, buf);
 }
 
+static void efi_print_hex(efi_simple_text_output_protocol_t *con, uint64_t v)
+{
+	char s[19];
+	s[0] = '0'; s[1] = 'x';
+	for (int i = 0; i < 16; i++) {
+		int n = (int)((v >> (60 - i * 4)) & 0xF);
+		s[2 + i] = (char)(n < 10 ? '0' + n : 'a' + n - 10);
+	}
+	s[18] = 0;
+	efi_print(con, s);
+}
+
 static int guid_eq(const efi_guid_t *a, const efi_guid_t *b)
 {
 	if (a->data1 != b->data1 || a->data2 != b->data2 || a->data3 != b->data3)
@@ -142,10 +154,13 @@ efi_status_t efi_main(efi_handle_t image_handle, efi_system_table_t *st)
 	 * Must happen before ExitBootServices; mmu_init() reads this to
 	 * wire the UART region without needing PMM. */
 	efi_uart_base = spcr_find_uart(efi_acpi_rsdp);
-	if (efi_uart_base)
-		PRINT("kappara: SPCR UART found\r\n");
-	else
+	if (efi_uart_base) {
+		PRINT("kappara: SPCR UART=");
+		if (st->con_out) efi_print_hex(st->con_out, efi_uart_base);
+		PRINT("\r\n");
+	} else {
 		PRINT("kappara: no SPCR, using platform default\r\n");
+	}
 
 	/* 2: snapshot the memory map.  GetMemoryMap is called twice in
 	 * the typical UEFI dance: first to get the required buffer size,
