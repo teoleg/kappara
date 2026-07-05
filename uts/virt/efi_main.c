@@ -34,6 +34,7 @@
 #include <stdint.h>
 
 #include "efi.h"
+#include "platform.h"
 
 /* Filled in by efi_main, read by kmain.  The kernel proper hasn't
  * started yet when these are written, so they sit in plain BSS;
@@ -155,22 +156,25 @@ efi_status_t efi_main(efi_handle_t image_handle, efi_system_table_t *st)
 	 * wire the UART region without needing PMM. */
 	efi_uart_base = spcr_find_uart(efi_acpi_rsdp);
 	if (efi_uart_base) {
-		PRINT("kappara: SPCR UART=");
-		if (st->con_out) efi_print_hex(st->con_out, efi_uart_base);
-		PRINT("\r\n");
-		/* Read FR and CR from the UART while EFI's page tables are
-		 * still live and ConOut still works.  This tells us whether
-		 * the UART TX path is ready (FR.TXFF=0, FR.BUSY=0, CR has
-		 * UARTEN|TXE set) before we hand over to the kernel. */
-		uint32_t uart_fr = *(volatile uint32_t *)(uintptr_t)(efi_uart_base + 0x18);
-		uint32_t uart_cr = *(volatile uint32_t *)(uintptr_t)(efi_uart_base + 0x30);
-		PRINT("kappara: UART FR=0x");
-		if (st->con_out) efi_print_hex(st->con_out, uart_fr);
-		PRINT(" CR=0x");
-		if (st->con_out) efi_print_hex(st->con_out, uart_cr);
-		PRINT("\r\n");
+		/* Validate the SPCR address by probing the PL011 Flag Register.
+		 * On AWS Nitro, SPCR reports 0x090a0000 but that address has no
+		 * device — reads return 0xFFFFFFFF.  The actual EC2 serial console
+		 * (ttyAMA0) is at the ARM Virt primary PL011 address 0x09000000
+		 * (PLAT_PL011_BASE), which is also what EFI ConOut uses. */
+		uint32_t probe_fr = *(volatile uint32_t *)(uintptr_t)(efi_uart_base + 0x18);
+		if (probe_fr == 0xFFFFFFFFu) {
+			PRINT("kappara: SPCR UART not present, using platform default\r\n");
+			efi_uart_base = PLAT_PL011_BASE;
+		} else {
+			PRINT("kappara: SPCR UART=");
+			if (st->con_out) efi_print_hex(st->con_out, efi_uart_base);
+			PRINT(" FR=");
+			if (st->con_out) efi_print_hex(st->con_out, probe_fr);
+			PRINT("\r\n");
+		}
 	} else {
 		PRINT("kappara: no SPCR, using platform default\r\n");
+		efi_uart_base = PLAT_PL011_BASE;
 	}
 
 	/* 2: snapshot the memory map.  GetMemoryMap is called twice in
