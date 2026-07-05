@@ -146,6 +146,18 @@ struct nvme_id_ns {
 
 /* ---- Driver state ---- */
 
+/*
+ * The NVMe namespace is split into two logical views:
+ *
+ *   minor 0  bd       "nvme0n1"    LBA 0..nsze-1  (full disk, /dev node)
+ *   minor 1  bd_home  "nvme0n1p1"  LBA NVME_HOME_FIRST_LBA..nsze-1
+ *
+ * The home partition starts at a 32 MB offset so KFS never overwrites
+ * the PE32+ kernel image stored at LBA 0 by tools/upload-ami.sh.
+ * The kernel image is ~10 MB; 32 MB provides ample margin for growth.
+ */
+#define NVME_HOME_FIRST_LBA	65536u	/* 32 MB @ 512B/block */
+
 struct nvme_dev {
 	volatile uint8_t *regs;		/* MMIO base (BAR0 mapped) */
 	uint32_t          dstrd_shift;	/* 2 + CAP.DSTRD */
@@ -168,7 +180,8 @@ struct nvme_dev {
 	uint32_t          lba_bytes;
 	uint32_t          nsid;
 
-	struct block_device bd;
+	struct block_device bd;		/* minor 0: full disk */
+	struct block_device bd_home;	/* minor 1: home partition */
 };
 
 static struct nvme_dev  nvme_singleton;
@@ -302,9 +315,13 @@ static int nvme_io_submit_and_wait(struct nvme_dev *d,
 static void nvme_strategy(unsigned minor, struct buf *bp)
 {
 	struct nvme_dev *d = &nvme_singleton;
-	(void)minor;	/* only namespace 1 today */
 
-	if (!nvme_singleton_init || bp->b_blkno >= d->bd.bd_nblocks ||
+	/* minor 1 = home partition: translate logical block to physical LBA. */
+	uint64_t lba_offset = (minor == 1) ? NVME_HOME_FIRST_LBA : 0;
+	uint32_t nblocks    = (minor == 1) ? d->bd_home.bd_nblocks
+					   : d->bd.bd_nblocks;
+
+	if (!nvme_singleton_init || bp->b_blkno >= nblocks ||
 	    bp->b_bcount != BLK_SIZE) {
 		bp->b_flags |= B_ERROR;
 		bp->b_error = -1;
@@ -313,12 +330,13 @@ static void nvme_strategy(unsigned minor, struct buf *bp)
 		return;
 	}
 
+	uint64_t lba = (uint64_t)bp->b_blkno + lba_offset;
 	struct nvme_sqe cmd = { 0 };
 	cmd.opc   = (bp->b_flags & B_READ) ? 0x02 : 0x01;
 	cmd.nsid  = d->nsid;
 	cmd.prp1  = (uint64_t)(uintptr_t)bp->b_addr;
-	cmd.cdw10 = (uint32_t)bp->b_blkno;
-	cmd.cdw11 = (uint32_t)((uint64_t)bp->b_blkno >> 32);
+	cmd.cdw10 = (uint32_t)lba;
+	cmd.cdw11 = (uint32_t)(lba >> 32);
 	cmd.cdw12 = 0;	/* NLB = 0 (=> 1 LBA) */
 
 	if (nvme_io_submit_and_wait(d, &cmd) < 0) {
@@ -588,11 +606,29 @@ void nvme_init(void)
 	d->bd.bd_name    = "nvme0n1";
 	d->bd.bd_nblocks = (uint32_t)d->nsze;	/* truncated for now */
 	d->bd.bd_dev     = MKDEV(BDEV_MAJ_NVME, 0);
+
+	/* Home partition: starts at NVME_HOME_FIRST_LBA so KFS never
+	 * overwrites the PE32+ kernel image stored at LBA 0. */
+	uint32_t home_nblocks = (d->nsze > NVME_HOME_FIRST_LBA)
+				? (uint32_t)(d->nsze - NVME_HOME_FIRST_LBA)
+				: 0;
+	d->bd_home.bd_name    = "nvme0n1p1";
+	d->bd_home.bd_nblocks = home_nblocks;
+	d->bd_home.bd_dev     = MKDEV(BDEV_MAJ_NVME, 1);
+
 	(void)bdev_register(BDEV_MAJ_NVME, &nvme_bdev_entry);
 	{
 		struct dentry *dev = vfs_lookup("/dev");
-		if (dev) vfs_mknod_blkdev(dev, "nvme0n1", d->bd.bd_dev);
+		if (dev) {
+			vfs_mknod_blkdev(dev, "nvme0n1",   d->bd.bd_dev);
+			if (home_nblocks)
+				vfs_mknod_blkdev(dev, "nvme0n1p1", d->bd_home.bd_dev);
+		}
 	}
+	kprintf("nvme: home partition nvme0n1p1 = %u blocks"
+		" (LBA %u..%u)\n",
+		home_nblocks, NVME_HOME_FIRST_LBA,
+		NVME_HOME_FIRST_LBA + home_nblocks - 1);
 
 	nvme_singleton_init = 1;
 	nvme_singleton_info.present = 1;
@@ -655,7 +691,7 @@ void nvme_init(void)
 struct block_device *nvme_get(void)
 {
 	if (!nvme_singleton_init) return NULL;
-	return &nvme_singleton.bd;
+	return &nvme_singleton.bd_home;  /* home partition, not full disk */
 }
 
 void nvme_get_info(struct nvme_info *out)
