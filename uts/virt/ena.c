@@ -434,19 +434,19 @@ static int ena_reset(struct ena_dev *d)
 
 	uint32_t s = ena_r32(d, ENA_REG_DEV_STS);
 
-	/* If a prior boot left RESET_IN_PROGRESS, wait for it to finish.
-	 * Triggering a new reset on top of one already in progress stalls
-	 * the firmware and RESET_FINISHED never arrives. */
+	/* If a prior boot left RESET_IN_PROGRESS, wait for it to clear.
+	 * Completion signal is RESET_IN_PROGRESS going back to 0, not
+	 * any "RESET_FINISHED" bit (that bit doesn't exist in ENA fw). */
 	if (s & ENA_DEV_STS_RESET_IN_PROGRESS) {
 		kprintf("ena: prior reset in progress (STS=0x%x), waiting %ums\n",
 			s, timeout_ms);
-		int rc = wait_dev_sts_ms(d, ENA_DEV_STS_RESET_FINISHED,
-					 ENA_DEV_STS_RESET_FINISHED, timeout_ms);
+		int rc = wait_dev_sts_ms(d, ENA_DEV_STS_RESET_IN_PROGRESS,
+					 0, timeout_ms);
 		if (rc >= 0) {
 			w32(d->regs, ENA_REG_DEV_CTL, 0);
 			wait_dev_sts_ms(d, ENA_DEV_STS_READY, ENA_DEV_STS_READY,
 					timeout_ms);
-			kprintf("ena: prior reset finished, issuing fresh reset\n");
+			kprintf("ena: prior reset cleared, issuing fresh reset\n");
 		} else {
 			kprintf("ena: prior reset stuck (STS=0x%x), forcing new reset\n",
 				ena_r32(d, ENA_REG_DEV_STS));
@@ -469,32 +469,36 @@ static int ena_reset(struct ena_dev *d)
 	w32(d->regs, ENA_REG_DEV_CTL, ctl);
 	w32(d->regs, ENA_REG_DEV_CTL, ctl);
 
-	/* Wait for RESET_IN_PROGRESS (or skip straight to RESET_FINISHED). */
+	/* Step 1: wait for RESET_IN_PROGRESS to set (device acks). */
 	{
 		uint64_t freq, start, deadline;
 		__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
 		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
-		deadline = start + (freq / 1000ULL) * (uint64_t)timeout_ms;
+		deadline = start + (freq / 1000ULL) * 1000ULL;   /* 1s */
 		for (;;) {
 			s = ena_r32(d, ENA_REG_DEV_STS);
-			if (s & (ENA_DEV_STS_RESET_IN_PROGRESS |
-				 ENA_DEV_STS_RESET_FINISHED)) break;
+			if (s & ENA_DEV_STS_RESET_IN_PROGRESS) break;
 			if (s & ENA_DEV_STS_FATAL_ERROR) {
 				kprintf("ena: fatal during reset (STS=0x%x)\n", s);
 				return -1;
 			}
 			uint64_t now;
 			__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
-			if (now >= deadline) break;
+			if (now >= deadline) {
+				kprintf("ena: RESET_IN_PROGRESS never set (STS=0x%x)\n", s);
+				return -1;
+			}
 		}
 	}
 
-	/* Wait for RESET_FINISHED. */
-	int rc = wait_dev_sts_ms(d, ENA_DEV_STS_RESET_FINISHED,
-				 ENA_DEV_STS_RESET_FINISHED, timeout_ms);
+	/* Step 2: wait for RESET_IN_PROGRESS to clear (device done).
+	 * This is the real completion signal -- there is no "RESET_FINISHED"
+	 * bit in ENA firmware.  Protocol matches Linux ena_com_dev_reset(). */
+	int rc = wait_dev_sts_ms(d, ENA_DEV_STS_RESET_IN_PROGRESS,
+				 0, timeout_ms);
 	if (rc < 0) {
-		kprintf("ena: timed out waiting for RESET_FINISHED "
-			"(STS=0x%x after %ums)\n",
+		kprintf("ena: reset timed out (RESET_IN_PROGRESS stuck, "
+			"STS=0x%x after %ums)\n",
 			ena_r32(d, ENA_REG_DEV_STS), timeout_ms);
 		return -1;
 	}
@@ -507,7 +511,7 @@ static int ena_reset(struct ena_dev *d)
 			ena_r32(d, ENA_REG_DEV_STS));
 		return -1;
 	}
-	kprintf("ena: reset complete (STS=0x%x)\n", (uint32_t)rc);
+	kprintf("ena: reset complete (STS=0x%x)\n", ena_r32(d, ENA_REG_DEV_STS));
 	return 0;
 }
 
