@@ -50,10 +50,14 @@ uint64_t                  efi_memmap_descriptor_version;
  * is available. */
 uint64_t                  efi_uart_base;
 
-/* Static scratch buffer for the memory map.  4 KB holds about 80
- * descriptors at the EFI 48-byte size; AAVMF + virt produces 20-40
- * so this is comfortable. */
-static uint8_t            efi_memmap_storage[4096];
+/* Static scratch buffer for the memory map.  AAVMF + virt produces
+ * 20-40 descriptors; AWS Nitro produces 100-150+ (NVMe, ENA, PCIe
+ * BARs, EFI runtime code/data, ACPI tables, etc.).  32 KB handles
+ * ~680 descriptors at the UEFI 2.x default 48-byte size, which is
+ * enough for any realistic Graviton instance.  BSS is zero-filled by
+ * the EFI loader (the PE section is RWX + SizeOfImage-padded), so
+ * the extra size costs nothing on disk. */
+static uint8_t            efi_memmap_storage[32768];
 
 /* Walk RSDP -> XSDT -> find "SPCR" -> return UART base from GAS.
  * SPCR layout (ACPI 6.x): standard 36-byte header, then 1-byte
@@ -94,6 +98,19 @@ static uint64_t spcr_find_uart(void *rsdp_ptr)
 	return 0;
 }
 
+/* Print a short ASCII string via EFI's ConOut (before ExitBootServices).
+ * Converts ASCII to the UCS-2 ConOut expects, 96 chars max per call.
+ * Called with con_out != NULL only. */
+static void efi_print(efi_simple_text_output_protocol_t *con, const char *s)
+{
+	efi_char16_t buf[97];
+	unsigned i;
+	for (i = 0; i < 96 && s[i]; i++)
+		buf[i] = (efi_char16_t)(unsigned char)s[i];
+	buf[i] = 0;
+	con->output_string(con, buf);
+}
+
 static int guid_eq(const efi_guid_t *a, const efi_guid_t *b)
 {
 	if (a->data1 != b->data1 || a->data2 != b->data2 || a->data3 != b->data3)
@@ -108,6 +125,10 @@ efi_status_t efi_main(efi_handle_t image_handle, efi_system_table_t *st)
 {
 	if (!st || !st->boot_services) return 1;
 
+#define PRINT(msg) do { if (st->con_out) efi_print(st->con_out, msg); } while(0)
+
+	PRINT("kappara: efi_main\r\n");
+
 	/* 1: walk the configuration table for ACPI 2.0. */
 	const efi_guid_t acpi_guid = EFI_ACPI_20_TABLE_GUID;
 	for (efi_uintn_t i = 0; i < st->nr_tables; i++) {
@@ -116,16 +137,22 @@ efi_status_t efi_main(efi_handle_t image_handle, efi_system_table_t *st)
 			break;
 		}
 	}
+
 	/* Extract UART base from SPCR while ACPI pages are still mapped.
 	 * Must happen before ExitBootServices; mmu_init() reads this to
 	 * wire the UART region without needing PMM. */
 	efi_uart_base = spcr_find_uart(efi_acpi_rsdp);
+	if (efi_uart_base)
+		PRINT("kappara: SPCR UART found\r\n");
+	else
+		PRINT("kappara: no SPCR, using platform default\r\n");
 
 	/* 2: snapshot the memory map.  GetMemoryMap is called twice in
-	 * the typical UEFI dance -- first to learn the size, then to
-	 * fetch the data + the key required by ExitBootServices.  Our
-	 * static buffer is sized once and for all so the first call is
-	 * skipped; if the firmware returns BUFFER_TOO_SMALL we bail. */
+	 * the typical UEFI dance: first to get the required buffer size,
+	 * then to fetch the map + key needed by ExitBootServices.  We
+	 * skip the first call and use our large static buffer directly;
+	 * at 32 KB it comfortably holds 680+ descriptors (Nitro typically
+	 * produces 100-150). */
 	efi_uintn_t  size = sizeof(efi_memmap_storage);
 	efi_uintn_t  map_key = 0;
 	efi_uintn_t  desc_size = 0;
@@ -136,22 +163,39 @@ efi_status_t efi_main(efi_handle_t image_handle, efi_system_table_t *st)
 				&map_key,
 				&desc_size,
 				&desc_version);
-	if (s != EFI_SUCCESS) return s;
+	if (s != EFI_SUCCESS) {
+		PRINT("kappara: GetMemoryMap failed\r\n");
+		return s;
+	}
 
 	efi_memmap_buf                = (efi_memory_descriptor_t *)efi_memmap_storage;
 	efi_memmap_size               = size;
 	efi_memmap_descriptor_size    = desc_size;
 	efi_memmap_descriptor_version = desc_version;
 
-	/* 3: exit boot services.  After this returns successfully, the
-	 * boot-services dispatch table is invalid; we own everything. */
-	s = st->boot_services->exit_boot_services(image_handle, map_key);
-	if (s != EFI_SUCCESS) {
-		/* Spec allows EFI to invalidate the map between get + exit;
-		 * a real loader retries with a refreshed map.  For stage B
-		 * we just give up. */
-		return s;
-	}
+	PRINT("kappara: ExitBootServices\r\n");
 
+	/* 3: exit boot services.  The UEFI spec allows firmware to
+	 * invalidate the map key between get_memory_map and
+	 * exit_boot_services (e.g. the console write above allocated a
+	 * pool buffer internally).  Retry once with a refreshed map if
+	 * that happens -- this is the standard UEFI loader dance. */
+	s = st->boot_services->exit_boot_services(image_handle, map_key);
+	if (s == EFI_INVALID_PARAMETER) {
+		/* Map changed under us -- refresh key and retry. */
+		size = sizeof(efi_memmap_storage);
+		s = st->boot_services->get_memory_map(&size,
+					efi_memmap_storage, &map_key,
+					&desc_size, &desc_version);
+		if (s != EFI_SUCCESS) return s;
+		efi_memmap_size               = size;
+		efi_memmap_descriptor_size    = desc_size;
+		efi_memmap_descriptor_version = desc_version;
+		s = st->boot_services->exit_boot_services(image_handle, map_key);
+	}
+	if (s != EFI_SUCCESS)
+		return s;
+
+#undef PRINT
 	return EFI_SUCCESS;
 }
