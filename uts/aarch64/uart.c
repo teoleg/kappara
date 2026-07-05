@@ -65,6 +65,8 @@ static spinlock_t uart_lock = SPINLOCK_INIT;
 /* Runtime UART base: PLAT_PL011_BASE on QEMU -kernel; overridden by
  * the SPCR address that efi_main discovers on UEFI / Nitro paths. */
 extern uint64_t efi_uart_base;
+extern uint32_t efi_uart_ibrd;
+extern uint32_t efi_uart_fbrd;
 static uintptr_t pl011_base = PLAT_PL011_BASE;
 
 #define UART_DR		(pl011_base + 0x00)
@@ -100,19 +102,32 @@ void uart_init(void)
 	if (efi_uart_base != 0) {
 		pl011_base = (uintptr_t)efi_uart_base;
 		/*
-		 * EFI path: the firmware already configured the PL011
-		 * (baud rate, 8N1, FIFOs) and is actively using it for
-		 * ConOut output up to the ExitBootServices call.  Leave
-		 * every register untouched -- only record the base address
-		 * so our UART_* macros resolve to the right physical address.
+		 * EFI path: re-enable the PL011 using the baud-rate divisors
+		 * that efi_main saved before ExitBootServices.
 		 *
-		 * Re-initialising here (CR=0 → drain → ICR → LCRH sequence)
-		 * silences the UART on Nitro: the baud-rate divisors
-		 * (IBRD/FBRD) are reset to zero when the UART is disabled on
-		 * some PL011 implementations, producing no output after
-		 * re-enable.  Since EFI already brought the UART up correctly,
-		 * there is nothing to fix.
+		 * Older UEFI firmware (e.g. AWS Nitro 2018 build) writes
+		 * CR=0 to the UART as part of EBS cleanup, which disables
+		 * the transmitter.  On some PL011 implementations this also
+		 * resets IBRD/FBRD to zero, so simply re-enabling CR without
+		 * restoring the divisors produces zero baud rate (no output).
+		 *
+		 * We write IBRD/FBRD explicitly from the values snapshotted
+		 * in efi_main (before EBS, while EFI's config was live), then
+		 * latch them with LCRH=8N1+FEN, then re-enable.  This
+		 * tolerates both "firmware left UART enabled" (harmless
+		 * re-init) and "firmware disabled UART" (full restore).
+		 *
+		 * IBRD/FBRD may only be written while the UART is disabled
+		 * (per ARM PL011 TRM §3.3.8), hence the CR=0 first.
 		 */
+		mmio_write(UART_CR, 0);
+		for (volatile unsigned i = 0; i < 1000000u; i++)
+			if (!(mmio_read(UART_FR) & 0x08u)) break; /* !BUSY */
+		mmio_write(UART_ICR, 0x7FFu);
+		mmio_write(UART_IBRD, efi_uart_ibrd);
+		mmio_write(UART_FBRD, efi_uart_fbrd);
+		mmio_write(UART_LCRH, LCRH_FEN | LCRH_WLEN_8);
+		mmio_write(UART_CR, CR_UARTEN | CR_TXE | CR_RXE);
 		return;
 	}
 	/* QEMU -kernel path: full init at 115200/8N1 from scratch. */

@@ -50,6 +50,15 @@ uint64_t                  efi_memmap_descriptor_version;
  * case.  mmu_init() uses this to wire the UART region before PMM
  * is available. */
 uint64_t                  efi_uart_base;
+/* Baud-rate divisors read from the UART *before* ExitBootServices
+ * while EFI's configuration is still valid.  Saved so uart_init()
+ * can restore them exactly after ExitBootServices: some UEFI
+ * implementations (notably older Nitro firmware) write CR=0 to
+ * disable the UART as part of EBS cleanup, clearing the divisor
+ * shadow registers.  Re-enabling without restoring IBRD/FBRD
+ * produces zero baud rate (no output). */
+uint32_t                  efi_uart_ibrd;
+uint32_t                  efi_uart_fbrd;
 
 /* Static scratch buffer for the memory map.  AAVMF + virt produces
  * 20-40 descriptors; AWS Nitro produces 100-150+ (NVMe, ENA, PCIe
@@ -176,6 +185,15 @@ efi_status_t efi_main(efi_handle_t image_handle, efi_system_table_t *st)
 		PRINT("kappara: no SPCR, using platform default\r\n");
 		efi_uart_base = PLAT_PL011_BASE;
 	}
+
+	/* Save UART baud-rate divisors before ExitBootServices.  EFI has
+	 * already configured IBRD/FBRD for whatever clock and baud rate
+	 * the platform uses.  We read them now (while EFI's UART driver
+	 * is active and the values are known-good) so uart_init() can
+	 * restore them after ExitBootServices in case the firmware resets
+	 * them to zero as part of its EBS cleanup. */
+	efi_uart_ibrd = *(volatile uint32_t *)(uintptr_t)(efi_uart_base + 0x24);
+	efi_uart_fbrd = *(volatile uint32_t *)(uintptr_t)(efi_uart_base + 0x28);
 
 	/* 2: snapshot the memory map.  GetMemoryMap is called twice in
 	 * the typical UEFI dance: first to get the required buffer size,
