@@ -97,8 +97,17 @@ static inline uint32_t mmio_read(uintptr_t reg)
 
 void uart_init(void)
 {
-	if (efi_uart_base != 0)
+	if (efi_uart_base != 0) {
 		pl011_base = (uintptr_t)efi_uart_base;
+		/* EFI already configured baud rate and line control for
+		 * this UART.  Reprogramming IBRD/FBRD would corrupt the
+		 * baud rate because we don't know the platform UART clock.
+		 * Just inherit EFI's setup and ensure TX+RX are on. */
+		mmio_write(UART_ICR, 0x7FF);
+		mmio_write(UART_CR, CR_UARTEN | CR_TXE | CR_RXE);
+		return;
+	}
+	/* QEMU -kernel path: full init at 115200/8N1 from scratch. */
 	mmio_write(UART_CR, 0);
 	mmio_write(UART_ICR, 0x7FF);
 	mmio_write(UART_IBRD, 26);
