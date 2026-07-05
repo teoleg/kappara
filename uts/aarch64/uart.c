@@ -100,28 +100,19 @@ void uart_init(void)
 	if (efi_uart_base != 0) {
 		pl011_base = (uintptr_t)efi_uart_base;
 		/*
-		 * EFI path: full re-init per ARM PL011 TRM §3.3.8 without
-		 * touching IBRD/FBRD (we don't know the platform UART clock).
+		 * EFI path: the firmware already configured the PL011
+		 * (baud rate, 8N1, FIFOs) and is actively using it for
+		 * ConOut output up to the ExitBootServices call.  Leave
+		 * every register untouched -- only record the base address
+		 * so our UART_* macros resolve to the right physical address.
 		 *
-		 *   1. Disable UART so reprogramming is safe.
-		 *   2. Wait for any in-progress TX to drain (bounded spin so
-		 *      we never hang if hardware is stuck).
-		 *   3. Clear pending interrupts.
-		 *   4. Write LCRH=0 first to flush/disable FIFOs -- the TRM
-		 *      requires a LCRH write between disabling and re-enabling
-		 *      to "latch" the control registers; writing 0 then the
-		 *      real value also clears any FIFO state EFI left behind.
-		 *   5. Write real LCRH (8N1, FIFOs on) -- this latches IBRD/
-		 *      FBRD which we deliberately leave unchanged.
-		 *   6. Re-enable.
+		 * Re-initialising here (CR=0 → drain → ICR → LCRH sequence)
+		 * silences the UART on Nitro: the baud-rate divisors
+		 * (IBRD/FBRD) are reset to zero when the UART is disabled on
+		 * some PL011 implementations, producing no output after
+		 * re-enable.  Since EFI already brought the UART up correctly,
+		 * there is nothing to fix.
 		 */
-		mmio_write(UART_CR, 0);
-		for (volatile unsigned i = 0; i < 1000000u; i++)
-			if (!(mmio_read(UART_FR) & 0x08u)) break; /* !BUSY */
-		mmio_write(UART_ICR, 0x7FFu);
-		mmio_write(UART_LCRH, 0);
-		mmio_write(UART_LCRH, LCRH_FEN | LCRH_WLEN_8);
-		mmio_write(UART_CR, CR_UARTEN | CR_TXE | CR_RXE);
 		return;
 	}
 	/* QEMU -kernel path: full init at 115200/8N1 from scratch. */

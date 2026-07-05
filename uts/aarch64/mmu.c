@@ -378,20 +378,18 @@ void mmu_init(void)
 	 * valid after mmu_enable_this_cpu() switches to our tables.
 	 * Three cases, ordered by the 1 GB block the UART falls in:
 	 *
-	 *   l1i == 1 (0x40000000–0x7FFFFFFF): this is the kernel RAM
-	 *   range.  Overwriting l1_table[1] with a Device block would
-	 *   set PXN on kernel text and crash the CPU at the first
-	 *   instruction fetch after the MMU switch.  Use l2_table_hi
-	 *   (already wired at L1[1]) and mark only the 2 MB block that
-	 *   contains the UART as Device.
+	 *   l0i==0, l1i==0 (0x00000000–0x3FFFFFFF): l1_table[0] is a
+	 *   TABLE pointing at l2_table.  Update the 2 MB slot in l2_table
+	 *   that contains the UART.  Never touch l1_table[0] itself --
+	 *   overwriting it with a Device block makes all of 0–1 GB
+	 *   Device/non-executable, which kills user code at 0x10000000.
 	 *
-	 *   l0i != 0 (above first 512 GB): use the static l1_table_uart
-	 *   so we don't need PMM.
+	 *   l0i==0, l1i==1 (0x40000000–0x7FFFFFFF): this is the kernel
+	 *   RAM range.  Use l2_table_hi (already wired at L1[1]) and mark
+	 *   only the 2 MB block that contains the UART as Device.
 	 *
-	 *   All other cases (l0i==0, l1i!=1): overwrite the L1 entry
-	 *   with a 1 GB Device block.  The l1i==0 case turns the whole
-	 *   0–1 GB range Device; that's fine because there's no Normal
-	 *   RAM below 0x40000000 on virt/Graviton. */
+	 *   l0i!=0 (above first 512 GB): use the static l1_table_uart
+	 *   so we don't need PMM. */
 	extern uint64_t efi_uart_base;
 	if (efi_uart_base != 0) {
 		uint64_t base  = efi_uart_base & ~BLOCK_1G_MASK;
@@ -400,21 +398,34 @@ void mmu_init(void)
 
 		if (l0i == 0 && l1i == 1) {
 			/* UART in 1–2 GB (kernel RAM range): use l2_table_hi
-			 * at 2 MB granularity. */
+			 * at 2 MB granularity so Normal RAM blocks in that 1 GB
+			 * window remain intact. */
 			unsigned l2i = (unsigned)(efi_uart_base >> BLOCK_2M_SHIFT)
 			               & (ENTRIES_PER_TABLE - 1);
 			l2_table_hi[l2i] =
 				(efi_uart_base & ~(BLOCK_2M_SIZE - 1)) |
 				D_VALID | D_ATTRIDX(ATTR_DEVICE_IDX) |
 				D_AP_RW_EL1 | D_SH_NONE | D_AF | D_PXN | D_UXN;
+		} else if (l0i == 0) {
+			/* UART in 0–1 GB: l1_table[0] is a TABLE pointing at
+			 * l2_table; updating the 2 MB slot there preserves all
+			 * other L2 mappings (including user code at 0x10000000).
+			 * Overwriting l1_table[0] with a Device block would make
+			 * the whole 0–1 GB range Device/non-executable. */
+			unsigned l2i = (unsigned)(efi_uart_base >> BLOCK_2M_SHIFT)
+			               & (ENTRIES_PER_TABLE - 1);
+			l2_table[l2i] =
+				(efi_uart_base & ~(BLOCK_2M_SIZE - 1)) |
+				D_VALID | D_ATTRIDX(ATTR_DEVICE_IDX) |
+				D_AP_RW_EL1 | D_SH_NONE | D_AF | D_PXN | D_UXN;
 		} else {
-			uint64_t *l1 = (l0i == 0) ? l1_table : l1_table_uart;
-			if (l0i != 0)
-				l0_table[l0i] = (uint64_t)(uintptr_t)l1_table_uart
-				                | D_VALID | D_TABLE;
-			l1[l1i] = base | D_VALID | D_ATTRIDX(ATTR_DEVICE_IDX)
-			               | D_AP_RW_EL1 | D_SH_NONE | D_AF
-			               | D_PXN | D_UXN;
+			/* UART above 2 GB: wire a fresh L1 under the L0 entry. */
+			l0_table[l0i] = (uint64_t)(uintptr_t)l1_table_uart
+			                | D_VALID | D_TABLE;
+			l1_table_uart[l1i] = base | D_VALID |
+			               D_ATTRIDX(ATTR_DEVICE_IDX) |
+			               D_AP_RW_EL1 | D_SH_NONE | D_AF |
+			               D_PXN | D_UXN;
 		}
 	}
 
