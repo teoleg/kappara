@@ -194,6 +194,15 @@ efi_status_t efi_main(efi_handle_t image_handle, efi_system_table_t *st)
 	 * them to zero as part of its EBS cleanup. */
 	efi_uart_ibrd = *(volatile uint32_t *)(uintptr_t)(efi_uart_base + 0x24);
 	efi_uart_fbrd = *(volatile uint32_t *)(uintptr_t)(efi_uart_base + 0x28);
+	/* Diagnostic: print saved divisors so we can see the actual clock
+	 * config on this platform in the system log. */
+	PRINT("kappara: UART base=");
+	if (st->con_out) efi_print_hex(st->con_out, efi_uart_base);
+	PRINT(" IBRD=");
+	if (st->con_out) efi_print_hex(st->con_out, efi_uart_ibrd);
+	PRINT(" FBRD=");
+	if (st->con_out) efi_print_hex(st->con_out, efi_uart_fbrd);
+	PRINT("\r\n");
 
 	/* 2: snapshot the memory map.  GetMemoryMap is called twice in
 	 * the typical UEFI dance: first to get the required buffer size,
