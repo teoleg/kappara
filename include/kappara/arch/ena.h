@@ -36,5 +36,6 @@
 #define KAPPARA_ARCH_ENA_H
 
 void ena_init(void);
+int  ena_present(void);	/* 1 if ENA NIC found in PCI device list */
 
 #endif /* KAPPARA_ARCH_ENA_H */
