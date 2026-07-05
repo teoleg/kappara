@@ -177,6 +177,12 @@ unsigned long mmu_boot_l0_phys(void)
 }
 __attribute__((aligned(PAGE_SIZE))) static uint64_t l1_table[ENTRIES_PER_TABLE];
 __attribute__((aligned(PAGE_SIZE))) static uint64_t l2_table[ENTRIES_PER_TABLE];
+/* L2 for the second 1 GB (VA 0x40000000–0x7FFFFFFF, where the kernel
+ * lives on QEMU virt + AWS Graviton).  Using a TABLE at L1[1] instead
+ * of a 1 GB Device block keeps the RAM 2 MB entries as Normal while
+ * still letting us carve a single 2 MB Device block for a UEFI UART
+ * whose SPCR address falls in this range (e.g. 0x60000000). */
+__attribute__((aligned(PAGE_SIZE))) static uint64_t l2_table_hi[ENTRIES_PER_TABLE];
 /* Static L1 reserved for the UART region on UEFI paths where the
  * SPCR base is outside the first 512 GB (L0[0]).  Cannot use PMM
  * here — mmu_init() runs before pmm_init(). */
@@ -189,15 +195,22 @@ static void build_identity_map(void)
 
 #if defined(PLATFORM_VIRT)
 	/*
-	 * QEMU virt: RAM lives in the second 1 GB block at 0x40000000.
-	 * Map it as normal cacheable so the kernel + stack + heap that
-	 * the linker placed at 0x40080000+ are actually performant
-	 * (Device mapping for RAM would still work but every load/store
-	 * would bypass caches).
+	 * QEMU virt / AWS Graviton: RAM lives in the second 1 GB
+	 * starting at 0x40000000.  Use a TABLE descriptor pointing at
+	 * l2_table_hi (2 MB blocks) rather than a 1 GB Device block so
+	 * that mmu_init can later carve out a single 2 MB Device slot
+	 * for a UEFI UART whose SPCR address falls in this range
+	 * without clobbering the Normal RAM mapping that covers the
+	 * kernel text.  A 1 GB Device block with PXN set (the only
+	 * alternative) would make the kernel text non-executable the
+	 * moment the MMU switched to our tables.
 	 */
-	l1_table[1] = 0x40000000UL |
-		      D_VALID | D_ATTRIDX(ATTR_NORMAL_IDX) |
-		      D_AP_RW_EL1 | D_SH_INNER | D_AF | D_UXN;
+	l1_table[1] = (uint64_t)(uintptr_t)l2_table_hi | D_VALID | D_TABLE;
+	for (int i = 0; i < ENTRIES_PER_TABLE; i++) {
+		uint64_t pa = 0x40000000UL + ((uint64_t)i << BLOCK_2M_SHIFT);
+		l2_table_hi[i] = pa | D_VALID | D_ATTRIDX(ATTR_NORMAL_IDX) |
+				 D_AP_RW_EL1 | D_SH_INNER | D_AF | D_UXN;
+	}
 #else
 	/*
 	 * L1[1]: identity-map VA 0x40000000..0x80000000 (1 GB block) as Device.
@@ -361,21 +374,48 @@ void mmu_init(void)
 {
 	build_identity_map();
 
-	/* If efi_main found a UART base via SPCR that lives outside the
-	 * first 512 GB (L0[0]), wire it up using the static l1_table_uart
-	 * so uart_putc stays valid after the MMU flips to our tables.
-	 * PMM is not yet available here, hence the static fallback. */
+	/* Wire the SPCR UART into our page tables so uart_putc stays
+	 * valid after mmu_enable_this_cpu() switches to our tables.
+	 * Three cases, ordered by the 1 GB block the UART falls in:
+	 *
+	 *   l1i == 1 (0x40000000–0x7FFFFFFF): this is the kernel RAM
+	 *   range.  Overwriting l1_table[1] with a Device block would
+	 *   set PXN on kernel text and crash the CPU at the first
+	 *   instruction fetch after the MMU switch.  Use l2_table_hi
+	 *   (already wired at L1[1]) and mark only the 2 MB block that
+	 *   contains the UART as Device.
+	 *
+	 *   l0i != 0 (above first 512 GB): use the static l1_table_uart
+	 *   so we don't need PMM.
+	 *
+	 *   All other cases (l0i==0, l1i!=1): overwrite the L1 entry
+	 *   with a 1 GB Device block.  The l1i==0 case turns the whole
+	 *   0–1 GB range Device; that's fine because there's no Normal
+	 *   RAM below 0x40000000 on virt/Graviton. */
 	extern uint64_t efi_uart_base;
 	if (efi_uart_base != 0) {
 		uint64_t base  = efi_uart_base & ~BLOCK_1G_MASK;
 		unsigned l0i   = (unsigned)(base >> BLOCK_512G_SHIFT) & 0x1ff;
 		unsigned l1i   = (unsigned)(base >> BLOCK_1G_SHIFT)   & 0x1ff;
-		uint64_t *l1   = (l0i == 0) ? l1_table : l1_table_uart;
-		if (l0i != 0)
-			l0_table[l0i] = (uint64_t)(uintptr_t)l1_table_uart
-			                | D_VALID | D_TABLE;
-		l1[l1i] = base | D_VALID | D_ATTRIDX(ATTR_DEVICE_IDX)
-		               | D_AP_RW_EL1 | D_SH_NONE | D_AF | D_PXN | D_UXN;
+
+		if (l0i == 0 && l1i == 1) {
+			/* UART in 1–2 GB (kernel RAM range): use l2_table_hi
+			 * at 2 MB granularity. */
+			unsigned l2i = (unsigned)(efi_uart_base >> BLOCK_2M_SHIFT)
+			               & (ENTRIES_PER_TABLE - 1);
+			l2_table_hi[l2i] =
+				(efi_uart_base & ~(BLOCK_2M_SIZE - 1)) |
+				D_VALID | D_ATTRIDX(ATTR_DEVICE_IDX) |
+				D_AP_RW_EL1 | D_SH_NONE | D_AF | D_PXN | D_UXN;
+		} else {
+			uint64_t *l1 = (l0i == 0) ? l1_table : l1_table_uart;
+			if (l0i != 0)
+				l0_table[l0i] = (uint64_t)(uintptr_t)l1_table_uart
+				                | D_VALID | D_TABLE;
+			l1[l1i] = base | D_VALID | D_ATTRIDX(ATTR_DEVICE_IDX)
+			               | D_AP_RW_EL1 | D_SH_NONE | D_AF
+			               | D_PXN | D_UXN;
+		}
 	}
 
 	mmu_enable_this_cpu();
