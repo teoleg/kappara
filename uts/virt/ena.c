@@ -203,6 +203,19 @@ struct ena_admin_get_feat_dev_attr {
 	uint32_t max_mtu;
 } __attribute__((packed));
 
+/* MMIO register read-less response buffer (8 bytes, one entry).
+ * The device DMA-writes the response here when we trigger an indirect
+ * read via ENA_REG_MMIO_REG_READ.  Layout from ena_admin_defs.h:
+ *   u16 req_id     -- echoes the seq number we sent
+ *   u16 reg_off    -- echoes the register offset
+ *   u32 reg_val    -- the register value
+ * See ena_com.c::ena_com_mmio_reg_read_request_init. */
+struct ena_mmio_read_resp {
+	uint16_t req_id;
+	uint16_t reg_off;
+	uint32_t reg_val;
+} __attribute__((packed));
+
 /* ---- I/O queue descriptors ----
  *
  * TX SQ descriptor: 16 bytes.
@@ -260,6 +273,12 @@ struct ena_io_q {
 struct ena_dev {
 	volatile uint8_t *regs;
 
+	/* MMIO read-less mechanism: device DMA-writes register values here.
+	 * Allocated in ena_mmio_read_init(); NULL until then (callers fall
+	 * back to direct r32 while it's unset). */
+	struct ena_mmio_read_resp  *mmio_resp;
+	uint16_t                    mmio_seq;
+
 	struct ena_admin_aq_entry  *aq;
 	struct ena_admin_acq_entry *acq;
 	struct ena_aenq_entry      *aenq;
@@ -297,6 +316,66 @@ static void w32(volatile uint8_t *base, unsigned off, uint32_t v)
 	*(volatile uint32_t *)(base + off) = v;
 }
 
+/* ---- MMIO read-less: indirect register read ----
+ *
+ * The ENA spec (ena_regs_defs.h / ena_com.c) warns that direct BAR
+ * reads of control registers may return stale values on some Nitro
+ * firmware versions.  The preferred path is:
+ *   1. Host writes the response-buffer PA to MMIO_RESP_LO/HI once.
+ *   2. For each read: write (reg_off<<16 | seq) to MMIO_REG_READ.
+ *   3. Device DMA-writes an 8-byte record (req_id, reg_off, reg_val)
+ *      into the response buffer; host polls req_id for the match.
+ * Falls back to direct r32 when mmio_resp is unset (early init) or
+ * if the device times out (1 ms). */
+#define ENA_RESET_CAPS_MAX_UNITS	40	/* 4 s hard cap */
+
+static void ena_mmio_read_init(struct ena_dev *d)
+{
+	d->mmio_resp = pmm_alloc();
+	if (!d->mmio_resp) {
+		kprintf("ena: PMM exhausted for MMIO read buffer\n");
+		return;
+	}
+	kmemset(d->mmio_resp, 0, 4096);
+	d->mmio_seq = 1;
+
+	uint64_t pa = (uint64_t)(uintptr_t)d->mmio_resp;
+	w32(d->regs, ENA_REG_MMIO_RESP_LO, (uint32_t)pa);
+	w32(d->regs, ENA_REG_MMIO_RESP_HI, (uint32_t)(pa >> 32));
+}
+
+static uint32_t ena_r32(struct ena_dev *d, uint16_t off)
+{
+	if (!d->mmio_resp) return r32(d->regs, off);
+
+	uint16_t seq = d->mmio_seq++;
+	if (d->mmio_seq == 0) d->mmio_seq = 1;
+
+	/* Invalidate the response buffer so we see the device's DMA write. */
+	__asm__ volatile ("dc ivac, %0\n\t" "dsb sy\n\t"
+			  :: "r"(d->mmio_resp) : "memory");
+
+	/* Trigger: bits[15:0] = req_id, bits[31:16] = reg_off. */
+	w32(d->regs, ENA_REG_MMIO_REG_READ,
+	    (uint32_t)seq | ((uint32_t)off << 16));
+
+	/* Poll for completion (1 ms using the AArch64 generic counter). */
+	uint64_t freq, start, deadline;
+	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+	__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
+	deadline = start + (freq / 1000ULL);
+	for (;;) {
+		__asm__ volatile ("dc ivac, %0\n\t" "dsb sy\n\t"
+				  :: "r"(d->mmio_resp) : "memory");
+		if (d->mmio_resp->req_id == seq)
+			return d->mmio_resp->reg_val;
+		uint64_t now;
+		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+		if (now >= deadline) break;
+	}
+	return r32(d->regs, off);	/* timeout fallback */
+}
+
 /* ---- Reset ----
  *
  * Linux driver sequence (ena_com.c ena_com_dev_reset):
@@ -306,81 +385,130 @@ static void w32(volatile uint8_t *base, unsigned off, uint32_t v)
  *   3. Write DEV_CTL = RESET | (NORMAL_REASON << 28).  Write twice;
  *      the second write is required by the spec.
  *   4. Poll DEV_STS.RESET_IN_PROGRESS (bit 3).
- *   5. Poll DEV_STS.RESET_FINISHED   (bit 4) -- takes up to
- *      caps_timeout × 100 ms; use ENA_RESET_SPINS_PER_100MS × caps.
+ *   5. Poll DEV_STS.RESET_FINISHED (bit 4) -- takes up to
+ *      caps_timeout × 100 ms.
  *   6. Clear DEV_CTL.
  *   7. Poll DEV_STS.READY (bit 0).
  *
- * ENA_RESET_SPINS_PER_100MS: one MMIO read on Graviton takes ~50-100 ns.
- * 100 ms / 100 ns = 1,000,000 spins per 100 ms unit.  Use a conservative
- * multiplier and clamp the max to avoid spinning for absurd amounts of
- * time on a broken device. */
-#define ENA_RESET_SPINS_PER_100MS	1000000
-#define ENA_RESET_CAPS_MAX_UNITS	40	/* 4 s hard cap */
+ * Timing: uses CNTPCT_EL0 + CNTFRQ_EL0 for wall-clock correctness.
+ * Spin-count estimation was unreliable because MMIO read latency on
+ * Nitro varies; real-time polling removes the uncertainty entirely.
+ *
+ * Prior-reset handling: when the previous OS boot left a reset in
+ * progress (STS has RESET_IN_PROGRESS set at entry), we wait for it
+ * to finish before triggering a new one.  Stacking resets confuses
+ * the ENA firmware and guarantees RESET_FINISHED never appears. */
+
+/* Poll DEV_STS (via indirect read) until (sts & mask)==expected.
+ * Returns the matching sts value on success, -1 on FATAL_ERROR,
+ * -2 on timeout. */
+static int wait_dev_sts_ms(struct ena_dev *d, uint32_t mask,
+			   uint32_t expected, unsigned ms)
+{
+	uint64_t freq, start, deadline;
+	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+	__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
+	deadline = start + (freq / 1000ULL) * (uint64_t)ms;
+	for (;;) {
+		uint32_t s = ena_r32(d, ENA_REG_DEV_STS);
+		if ((s & mask) == expected) return (int)s;
+		if (s & ENA_DEV_STS_FATAL_ERROR) {
+			kprintf("ena: FATAL_ERROR in DEV_STS (0x%x)\n", s);
+			return -1;
+		}
+		uint64_t now;
+		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+		if (now >= deadline) return -2;
+	}
+}
 
 static int ena_reset(struct ena_dev *d)
 {
-	uint32_t s = r32(d->regs, ENA_REG_DEV_STS);
-	if (!(s & ENA_DEV_STS_READY)) {
-		kprintf("ena: device not READY before reset (STS=0x%x)\n", s);
-		return -1;
+	uint32_t caps    = ena_r32(d, ENA_REG_CAPS);
+	uint32_t t_units = (caps & ENA_CAPS_RESET_TIMEOUT_MASK) >>
+			   ENA_CAPS_RESET_TIMEOUT_SHIFT;
+	if (t_units == 0) t_units = 8;
+	if (t_units > ENA_RESET_CAPS_MAX_UNITS) t_units = ENA_RESET_CAPS_MAX_UNITS;
+	unsigned timeout_ms = t_units * 100;
+	kprintf("ena: reset  caps=0x%x  timeout=%ux100ms\n", caps, t_units);
+
+	uint32_t s = ena_r32(d, ENA_REG_DEV_STS);
+
+	/* If a prior boot left RESET_IN_PROGRESS, wait for it to finish.
+	 * Triggering a new reset on top of one already in progress stalls
+	 * the firmware and RESET_FINISHED never arrives. */
+	if (s & ENA_DEV_STS_RESET_IN_PROGRESS) {
+		kprintf("ena: prior reset in progress (STS=0x%x), waiting %ums\n",
+			s, timeout_ms);
+		int rc = wait_dev_sts_ms(d, ENA_DEV_STS_RESET_FINISHED,
+					 ENA_DEV_STS_RESET_FINISHED, timeout_ms);
+		if (rc >= 0) {
+			w32(d->regs, ENA_REG_DEV_CTL, 0);
+			wait_dev_sts_ms(d, ENA_DEV_STS_READY, ENA_DEV_STS_READY,
+					timeout_ms);
+			kprintf("ena: prior reset finished, issuing fresh reset\n");
+		} else {
+			kprintf("ena: prior reset stuck (STS=0x%x), forcing new reset\n",
+				ena_r32(d, ENA_REG_DEV_STS));
+		}
+		s = ena_r32(d, ENA_REG_DEV_STS);
 	}
 
-	/* Extract reset timeout from CAPS bits[5:1] (units = 100 ms). */
-	uint32_t caps     = r32(d->regs, ENA_REG_CAPS);
-	uint32_t t_units  = (caps & ENA_CAPS_RESET_TIMEOUT_MASK) >>
-			    ENA_CAPS_RESET_TIMEOUT_SHIFT;
-	if (t_units == 0) t_units = 8;	/* fallback: 800 ms */
-	if (t_units > ENA_RESET_CAPS_MAX_UNITS) t_units = ENA_RESET_CAPS_MAX_UNITS;
-	int max_spins = (int)((uint64_t)t_units * ENA_RESET_SPINS_PER_100MS);
-	kprintf("ena: reset  caps=0x%x  timeout=%u×100ms\n", caps, t_units);
+	if (!(s & ENA_DEV_STS_READY)) {
+		int rc = wait_dev_sts_ms(d, ENA_DEV_STS_READY, ENA_DEV_STS_READY,
+					 timeout_ms);
+		if (rc < 0) {
+			kprintf("ena: not READY before reset (STS=0x%x)\n",
+				ena_r32(d, ENA_REG_DEV_STS));
+			return -1;
+		}
+	}
 
 	/* Write reset command twice (spec requirement for RESET_REASON). */
-	uint32_t ctl = ENA_DEV_CTL_RESET; /* NORMAL reason = 0 << 28 */
+	uint32_t ctl = ENA_DEV_CTL_RESET;
 	w32(d->regs, ENA_REG_DEV_CTL, ctl);
 	w32(d->regs, ENA_REG_DEV_CTL, ctl);
 
-	/* Wait for RESET_IN_PROGRESS. */
-	for (int i = 0; i < max_spins; i++) {
-		s = r32(d->regs, ENA_REG_DEV_STS);
-		if (s & ENA_DEV_STS_RESET_IN_PROGRESS) break;
-		if (s & ENA_DEV_STS_FATAL_ERROR) {
-			kprintf("ena: fatal during reset (STS=0x%x)\n", s);
-			return -1;
+	/* Wait for RESET_IN_PROGRESS (or skip straight to RESET_FINISHED). */
+	{
+		uint64_t freq, start, deadline;
+		__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
+		deadline = start + (freq / 1000ULL) * (uint64_t)timeout_ms;
+		for (;;) {
+			s = ena_r32(d, ENA_REG_DEV_STS);
+			if (s & (ENA_DEV_STS_RESET_IN_PROGRESS |
+				 ENA_DEV_STS_RESET_FINISHED)) break;
+			if (s & ENA_DEV_STS_FATAL_ERROR) {
+				kprintf("ena: fatal during reset (STS=0x%x)\n", s);
+				return -1;
+			}
+			uint64_t now;
+			__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+			if (now >= deadline) break;
 		}
 	}
-	/* RESET_IN_PROGRESS is transitional; absence doesn't mean failure --
-	 * the device may have already moved to RESET_FINISHED. */
 
 	/* Wait for RESET_FINISHED. */
-	for (int i = 0; i < max_spins; i++) {
-		s = r32(d->regs, ENA_REG_DEV_STS);
-		if (s & ENA_DEV_STS_RESET_FINISHED) break;
-		if (s & ENA_DEV_STS_FATAL_ERROR) {
-			kprintf("ena: fatal waiting RESET_FINISHED (STS=0x%x)\n", s);
-			return -1;
-		}
-	}
-	if (!(s & ENA_DEV_STS_RESET_FINISHED)) {
+	int rc = wait_dev_sts_ms(d, ENA_DEV_STS_RESET_FINISHED,
+				 ENA_DEV_STS_RESET_FINISHED, timeout_ms);
+	if (rc < 0) {
 		kprintf("ena: timed out waiting for RESET_FINISHED "
-			"(STS=0x%x after %u×100ms)\n", s, t_units);
+			"(STS=0x%x after %ums)\n",
+			ena_r32(d, ENA_REG_DEV_STS), timeout_ms);
 		return -1;
 	}
 
 	w32(d->regs, ENA_REG_DEV_CTL, 0);
 
-	/* Wait for READY. */
-	for (int i = 0; i < max_spins; i++) {
-		s = r32(d->regs, ENA_REG_DEV_STS);
-		if (s & ENA_DEV_STS_READY) return 0;
-		if (s & ENA_DEV_STS_FATAL_ERROR) {
-			kprintf("ena: fatal post-reset (STS=0x%x)\n", s);
-			return -1;
-		}
+	rc = wait_dev_sts_ms(d, ENA_DEV_STS_READY, ENA_DEV_STS_READY, timeout_ms);
+	if (rc < 0) {
+		kprintf("ena: timed out waiting for READY after reset (STS=0x%x)\n",
+			ena_r32(d, ENA_REG_DEV_STS));
+		return -1;
 	}
-	kprintf("ena: timed out waiting for READY (STS=0x%x)\n",
-		r32(d->regs, ENA_REG_DEV_STS));
-	return -1;
+	kprintf("ena: reset complete (STS=0x%x)\n", (uint32_t)rc);
+	return 0;
 }
 
 /* ---- Admin queue setup ---- */
@@ -657,9 +785,15 @@ void ena_init(void)
 	mmu_map_device_1gb(bar0_pa);
 	d->regs = (volatile uint8_t *)(uintptr_t)bar0_pa;
 
-	uint32_t ver  = r32(d->regs, ENA_REG_VERSION);
-	uint32_t cver = r32(d->regs, ENA_REG_CONTROLLER_VERSION);
-	uint32_t sts  = r32(d->regs, ENA_REG_DEV_STS);
+	/* Set up the MMIO read-less mechanism before any register reads so
+	 * that control-register reads (CAPS, DEV_STS) go through the DMA
+	 * path and are not affected by any direct-read stale-value quirks
+	 * in the Nitro ENA firmware. */
+	ena_mmio_read_init(d);
+
+	uint32_t ver  = ena_r32(d, ENA_REG_VERSION);
+	uint32_t cver = ena_r32(d, ENA_REG_CONTROLLER_VERSION);
+	uint32_t sts  = ena_r32(d, ENA_REG_DEV_STS);
 	kprintf("ena: bar0 0x%lx  ver 0x%x  ctrl-ver 0x%x  sts 0x%x\n",
 		bar0_pa, ver, cver, sts);
 
@@ -684,4 +818,11 @@ void ena_init(void)
 		d->mac[0], d->mac[1], d->mac[2],
 		d->mac[3], d->mac[4], d->mac[5],
 		d->nif.mtu);
+}
+
+/* Returns 1 if an ENA NIC is present in the PCIe device list.
+ * Used by kmain to suppress virtio_net_init on AWS Graviton. */
+int ena_present(void)
+{
+	return ena_find() != NULL;
 }

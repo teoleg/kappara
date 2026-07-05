@@ -533,12 +533,15 @@ void kmain(void)
 	 * Virt has no mini-UART; it gets eth0 via virtio-net instead. */
 	slip_init();
 #else
-	/* Phase 2-3: probe virtio-mmio and attach eth0 to IP.  Phase 5:
-	 * spawn the telnet listener kthread once TCP is alive. */
+	/* Phase 2-3: probe virtio-mmio and attach eth0 to IP.  Skip on
+	 * AWS Graviton where ENA is the NIC and 0x0A000000 is not a valid
+	 * virtio-mmio region -- accessing it there can cause an external
+	 * abort.  Phase 5: spawn the telnet listener either way. */
 	{
 		extern void virtio_net_init(void);
 		extern void telnetd_init(void);
-		virtio_net_init();
+		if (!ena_present())
+			virtio_net_init();
 		telnetd_init();
 	}
 #endif
