@@ -301,15 +301,23 @@ static void w32(volatile uint8_t *base, unsigned off, uint32_t v)
  *
  * Linux driver sequence (ena_com.c ena_com_dev_reset):
  *   1. Check DEV_STS.READY -- must be set before we can reset.
- *   2. Write DEV_CTL = RESET | (NORMAL_REASON << 28).  Write twice;
- *      the second write is required by the spec for the reason field.
- *   3. Poll DEV_STS.RESET_IN_PROGRESS (bit 3).
- *   4. Poll DEV_STS.RESET_FINISHED   (bit 4).
- *   5. Clear DEV_CTL.
- *   6. Poll DEV_STS.READY (bit 0).
+ *   2. Read CAPS bits[5:1] to get the device-advertised reset timeout
+ *      (each unit = 100 ms).
+ *   3. Write DEV_CTL = RESET | (NORMAL_REASON << 28).  Write twice;
+ *      the second write is required by the spec.
+ *   4. Poll DEV_STS.RESET_IN_PROGRESS (bit 3).
+ *   5. Poll DEV_STS.RESET_FINISHED   (bit 4) -- takes up to
+ *      caps_timeout × 100 ms; use ENA_RESET_SPINS_PER_100MS × caps.
+ *   6. Clear DEV_CTL.
+ *   7. Poll DEV_STS.READY (bit 0).
  *
- * Timeout comes from CAPS register bits[5:1] × 100 ms; we use a
- * generous fixed spin count that covers ~1 second at GHz rates. */
+ * ENA_RESET_SPINS_PER_100MS: one MMIO read on Graviton takes ~50-100 ns.
+ * 100 ms / 100 ns = 1,000,000 spins per 100 ms unit.  Use a conservative
+ * multiplier and clamp the max to avoid spinning for absurd amounts of
+ * time on a broken device. */
+#define ENA_RESET_SPINS_PER_100MS	1000000
+#define ENA_RESET_CAPS_MAX_UNITS	40	/* 4 s hard cap */
+
 static int ena_reset(struct ena_dev *d)
 {
 	uint32_t s = r32(d->regs, ENA_REG_DEV_STS);
@@ -318,13 +326,22 @@ static int ena_reset(struct ena_dev *d)
 		return -1;
 	}
 
-	/* Write reset command twice (spec requirement). */
+	/* Extract reset timeout from CAPS bits[5:1] (units = 100 ms). */
+	uint32_t caps     = r32(d->regs, ENA_REG_CAPS);
+	uint32_t t_units  = (caps & ENA_CAPS_RESET_TIMEOUT_MASK) >>
+			    ENA_CAPS_RESET_TIMEOUT_SHIFT;
+	if (t_units == 0) t_units = 8;	/* fallback: 800 ms */
+	if (t_units > ENA_RESET_CAPS_MAX_UNITS) t_units = ENA_RESET_CAPS_MAX_UNITS;
+	int max_spins = (int)((uint64_t)t_units * ENA_RESET_SPINS_PER_100MS);
+	kprintf("ena: reset  caps=0x%x  timeout=%u×100ms\n", caps, t_units);
+
+	/* Write reset command twice (spec requirement for RESET_REASON). */
 	uint32_t ctl = ENA_DEV_CTL_RESET; /* NORMAL reason = 0 << 28 */
 	w32(d->regs, ENA_REG_DEV_CTL, ctl);
 	w32(d->regs, ENA_REG_DEV_CTL, ctl);
 
 	/* Wait for RESET_IN_PROGRESS. */
-	for (int i = 0; i < 1000000; i++) {
+	for (int i = 0; i < max_spins; i++) {
 		s = r32(d->regs, ENA_REG_DEV_STS);
 		if (s & ENA_DEV_STS_RESET_IN_PROGRESS) break;
 		if (s & ENA_DEV_STS_FATAL_ERROR) {
@@ -332,9 +349,11 @@ static int ena_reset(struct ena_dev *d)
 			return -1;
 		}
 	}
+	/* RESET_IN_PROGRESS is transitional; absence doesn't mean failure --
+	 * the device may have already moved to RESET_FINISHED. */
 
 	/* Wait for RESET_FINISHED. */
-	for (int i = 0; i < 5000000; i++) {
+	for (int i = 0; i < max_spins; i++) {
 		s = r32(d->regs, ENA_REG_DEV_STS);
 		if (s & ENA_DEV_STS_RESET_FINISHED) break;
 		if (s & ENA_DEV_STS_FATAL_ERROR) {
@@ -343,14 +362,15 @@ static int ena_reset(struct ena_dev *d)
 		}
 	}
 	if (!(s & ENA_DEV_STS_RESET_FINISHED)) {
-		kprintf("ena: timed out waiting for RESET_FINISHED (STS=0x%x)\n", s);
+		kprintf("ena: timed out waiting for RESET_FINISHED "
+			"(STS=0x%x after %u×100ms)\n", s, t_units);
 		return -1;
 	}
 
 	w32(d->regs, ENA_REG_DEV_CTL, 0);
 
 	/* Wait for READY. */
-	for (int i = 0; i < 1000000; i++) {
+	for (int i = 0; i < max_spins; i++) {
 		s = r32(d->regs, ENA_REG_DEV_STS);
 		if (s & ENA_DEV_STS_READY) return 0;
 		if (s & ENA_DEV_STS_FATAL_ERROR) {
