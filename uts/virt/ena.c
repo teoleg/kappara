@@ -434,23 +434,20 @@ static int ena_reset(struct ena_dev *d)
 
 	uint32_t s = ena_r32(d, ENA_REG_DEV_STS);
 
-	/* If a prior boot left RESET_IN_PROGRESS, wait for it to clear.
-	 * Completion signal is RESET_IN_PROGRESS going back to 0, not
-	 * any "RESET_FINISHED" bit (that bit doesn't exist in ENA fw). */
+	/* If a prior boot left RESET_IN_PROGRESS, the previous OS wrote
+	 * DEV_CTL=RESET and then crashed before clearing it.  The device is
+	 * waiting for DEV_CTL to be cleared before it can finish.  Clear
+	 * DEV_CTL first, then wait for RESET_IN_PROGRESS to go away. */
 	if (s & ENA_DEV_STS_RESET_IN_PROGRESS) {
-		kprintf("ena: prior reset in progress (STS=0x%x), waiting %ums\n",
-			s, timeout_ms);
+		kprintf("ena: prior reset in progress (STS=0x%x), clearing CTL\n", s);
+		w32(d->regs, ENA_REG_DEV_CTL, 0);
 		int rc = wait_dev_sts_ms(d, ENA_DEV_STS_RESET_IN_PROGRESS,
 					 0, timeout_ms);
-		if (rc >= 0) {
-			w32(d->regs, ENA_REG_DEV_CTL, 0);
-			wait_dev_sts_ms(d, ENA_DEV_STS_READY, ENA_DEV_STS_READY,
-					timeout_ms);
-			kprintf("ena: prior reset cleared, issuing fresh reset\n");
-		} else {
-			kprintf("ena: prior reset stuck (STS=0x%x), forcing new reset\n",
+		if (rc < 0)
+			kprintf("ena: prior reset stuck (STS=0x%x), continuing\n",
 				ena_r32(d, ENA_REG_DEV_STS));
-		}
+		else
+			kprintf("ena: prior reset cleared\n");
 		s = ena_r32(d, ENA_REG_DEV_STS);
 	}
 
@@ -464,10 +461,16 @@ static int ena_reset(struct ena_dev *d)
 		}
 	}
 
-	/* Write reset command twice (spec requirement for RESET_REASON). */
-	uint32_t ctl = ENA_DEV_CTL_RESET;
-	w32(d->regs, ENA_REG_DEV_CTL, ctl);
-	w32(d->regs, ENA_REG_DEV_CTL, ctl);
+	/* Write reset command once.  Immediately re-write the MMIO response
+	 * buffer address: the device loses its DMA config when it sees the
+	 * reset bit and will not respond to indirect reads until we re-arm it.
+	 * (Linux: writel(reset_val); ena_com_mmio_reg_read_request_write_dev_addr) */
+	w32(d->regs, ENA_REG_DEV_CTL, ENA_DEV_CTL_RESET);
+	if (d->mmio_resp) {
+		uint64_t pa = (uint64_t)(uintptr_t)d->mmio_resp;
+		w32(d->regs, ENA_REG_MMIO_RESP_LO, (uint32_t)pa);
+		w32(d->regs, ENA_REG_MMIO_RESP_HI, (uint32_t)(pa >> 32));
+	}
 
 	/* Step 1: wait for RESET_IN_PROGRESS to set (device acks). */
 	{
@@ -491,9 +494,11 @@ static int ena_reset(struct ena_dev *d)
 		}
 	}
 
-	/* Step 2: wait for RESET_IN_PROGRESS to clear (device done).
-	 * This is the real completion signal -- there is no "RESET_FINISHED"
-	 * bit in ENA firmware.  Protocol matches Linux ena_com_dev_reset(). */
+	/* Step 2: clear DEV_CTL first, THEN wait for RESET_IN_PROGRESS to
+	 * clear.  Linux: writel(0, DEV_CTL); wait_for_reset_state(0).
+	 * The device will not complete reset until we release the reset bit. */
+	w32(d->regs, ENA_REG_DEV_CTL, 0);
+
 	int rc = wait_dev_sts_ms(d, ENA_DEV_STS_RESET_IN_PROGRESS,
 				 0, timeout_ms);
 	if (rc < 0) {
@@ -502,8 +507,6 @@ static int ena_reset(struct ena_dev *d)
 			ena_r32(d, ENA_REG_DEV_STS), timeout_ms);
 		return -1;
 	}
-
-	w32(d->regs, ENA_REG_DEV_CTL, 0);
 
 	rc = wait_dev_sts_ms(d, ENA_DEV_STS_READY, ENA_DEV_STS_READY, timeout_ms);
 	if (rc < 0) {
@@ -629,16 +632,20 @@ static int ena_get_dev_attr(struct ena_dev *d)
 		(struct ena_admin_feat_common *)(cmd.payload + 12);
 	fc->feature_id = ENA_ADMIN_FEAT_DEVICE_ATTRIBUTES;
 
-	struct ena_admin_get_feat_dev_attr attr;
-	kmemset(&attr, 0, sizeof(attr));
-	if (ena_admin_submit(d, &cmd, &attr) < 0) {
+	/* Response payload is 56 bytes; struct is 36 -- use a full-size buffer. */
+	union {
+		struct ena_admin_get_feat_dev_attr dev_attr;
+		uint8_t raw[56];
+	} resp_buf;
+	kmemset(&resp_buf, 0, sizeof(resp_buf));
+	if (ena_admin_submit(d, &cmd, &resp_buf) < 0) {
 		kprintf("ena: GET_FEATURE(DEVICE_ATTRIBUTES) failed\n");
 		return -1;
 	}
 
-	for (int i = 0; i < 6; i++) d->mac[i] = attr.mac_addr[i];
-	d->max_mtu = attr.max_mtu ? attr.max_mtu : 1500;
-	kprintf("ena: mac %02x:%02x:%02x:%02x:%02x:%02x  max_mtu %u\n",
+	for (int i = 0; i < 6; i++) d->mac[i] = resp_buf.dev_attr.mac_addr[i];
+	d->max_mtu = resp_buf.dev_attr.max_mtu ? resp_buf.dev_attr.max_mtu : 1500;
+	kprintf("ena: mac %02x:%02x:%02x:%02x:%02x:%02x  mtu %u\n",
 		d->mac[0], d->mac[1], d->mac[2],
 		d->mac[3], d->mac[4], d->mac[5],
 		d->max_mtu);
