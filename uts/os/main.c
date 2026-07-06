@@ -27,6 +27,7 @@
 #include "kappara/abi/syscall.h"
 #include "kappara/arch/acpi.h"
 #include "kappara/arch/framebuffer.h"
+#include "kappara/arch/gic.h"
 #include "kappara/arch/ipi.h"
 #include "kappara/arch/ena.h"
 #include "kappara/arch/mmu.h"
@@ -404,6 +405,15 @@ void kmain(void)
 	pmm_add_range(EXEC_HOLE_END, pmm_end);
 #endif
 	kmem_init();
+
+	/* Bring up the GIC distributor now -- before user_init() remaps
+	 * any 2 MB VA blocks.  On Graviton the ACPI-reported GICD PA may
+	 * share its 2 MB window with the EL0 user-code VA (0x10000000);
+	 * if user_init runs first it overwrites the Device L2 entry with
+	 * a Normal one, misdirecting subsequent distributor MMIO writes to
+	 * user-code storage instead of real hardware.  The idempotent guard
+	 * in gic_dist_init() ensures timer_init()'s later call is a no-op. */
+	gic_dist_init();
 
 	/* Bring up the SVR4 buffer cache before any filesystem touches
 	 * a block device: kfs_mkimage / kfs_mount call bread/bwrite,

@@ -41,6 +41,7 @@
 
 #include "kappara/arch/acpi.h"
 #include "kappara/arch/gic.h"
+#include "kappara/arch/mmu.h"
 #include "kappara/core/printk.h"
 #include "platform.h"
 
@@ -73,6 +74,7 @@
  * constants under -kernel dev boot (QEMU virt). */
 static uintptr_t gic_dist_base;
 static uintptr_t gic_redist_base;
+static int       gic_dist_inited;
 
 static inline void d_write(unsigned off, uint32_t v)
 {
@@ -104,6 +106,10 @@ static inline unsigned this_cpu_id(void)
 
 void gic_dist_init(void)
 {
+	if (gic_dist_inited)
+		return;
+	gic_dist_inited = 1;
+
 	if (acpi_present && acpi_gicd_base) {
 		gic_dist_base   = (uintptr_t)acpi_gicd_base;
 		gic_redist_base = (uintptr_t)acpi_gicr_base;
@@ -112,9 +118,27 @@ void gic_dist_init(void)
 		gic_redist_base = PLAT_GIC_REDIST_BASE;
 	}
 
-	d_write(GICD_CTLR, 0);
+	kprintf("gic: dist_init base=0x%lx redist=0x%lx\n",
+		(unsigned long)gic_dist_base, (unsigned long)gic_redist_base);
 
-	/* Disable all SPIs while we configure them.  ISENABLER 0 is
+	/* Map GIC MMIO if the ACPI-reported address falls outside the
+	 * pre-wired periph Device range [PLAT_PERIPH_BASE, PLAT_PERIPH_END).
+	 * mmu_map_device_1gb is idempotent for the same 1 GB block. */
+	if (gic_dist_base >= PLAT_PERIPH_END)
+		mmu_map_device_1gb(gic_dist_base);
+	if (gic_redist_base >= PLAT_PERIPH_END)
+		mmu_map_device_1gb(gic_redist_base);
+
+	/* DO NOT write 0 to GICD_CTLR here.  In GIC v3, clearing ARE_NS
+	 * while affinity routing is enabled is UNPREDICTABLE (ARM IHI0069F
+	 * §8.2.1).  On Nitro/Graviton the virtual GIC enforces this and
+	 * resets the guest silently -- no EL1 trap, no crash dump, just
+	 * watchdog reboot.  UEFI already configured ARE_NS=1; we must not
+	 * clear it.  Disabling groups before SPI config is also unnecessary
+	 * because IRQs are masked at PSTATE level (DAIF.I=1) throughout
+	 * init and the final CTLR write enables the group anyway. */
+
+	/* Disable all SPIs and put them in Group 1 NS.  ISENABLER 0 is
 	 * banked per-CPU (covers SGIs+PPIs); SPIs start at n=1. */
 	uint32_t typer = d_read(0x004);
 	unsigned itlines = (typer & 0x1f) + 1;	/* number of 32-int blocks */
@@ -131,6 +155,8 @@ void gic_dist_init(void)
 	 * pure CPU-0 targeting we just leave IROUTER zero. */
 	(void)0;
 
+	/* Set ARE_NS + EnableGrp1NS.  ARE_NS is safe to set (it was
+	 * already 1 from UEFI; toggling 1->1 is harmless). */
 	d_write(GICD_CTLR, GICD_CTLR_ARE_NS | GICD_CTLR_ENGRP1_NS);
 }
 
