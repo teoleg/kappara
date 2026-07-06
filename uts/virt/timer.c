@@ -62,10 +62,14 @@ void timer_init(unsigned hz)
 	uint64_t freq = read_cntfrq();
 	tick_cycles = freq / hz;
 
+	kprintf("timer: init hz=%u cntfrq=%lu\n", hz, (unsigned long)freq);
+
 	/* Distributor bring-up runs once on the boot CPU. */
 	gic_dist_init();
+	kprintf("timer: gic_dist_init done\n");
 
 	timer_init_this_cpu();
+	kprintf("timer: gic_cpu_init done\n");
 
 	kprintf("timer: cntfrq=%lu Hz, tick=%u Hz (%lu cycles), via GIC PPI %u\n",
 		(unsigned long)freq, hz, (unsigned long)tick_cycles,

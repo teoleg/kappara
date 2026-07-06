@@ -41,6 +41,7 @@
 
 #include "kappara/arch/acpi.h"
 #include "kappara/arch/gic.h"
+#include "kappara/core/printk.h"
 #include "platform.h"
 
 /* Distributor offsets */
@@ -137,12 +138,32 @@ void gic_cpu_init(void)
 {
 	unsigned cpu = this_cpu_id();
 
+	kprintf("gic: cpu_init cpu=%u redist_base=0x%lx\n",
+		cpu, (unsigned long)(gic_redist_base + (uintptr_t)cpu * PLAT_GIC_REDIST_STRIDE));
+
 	/* Wake the per-CPU redistributor: clear ProcessorSleep, then
 	 * spin until the GIC clears ChildrenAsleep. */
 	uint32_t waker = r_read(cpu, GICR_WAKER);
+	kprintf("gic: GICR_WAKER initial=0x%x\n", waker);
 	waker &= ~GICR_WAKER_PS;
 	r_write(cpu, GICR_WAKER, waker);
-	while (r_read(cpu, GICR_WAKER) & GICR_WAKER_CA) { }
+	{
+		uint64_t freq, start, deadline;
+		__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
+		deadline = start + freq;	/* 1 s */
+		while (r_read(cpu, GICR_WAKER) & GICR_WAKER_CA) {
+			uint64_t now;
+			__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+			if (now >= deadline) {
+				kprintf("gic: GICR_WAKER ChildrenAsleep stuck "
+					"(WAKER=0x%x) -- bad redistributor addr?\n",
+					r_read(cpu, GICR_WAKER));
+				kpanic("GIC redistributor not responding");
+			}
+		}
+	}
+	kprintf("gic: GICR_WAKER woken\n");
 
 	/* Per-CPU SGI/PPI config in the redistributor SGI bank: all in
 	 * Group 1, priority 0xa0, enable nothing yet (per-IRQ enable

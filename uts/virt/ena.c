@@ -595,7 +595,13 @@ static int ena_admin_submit(struct ena_dev *d,
 	w32(d->regs, ENA_REG_AQ_DB, d->aq_tail);
 
 	/* Poll CQ for the matching response.  Phase bit is in flags[0] of
-	 * the ACQ common descriptor, NOT in command[12]. */
+	 * the ACQ common descriptor, NOT in command[12].
+	 * Hard timeout: 5 s via CNTPCT_EL0 to avoid infinite spin on a
+	 * broken admin queue. */
+	uint64_t _freq, _start, _deadline;
+	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(_freq));
+	__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(_start));
+	_deadline = _start + _freq * 5ULL;
 	for (;;) {
 		struct ena_admin_acq_entry *e = &d->acq[d->acq_head];
 		__asm__ volatile ("dc ivac, %0\n\t" "dsb sy\n\t"
@@ -612,6 +618,15 @@ static int ena_admin_submit(struct ena_dev *d,
 			}
 			w32(d->regs, ENA_REG_ACQ_TAIL, d->acq_head);
 			return status == 0 ? 0 : -1;
+		}
+		uint64_t _now;
+		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(_now));
+		if (_now >= _deadline) {
+			kprintf("ena: admin cmd %u timeout (opcode=%u, "
+				"acq_head=%u phase=%u cid=%u)\n",
+				cmd_id, cmd->common.opcode,
+				d->acq_head, phase, cid);
+			return -1;
 		}
 	}
 }
@@ -655,27 +670,41 @@ static int ena_get_dev_attr(struct ena_dev *d)
 
 /* ---- I/O queue creation (CREATE_CQ then CREATE_SQ) ----
  *
- * CREATE_CQ payload (offsets in the 60-byte AQ payload):
- *   [0..3]   num_descs (u32)
- *   [4..11]  cq_phys_addr (u64, little-endian)
- *   [12..15] msix_vector (u32, 0 = polled)
+ * Struct layouts verified against torvalds/linux
+ * drivers/net/ethernet/amazon/ena/ena_admin_defs.h.
  *
- * CREATE_CQ response payload (first bytes of 56-byte ACQ payload):
- *   [0..1]   cq_idx (u16)
- *   [2..3]   cq_depth (u16, actual depth granted)
- *   [4..7]   db_doorbell_offset (u32)
+ * CREATE_CQ payload (ena_admin_aq_create_cq_cmd, after 4-byte common):
+ *   byte  0     cq_caps_1: bit5=interrupt_mode_enabled (0=polling)
+ *   byte  1     cq_caps_2: bits[4:0]=entry_size_words (4=16-byte entries)
+ *   bytes 2-3   cq_depth (u16, power of 2)
+ *   bytes 4-7   msix_vector (u32, 0=none)
+ *   bytes 8-11  cq_ba.mem_addr_low (u32)
+ *   bytes 12-13 cq_ba.mem_addr_high (u16, upper 16 bits of 48-bit PA)
+ *   bytes 14-15 cq_ba.reserved16 = 0
  *
- * CREATE_SQ payload:
- *   [0..1]   cq_id (u16, from CREATE_CQ response)
- *   [2..3]   num_descs (u16)
- *   [4]      direction (0=TX, 1=RX)
- *   [5..7]   reserved
- *   [8..15]  sq_phys_addr (u64)
+ * CREATE_CQ response (ena_admin_acq_create_cq_resp_desc, after 8-byte common):
+ *   bytes 0-1   cq_idx (u16)
+ *   bytes 2-3   cq_actual_depth (u16)
+ *   bytes 4-7   numa_node_register_offset (u32)
+ *   bytes 8-11  cq_head_db_register_offset (u32)  <-- this is the doorbell
+ *   bytes 12-15 cq_interrupt_unmask_register_offset (u32)
  *
- * CREATE_SQ response:
- *   [0..1]   sq_idx (u16)
- *   [2..3]   sq_depth (u16)
- *   [4..7]   db_doorbell_offset (u32)
+ * CREATE_SQ payload (ena_admin_aq_create_sq_cmd, after 4-byte common):
+ *   byte  0     sq_identity: bits[7:5]=sq_direction (0x1=TX, 0x2=RX)
+ *   byte  1     reserved
+ *   byte  2     sq_caps_2: bits[3:0]=placement_policy (0=host mem)
+ *   byte  3     sq_caps_3: bit[0]=is_physically_contiguous (1)
+ *   bytes 4-5   cq_idx (u16)
+ *   bytes 6-7   sq_depth (u16)
+ *   bytes 8-11  sq_ba.mem_addr_low (u32)
+ *   bytes 12-13 sq_ba.mem_addr_high (u16)
+ *   bytes 14-15 sq_ba.reserved16 = 0
+ *   bytes 16-23 sq_head_writeback (0 = no writeback)
+ *
+ * CREATE_SQ response (ena_admin_acq_create_sq_resp_desc, after 8-byte common):
+ *   bytes 0-1   sq_idx (u16)
+ *   bytes 2-3   reserved (u16)
+ *   bytes 4-7   sq_doorbell_offset (u32)
  */
 static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 			   int direction)
@@ -698,32 +727,43 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 	/* CREATE_CQ */
 	kmemset(&cmd, 0, sizeof(cmd));
 	cmd.common.opcode = ENA_ADMIN_OP_CREATE_CQ;
-	*(uint32_t *)(cmd.payload +  0) = ENA_IOQ_DEPTH;
-	*(uint64_t *)(cmd.payload +  4) = (uint64_t)(uintptr_t)q->cq_pa;
-	*(uint32_t *)(cmd.payload + 12) = 0;	/* MSI-X vector = none */
+	uint64_t cq_pa = (uint64_t)(uintptr_t)q->cq_pa;
+	cmd.payload[0] = 0;				/* cq_caps_1: polling */
+	cmd.payload[1] = 4;				/* cq_caps_2: 4 words = 16 B */
+	*(uint16_t *)(cmd.payload + 2) = (uint16_t)ENA_IOQ_DEPTH;
+	*(uint32_t *)(cmd.payload + 4) = 0;		/* msix_vector */
+	*(uint32_t *)(cmd.payload + 8) = (uint32_t)cq_pa;
+	*(uint16_t *)(cmd.payload + 12) = (uint16_t)(cq_pa >> 32);
 	kmemset(resp, 0, sizeof(resp));
 	if (ena_admin_submit(d, &cmd, resp) < 0) {
 		kprintf("ena: CREATE_CQ (%s) failed\n",
 			direction ? "rx" : "tx");
 		return -1;
 	}
-	uint16_t cq_id   = *(uint16_t *)(resp + 0);
-	q->cq_db_off     = *(uint32_t *)(resp + 4);
+	uint16_t cq_id = *(uint16_t *)(resp + 0);
+	q->cq_db_off   = *(uint32_t *)(resp + 8);	/* cq_head_db_register_offset */
 
 	/* CREATE_SQ */
 	kmemset(&cmd, 0, sizeof(cmd));
 	cmd.common.opcode = ENA_ADMIN_OP_CREATE_SQ;
-	*(uint16_t *)(cmd.payload + 0) = cq_id;
-	*(uint16_t *)(cmd.payload + 2) = (uint16_t)ENA_IOQ_DEPTH;
-	*(uint8_t  *)(cmd.payload + 4) = (uint8_t)direction;
-	*(uint64_t *)(cmd.payload + 8) = (uint64_t)(uintptr_t)q->sq_pa;
+	uint64_t sq_pa = (uint64_t)(uintptr_t)q->sq_pa;
+	/* sq_direction: bits[7:5]; 0x1=TX (direction=0), 0x2=RX (direction=1) */
+	cmd.payload[0] = (uint8_t)((direction + 1) << 5);
+	cmd.payload[1] = 0;				/* reserved */
+	cmd.payload[2] = 0x01;				/* sq_caps_2: placement_policy=1 (host mem) */
+	cmd.payload[3] = 1;				/* sq_caps_3: physically contiguous */
+	*(uint16_t *)(cmd.payload + 4) = cq_id;
+	*(uint16_t *)(cmd.payload + 6) = (uint16_t)ENA_IOQ_DEPTH;
+	*(uint32_t *)(cmd.payload + 8) = (uint32_t)sq_pa;
+	*(uint16_t *)(cmd.payload + 12) = (uint16_t)(sq_pa >> 32);
+	/* bytes 14-23: reserved + sq_head_writeback = 0 */
 	kmemset(resp, 0, sizeof(resp));
 	if (ena_admin_submit(d, &cmd, resp) < 0) {
 		kprintf("ena: CREATE_SQ (%s) failed\n",
 			direction ? "rx" : "tx");
 		return -1;
 	}
-	q->sq_db_off = *(uint32_t *)(resp + 4);
+	q->sq_db_off = *(uint32_t *)(resp + 4);	/* sq_doorbell_offset */
 
 	return 0;
 }
