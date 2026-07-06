@@ -10,7 +10,7 @@ image boots in QEMU `virt` today and is the basis for the AWS
 Graviton port (see docs/AWS.md).  Boot to prompt is ~3s in QEMU TCG.
 
 For the canonical "is HEAD healthy?" check, prefer `make test` --
-it runs all four smoke targets plus `cmd/test all` 14/14 and
+it runs all four smoke targets plus `cmd/test all` 15/15 and
 reports a single "ALL TESTS PASS" line.  Use this skill when you
 want to drive specific commands into the shell or inspect a
 particular boot transcript.

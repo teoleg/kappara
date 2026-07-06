@@ -1578,34 +1578,74 @@ released before `context_switch` — IRQs are restored from the saved
 one — but it's a leaf lock (nothing else is held while it's held)
 so cross-CPU deadlock isn't possible.
 
-### Per-CPU timer
+### GIC v3 (QEMU virt + AWS Graviton)
 
-The ARMv8 generic timer is per-core: each `mrs CNTP_CTL_EL0` / `mrs
-CNTP_TVAL_EL0` lands on the executing core's banked register.  The
-BCM2836 ARM-local block routes each core's CNTPNSIRQ to that core's
-IRQ line via `TIMER_CONTROL(N) = 0x40000040 + 4N`.  `irq_dispatch`
-reads `IRQ_SOURCE(N) = 0x40000060 + 4N` to know who fired.
+Interrupts are routed through an ARM GIC v3.  The distributor
+(`uts/virt/gic.c`) and the per-CPU redistributors are MMIO; the CPU
+interface is sysreg-only (ICC_IAR1_EL1, ICC_EOIR1_EL1, ICC_SGI1R_EL1
+etc.).
 
-`timer_init_this_cpu()` (uts/aarch64/timer.c) writes the per-core
-timer-control register, reloads CNTP_TVAL_EL0, and enables the
-timer.  Core 0 calls it from `timer_init(hz)`; each secondary calls
-it from `secondary_main` after MMU + traps are up.
+Base addresses come from ACPI (UEFI boot) or compile-time constants
+(QEMU `-kernel`):
 
-Result: all four cores get scheduler ticks at the same rate.
+| Region          | QEMU virt          | Source            |
+|-----------------|--------------------|-------------------|
+| Distributor     | `0x08000000`       | `PLAT_GIC_DIST_BASE`  |
+| Redistributors  | `0x080A0000+`      | `PLAT_GIC_REDIST_BASE` |
 
-### IPI (BCM2836 mailbox)
+**Graviton/ARE_NS constraint.**  UEFI leaves `GICD_CTLR.ARE_NS = 1`
+(affinity routing enabled).  The GIC v3 spec (ARM IHI0069F §8.2.1)
+makes clearing `ARE_NS` UNPREDICTABLE; Nitro's virtual GIC enforces
+this and resets the guest on the offending write.  `gic_dist_init()`
+must never write 0 to `GICD_CTLR` — only ever set bits (ARE_NS |
+ENGRP1_NS).
 
-Inter-processor interrupts on BCM2836 use the mailbox MMIO at
-`0x40000080..0xC0`.  Each core has four 32-bit write-set / read-clear
-mailbox slots; writing to a peer's slot raises an IRQ on the peer if
-the peer enabled that mailbox in `MBOX_IRQ_CTL(N) = 0x40000050+4N`.
+**Init sequence** (`gic_dist_init()` then per-CPU `gic_cpu_init()`):
+1. Set base addresses (ACPI or platform constant); map MMIO with
+   `mmu_map_device_1gb` if address falls outside the pre-wired periph
+   Device range (`PLAT_PERIPH_BASE..PLAT_PERIPH_END`).
+2. Disable all SPI enables (GICD_ICENABLER) and assign Group 1 NS
+   (GICD_IGROUPR); set priorities to 0xa0.
+3. Write `GICD_CTLR = ARE_NS | ENGRP1_NS`.
+4. Wake redistributor: clear `GICR_WAKER.ProcessorSleep`, poll until
+   `ChildrenAsleep = 0` (1-second CNTPCT-based timeout).
+5. Configure SGI/PPI group + priority via redistributor SGI bank.
+6. Enable sysreg CPU interface: `ICC_SRE_EL1.SRE = 1`.
+7. `ICC_PMR_EL1 = 0xff`, `ICC_BPR1_EL1 = 0`, `ICC_IGRPEN1_EL1 = 1`.
 
-`uts/aarch64/ipi.c`:
-- `ipi_init_this_cpu()` enables mailbox 0 IRQ for the calling core.
-- `ipi_send(cpu)` writes to a peer's mailbox 0 set + DSB SY.
-- `ipi_handle()` clears the pending bit.  No payload is needed --
-  the IRQ itself is the signal; returning from it drops back into
-  the scheduler which retries `try_steal`.
+**Idempotent guard.**  `gic_dist_init()` checks a `gic_dist_inited`
+flag; the second call (from `timer_init`) is a no-op.  `kmain` calls
+`gic_dist_init()` early — after `pmm_init`, before `user_init()` —
+so the distributor is programmed before `user_init()` can remap any
+2 MB VA window that might alias the GICD physical address.
+
+### Per-CPU timer (GIC PPI 30)
+
+The ARMv8 generic timer is per-core: `CNTP_CTL_EL0` / `CNTP_TVAL_EL0`
+are banked per CPU.  The non-secure physical timer fires as **PPI 30**
+(INTID 30) routed through the GIC.  `gic_enable_irq(30)` enables it
+per-CPU via the redistributor SGI bank; `irq_dispatch` matches on
+`intid == PLAT_TIMER_PPI`.
+
+`timer_init_this_cpu()` (`uts/virt/timer.c`):
+1. Calls `gic_cpu_init()` + `gic_enable_irq(PLAT_TIMER_PPI)`.
+2. Writes `CNTP_TVAL_EL0 = tick_cycles` and sets `CNTP_CTL_EL0 = 1`.
+
+Core 0 calls it from `timer_init(hz)`; each secondary calls it from
+`secondary_main` after MMU + traps are up.
+
+### IPI (GIC SGI 0)
+
+Cross-CPU interrupts use **SGI 0** (software-generated interrupt,
+`PLAT_IPI_SGI`).  `gic_send_sgi(cpu, 0)` writes `ICC_SGI1R_EL1` with
+the target's Aff0 bit set; the GIC delivers INTID 0 to that CPU.
+
+`uts/virt/ipi.c`:
+- `ipi_init_this_cpu()` — no per-CPU MMIO setup needed; SGIs are
+  always enabled in the redistributor Group 1 NS by `gic_cpu_init`.
+- `ipi_send(cpu)` writes `ICC_SGI1R_EL1` + `isb`.
+- `ipi_handle()` — the SGI is self-clearing; just re-enter the
+  scheduler.  No payload: the IRQ itself is the signal.
 - `ipi_wake_idle()` reads `sched_idle_mask()` and pokes every CPU
   currently parked on its idle thread.
 

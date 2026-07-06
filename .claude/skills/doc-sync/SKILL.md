@@ -13,13 +13,14 @@ CLAUDE.md is explicit: "a commit that changes a public-facing command, a syscall
 |---------------------------------------------------------------------|-----------------------------|
 | `user/init.c` — new/changed shell command, help text                | `docs/SHELL.md`             |
 | `user/ked.c`, `user/ked_*.c` — editor behavior                      | `docs/KED.md`               |
-| `kernel/proc.c`, new `/proc/*` STREAMS cdev                         | `docs/PROCFS.md`            |
-| New `/dev/*` major (touches `cdevsw.h`)                             | `docs/PROCFS.md`            |
-| `kernel/sched.c`, `kernel/vfs.c`, `kernel/stream*.c`, `kernel/sig*.c`, `kernel/pmm.c`, `kernel/vmm.c`, `arch/*/mmu.c`, `arch/*/boot.S`, anything in `kernel/smp/` | `docs/ARCHITECTURE.md` |
+| `uts/os/fs/procfs.c`, new `/proc/*` STREAMS cdev                    | `docs/PROCFS.md`            |
+| New `/dev/*` major (touches `include/kappara/io/cdevsw.h`)          | `docs/PROCFS.md`            |
+| `uts/os/proc/sched.c`, `uts/os/fs/vfs.c`, `uts/os/io/stream*.c`, `uts/os/proc/signal.c`, `uts/os/core/pmm.c`, `uts/aarch64/mmu.c`, `uts/virt/boot.S`, `uts/virt/gic.c`, `uts/virt/timer.c` | `docs/ARCHITECTURE.md` |
+| `uts/virt/ena.c`, `uts/virt/nvme.c`, `uts/virt/acpi.c`, `uts/virt/pcie.c`, `uts/virt/efi_main.c` — AWS/Graviton driver changes | `docs/AWS.md` |
 | `Makefile` (build targets, CFLAGS, ARCH), QEMU rig changes          | `docs/BUILDING.md`          |
 | Top-level structure, status, what-works list                         | `README.md`                 |
 | ftrace API or workflow                                              | `docs/FTRACE.md`            |
-| New syscall number (`include/kappara/syscalls.h`)                   | `docs/ARCHITECTURE.md` (Syscall section) |
+| New syscall number (`include/kappara/abi/syscall.h`)                | `docs/ARCHITECTURE.md` (Syscall section) |
 
 ## Procedure
 
