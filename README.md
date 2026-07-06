@@ -1,7 +1,7 @@
 # kappara
 
-[![build](https://github.com/teoleg/kappara/actions/workflows/build.yml/badge.svg)](https://github.com/teoleg/kappara/actions/workflows/build.yml)
-[![AMI deploy](https://github.com/teoleg/kappara/actions/workflows/build.yml/badge.svg?event=push)](https://github.com/teoleg/kappara/actions/workflows/build.yml?query=workflow%3Abuild+event%3Apush+branch%3Amain)
+[![CI](https://github.com/teoleg/kappara/actions/workflows/build.yml/badge.svg)](https://github.com/teoleg/kappara/actions/workflows/build.yml)
+[![AMI deploy](https://github.com/teoleg/kappara/actions/workflows/deploy.yml/badge.svg?branch=main)](https://github.com/teoleg/kappara/actions/workflows/deploy.yml)
 
 A small SVR4-flavored Unix-like operating system for AArch64.  Develops on
 QEMU `virt` (`qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72`)

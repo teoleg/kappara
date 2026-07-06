@@ -1,0 +1,86 @@
+# AMI deployment: build kernel.img + AMI image, upload to S3, register
+# as an EC2 snapshot-backed AMI.
+#
+# Runs ONLY on pushes to main (i.e. after an approved PR merges) AND
+# only when HAS_AWS_DEPLOY="true" is set in repository variables.
+# Repos / forks without AWS configured fall through silently.
+#
+# Required setup (once):
+#
+#   Repository variables (Settings -> Secrets and variables ->
+#                         Actions -> Variables):
+#     HAS_AWS_DEPLOY = "true"
+#
+#   Secrets (Settings -> Secrets and variables -> Actions -> Secrets):
+#     AWS_ROLE_ARN        arn:aws:iam::<acct>:role/kappara-ci-role
+#     AWS_REGION          e.g. us-east-2
+#     KAPPARA_S3_BUCKET   bucket the vmimport role can read
+#
+#   Branch protection (Settings -> Branches -> main):
+#     [x] Require a pull request before merging
+#     [x] Require approvals: 1
+#     [x] Do not allow bypassing the above settings
+#
+#   Environment (Settings -> Environments -> aws-prod):
+#     [x] Required reviewers: <yourself>   (optional belt-and-suspenders)
+#
+# See docs/AWS.md for the vmimport IAM role and S3 bucket setup.
+
+name: AMI deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  ami:
+    # Skip silently when AWS deploy isn't configured -- keeps the
+    # workflow green for forks and dev environments.
+    if: vars.HAS_AWS_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    environment: aws-prod
+    permissions:
+      id-token: write   # required for OIDC credential exchange
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            parted dosfstools mtools \
+            python3 jq
+
+      - name: Build kernel + AMI image
+        run: |
+          make -j$(nproc)
+          make ami
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ secrets.AWS_REGION }}
+
+      # AMI name embeds the commit SHA -- AWS rejects duplicate names.
+      - name: Upload AMI to S3 + register
+        run: |
+          SHORT_SHA=${GITHUB_SHA:0:7}
+          ./tools/upload-ami.sh \
+            --bucket "${{ secrets.KAPPARA_S3_BUCKET }}" \
+            --name   "kappara-main-${SHORT_SHA}"
+
+      # Surface the AMI ID in the run summary so it's easy to find
+      # via the Actions tab or commit history.
+      - name: Annotate run summary
+        if: success()
+        run: |
+          if [[ -f build/last-ami-id.txt ]]; then
+            AMI=$(cat build/last-ami-id.txt)
+            echo "### Deployed AMI" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "\`$AMI\`" >> $GITHUB_STEP_SUMMARY
+          fi
