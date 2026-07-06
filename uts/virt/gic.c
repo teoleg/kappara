@@ -39,6 +39,7 @@
 
 #include <stdint.h>
 
+#include "kappara/arch/acpi.h"
 #include "kappara/arch/gic.h"
 #include "platform.h"
 
@@ -66,17 +67,23 @@
 #define GICR_IPRIORITYR(n)	(0x10000 + 0x400 + 4 * (n))
 #define GICR_ICFGR1		(0x10000 + 0xC04)
 
+/* Runtime GIC base addresses.  Set by gic_dist_init() from ACPI on
+ * UEFI boot (AWS Graviton); fall back to compile-time platform
+ * constants under -kernel dev boot (QEMU virt). */
+static uintptr_t gic_dist_base;
+static uintptr_t gic_redist_base;
+
 static inline void d_write(unsigned off, uint32_t v)
 {
-	*(volatile uint32_t *)(PLAT_GIC_DIST_BASE + off) = v;
+	*(volatile uint32_t *)(gic_dist_base + off) = v;
 }
 static inline uint32_t d_read(unsigned off)
 {
-	return *(volatile uint32_t *)(PLAT_GIC_DIST_BASE + off);
+	return *(volatile uint32_t *)(gic_dist_base + off);
 }
 static inline uintptr_t redist_base(unsigned cpu)
 {
-	return PLAT_GIC_REDIST_BASE + (uintptr_t)cpu * PLAT_GIC_REDIST_STRIDE;
+	return gic_redist_base + (uintptr_t)cpu * PLAT_GIC_REDIST_STRIDE;
 }
 static inline void r_write(unsigned cpu, unsigned off, uint32_t v)
 {
@@ -96,6 +103,14 @@ static inline unsigned this_cpu_id(void)
 
 void gic_dist_init(void)
 {
+	if (acpi_present && acpi_gicd_base) {
+		gic_dist_base   = (uintptr_t)acpi_gicd_base;
+		gic_redist_base = (uintptr_t)acpi_gicr_base;
+	} else {
+		gic_dist_base   = PLAT_GIC_DIST_BASE;
+		gic_redist_base = PLAT_GIC_REDIST_BASE;
+	}
+
 	d_write(GICD_CTLR, 0);
 
 	/* Disable all SPIs while we configure them.  ISENABLER 0 is
