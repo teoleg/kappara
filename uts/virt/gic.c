@@ -41,6 +41,7 @@
 
 #include "kappara/arch/acpi.h"
 #include "kappara/arch/gic.h"
+#include "kappara/core/printk.h"
 #include "platform.h"
 
 /* Distributor offsets */
@@ -136,6 +137,9 @@ void gic_dist_init(void)
 void gic_cpu_init(void)
 {
 	unsigned cpu = this_cpu_id();
+
+	kprintf("gic: cpu_init cpu=%u redist_base=0x%lx\n",
+		cpu, (unsigned long)(gic_redist_base + (uintptr_t)cpu * PLAT_GIC_REDIST_STRIDE));
 
 	/* Wake the per-CPU redistributor: clear ProcessorSleep, then
 	 * spin until the GIC clears ChildrenAsleep. */
