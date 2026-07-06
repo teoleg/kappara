@@ -595,7 +595,13 @@ static int ena_admin_submit(struct ena_dev *d,
 	w32(d->regs, ENA_REG_AQ_DB, d->aq_tail);
 
 	/* Poll CQ for the matching response.  Phase bit is in flags[0] of
-	 * the ACQ common descriptor, NOT in command[12]. */
+	 * the ACQ common descriptor, NOT in command[12].
+	 * Hard timeout: 5 s via CNTPCT_EL0 to avoid infinite spin on a
+	 * broken admin queue. */
+	uint64_t _freq, _start, _deadline;
+	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(_freq));
+	__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(_start));
+	_deadline = _start + _freq * 5ULL;
 	for (;;) {
 		struct ena_admin_acq_entry *e = &d->acq[d->acq_head];
 		__asm__ volatile ("dc ivac, %0\n\t" "dsb sy\n\t"
@@ -612,6 +618,15 @@ static int ena_admin_submit(struct ena_dev *d,
 			}
 			w32(d->regs, ENA_REG_ACQ_TAIL, d->acq_head);
 			return status == 0 ? 0 : -1;
+		}
+		uint64_t _now;
+		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(_now));
+		if (_now >= _deadline) {
+			kprintf("ena: admin cmd %u timeout (opcode=%u, "
+				"acq_head=%u phase=%u cid=%u)\n",
+				cmd_id, cmd->common.opcode,
+				d->acq_head, phase, cid);
+			return -1;
 		}
 	}
 }
