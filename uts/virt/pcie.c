@@ -155,12 +155,21 @@ void pcie_init(void)
 
 	/* Make sure the ECAM window is reachable.  QEMU virt (with
 	 * highmem PCIe) puts ECAM at 0x4010000000 = 256 GB + 256 MB,
-	 * well outside the 0..2 GB chunk the boot identity map
-	 * covers.  Map the 1 GB block that contains the start; the
-	 * full range fits in one block for any plausible bus_end
-	 * because each bus is 1 MB of config space.  (For >256 bus,
-	 * we'd need a multi-block loop; nothing real has that.) */
-	mmu_map_device_1gb(pcie_ecam_base);
+	 * well outside the 0..2 GB chunk the boot identity map covers.
+	 * Map the 1 GB block that contains the start; the full range
+	 * fits in one block for any plausible bus_end because each bus
+	 * is 1 MB of config space.  (For >256 buses, we'd need a
+	 * multi-block loop; nothing real has that.)
+	 * Guard: skip for addresses in the first 2 GB -- those are
+	 * already wired by build_identity_map:
+	 *   L1[0] → l2_table  (0..1 GB, with Device blocks for PERIPH)
+	 *   L1[1] → l2_table_hi (1..2 GB, Normal RAM)
+	 * Calling mmu_map_device_1gb for an address < 0x80000000 rounds
+	 * its base to 0 and overwrites l1_table[0] with a 1 GB Device
+	 * block, destroying the TABLE pointer to l2_table and making the
+	 * entire 0..1 GB range inaccessible from EL0. */
+	if (pcie_ecam_base >= 0x80000000UL)
+		mmu_map_device_1gb(pcie_ecam_base);
 
 	kprintf("pcie: ECAM 0x%lx bus %u..%u (ACPI MCFG)\n",
 		pcie_ecam_base, pcie_bus_start, pcie_bus_end);

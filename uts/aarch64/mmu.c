@@ -363,6 +363,12 @@ void mmu_enable_this_cpu(void)
 
 	uint64_t sctlr;
 	__asm__ volatile ("mrs %0, sctlr_el1" : "=r"(sctlr));
+	/* Clear WXN (bit 19) and UWXN (bit 26): firmware (UEFI) may leave
+	 * these set.  WXN makes any writable mapping execute-never, which
+	 * would prevent EL0 from executing the user code page we mapped as
+	 * AP_RW_EL0.  On the -kernel path boot.S writes SCTLR_EL1=0x30d00800
+	 * (no WXN), so this is a no-op there but harmless. */
+	sctlr &= ~((1UL << 19) | (1UL << 26));
 	sctlr |= SCTLR_M | SCTLR_C | SCTLR_I;
 
 	__asm__ volatile (
@@ -681,6 +687,11 @@ void mmu_vmap_switch(const struct vm_map *vm)
 {
 	if (!vm) return;
 	__asm__ volatile (
+		/* ARM DDI0487 §D8.2.3: page-table writes must be visible to
+		 * the table walker before TTBR0_EL1 is written.  QEMU TCG
+		 * serialises implicitly; Graviton N1/V1 cores have out-of-order
+		 * L2 write queues that don't. */
+		"dsb	ishst\n"
 		"msr	ttbr0_el1, %0\n"
 		"isb\n"
 		"tlbi	vmalle1\n"
