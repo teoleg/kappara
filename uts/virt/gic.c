@@ -122,26 +122,30 @@ void gic_dist_init(void)
 		(unsigned long)gic_dist_base, (unsigned long)gic_redist_base);
 
 	/* Map GIC MMIO if the ACPI-reported address falls above the static
-	 * 2 GB identity map boundary.  mmu_map_device_1gb handles the L1
-	 * entry for the 1 GB block that contains the address.  Only call
-	 * it for addresses >= 0x80000000: L1[0] (0..1 GB, via L2 table)
-	 * and L1[1] (0x40000000..0x7FFFFFFF, 1 GB Normal block for RAM)
-	 * are already wired by build_identity_map() and must not be
-	 * overwritten.  Calling mmu_map_device_1gb on anything in
-	 * [0x40000000, 0x80000000) would clobber L1[1] (RAM) and crash. */
+	 * 2 GB identity map boundary.  Only call for addresses >= 0x80000000:
+	 * L1[0] (0..1 GB via L2 table) and L1[1] (0x40000000..0x7FFFFFFF
+	 * Normal RAM block) are already wired and must not be overwritten. */
 	if (gic_dist_base >= 0x80000000UL)
 		mmu_map_device_1gb(gic_dist_base);
 	if (gic_redist_base >= 0x80000000UL)
 		mmu_map_device_1gb(gic_redist_base);
 
-	/* DO NOT write 0 to GICD_CTLR here.  In GIC v3, clearing ARE_NS
-	 * while affinity routing is enabled is UNPREDICTABLE (ARM IHI0069F
-	 * §8.2.1).  On Nitro/Graviton the virtual GIC enforces this and
-	 * resets the guest silently -- no EL1 trap, no crash dump, just
-	 * watchdog reboot.  UEFI already configured ARE_NS=1; we must not
-	 * clear it.  Disabling groups before SPI config is also unnecessary
-	 * because IRQs are masked at PSTATE level (DAIF.I=1) throughout
-	 * init and the final CTLR write enables the group anyway. */
+	if (acpi_present) {
+		/* UEFI already fully configured the GIC distributor:
+		 * ARE_NS=1, EnableGrp1NS=1, groups and priorities set.
+		 * On Nitro/Graviton any write to GICD_CTLR from non-secure
+		 * EL1 -- even setting ARE_NS=1 when it's already 1 -- is
+		 * treated as a security violation by the hypervisor and
+		 * causes a silent guest reset (no EL1 trap, no crash dump,
+		 * just watchdog reboot).  Same applies to the SPI
+		 * ICENABLER/IGROUPR sweep: UEFI already set these correctly,
+		 * and re-writing them from NS EL1 triggers the same trap.
+		 * Trust UEFI's config; gic_enable_irq() handles individual
+		 * enables when the driver needs them. */
+		return;
+	}
+
+	/* QEMU -kernel path: GIC is in reset state, configure from scratch. */
 
 	/* Disable all SPIs and put them in Group 1 NS.  ISENABLER 0 is
 	 * banked per-CPU (covers SGIs+PPIs); SPIs start at n=1. */
@@ -154,14 +158,7 @@ void gic_dist_init(void)
 	for (unsigned n = 0; n < itlines * 8; n++)
 		d_write(GICD_IPRIORITYR(n), 0xa0a0a0a0u);
 
-	/* Route all SPIs to CPU 0 (MPIDR aff0/aff1/aff2/aff3 = 0).  In
-	 * GIC v3 ITARGETSR is replaced by IROUTER which is per-SPI
-	 * 64-bit.  Affinity-routing requires ARE_NS bit in CTLR; for
-	 * pure CPU-0 targeting we just leave IROUTER zero. */
-	(void)0;
-
-	/* Set ARE_NS + EnableGrp1NS.  ARE_NS is safe to set (it was
-	 * already 1 from UEFI; toggling 1->1 is harmless). */
+	/* ARE_NS + EnableGrp1NS.  SPIs routed to CPU 0 via IROUTER=0. */
 	d_write(GICD_CTLR, GICD_CTLR_ARE_NS | GICD_CTLR_ENGRP1_NS);
 }
 
