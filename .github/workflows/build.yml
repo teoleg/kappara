@@ -1,53 +1,20 @@
-# kappara CI -- two-stage build:
+# CI: build + test on every push and pull request.
 #
-#   build-and-test : runs on every push + PR.  Cross-compiles the
-#                    kernel and userland on x86, runs `make test`
-#                    (smoke-ftp + smoke-sdk + smoke-linux* + cmd/test
-#                    all 15/15) under QEMU TCG.  ZERO AWS secrets
-#                    needed.
+# Runs the cross-compiler + QEMU smoke suite (smoke-ftp, smoke-sdk,
+# smoke-linux, smoke-linux-mmap, cmd/test all 15/15) on x86 GitHub
+# runners.  No AWS secrets required.
 #
-#   ami            : runs ONLY on pushes to main, which means
-#                    "after a PR was reviewed + approved + merged"
-#                    when paired with branch protection (Settings
-#                    -> Branches -> Add rule -> Require PR + 1
-#                    approving review before merge).  Direct pushes
-#                    to main are blocked by the rule so the only
-#                    way this job ever runs is through an approved
-#                    PR.  Second-gate safety net: the job runs in
-#                    the `aws-prod` environment, which can have
-#                    required reviewers configured (Settings ->
-#                    Environments -> aws-prod).  Silently skipped
-#                    when the AWS deploy isn't configured.
-#
-# Required for the ami job (only when you're ready to deploy):
-#
-#   Repository variables (Settings -> Secrets and variables ->
-#                         Actions -> Variables):
-#     HAS_AWS_DEPLOY = "true"
-#
-#   Secrets (Settings -> Secrets and variables -> Actions -> Secrets):
-#     AWS_ROLE_ARN            OIDC role arn:aws:iam::<acct>:role/kappara-ci-role
-#     AWS_REGION              e.g. us-east-2
-#     KAPPARA_S3_BUCKET       bucket the vmimport role can read
-#
-#   Branch protection (Settings -> Branches -> main):
-#     [x] Require a pull request before merging
-#     [x] Require approvals: 1
-#     [x] Do not allow bypassing the above settings
-#
-#   Environment (Settings -> Environments -> New environment "aws-prod"):
-#     [x] Required reviewers: <yourself>  (optional but recommended)
-#
-# The vmimport IAM service role itself is a one-time AWS-side
-# setup; see docs/AWS.md.
+# AMI deployment lives in deploy.yml and is gated on pushes to main
+# only.  Splitting the workflows gives two distinct status badges so
+# CI health and deployment health are immediately distinguishable.
 
-name: build
+name: CI
 
 on:
   push:
     branches: ['**']
   pull_request:
-  workflow_dispatch:  # manual trigger from the Actions tab
+  workflow_dispatch:
 
 jobs:
   build-and-test:
@@ -55,11 +22,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Toolchain + smoke-test dependencies.  parted/dosfstools/mtools
-      # are only needed by `make ami`, but the AMI job re-checks out
-      # and re-installs anyway; including them here lets `make ami`
-      # work as a smoke step too if we ever want to gate releases on
-      # "image built successfully" without uploading.
       - name: Install build + test deps
         run: |
           sudo apt-get update
@@ -74,73 +36,7 @@ jobs:
       - name: Build
         run: make -j$(nproc)
 
-      # `make test` is the canonical health check: smoke-ftp, smoke-sdk,
-      # smoke-linux, smoke-linux-mmap, and cmd/test all 15/15.  Runs
-      # under QEMU TCG -- ~90s on GitHub's x86 runner.
+      # smoke-ftp + smoke-sdk + smoke-linux + smoke-linux-mmap + cmd/test 15/15
       - name: Test
         run: make test
-
-  ami:
-    needs: build-and-test
-    # Two-gate filter:
-    #   (1) Only on pushes to main (which require an approved PR
-    #       when branch protection is enabled).
-    #   (2) Only when the repo opted in via the HAS_AWS_DEPLOY
-    #       variable.  Repos / forks without AWS set up fall
-    #       through silently so the workflow stays green for
-    #       everyone.
-    if: |
-      github.event_name == 'push' &&
-      github.ref == 'refs/heads/main' &&
-      vars.HAS_AWS_DEPLOY == 'true'
-    runs-on: ubuntu-latest
-    # GitHub Environment -- can be configured to require manual
-    # approval in Settings -> Environments -> aws-prod, even if
-    # branch protection wasn't set up.  Belt-and-suspenders.
-    environment: aws-prod
-    permissions:
-      id-token: write   # required for OIDC credential exchange
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu \
-            parted dosfstools mtools \
-            python3 jq
-
-      - name: Build kernel + AMI image
-        run: |
-          make -j$(nproc)
-          make ami
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region:     ${{ secrets.AWS_REGION }}
-
-      # AMI name embeds the commit SHA so every merge to main
-      # produces a uniquely-named AMI -- AWS rejects duplicates.
-      - name: Upload AMI to S3 + register
-        run: |
-          SHORT_SHA=${GITHUB_SHA:0:7}
-          ./tools/upload-ami.sh \
-            --bucket "${{ secrets.KAPPARA_S3_BUCKET }}" \
-            --name   "kappara-main-${SHORT_SHA}"
-
-      # Surface the AMI ID on the merged commit so it's easy to
-      # find later via the Actions tab or commit history.
-      - name: Annotate run summary
-        if: success()
-        run: |
-          if [[ -f build/last-ami-id.txt ]]; then
-            AMI=$(cat build/last-ami-id.txt)
-            echo "### Deployed AMI" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "\`$AMI\`" >> $GITHUB_STEP_SUMMARY
-          fi
 

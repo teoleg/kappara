@@ -121,12 +121,17 @@ void gic_dist_init(void)
 	kprintf("gic: dist_init base=0x%lx redist=0x%lx\n",
 		(unsigned long)gic_dist_base, (unsigned long)gic_redist_base);
 
-	/* Map GIC MMIO if the ACPI-reported address falls outside the
-	 * pre-wired periph Device range [PLAT_PERIPH_BASE, PLAT_PERIPH_END).
-	 * mmu_map_device_1gb is idempotent for the same 1 GB block. */
-	if (gic_dist_base >= PLAT_PERIPH_END)
+	/* Map GIC MMIO if the ACPI-reported address falls above the static
+	 * 2 GB identity map boundary.  mmu_map_device_1gb handles the L1
+	 * entry for the 1 GB block that contains the address.  Only call
+	 * it for addresses >= 0x80000000: L1[0] (0..1 GB, via L2 table)
+	 * and L1[1] (0x40000000..0x7FFFFFFF, 1 GB Normal block for RAM)
+	 * are already wired by build_identity_map() and must not be
+	 * overwritten.  Calling mmu_map_device_1gb on anything in
+	 * [0x40000000, 0x80000000) would clobber L1[1] (RAM) and crash. */
+	if (gic_dist_base >= 0x80000000UL)
 		mmu_map_device_1gb(gic_dist_base);
-	if (gic_redist_base >= PLAT_PERIPH_END)
+	if (gic_redist_base >= 0x80000000UL)
 		mmu_map_device_1gb(gic_redist_base);
 
 	/* DO NOT write 0 to GICD_CTLR here.  In GIC v3, clearing ARE_NS

@@ -1,5 +1,8 @@
 # kappara
 
+[![CI](https://github.com/teoleg/kappara/actions/workflows/build.yml/badge.svg)](https://github.com/teoleg/kappara/actions/workflows/build.yml)
+[![AMI deploy](https://github.com/teoleg/kappara/actions/workflows/deploy.yml/badge.svg?branch=main)](https://github.com/teoleg/kappara/actions/workflows/deploy.yml)
+
 A small SVR4-flavored Unix-like operating system for AArch64.  Develops on
 QEMU `virt` (`qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72`)
 and is on the runway to boot on AWS Graviton (EC2 EFI / UEFI) via the
