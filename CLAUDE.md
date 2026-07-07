@@ -112,6 +112,40 @@
   CPUs touch (a global queue, a hash table, etc.), pick a lock
   for it before the first SMP test, not after.
 
+## Git workflow — squash-merge drift (critical)
+
+This repo merges PRs via **squash-merge**.  Every squash-merge
+creates a new commit hash on `main` even if the content is
+identical to what was on the branch.  The result: the branch
+always looks "1 ahead" of main after a merge, and `git status`
+shows diverged history forever.
+
+**At the start of every session, before writing any code:**
+
+```sh
+git fetch origin
+git log --oneline HEAD..origin/main   # anything new on main?
+git log --oneline origin/main..HEAD   # anything unmerged on branch?
+```
+
+If `origin/main..HEAD` shows commits whose subject lines match
+recent merged PRs, reset the branch:
+
+```sh
+git checkout -B claude/custom-os-build-kUWVJ origin/main
+# cherry-pick only commits NOT yet in main (if any)
+git push -u origin claude/custom-os-build-kUWVJ --force-with-lease
+```
+
+Never stack new commits on a branch that has already-merged
+history — the PR diff will show those old commits as new changes
+and confuse the reviewer.
+
+**Plans and design notes** belong in `docs/` as `.md` files,
+following the same table in the "Always update the docs" rule
+above.  Do not create HTML artifacts or scratchpad files for
+design decisions — write them as docs commits instead.
+
 ## Commit message style
 
 - Imperative subject, 60 chars max.
