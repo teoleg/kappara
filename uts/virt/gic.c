@@ -193,16 +193,20 @@ void gic_cpu_init(void)
 	}
 	kprintf("gic: GICR_WAKER woken\n");
 
-	/* Per-CPU SGI/PPI config in the redistributor SGI bank: all in
-	 * Group 1, priority 0xa0, enable nothing yet (per-IRQ enable
-	 * comes via gic_enable_irq). */
-	r_write(cpu, GICR_IGROUPR0,   0xffffffffu);
-	r_write(cpu, GICR_ICENABLER0, 0xffffffffu);
-	for (unsigned n = 0; n < 8; n++)
-		r_write(cpu, GICR_IPRIORITYR(n), 0xa0a0a0a0u);
-	/* ICFGR1: PPIs (intids 16..31) are 2 bits each, 0=level, 2=edge.
-	 * Architectural timers are level-sensitive. */
-	r_write(cpu, GICR_ICFGR1, 0);
+	if (!acpi_present) {
+		/* QEMU -kernel: redistributor is in reset state, configure
+		 * from scratch.  On UEFI/Graviton, UEFI already set all
+		 * redistributor group/enable/priority registers; Nitro
+		 * treats NS EL1 writes to these registers as a security
+		 * violation and silently resets the guest. */
+		r_write(cpu, GICR_IGROUPR0,   0xffffffffu);
+		r_write(cpu, GICR_ICENABLER0, 0xffffffffu);
+		for (unsigned n = 0; n < 8; n++)
+			r_write(cpu, GICR_IPRIORITYR(n), 0xa0a0a0a0u);
+		/* ICFGR1: PPIs (intids 16..31) are 2 bits each, 0=level,
+		 * 2=edge.  Architectural timers are level-sensitive. */
+		r_write(cpu, GICR_ICFGR1, 0);
+	}
 
 	/* Enable the v3 sysreg CPU interface.  ICC_SRE_EL1.SRE = 1
 	 * lets us use ICC_IAR1_EL1/ICC_EOIR1_EL1; QEMU virt with EL2
