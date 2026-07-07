@@ -573,6 +573,8 @@ static int ena_admin_init(struct ena_dev *d)
  *   SQ: we toggle aq_phase on every depth wrap and set it in flags[0].
  *   CQ: device toggles phase on every depth wrap; we compare flags[0].
  */
+/* Returns 0 on success, device status code (>0) on device error,
+ * -1 on admin queue timeout. */
 static int ena_admin_submit(struct ena_dev *d,
 			    struct ena_admin_aq_entry *cmd,
 			    void *resp)
@@ -617,7 +619,7 @@ static int ena_admin_submit(struct ena_dev *d,
 				d->acq_phase ^= 1;
 			}
 			w32(d->regs, ENA_REG_ACQ_TAIL, d->acq_head);
-			return status == 0 ? 0 : -1;
+			return (int)status;
 		}
 		uint64_t _now;
 		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(_now));
@@ -653,8 +655,9 @@ static int ena_get_dev_attr(struct ena_dev *d)
 		uint8_t raw[56];
 	} resp_buf;
 	kmemset(&resp_buf, 0, sizeof(resp_buf));
-	if (ena_admin_submit(d, &cmd, &resp_buf) < 0) {
-		kprintf("ena: GET_FEATURE(DEVICE_ATTRIBUTES) failed\n");
+	int rc = ena_admin_submit(d, &cmd, &resp_buf);
+	if (rc != 0) {
+		kprintf("ena: GET_FEATURE(DEVICE_ATTRIBUTES) failed (status=%d)\n", rc);
 		return -1;
 	}
 
@@ -735,10 +738,13 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 	*(uint32_t *)(cmd.payload + 8) = (uint32_t)cq_pa;
 	*(uint16_t *)(cmd.payload + 12) = (uint16_t)(cq_pa >> 32);
 	kmemset(resp, 0, sizeof(resp));
-	if (ena_admin_submit(d, &cmd, resp) < 0) {
-		kprintf("ena: CREATE_CQ (%s) failed\n",
-			direction ? "rx" : "tx");
-		return -1;
+	{
+		int rc = ena_admin_submit(d, &cmd, resp);
+		if (rc != 0) {
+			kprintf("ena: CREATE_CQ (%s) failed (status=%d)\n",
+				direction ? "rx" : "tx", rc);
+			return -1;
+		}
 	}
 	uint16_t cq_id = *(uint16_t *)(resp + 0);
 	q->cq_db_off   = *(uint32_t *)(resp + 8);	/* cq_head_db_register_offset */
@@ -747,21 +753,27 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 	kmemset(&cmd, 0, sizeof(cmd));
 	cmd.common.opcode = ENA_ADMIN_OP_CREATE_SQ;
 	uint64_t sq_pa = (uint64_t)(uintptr_t)q->sq_pa;
-	/* sq_direction: bits[7:5]; 0x1=TX (direction=0), 0x2=RX (direction=1) */
+	/* sq_identity bits[7:5]=direction; 0x1=TX, 0x2=RX */
 	cmd.payload[0] = (uint8_t)((direction + 1) << 5);
-	cmd.payload[1] = 0;				/* reserved */
-	cmd.payload[2] = 0x01;				/* sq_caps_2: placement_policy=1 (host mem) */
-	cmd.payload[3] = 1;				/* sq_caps_3: physically contiguous */
+	cmd.payload[1] = 0;			/* reserved */
+	/* sq_caps_2 bits[3:0]=placement_policy: 1=host memory */
+	cmd.payload[2] = 0x01;
+	/* sq_caps_3 bit[0]=phase_desc, bit[1]=is_physically_contiguous.
+	 * We want is_physically_contiguous=1 → bit 1 → value 0x02. */
+	cmd.payload[3] = 0x02;
 	*(uint16_t *)(cmd.payload + 4) = cq_id;
 	*(uint16_t *)(cmd.payload + 6) = (uint16_t)ENA_IOQ_DEPTH;
 	*(uint32_t *)(cmd.payload + 8) = (uint32_t)sq_pa;
 	*(uint16_t *)(cmd.payload + 12) = (uint16_t)(sq_pa >> 32);
 	/* bytes 14-23: reserved + sq_head_writeback = 0 */
 	kmemset(resp, 0, sizeof(resp));
-	if (ena_admin_submit(d, &cmd, resp) < 0) {
-		kprintf("ena: CREATE_SQ (%s) failed\n",
-			direction ? "rx" : "tx");
-		return -1;
+	{
+		int rc = ena_admin_submit(d, &cmd, resp);
+		if (rc != 0) {
+			kprintf("ena: CREATE_SQ (%s) failed (status=%d)\n",
+				direction ? "rx" : "tx", rc);
+			return -1;
+		}
 	}
 	q->sq_db_off = *(uint32_t *)(resp + 4);	/* sq_doorbell_offset */
 
