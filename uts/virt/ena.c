@@ -335,6 +335,8 @@ struct ena_dev {
 	void    *rx_bufs[ENA_IOQ_DEPTH];
 	void    *tx_bufs[ENA_IOQ_DEPTH];	/* bounce buffers; freed on TX CQ */
 
+	int      io_ready;		/* TX+RX rings set up; checked by ena_eth_tx */
+
 	/* Ethernet/IP addressing */
 	uint32_t ip;
 	uint32_t netmask;
@@ -695,18 +697,16 @@ static int ena_get_llq(struct ena_dev *d)
 	uint8_t resp[56];
 	kmemset(resp, 0, sizeof(resp));
 	int rc = ena_admin_submit(d, &cmd, resp);
-	if (rc != 0) {
-		/* LLQ not supported — use host memory placement. */
-		d->use_llq = 0;
-		kprintf("ena: LLQ not supported, using host memory placement\n");
-		return 0;
-	}
+	(void)rc;	/* result is informational; we always use host memory */
 
-	/* ena_admin_get_feat_llq response [0..3]: supported_feat bitmask.
-	 * bit 0 = LLQ entries supported.  If zero, fall back to host memory. */
-	uint32_t llq_feat = *(uint32_t *)(resp + 0);
-	d->use_llq = (llq_feat & 0x1) ? 1 : 0;
-	kprintf("ena: LLQ %s\n", d->use_llq ? "enabled" : "not supported");
+	/* Always use host-memory placement (placement_policy=1).
+	 * LLQ (policy=3) requires an additional push-queue header buffer
+	 * that we have not set up.  Firmware rejects CREATE_SQ with
+	 * ENA_SPEC_VERSION_MISMATCH (status=6) when told placement=3
+	 * without the matching LLQ descriptor ring.  Host memory is
+	 * functionally equivalent and simpler. */
+	d->use_llq = 0;
+	kprintf("ena: using host memory placement policy\n");
 	return 0;
 }
 
@@ -804,12 +804,13 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 	kmemset(&cmd, 0, sizeof(cmd));
 	cmd.common.opcode = ENA_ADMIN_OP_CREATE_SQ;
 	uint64_t sq_pa = (uint64_t)(uintptr_t)q->sq_pa;
-	cmd.payload[0] = (uint8_t)((direction + 1) << 5);  /* direction: 0x20=TX 0x40=RX */
+	/* sq_identity byte: bits[7:5] = direction (TX=1→0x20, RX=2→0x40) */
+	cmd.payload[0] = (uint8_t)((direction + 1) << 5);
 	cmd.payload[1] = 0;
-	/* placement_policy: use LLQ (3) if negotiated, else host memory (1) */
+	/* sq_caps_2: bits[1:0] = placement_policy (1=host_mem, 3=LLQ) */
 	cmd.payload[2] = d->use_llq ? 0x03 : 0x01;
-	/* is_physically_contiguous: bit[1] = value 0x02 */
-	cmd.payload[3] = 0x02;
+	/* sq_caps_3: bit[0] = is_physically_contiguous (our PMM pages are) */
+	cmd.payload[3] = 0x01;
 	*(uint16_t *)(cmd.payload + 4) = cq_id;
 	*(uint16_t *)(cmd.payload + 6) = (uint16_t)depth;
 	*(uint32_t *)(cmd.payload + 8) = (uint32_t)sq_pa;
@@ -895,7 +896,7 @@ static void ena_tx_drain(struct ena_dev *d)
 
 static int ena_eth_tx(struct ena_dev *d, const void *frame, unsigned len)
 {
-	if (!g_ena_init_ok || len == 0 || len > ENA_RX_BUF_BYTES) return -1;
+	if (!d->io_ready || len == 0 || len > ENA_RX_BUF_BYTES) return -1;
 
 	void *buf = pmm_alloc();
 	if (!buf) return -1;
@@ -1234,11 +1235,12 @@ static int ena_dhcp_run(struct ena_dev *d)
 	uint64_t freq, start, deadline;
 	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
 	__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
-	deadline = start + freq * 10ULL;	/* 10-second timeout */
+	deadline = start + freq * 3ULL;		/* 3-second timeout */
 
 	while (d->dhcp_state != DHCP_BOUND &&
 	       d->dhcp_state != DHCP_FAILED) {
 		ena_rx_poll_one(d);
+		kthread_yield();		/* let other threads run during wait */
 		uint64_t now;
 		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
 		if (now >= deadline) {
@@ -1400,7 +1402,14 @@ void ena_init(void)
 	if (ena_create_io_q(d, &d->rx, 1) < 0) return;
 	if (ena_rx_refill_all(d)   < 0) return;
 
-	/* E5: DHCP (spin-polls RX CQ directly, no kthread yet) */
+	/* io_ready gates ena_eth_tx; must be set before DHCP so
+	 * dhcp_send can actually transmit DISCOVER/REQUEST frames. */
+	d->io_ready = 1;
+
+	/* E5: DHCP (spin-polls RX CQ; kthread_yield lets other threads run).
+	 * wire_ena_into_ip requires ip_ctl_sd which is set by ip_init();
+	 * ip_init() runs after us in main.c -- guard on DHCP success so
+	 * we don't attempt wire-up before ip_ctl_sd exists. */
 	if (ena_dhcp_run(d)) {
 		unsigned nm_bits = 0;
 		uint32_t m = d->netmask;
@@ -1411,23 +1420,25 @@ void ena_init(void)
 			nm_bits,
 			(d->gateway >> 24) & 0xff, (d->gateway >> 16) & 0xff,
 			(d->gateway >>  8) & 0xff,  d->gateway        & 0xff);
+
+		/* E6+E7: STREAMS wire-up (requires ip_ctl_sd from ip_init).
+		 * When ena_init is called before ip_init, ip_attach_stream
+		 * returns -1 safely; the caller (main.c's PLATFORM_VIRT block)
+		 * should call ena_streams_attach() again after ip_init. */
+		wire_ena_into_ip(d);
+		if (d->ena_sd) {
+			g_ena_init_ok = 1;
+			kprintf("ena: ready  mac %02x:%02x:%02x:%02x:%02x:%02x"
+				"  mtu %u  eth0 linked\n",
+				d->mac[0], d->mac[1], d->mac[2],
+				d->mac[3], d->mac[4], d->mac[5],
+				d->nif.mtu);
+			/* E4: start RX poll thread only after IP is wired */
+			kthread_create("ena_rx", ena_rx_thread, d);
+		}
 	} else {
-		kprintf("ena: DHCP failed -- no IP assigned\n");
+		kprintf("ena: DHCP failed -- no IP assigned, network inactive\n");
 	}
-
-	/* E6+E7: STREAMS wire-up */
-	wire_ena_into_ip(d);
-
-	g_ena_init_ok = 1;
-	kprintf("ena: ready  mac %02x:%02x:%02x:%02x:%02x:%02x"
-		"  mtu %u  eth0 registered\n",
-		d->mac[0], d->mac[1], d->mac[2],
-		d->mac[3], d->mac[4], d->mac[5],
-		d->nif.mtu);
-
-	/* E4: start RX poll thread after IP is wired so ena_rx_dispatch
-	 * can safely putnext into the live stream. */
-	kthread_create("ena_rx", ena_rx_thread, d);
 }
 
 int ena_present(void)
