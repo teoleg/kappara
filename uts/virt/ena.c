@@ -1,27 +1,41 @@
 /*
- * uts/virt/ena.c -- AWS ENA network driver
+ * uts/virt/ena.c -- AWS ENA network driver (SVR4 STREAMS)
  *
- * Amazon Elastic Network Adapter.  PCI vendor 0x1d0f, device 0xec20 /
- * 0xec21.  Probed via pci_devs[], BAR0 mapped with mmu_map_device_1gb,
- * admin queue polled (no MSI-X).
+ * Amazon Elastic Network Adapter.  PCI vendor 0x1d0f, device 0xec20/0xec21.
+ * Probed via pci_devs[], BAR0 mapped with mmu_map_device_1gb, admin queue
+ * polled (interrupts masked).
  *
- * Register offsets and bit definitions verified against:
+ * Stages implemented:
+ *   E1  Admin hardening: GET_FEATURE(MAX_QUEUES), GET_FEATURE(LLQ),
+ *       SET_FEATURE(HOST_ATTR_CONFIG).  Queue depth clamped to device max;
+ *       placement_policy set from LLQ negotiation result.
+ *   E2  Ethernet + ARP layer: ether_hdr, arp_pkt, ARP cache (gateway MAC),
+ *       arp_send / arp_send_request / ena_arp_process.
+ *   E3  TX ring: ena_eth_tx posts ena_io_tx_desc with dc cvac + dsb sy
+ *       cache flush before the SQ doorbell; ena_tx_drain reclaims bounce
+ *       buffers by polling the TX CQ (dc ivac before reading phase bit).
+ *   E4  RX kthread: ena_rx_poll_one drains one RX CQ entry per call,
+ *       dc ivac on both the CQ entry and the data buffer before reading;
+ *       ena_rx_repost refills the slot.  ena_rx_thread yields when idle.
+ *   E5  DHCP client: raw-Ethernet DISCOVER→OFFER→REQUEST→ACK state machine
+ *       spin-polling the ENA RX CQ directly (no IRQ, no kthread yet).
+ *       10-second timeout; no fallback on Graviton (no slirp).
+ *   E6  STREAMS personality: ena_streamtab (ena_wq_putp / ena_rq_putp /
+ *       ena_qopen).  Write side prepends Ethernet header, calls ena_eth_tx.
+ *       Read side is a pass-through putnext.
+ *   E7  IP wire-up: wire_ena_into_ip builds a kernel stream from
+ *       ena_streamtab, calls ip_attach_stream, registers the netif, then
+ *       starts the ena_rx kthread.
+ *
+ * Cache maintenance (AArch64, non-coherent DMA on Nitro):
+ *   TX: dc cvac + dsb sy on the buffer and the SQ descriptor before doorbell.
+ *   RX CQ: dc ivac + dsb sy on the CQ entry before reading the phase bit.
+ *   RX data: dc ivac + dsb sy on the buffer before reading received bytes.
+ *   RX repost: dc cvac + dsb sy on the updated RX SQ descriptor.
+ *
+ * Register offsets and bit definitions cross-checked against:
  *   torvalds/linux drivers/net/ethernet/amazon/ena/ena_regs_defs.h
  *   torvalds/linux drivers/net/ethernet/amazon/ena/ena_admin_defs.h
- *
- * Steps implemented:
- *   1. PCI probe: vendor 0x1d0f, device 0xec20/ec21, class 0x0200.
- *   2. Enable PCI Memory Space + Bus Master in Command register.
- *   3. Map BAR0 (registers) with mmu_map_device_1gb.
- *   4. Reset: set DEV_CTL.RESET, wait RESET_IN_PROGRESS, RESET_FINISHED,
- *      clear CTL, wait READY.
- *   5. Allocate Admin SQ + Admin CQ + AENQ pages from PMM.
- *   6. Program AQ/ACQ/AENQ base addresses and CAPS registers.
- *   7. GET_FEATURE(DEVICE_ATTRIBUTES) → MAC, max_mtu.
- *   8. CREATE_CQ + CREATE_SQ for one TX pair and one RX pair.
- *   9. Refill RX descriptors with PMM-backed buffers.
- *  10. Register a struct netif "eth0".
- *  11. (Future) RX kthread or interrupt-driven drain; TX path completes.
  */
 
 #include <stddef.h>
@@ -34,7 +48,11 @@
 #include "kappara/core/pmm.h"
 #include "kappara/core/printk.h"
 #include "kappara/core/string.h"
+#include "kappara/io/stream_head.h"
+#include "kappara/io/streams.h"
+#include "kappara/net/ip.h"
 #include "kappara/net/netif.h"
+#include "kappara/proc/sched.h"
 
 /* ---- PCI IDs ---- */
 #define ENA_PCI_VID		0x1d0f
@@ -59,7 +77,7 @@
 #define ENA_REG_AENQ_BASE_LO		0x38
 #define ENA_REG_AENQ_BASE_HI		0x3C
 #define ENA_REG_AENQ_HEAD_DB		0x40
-#define ENA_REG_AENQ_TAIL		0x44	/* init to 0 after reset */
+#define ENA_REG_AENQ_TAIL		0x44
 #define ENA_REG_INTR_MASK		0x4C
 #define ENA_REG_DEV_CTL			0x54
 #define ENA_REG_DEV_STS			0x58
@@ -67,130 +85,80 @@
 #define ENA_REG_MMIO_RESP_LO		0x60
 #define ENA_REG_MMIO_RESP_HI		0x64
 
-/* CAPS register: reset timeout in bits[5:1] (units = 100 ms) */
 #define ENA_CAPS_RESET_TIMEOUT_SHIFT	1
 #define ENA_CAPS_RESET_TIMEOUT_MASK	0x3E
 
-/* DEV_CTL bits (ena_regs_defs.h) */
 #define ENA_DEV_CTL_RESET		(1u << 0)
 #define ENA_DEV_CTL_AQ_RESTART		(1u << 1)
 #define ENA_DEV_CTL_QUIESCENT		(1u << 2)
 #define ENA_DEV_CTL_IO_RESUME		(1u << 3)
-#define ENA_DEV_CTL_RESET_REASON_SHIFT	28	/* NORMAL=0 */
+#define ENA_DEV_CTL_RESET_REASON_SHIFT	28
 
-/* DEV_STS bits (ena_regs_defs.h) */
-#define ENA_DEV_STS_READY		(1u << 0)	/* 0x01 */
-#define ENA_DEV_STS_AQ_RESTART_PROG	(1u << 1)	/* 0x02 */
-#define ENA_DEV_STS_AQ_RESTART_DONE	(1u << 2)	/* 0x04 */
-#define ENA_DEV_STS_RESET_IN_PROGRESS	(1u << 3)	/* 0x08 */
-#define ENA_DEV_STS_RESET_FINISHED	(1u << 4)	/* 0x10 */
-#define ENA_DEV_STS_FATAL_ERROR		(1u << 5)	/* 0x20 */
+#define ENA_DEV_STS_READY		(1u << 0)
+#define ENA_DEV_STS_AQ_RESTART_PROG	(1u << 1)
+#define ENA_DEV_STS_AQ_RESTART_DONE	(1u << 2)
+#define ENA_DEV_STS_RESET_IN_PROGRESS	(1u << 3)
+#define ENA_DEV_STS_RESET_FINISHED	(1u << 4)
+#define ENA_DEV_STS_FATAL_ERROR		(1u << 5)
 
-/* AQ/ACQ/AENQ CAPS register layout:
- *   bits[15:0]  = depth (number of entries)
- *   bits[31:16] = entry size in bytes
- */
 #define ENA_QCAPS(depth, entry_size) \
 	(((uint32_t)(entry_size) << 16) | (uint32_t)(depth))
 
-/* ---- Admin queue structures (ena_admin_defs.h) ----
- *
- * AQ entry: 64 bytes.
- *   common_desc:       4 bytes (command_id u16, opcode u8, flags u8)
- *   command-specific: 60 bytes
- *
- * ACQ entry: 64 bytes.
- *   common_desc:       8 bytes
- *   response payload: 56 bytes
- *
- * AENQ entry: 64 bytes.
- *
- * Phase bit: carried in common_desc.flags bit 0 for SQ entries, in
- * acq_common_desc.flags bit 0 for CQ entries.  Toggles on ring wrap.
- */
+/* ---- Admin queue structures ---- */
 
-/* SQ common descriptor (4 bytes) */
 struct ena_admin_aq_common_desc {
-	uint16_t command_id;	/* bits[11:0] = id; bits[15:12] = reserved */
+	uint16_t command_id;
 	uint8_t  opcode;
-	uint8_t  flags;		/* bit[0] = phase, bit[1] = ctrl_data,
-				 * bit[2] = ctrl_data_indirect */
+	uint8_t  flags;		/* bit[0]=phase, bit[1]=ctrl_data */
 } __attribute__((packed));
 
-/* CQ common descriptor (8 bytes) */
 struct ena_admin_acq_common_desc {
-	uint16_t command;	/* bits[11:0] = command_id echoed */
-	uint8_t  status;	/* 0 = success */
-	uint8_t  flags;		/* bit[0] = phase tag */
+	uint16_t command;	/* bits[11:0]=command_id echoed */
+	uint8_t  status;
+	uint8_t  flags;		/* bit[0]=phase tag */
 	uint16_t extended_status;
 	uint16_t sq_head_indx;
 } __attribute__((packed));
 
-/* AQ entry: 4-byte header + 60-byte payload = 64 bytes */
 struct ena_admin_aq_entry {
-	struct ena_admin_aq_common_desc common;	/* 4 bytes */
+	struct ena_admin_aq_common_desc common;
 	uint8_t                         payload[60];
 } __attribute__((packed));
 
-/* CQ entry: 8-byte header + 56-byte payload = 64 bytes */
 struct ena_admin_acq_entry {
-	struct ena_admin_acq_common_desc common;	/* 8 bytes */
+	struct ena_admin_acq_common_desc common;
 	uint8_t                          payload[56];
 } __attribute__((packed));
 
-/* AENQ entry: 64 bytes */
 struct ena_aenq_entry {
 	uint16_t group;
 	uint16_t syndrome;
-	uint8_t  flags;		/* bit[0] = phase tag */
+	uint8_t  flags;
 	uint8_t  reserved[3];
 	uint64_t timestamp_us;
-	uint8_t  payload[48];	/* 2+2+1+3+8+48 = 64 */
+	uint8_t  payload[48];
 } __attribute__((packed));
 
-/* opcodes (admin) */
+/* opcodes */
 #define ENA_ADMIN_OP_CREATE_SQ		1
 #define ENA_ADMIN_OP_DESTROY_SQ		2
 #define ENA_ADMIN_OP_CREATE_CQ		3
 #define ENA_ADMIN_OP_DESTROY_CQ		4
 #define ENA_ADMIN_OP_GET_FEATURE	8
 #define ENA_ADMIN_OP_SET_FEATURE	9
-#define ENA_ADMIN_OP_GET_STATS		11
 
 /* Feature IDs */
 #define ENA_ADMIN_FEAT_DEVICE_ATTRIBUTES	1
 #define ENA_ADMIN_FEAT_MAX_QUEUES_NUM		2
-#define ENA_ADMIN_FEAT_HW_HINTS			3
 #define ENA_ADMIN_FEAT_LLQ			4
-#define ENA_ADMIN_FEAT_MTU			14
 #define ENA_ADMIN_FEAT_HOST_ATTR_CONFIG		16
 
-/* Control-buffer descriptor: 12 bytes
- *   u32 length
- *   u32 mem_addr_lo
- *   u16 mem_addr_hi
- *   u16 reserved
- * Used in inline GET/SET_FEATURE commands when ctrl_data=0 (no buffer). */
-struct ena_admin_ctrl_buff {
-	uint32_t length;
-	uint32_t mem_addr_lo;
-	uint16_t mem_addr_hi;
-	uint16_t reserved;
-} __attribute__((packed));
-
-/* GET_FEATURE / SET_FEATURE feature selector: 4 bytes
- *   u8  flags        (bit[0] = relative_feat_id, bit[1] = vf_exist)
- *   u8  feature_id   (ENA_ADMIN_FEAT_*)
- *   u16 feature_version
- */
 struct ena_admin_feat_common {
 	uint8_t  flags;
 	uint8_t  feature_id;
 	uint16_t feature_version;
 } __attribute__((packed));
 
-/* GET_FEATURE(DEVICE_ATTRIBUTES) response payload layout (56 bytes max in
- * ACQ payload).  Starts at payload[0] of the ACQ entry. */
 struct ena_admin_get_feat_dev_attr {
 	uint32_t impl_id;
 	uint32_t device_version;
@@ -203,25 +171,13 @@ struct ena_admin_get_feat_dev_attr {
 	uint32_t max_mtu;
 } __attribute__((packed));
 
-/* MMIO register read-less response buffer (8 bytes, one entry).
- * The device DMA-writes the response here when we trigger an indirect
- * read via ENA_REG_MMIO_REG_READ.  Layout from ena_admin_defs.h:
- *   u16 req_id     -- echoes the seq number we sent
- *   u16 reg_off    -- echoes the register offset
- *   u32 reg_val    -- the register value
- * See ena_com.c::ena_com_mmio_reg_read_request_init. */
 struct ena_mmio_read_resp {
 	uint16_t req_id;
 	uint16_t reg_off;
 	uint32_t reg_val;
 } __attribute__((packed));
 
-/* ---- I/O queue descriptors ----
- *
- * TX SQ descriptor: 16 bytes.
- * RX SQ descriptor: 16 bytes.
- * Completion (CQ) descriptor: 16 bytes, with phase bit in flags.
- */
+/* ---- I/O queue descriptors ---- */
 
 #define ENA_TX_CTRL_FIRST	(1u << 7)
 #define ENA_TX_CTRL_LAST	(1u << 6)
@@ -230,14 +186,14 @@ struct ena_mmio_read_resp {
 struct ena_io_tx_desc {
 	uint16_t length;
 	uint8_t  reserved;
-	uint8_t  ctrl;		/* FIRST | LAST | COMP_REQ */
+	uint8_t  ctrl;
 	uint16_t req_id;
 	uint8_t  reserved2[2];
 	uint64_t buff_addr;
 } __attribute__((packed));
 
 struct ena_io_rx_desc {
-	uint16_t length;	/* buffer capacity */
+	uint16_t length;
 	uint16_t req_id;
 	uint8_t  reserved[4];
 	uint64_t buff_addr;
@@ -246,10 +202,91 @@ struct ena_io_rx_desc {
 struct ena_io_cdesc {
 	uint16_t req_id;
 	uint8_t  status;
-	uint8_t  flags;		/* bit[0] = phase tag */
+	uint8_t  flags;		/* bit[0]=phase tag */
 	uint16_t length;	/* RX: actual bytes received */
 	uint8_t  reserved[10];
 } __attribute__((packed));
+
+/* ---- Ethernet + ARP ---- */
+
+struct ena_ether_hdr {
+	uint8_t  dst[6];
+	uint8_t  src[6];
+	uint16_t ethertype;	/* big-endian */
+} __attribute__((packed));
+
+struct ena_arp_pkt {
+	uint16_t hw_type;
+	uint16_t proto_type;
+	uint8_t  hw_len;
+	uint8_t  proto_len;
+	uint16_t opcode;
+	uint8_t  sender_mac[6];
+	uint8_t  sender_ip[4];
+	uint8_t  target_mac[6];
+	uint8_t  target_ip[4];
+} __attribute__((packed));
+
+#define ENA_ETH_HDR_LEN		14
+#define ENA_ETHERTYPE_IPV4	0x0800
+#define ENA_ETHERTYPE_ARP	0x0806
+#define ENA_ARP_REQUEST		1
+#define ENA_ARP_REPLY		2
+
+/* ---- DHCP structures ---- */
+
+#define DHCP_OP_BOOTREQUEST	1
+#define DHCP_OP_BOOTREPLY	2
+#define DHCP_HTYPE_ETHER	1
+#define DHCP_HLEN_ETHER		6
+#define DHCP_MAGIC		0x63825363u
+
+#define DHCP_MSG_DISCOVER	1
+#define DHCP_MSG_OFFER		2
+#define DHCP_MSG_REQUEST	3
+#define DHCP_MSG_ACK		5
+
+#define DHCP_OPT_PAD		0
+#define DHCP_OPT_SUBNET		1
+#define DHCP_OPT_ROUTER		3
+#define DHCP_OPT_REQ_IP		50
+#define DHCP_OPT_MSG_TYPE	53
+#define DHCP_OPT_SERVER_ID	54
+#define DHCP_OPT_PARAM_LIST	55
+#define DHCP_OPT_END		255
+
+#define DHCP_CLIENT_PORT	68
+#define DHCP_SERVER_PORT	67
+#define IPPROTO_UDP		17
+#define IPV4_HDR_LEN		20
+#define UDP_HDR_LEN		8
+
+struct dhcp_pkt {
+	uint8_t  op;
+	uint8_t  htype;
+	uint8_t  hlen;
+	uint8_t  hops;
+	uint32_t xid;
+	uint16_t secs;
+	uint16_t flags;
+	uint32_t ciaddr;
+	uint32_t yiaddr;
+	uint32_t siaddr;
+	uint32_t giaddr;
+	uint8_t  chaddr[16];
+	uint8_t  sname[64];
+	uint8_t  file[128];
+	uint32_t magic;
+	uint8_t  options[312];
+} __attribute__((packed));
+
+enum {
+	DHCP_INIT,
+	DHCP_WAIT_OFFER,
+	DHCP_WAIT_ACK,
+	DHCP_BOUND,
+	DHCP_FAILED,
+};
 
 /* ---- Driver state ---- */
 
@@ -273,9 +310,6 @@ struct ena_io_q {
 struct ena_dev {
 	volatile uint8_t *regs;
 
-	/* MMIO read-less mechanism: device DMA-writes register values here.
-	 * Allocated in ena_mmio_read_init(); NULL until then (callers fall
-	 * back to direct r32 while it's unset). */
 	struct ena_mmio_read_resp  *mmio_resp;
 	uint16_t                    mmio_seq;
 
@@ -292,14 +326,33 @@ struct ena_dev {
 
 	uint8_t  mac[6];
 	uint32_t max_mtu;
-	uint32_t max_io_queues;
+	uint32_t max_sq_depth;	/* from GET_FEATURE(MAX_QUEUES) */
+	int      use_llq;	/* placement_policy: 1=host_mem 3=LLQ */
 
 	struct ena_io_q tx;
 	struct ena_io_q rx;
 
 	void    *rx_bufs[ENA_IOQ_DEPTH];
+	void    *tx_bufs[ENA_IOQ_DEPTH];	/* bounce buffers; freed on TX CQ */
 
-	struct netif nif;
+	/* Ethernet/IP addressing */
+	uint32_t ip;
+	uint32_t netmask;
+	uint32_t gateway;
+	uint8_t  arp_gw_mac[6];
+	int      arp_gw_have;
+
+	/* DHCP state machine */
+	int      dhcp_state;
+	uint32_t dhcp_xid;
+	uint32_t dhcp_offer_ip;
+	uint32_t dhcp_offer_netmask;
+	uint32_t dhcp_offer_gw;
+	uint32_t dhcp_offer_server;
+
+	/* STREAMS */
+	struct stdata *ena_sd;	/* set by wire_ena_into_ip */
+	struct netif   nif;
 };
 
 static struct ena_dev g_ena;
@@ -316,18 +369,8 @@ static void w32(volatile uint8_t *base, unsigned off, uint32_t v)
 	*(volatile uint32_t *)(base + off) = v;
 }
 
-/* ---- MMIO read-less: indirect register read ----
- *
- * The ENA spec (ena_regs_defs.h / ena_com.c) warns that direct BAR
- * reads of control registers may return stale values on some Nitro
- * firmware versions.  The preferred path is:
- *   1. Host writes the response-buffer PA to MMIO_RESP_LO/HI once.
- *   2. For each read: write (reg_off<<16 | seq) to MMIO_REG_READ.
- *   3. Device DMA-writes an 8-byte record (req_id, reg_off, reg_val)
- *      into the response buffer; host polls req_id for the match.
- * Falls back to direct r32 when mmio_resp is unset (early init) or
- * if the device times out (1 ms). */
-#define ENA_RESET_CAPS_MAX_UNITS	40	/* 4 s hard cap */
+/* ---- MMIO read-less mechanism ---- */
+#define ENA_RESET_CAPS_MAX_UNITS	40
 
 static void ena_mmio_read_init(struct ena_dev *d)
 {
@@ -351,15 +394,12 @@ static uint32_t ena_r32(struct ena_dev *d, uint16_t off)
 	uint16_t seq = d->mmio_seq++;
 	if (d->mmio_seq == 0) d->mmio_seq = 1;
 
-	/* Invalidate the response buffer so we see the device's DMA write. */
 	__asm__ volatile ("dc ivac, %0\n\t" "dsb sy\n\t"
 			  :: "r"(d->mmio_resp) : "memory");
 
-	/* Trigger: bits[15:0] = req_id, bits[31:16] = reg_off. */
 	w32(d->regs, ENA_REG_MMIO_REG_READ,
 	    (uint32_t)seq | ((uint32_t)off << 16));
 
-	/* Poll for completion (1 ms using the AArch64 generic counter). */
 	uint64_t freq, start, deadline;
 	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
 	__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
@@ -373,35 +413,11 @@ static uint32_t ena_r32(struct ena_dev *d, uint16_t off)
 		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
 		if (now >= deadline) break;
 	}
-	return r32(d->regs, off);	/* timeout fallback */
+	return r32(d->regs, off);
 }
 
-/* ---- Reset ----
- *
- * Linux driver sequence (ena_com.c ena_com_dev_reset):
- *   1. Check DEV_STS.READY -- must be set before we can reset.
- *   2. Read CAPS bits[5:1] to get the device-advertised reset timeout
- *      (each unit = 100 ms).
- *   3. Write DEV_CTL = RESET | (NORMAL_REASON << 28).  Write twice;
- *      the second write is required by the spec.
- *   4. Poll DEV_STS.RESET_IN_PROGRESS (bit 3).
- *   5. Poll DEV_STS.RESET_FINISHED (bit 4) -- takes up to
- *      caps_timeout × 100 ms.
- *   6. Clear DEV_CTL.
- *   7. Poll DEV_STS.READY (bit 0).
- *
- * Timing: uses CNTPCT_EL0 + CNTFRQ_EL0 for wall-clock correctness.
- * Spin-count estimation was unreliable because MMIO read latency on
- * Nitro varies; real-time polling removes the uncertainty entirely.
- *
- * Prior-reset handling: when the previous OS boot left a reset in
- * progress (STS has RESET_IN_PROGRESS set at entry), we wait for it
- * to finish before triggering a new one.  Stacking resets confuses
- * the ENA firmware and guarantees RESET_FINISHED never appears. */
+/* ---- Reset ---- */
 
-/* Poll DEV_STS (via indirect read) until (sts & mask)==expected.
- * Returns the matching sts value on success, -1 on FATAL_ERROR,
- * -2 on timeout. */
 static int wait_dev_sts_ms(struct ena_dev *d, uint32_t mask,
 			   uint32_t expected, unsigned ms)
 {
@@ -434,10 +450,6 @@ static int ena_reset(struct ena_dev *d)
 
 	uint32_t s = ena_r32(d, ENA_REG_DEV_STS);
 
-	/* If a prior boot left RESET_IN_PROGRESS, the previous OS wrote
-	 * DEV_CTL=RESET and then crashed before clearing it.  The device is
-	 * waiting for DEV_CTL to be cleared before it can finish.  Clear
-	 * DEV_CTL first, then wait for RESET_IN_PROGRESS to go away. */
 	if (s & ENA_DEV_STS_RESET_IN_PROGRESS) {
 		kprintf("ena: prior reset in progress (STS=0x%x), clearing CTL\n", s);
 		w32(d->regs, ENA_REG_DEV_CTL, 0);
@@ -461,10 +473,6 @@ static int ena_reset(struct ena_dev *d)
 		}
 	}
 
-	/* Write reset command once.  Immediately re-write the MMIO response
-	 * buffer address: the device loses its DMA config when it sees the
-	 * reset bit and will not respond to indirect reads until we re-arm it.
-	 * (Linux: writel(reset_val); ena_com_mmio_reg_read_request_write_dev_addr) */
 	w32(d->regs, ENA_REG_DEV_CTL, ENA_DEV_CTL_RESET);
 	if (d->mmio_resp) {
 		uint64_t pa = (uint64_t)(uintptr_t)d->mmio_resp;
@@ -472,12 +480,11 @@ static int ena_reset(struct ena_dev *d)
 		w32(d->regs, ENA_REG_MMIO_RESP_HI, (uint32_t)(pa >> 32));
 	}
 
-	/* Step 1: wait for RESET_IN_PROGRESS to set (device acks). */
 	{
 		uint64_t freq, start, deadline;
 		__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
 		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
-		deadline = start + (freq / 1000ULL) * 1000ULL;   /* 1s */
+		deadline = start + (freq / 1000ULL) * 1000ULL;
 		for (;;) {
 			s = ena_r32(d, ENA_REG_DEV_STS);
 			if (s & ENA_DEV_STS_RESET_IN_PROGRESS) break;
@@ -494,23 +501,19 @@ static int ena_reset(struct ena_dev *d)
 		}
 	}
 
-	/* Step 2: clear DEV_CTL first, THEN wait for RESET_IN_PROGRESS to
-	 * clear.  Linux: writel(0, DEV_CTL); wait_for_reset_state(0).
-	 * The device will not complete reset until we release the reset bit. */
 	w32(d->regs, ENA_REG_DEV_CTL, 0);
 
 	int rc = wait_dev_sts_ms(d, ENA_DEV_STS_RESET_IN_PROGRESS,
 				 0, timeout_ms);
 	if (rc < 0) {
-		kprintf("ena: reset timed out (RESET_IN_PROGRESS stuck, "
-			"STS=0x%x after %ums)\n",
+		kprintf("ena: reset timed out (STS=0x%x after %ums)\n",
 			ena_r32(d, ENA_REG_DEV_STS), timeout_ms);
 		return -1;
 	}
 
 	rc = wait_dev_sts_ms(d, ENA_DEV_STS_READY, ENA_DEV_STS_READY, timeout_ms);
 	if (rc < 0) {
-		kprintf("ena: timed out waiting for READY after reset (STS=0x%x)\n",
+		kprintf("ena: timed out waiting for READY (STS=0x%x)\n",
 			ena_r32(d, ENA_REG_DEV_STS));
 		return -1;
 	}
@@ -534,7 +537,7 @@ static int ena_admin_init(struct ena_dev *d)
 	kmemset(d->aenq, 0, 4096);
 	d->aq_tail     = 0;
 	d->acq_head    = 0;
-	d->acq_phase   = 1;	/* expected phase from device starts at 1 */
+	d->acq_phase   = 1;
 	d->aq_phase    = 0;
 	d->aenq_head   = 0;
 	d->aenq_phase  = 1;
@@ -560,21 +563,12 @@ static int ena_admin_init(struct ena_dev *d)
 	    ENA_QCAPS(ENA_AQ_DEPTH, sizeof(struct ena_aenq_entry)));
 	w32(d->regs, ENA_REG_AENQ_TAIL, 0);
 
-	/* Mask all interrupts; driver polls. */
 	w32(d->regs, ENA_REG_INTR_MASK, 0xFFFFFFFFu);
 	return 0;
 }
 
-/* Submit one admin command, poll the ACQ for the matching CQE.
- * Copies the 56-byte ACQ response payload into `resp` if non-NULL.
- * Returns 0 on status==0, -1 otherwise.
- *
- * Phase protocol:
- *   SQ: we toggle aq_phase on every depth wrap and set it in flags[0].
- *   CQ: device toggles phase on every depth wrap; we compare flags[0].
- */
-/* Returns 0 on success, device status code (>0) on device error,
- * -1 on admin queue timeout. */
+/* Submit one admin command; poll ACQ for the matching CQE.
+ * Returns 0 on success, device status (>0) on device error, -1 on timeout. */
 static int ena_admin_submit(struct ena_dev *d,
 			    struct ena_admin_aq_entry *cmd,
 			    void *resp)
@@ -584,7 +578,6 @@ static int ena_admin_submit(struct ena_dev *d,
 	struct ena_admin_aq_entry *slot = &d->aq[d->aq_tail];
 	*slot = *cmd;
 	slot->common.command_id = cmd_id;
-	/* Set phase bit in SQ entry flags. */
 	slot->common.flags = (uint8_t)((slot->common.flags & ~1u) | d->aq_phase);
 
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -596,10 +589,6 @@ static int ena_admin_submit(struct ena_dev *d,
 	}
 	w32(d->regs, ENA_REG_AQ_DB, d->aq_tail);
 
-	/* Poll CQ for the matching response.  Phase bit is in flags[0] of
-	 * the ACQ common descriptor, NOT in command[12].
-	 * Hard timeout: 5 s via CNTPCT_EL0 to avoid infinite spin on a
-	 * broken admin queue. */
 	uint64_t _freq, _start, _deadline;
 	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(_freq));
 	__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(_start));
@@ -624,32 +613,31 @@ static int ena_admin_submit(struct ena_dev *d,
 		uint64_t _now;
 		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(_now));
 		if (_now >= _deadline) {
-			kprintf("ena: admin cmd %u timeout (opcode=%u, "
-				"acq_head=%u phase=%u cid=%u)\n",
-				cmd_id, cmd->common.opcode,
-				d->acq_head, phase, cid);
+			kprintf("ena: admin cmd %u timeout (opcode=%u)\n",
+				cmd_id, cmd->common.opcode);
 			return -1;
 		}
 	}
 }
 
-/* ---- GET_FEATURE(DEVICE_ATTRIBUTES) ---- */
+/* Helper: build a GET_FEATURE or SET_FEATURE command skeleton. */
+static void ena_feat_cmd(struct ena_admin_aq_entry *cmd,
+			 uint8_t opcode, uint8_t feat_id)
+{
+	kmemset(cmd, 0, sizeof(*cmd));
+	cmd->common.opcode = opcode;
+	struct ena_admin_feat_common *fc =
+		(struct ena_admin_feat_common *)(cmd->payload + 12);
+	fc->feature_id = feat_id;
+}
+
+/* ---- E1: Admin hardening ---- */
 
 static int ena_get_dev_attr(struct ena_dev *d)
 {
 	struct ena_admin_aq_entry cmd;
-	kmemset(&cmd, 0, sizeof(cmd));
-	cmd.common.opcode = ENA_ADMIN_OP_GET_FEATURE;
+	ena_feat_cmd(&cmd, ENA_ADMIN_OP_GET_FEATURE, ENA_ADMIN_FEAT_DEVICE_ATTRIBUTES);
 
-	/* GET_FEATURE layout (offsets within the 60-byte payload):
-	 *   [0..11]  ctrl_buff (length=0, addr=0 for inline request)
-	 *   [12..15] feat_common: flags(1), feature_id(1), version(2)
-	 * feature_id is at payload[13]. */
-	struct ena_admin_feat_common *fc =
-		(struct ena_admin_feat_common *)(cmd.payload + 12);
-	fc->feature_id = ENA_ADMIN_FEAT_DEVICE_ATTRIBUTES;
-
-	/* Response payload is 56 bytes; struct is 36 -- use a full-size buffer. */
 	union {
 		struct ena_admin_get_feat_dev_attr dev_attr;
 		uint8_t raw[56];
@@ -667,48 +655,109 @@ static int ena_get_dev_attr(struct ena_dev *d)
 		d->mac[0], d->mac[1], d->mac[2],
 		d->mac[3], d->mac[4], d->mac[5],
 		d->max_mtu);
-	d->max_io_queues = 1;
 	return 0;
 }
 
-/* ---- I/O queue creation (CREATE_CQ then CREATE_SQ) ----
- *
- * Struct layouts verified against torvalds/linux
- * drivers/net/ethernet/amazon/ena/ena_admin_defs.h.
- *
- * CREATE_CQ payload (ena_admin_aq_create_cq_cmd, after 4-byte common):
- *   byte  0     cq_caps_1: bit5=interrupt_mode_enabled (0=polling)
- *   byte  1     cq_caps_2: bits[4:0]=entry_size_words (4=16-byte entries)
- *   bytes 2-3   cq_depth (u16, power of 2)
- *   bytes 4-7   msix_vector (u32, 0=none)
- *   bytes 8-11  cq_ba.mem_addr_low (u32)
- *   bytes 12-13 cq_ba.mem_addr_high (u16, upper 16 bits of 48-bit PA)
- *   bytes 14-15 cq_ba.reserved16 = 0
- *
- * CREATE_CQ response (ena_admin_acq_create_cq_resp_desc, after 8-byte common):
- *   bytes 0-1   cq_idx (u16)
- *   bytes 2-3   cq_actual_depth (u16)
- *   bytes 4-7   numa_node_register_offset (u32)
- *   bytes 8-11  cq_head_db_register_offset (u32)  <-- this is the doorbell
- *   bytes 12-15 cq_interrupt_unmask_register_offset (u32)
- *
- * CREATE_SQ payload (ena_admin_aq_create_sq_cmd, after 4-byte common):
- *   byte  0     sq_identity: bits[7:5]=sq_direction (0x1=TX, 0x2=RX)
- *   byte  1     reserved
- *   byte  2     sq_caps_2: bits[3:0]=placement_policy (0=host mem)
- *   byte  3     sq_caps_3: bit[0]=is_physically_contiguous (1)
- *   bytes 4-5   cq_idx (u16)
- *   bytes 6-7   sq_depth (u16)
- *   bytes 8-11  sq_ba.mem_addr_low (u32)
- *   bytes 12-13 sq_ba.mem_addr_high (u16)
- *   bytes 14-15 sq_ba.reserved16 = 0
- *   bytes 16-23 sq_head_writeback (0 = no writeback)
- *
- * CREATE_SQ response (ena_admin_acq_create_sq_resp_desc, after 8-byte common):
- *   bytes 0-1   sq_idx (u16)
- *   bytes 2-3   reserved (u16)
- *   bytes 4-7   sq_doorbell_offset (u32)
- */
+static int ena_get_max_queues(struct ena_dev *d)
+{
+	struct ena_admin_aq_entry cmd;
+	ena_feat_cmd(&cmd, ENA_ADMIN_OP_GET_FEATURE, ENA_ADMIN_FEAT_MAX_QUEUES_NUM);
+
+	uint8_t resp[56];
+	kmemset(resp, 0, sizeof(resp));
+	int rc = ena_admin_submit(d, &cmd, resp);
+	if (rc != 0) {
+		kprintf("ena: GET_FEATURE(MAX_QUEUES) failed (status=%d), "
+			"using defaults\n", rc);
+		d->max_sq_depth = ENA_IOQ_DEPTH;
+		return 0;
+	}
+
+	/* Response layout (ena_admin_get_feat_max_queue_ex):
+	 *   [0..3]  max_sq_num      (u32)
+	 *   [4..7]  max_sq_depth    (u32)
+	 *   [8..11] max_cq_num      (u32)
+	 *   [12..15] max_cq_depth   (u32) */
+	uint32_t max_sq_depth = *(uint32_t *)(resp + 4);
+	if (max_sq_depth == 0) max_sq_depth = ENA_IOQ_DEPTH;
+	d->max_sq_depth = max_sq_depth < ENA_IOQ_DEPTH ?
+			  max_sq_depth : ENA_IOQ_DEPTH;
+	kprintf("ena: max_sq_depth %u (clamped to %u)\n",
+		max_sq_depth, d->max_sq_depth);
+	return 0;
+}
+
+static int ena_get_llq(struct ena_dev *d)
+{
+	struct ena_admin_aq_entry cmd;
+	ena_feat_cmd(&cmd, ENA_ADMIN_OP_GET_FEATURE, ENA_ADMIN_FEAT_LLQ);
+
+	uint8_t resp[56];
+	kmemset(resp, 0, sizeof(resp));
+	int rc = ena_admin_submit(d, &cmd, resp);
+	if (rc != 0) {
+		/* LLQ not supported — use host memory placement. */
+		d->use_llq = 0;
+		kprintf("ena: LLQ not supported, using host memory placement\n");
+		return 0;
+	}
+
+	/* ena_admin_get_feat_llq response [0..3]: supported_feat bitmask.
+	 * bit 0 = LLQ entries supported.  If zero, fall back to host memory. */
+	uint32_t llq_feat = *(uint32_t *)(resp + 0);
+	d->use_llq = (llq_feat & 0x1) ? 1 : 0;
+	kprintf("ena: LLQ %s\n", d->use_llq ? "enabled" : "not supported");
+	return 0;
+}
+
+static int ena_set_host_attr(struct ena_dev *d)
+{
+	/* Allocate a 4 KB host-attributes page.
+	 * Layout (ena_admin_host_info):
+	 *   [0..3]   os_type   (u32): 4 = Generic/Other
+	 *   [4..255] os_dist_str (252 bytes, NUL-terminated)
+	 *   ...      rest zeroed
+	 * Required by some Nitro firmware before I/O queue creation. */
+	void *ha = pmm_alloc();
+	if (!ha) {
+		kprintf("ena: pmm_alloc failed for host attr\n");
+		return -1;
+	}
+	kmemset(ha, 0, 4096);
+	*(uint32_t *)ha = 4;	/* os_type = Generic */
+
+	struct ena_admin_aq_entry cmd;
+	ena_feat_cmd(&cmd, ENA_ADMIN_OP_SET_FEATURE, ENA_ADMIN_FEAT_HOST_ATTR_CONFIG);
+
+	uint64_t ha_pa = (uint64_t)(uintptr_t)ha;
+	/* SET_FEATURE(HOST_ATTR_CONFIG) payload:
+	 *   [0..3]  ctrl_buff length (0 for inline)
+	 *   [4..7]  ctrl_buff addr_lo
+	 *   [8..9]  ctrl_buff addr_hi
+	 *   [12..15] feat_common (already set by ena_feat_cmd)
+	 *   [16..19] os_info_ba.addr_lo
+	 *   [20..21] os_info_ba.addr_hi */
+	*(uint32_t *)(cmd.payload + 16) = (uint32_t)ha_pa;
+	*(uint16_t *)(cmd.payload + 20) = (uint16_t)(ha_pa >> 32);
+
+	__asm__ volatile ("dc cvac, %0\n\t" "dsb sy\n\t" :: "r"(ha) : "memory");
+
+	uint8_t resp[56];
+	kmemset(resp, 0, sizeof(resp));
+	int rc = ena_admin_submit(d, &cmd, resp);
+	if (rc != 0)
+		kprintf("ena: SET_FEATURE(HOST_ATTR_CONFIG) failed (status=%d), "
+			"continuing\n", rc);
+	else
+		kprintf("ena: host attributes configured\n");
+
+	/* Page can be freed now -- device has read it. */
+	pmm_free(ha);
+	return 0;
+}
+
+/* ---- I/O queue creation ---- */
+
 static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 			   int direction)
 {
@@ -717,12 +766,14 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 	if (!q->sq_pa || !q->cq_pa) return -1;
 	kmemset(q->sq_pa, 0, 4096);
 	kmemset(q->cq_pa, 0, 4096);
-	q->depth      = ENA_IOQ_DEPTH;
-	q->sq_tail    = 0;
-	q->cq_head    = 0;
-	q->cq_phase   = 1;
-	q->sq_phase   = 0;
-	q->next_req_id = 1;
+
+	uint32_t depth = d->max_sq_depth ? d->max_sq_depth : ENA_IOQ_DEPTH;
+	q->depth       = depth;
+	q->sq_tail     = 0;
+	q->cq_head     = 0;
+	q->cq_phase    = 1;
+	q->sq_phase    = 0;
+	q->next_req_id = 0;
 
 	struct ena_admin_aq_entry cmd;
 	uint8_t resp[56];
@@ -731,10 +782,10 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 	kmemset(&cmd, 0, sizeof(cmd));
 	cmd.common.opcode = ENA_ADMIN_OP_CREATE_CQ;
 	uint64_t cq_pa = (uint64_t)(uintptr_t)q->cq_pa;
-	cmd.payload[0] = 0;				/* cq_caps_1: polling */
-	cmd.payload[1] = 4;				/* cq_caps_2: 4 words = 16 B */
-	*(uint16_t *)(cmd.payload + 2) = (uint16_t)ENA_IOQ_DEPTH;
-	*(uint32_t *)(cmd.payload + 4) = 0;		/* msix_vector */
+	cmd.payload[0] = 0;			/* cq_caps_1: polling mode */
+	cmd.payload[1] = 4;			/* cq_caps_2: 4 words = 16-byte entries */
+	*(uint16_t *)(cmd.payload + 2) = (uint16_t)depth;
+	*(uint32_t *)(cmd.payload + 4) = 0;	/* msix_vector = none */
 	*(uint32_t *)(cmd.payload + 8) = (uint32_t)cq_pa;
 	*(uint16_t *)(cmd.payload + 12) = (uint16_t)(cq_pa >> 32);
 	kmemset(resp, 0, sizeof(resp));
@@ -747,25 +798,22 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 		}
 	}
 	uint16_t cq_id = *(uint16_t *)(resp + 0);
-	q->cq_db_off   = *(uint32_t *)(resp + 8);	/* cq_head_db_register_offset */
+	q->cq_db_off   = *(uint32_t *)(resp + 8);
 
 	/* CREATE_SQ */
 	kmemset(&cmd, 0, sizeof(cmd));
 	cmd.common.opcode = ENA_ADMIN_OP_CREATE_SQ;
 	uint64_t sq_pa = (uint64_t)(uintptr_t)q->sq_pa;
-	/* sq_identity bits[7:5]=direction; 0x1=TX, 0x2=RX */
-	cmd.payload[0] = (uint8_t)((direction + 1) << 5);
-	cmd.payload[1] = 0;			/* reserved */
-	/* sq_caps_2 bits[3:0]=placement_policy: 1=host memory */
-	cmd.payload[2] = 0x01;
-	/* sq_caps_3 bit[0]=phase_desc, bit[1]=is_physically_contiguous.
-	 * We want is_physically_contiguous=1 → bit 1 → value 0x02. */
+	cmd.payload[0] = (uint8_t)((direction + 1) << 5);  /* direction: 0x20=TX 0x40=RX */
+	cmd.payload[1] = 0;
+	/* placement_policy: use LLQ (3) if negotiated, else host memory (1) */
+	cmd.payload[2] = d->use_llq ? 0x03 : 0x01;
+	/* is_physically_contiguous: bit[1] = value 0x02 */
 	cmd.payload[3] = 0x02;
 	*(uint16_t *)(cmd.payload + 4) = cq_id;
-	*(uint16_t *)(cmd.payload + 6) = (uint16_t)ENA_IOQ_DEPTH;
+	*(uint16_t *)(cmd.payload + 6) = (uint16_t)depth;
 	*(uint32_t *)(cmd.payload + 8) = (uint32_t)sq_pa;
 	*(uint16_t *)(cmd.payload + 12) = (uint16_t)(sq_pa >> 32);
-	/* bytes 14-23: reserved + sq_head_writeback = 0 */
 	kmemset(resp, 0, sizeof(resp));
 	{
 		int rc = ena_admin_submit(d, &cmd, resp);
@@ -775,13 +823,12 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 			return -1;
 		}
 	}
-	q->sq_db_off = *(uint32_t *)(resp + 4);	/* sq_doorbell_offset */
-
+	q->sq_db_off = *(uint32_t *)(resp + 4);
 	return 0;
 }
 
-/* Pre-fill the RX submission ring with PMM-backed buffers. */
-static int ena_rx_refill(struct ena_dev *d)
+/* Pre-fill the RX SQ with PMM-backed buffers. */
+static int ena_rx_refill_all(struct ena_dev *d)
 {
 	struct ena_io_rx_desc *ring = d->rx.sq_pa;
 	for (uint32_t i = 0; i < d->rx.depth; i++) {
@@ -797,18 +844,505 @@ static int ena_rx_refill(struct ena_dev *d)
 	return 0;
 }
 
-/* ---- netif TX hook (skeleton) ---- */
-struct msgb;
-typedef struct msgb mblk_t;
-extern void freemsg(mblk_t *);
+/* ---- E2: Ethernet helpers ---- */
 
-static int ena_tx_one(struct netif *nif, mblk_t *mp)
+static void put_be16(uint8_t *p, uint16_t v)
 {
-	(void)nif;
-	if (!g_ena_init_ok) { freemsg(mp); return -1; }
-	/* TODO: build TX descriptor, ring doorbell, poll completion */
-	freemsg(mp);
+	p[0] = (uint8_t)(v >> 8);
+	p[1] = (uint8_t)(v & 0xff);
+}
+static void put_be32(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)(v >> 24);
+	p[1] = (uint8_t)(v >> 16);
+	p[2] = (uint8_t)(v >>  8);
+	p[3] = (uint8_t) v;
+}
+static uint16_t get_be16(const uint8_t *p)
+{
+	return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+static uint32_t get_be32(const uint8_t *p)
+{
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+	     | ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
+}
+
+/* ---- E3: TX ring ---- */
+
+static void ena_tx_drain(struct ena_dev *d)
+{
+	struct ena_io_q    *q     = &d->tx;
+	struct ena_io_cdesc *cring = q->cq_pa;
+
+	for (;;) {
+		struct ena_io_cdesc *c = &cring[q->cq_head % q->depth];
+		__asm__ volatile ("dc ivac, %0\n\t" "dsb sy\n\t"
+				  :: "r"(c) : "memory");
+		if ((c->flags & 1u) != q->cq_phase) break;
+
+		uint16_t rid = c->req_id;
+		unsigned slot = rid % ENA_IOQ_DEPTH;
+		if (d->tx_bufs[slot]) {
+			pmm_free(d->tx_bufs[slot]);
+			d->tx_bufs[slot] = NULL;
+		}
+		q->cq_head++;
+		if (q->cq_head % q->depth == 0) q->cq_phase ^= 1;
+		w32(d->regs, q->cq_db_off, q->cq_head);
+	}
+}
+
+static int ena_eth_tx(struct ena_dev *d, const void *frame, unsigned len)
+{
+	if (!g_ena_init_ok || len == 0 || len > ENA_RX_BUF_BYTES) return -1;
+
+	void *buf = pmm_alloc();
+	if (!buf) return -1;
+	kmemcpy(buf, frame, len);
+
+	__asm__ volatile ("dc cvac, %0\n\t" "dsb sy\n\t" :: "r"(buf) : "memory");
+
+	struct ena_io_q     *q    = &d->tx;
+	uint16_t             rid  = q->next_req_id++;
+	unsigned             slot = rid % ENA_IOQ_DEPTH;
+	d->tx_bufs[slot] = buf;
+
+	struct ena_io_tx_desc *ring = q->sq_pa;
+	struct ena_io_tx_desc *desc = &ring[q->sq_tail % q->depth];
+	desc->length    = (uint16_t)len;
+	desc->ctrl      = ENA_TX_CTRL_FIRST | ENA_TX_CTRL_LAST | ENA_TX_CTRL_COMP_REQ;
+	desc->req_id    = rid;
+	desc->buff_addr = (uint64_t)(uintptr_t)buf;
+
+	__asm__ volatile ("dc cvac, %0\n\t" "dsb sy\n\t" :: "r"(desc) : "memory");
+
+	q->sq_tail++;
+	w32(d->regs, q->sq_db_off, q->sq_tail);
+
+	ena_tx_drain(d);
 	return 0;
+}
+
+/* ---- E2: ARP ---- */
+
+static void ena_arp_send(struct ena_dev *d, int op,
+			 const uint8_t dst_mac[6],
+			 uint32_t sender_ip, uint32_t target_ip,
+			 const uint8_t target_mac[6])
+{
+	uint8_t frame[ENA_ETH_HDR_LEN + sizeof(struct ena_arp_pkt)];
+	struct ena_ether_hdr *eh = (struct ena_ether_hdr *)frame;
+	kmemcpy(eh->dst, dst_mac, 6);
+	kmemcpy(eh->src, d->mac, 6);
+	put_be16((uint8_t *)&eh->ethertype, ENA_ETHERTYPE_ARP);
+
+	struct ena_arp_pkt *a = (struct ena_arp_pkt *)(frame + ENA_ETH_HDR_LEN);
+	put_be16((uint8_t *)&a->hw_type,    1);
+	put_be16((uint8_t *)&a->proto_type, ENA_ETHERTYPE_IPV4);
+	a->hw_len    = 6;
+	a->proto_len = 4;
+	put_be16((uint8_t *)&a->opcode, (uint16_t)op);
+	kmemcpy(a->sender_mac, d->mac, 6);
+	put_be32(a->sender_ip, sender_ip);
+	if (target_mac)
+		kmemcpy(a->target_mac, target_mac, 6);
+	else
+		kmemset(a->target_mac, 0, 6);
+	put_be32(a->target_ip, target_ip);
+
+	ena_eth_tx(d, frame, sizeof(frame));
+}
+
+static void ena_arp_send_request(struct ena_dev *d, uint32_t target_ip)
+{
+	static const uint8_t bcast[6] = { 0xff,0xff,0xff,0xff,0xff,0xff };
+	ena_arp_send(d, ENA_ARP_REQUEST, bcast, d->ip, target_ip, NULL);
+}
+
+static void ena_arp_process(struct ena_dev *d,
+			    const uint8_t *frame, unsigned len)
+{
+	if (len < ENA_ETH_HDR_LEN + sizeof(struct ena_arp_pkt)) return;
+	const struct ena_arp_pkt *a =
+		(const struct ena_arp_pkt *)(frame + ENA_ETH_HDR_LEN);
+	uint16_t op  = get_be16((const uint8_t *)&a->opcode);
+	uint32_t sip = get_be32(a->sender_ip);
+	uint32_t tip = get_be32(a->target_ip);
+
+	if (op == ENA_ARP_REQUEST && tip == d->ip) {
+		ena_arp_send(d, ENA_ARP_REPLY, a->sender_mac,
+			     d->ip, sip, a->sender_mac);
+	} else if (op == ENA_ARP_REPLY && sip == d->gateway) {
+		kmemcpy(d->arp_gw_mac, a->sender_mac, 6);
+		d->arp_gw_have = 1;
+		kprintf("ena: gw mac %02x:%02x:%02x:%02x:%02x:%02x\n",
+			d->arp_gw_mac[0], d->arp_gw_mac[1], d->arp_gw_mac[2],
+			d->arp_gw_mac[3], d->arp_gw_mac[4], d->arp_gw_mac[5]);
+	}
+}
+
+/* ---- E5: DHCP ---- */
+
+static uint16_t dhcp_udp_checksum(uint32_t src_ip, uint32_t dst_ip,
+				  const uint8_t *udp, unsigned udp_len)
+{
+	uint32_t sum = 0;
+	sum += (src_ip >> 16) & 0xffff;
+	sum += src_ip & 0xffff;
+	sum += (dst_ip >> 16) & 0xffff;
+	sum += dst_ip & 0xffff;
+	sum += IPPROTO_UDP;
+	sum += udp_len;
+	for (unsigned i = 0; i + 1 < udp_len; i += 2)
+		sum += ((uint16_t)udp[i] << 8) | udp[i + 1];
+	if (udp_len & 1)
+		sum += (uint16_t)udp[udp_len - 1] << 8;
+	while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+	return (uint16_t)~sum;
+}
+
+static void dhcp_send(struct ena_dev *d, uint8_t msg_type,
+		      uint32_t req_ip, uint32_t server_id)
+{
+	uint8_t frame[ENA_ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN
+		      + sizeof(struct dhcp_pkt)];
+	kmemset(frame, 0, sizeof(frame));
+
+	struct ena_ether_hdr *eh = (struct ena_ether_hdr *)frame;
+	kmemset(eh->dst, 0xff, 6);
+	kmemcpy(eh->src, d->mac, 6);
+	put_be16((uint8_t *)&eh->ethertype, ENA_ETHERTYPE_IPV4);
+
+	uint8_t *ip = frame + ENA_ETH_HDR_LEN;
+	unsigned ip_total = IPV4_HDR_LEN + UDP_HDR_LEN + sizeof(struct dhcp_pkt);
+	ip[0] = 0x45;
+	ip[1] = 0;
+	put_be16(ip + 2, (uint16_t)ip_total);
+	put_be16(ip + 4, d->dhcp_xid & 0xffff);
+	put_be16(ip + 6, 0);
+	ip[8] = 64;
+	ip[9] = IPPROTO_UDP;
+	/* src = 0.0.0.0, dst = 255.255.255.255 */
+	put_be32(ip + 12, 0);
+	put_be32(ip + 16, 0xffffffff);
+	uint16_t iphdr_csum = ip_checksum(ip, IPV4_HDR_LEN);
+	put_be16(ip + 10, iphdr_csum);
+
+	uint8_t *udp = ip + IPV4_HDR_LEN;
+	put_be16(udp + 0, DHCP_CLIENT_PORT);
+	put_be16(udp + 2, DHCP_SERVER_PORT);
+	unsigned udp_total = UDP_HDR_LEN + sizeof(struct dhcp_pkt);
+	put_be16(udp + 4, (uint16_t)udp_total);
+
+	struct dhcp_pkt *dp = (struct dhcp_pkt *)(udp + UDP_HDR_LEN);
+	dp->op    = DHCP_OP_BOOTREQUEST;
+	dp->htype = DHCP_HTYPE_ETHER;
+	dp->hlen  = DHCP_HLEN_ETHER;
+	dp->xid   = (uint32_t)__builtin_bswap32(d->dhcp_xid);
+	dp->flags = (uint16_t)((0x80 << 8) | 0x00);  /* broadcast flag BE */
+	kmemcpy(dp->chaddr, d->mac, 6);
+	dp->magic = (uint32_t)__builtin_bswap32(DHCP_MAGIC);
+
+	uint8_t *opt = dp->options;
+	*opt++ = DHCP_OPT_MSG_TYPE;  *opt++ = 1; *opt++ = msg_type;
+	if (msg_type == DHCP_MSG_REQUEST) {
+		*opt++ = DHCP_OPT_REQ_IP;  *opt++ = 4;
+		put_be32(opt, req_ip); opt += 4;
+		*opt++ = DHCP_OPT_SERVER_ID; *opt++ = 4;
+		put_be32(opt, server_id); opt += 4;
+	}
+	*opt++ = DHCP_OPT_PARAM_LIST; *opt++ = 2;
+	*opt++ = DHCP_OPT_SUBNET; *opt++ = DHCP_OPT_ROUTER;
+	*opt++ = DHCP_OPT_END;
+
+	uint16_t udp_csum = dhcp_udp_checksum(0, 0xffffffff, udp, udp_total);
+	put_be16(udp + 6, udp_csum);
+
+	ena_eth_tx(d, frame, sizeof(frame));
+}
+
+/* Returns 1 if this frame was consumed by the DHCP state machine. */
+static int dhcp_rx_filter(struct ena_dev *d,
+			  const uint8_t *frame, unsigned len)
+{
+	if (d->dhcp_state == DHCP_BOUND || d->dhcp_state == DHCP_FAILED)
+		return 0;
+
+	/* Need at least Ethernet + IP + UDP + DHCP headers. */
+	unsigned min = ENA_ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN
+		     + sizeof(struct dhcp_pkt);
+	if (len < min) return 0;
+
+	const uint8_t *ip  = frame + ENA_ETH_HDR_LEN;
+	if ((ip[0] & 0xf0) != 0x40) return 0;
+	if (ip[9] != IPPROTO_UDP) return 0;
+
+	const uint8_t *udp = ip + IPV4_HDR_LEN;
+	if (get_be16(udp + 2) != DHCP_CLIENT_PORT) return 0;
+
+	const struct dhcp_pkt *dp =
+		(const struct dhcp_pkt *)(udp + UDP_HDR_LEN);
+	if (__builtin_bswap32(dp->magic) != DHCP_MAGIC) return 0;
+	if (__builtin_bswap32(dp->xid) != d->dhcp_xid) return 0;
+	if (dp->op != DHCP_OP_BOOTREPLY) return 0;
+
+	/* Parse options for DHCP message type. */
+	uint8_t msg_type = 0;
+	uint32_t subnet = 0, router = 0, server = 0;
+	const uint8_t *o = dp->options;
+	const uint8_t *oend = dp->options + sizeof(dp->options);
+	while (o < oend && *o != DHCP_OPT_END) {
+		uint8_t code = *o++;
+		if (code == DHCP_OPT_PAD) continue;
+		if (o >= oend) break;
+		uint8_t olen = *o++;
+		if (o + olen > oend) break;
+		if (code == DHCP_OPT_MSG_TYPE && olen >= 1)
+			msg_type = o[0];
+		else if (code == DHCP_OPT_SUBNET && olen >= 4)
+			subnet = get_be32(o);
+		else if (code == DHCP_OPT_ROUTER && olen >= 4)
+			router = get_be32(o);
+		else if (code == DHCP_OPT_SERVER_ID && olen >= 4)
+			server = get_be32(o);
+		o += olen;
+	}
+
+	uint32_t offered_ip = __builtin_bswap32(dp->yiaddr);
+
+	if (msg_type == DHCP_MSG_OFFER &&
+	    d->dhcp_state == DHCP_WAIT_OFFER) {
+		d->dhcp_offer_ip      = offered_ip;
+		d->dhcp_offer_netmask = subnet ? subnet : 0xffffff00u;
+		d->dhcp_offer_gw      = router;
+		d->dhcp_offer_server  = server;
+		d->dhcp_state         = DHCP_WAIT_ACK;
+		dhcp_send(d, DHCP_MSG_REQUEST,
+			  d->dhcp_offer_ip, d->dhcp_offer_server);
+		return 1;
+	}
+
+	if (msg_type == DHCP_MSG_ACK &&
+	    d->dhcp_state == DHCP_WAIT_ACK) {
+		d->ip       = offered_ip ? offered_ip : d->dhcp_offer_ip;
+		d->netmask  = subnet ? subnet : d->dhcp_offer_netmask;
+		d->gateway  = router ? router : d->dhcp_offer_gw;
+		d->dhcp_state = DHCP_BOUND;
+		return 1;
+	}
+
+	return 1;
+}
+
+/* ---- E4: RX path ---- */
+
+static void ena_rx_dispatch(struct ena_dev *d,
+			    const uint8_t *frame, unsigned len)
+{
+	if (len < ENA_ETH_HDR_LEN) return;
+	const struct ena_ether_hdr *eh = (const struct ena_ether_hdr *)frame;
+	uint16_t et = get_be16((const uint8_t *)&eh->ethertype);
+
+	if (et == ENA_ETHERTYPE_ARP) {
+		ena_arp_process(d, frame, len);
+		return;
+	}
+
+	if (et != ENA_ETHERTYPE_IPV4) return;
+
+	if (dhcp_rx_filter(d, frame, len)) return;
+
+	if (d->ena_sd && d->ena_sd->sd_drv_rq) {
+		unsigned plen = len - ENA_ETH_HDR_LEN;
+		mblk_t *mp = allocb(plen, 0);
+		if (mp) {
+			kmemcpy(mp->b_wptr, frame + ENA_ETH_HDR_LEN, plen);
+			mp->b_wptr += plen;
+			mp->b_datap->db_type = M_DATA;
+			queue_t *rq = d->ena_sd->sd_drv_rq;
+			if (rq && rq->q_next)
+				putnext(rq, mp);
+			else
+				freemsg(mp);
+		}
+	}
+}
+
+static void ena_rx_repost(struct ena_dev *d, unsigned slot)
+{
+	struct ena_io_rx_desc *ring = d->rx.sq_pa;
+	ring[slot].length    = ENA_RX_BUF_BYTES;
+	ring[slot].req_id    = (uint16_t)slot;
+	ring[slot].buff_addr = (uint64_t)(uintptr_t)d->rx_bufs[slot];
+
+	__asm__ volatile ("dc cvac, %0\n\t" "dsb sy\n\t"
+			  :: "r"(&ring[slot]) : "memory");
+
+	d->rx.sq_tail++;
+	w32(d->regs, d->rx.sq_db_off, d->rx.sq_tail);
+}
+
+/* Poll one RX CQ entry.  Returns 1 if a packet was processed, 0 if ring empty. */
+static int ena_rx_poll_one(struct ena_dev *d)
+{
+	struct ena_io_q     *q     = &d->rx;
+	struct ena_io_cdesc *cring = q->cq_pa;
+	struct ena_io_cdesc *c     = &cring[q->cq_head % q->depth];
+
+	__asm__ volatile ("dc ivac, %0\n\t" "dsb sy\n\t"
+			  :: "r"(c) : "memory");
+	if ((c->flags & 1u) != q->cq_phase) return 0;
+
+	uint16_t rid   = c->req_id;
+	uint16_t rxlen = c->length;
+	unsigned slot  = rid % ENA_IOQ_DEPTH;
+	void    *buf   = d->rx_bufs[slot];
+
+	if (rxlen > 0 && rxlen <= ENA_RX_BUF_BYTES && buf) {
+		__asm__ volatile ("dc ivac, %0\n\t" "dsb sy\n\t"
+				  :: "r"(buf) : "memory");
+		ena_rx_dispatch(d, (const uint8_t *)buf, rxlen);
+	}
+
+	q->cq_head++;
+	if (q->cq_head % q->depth == 0) q->cq_phase ^= 1;
+	w32(d->regs, q->cq_db_off, q->cq_head);
+
+	ena_rx_repost(d, slot);
+	return 1;
+}
+
+static void ena_rx_thread(void *arg)
+{
+	struct ena_dev *d = arg;
+	for (;;) {
+		int drained = 0;
+		while (ena_rx_poll_one(d)) drained++;
+		if (!drained) kthread_yield();
+	}
+}
+
+/* ---- E5: DHCP run ---- */
+
+static int ena_dhcp_run(struct ena_dev *d)
+{
+	d->dhcp_xid   = 0xd1a10001u;	/* fixed seed; fine for single NIC */
+	d->dhcp_state = DHCP_WAIT_OFFER;
+	dhcp_send(d, DHCP_MSG_DISCOVER, 0, 0);
+
+	uint64_t freq, start, deadline;
+	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+	__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
+	deadline = start + freq * 10ULL;	/* 10-second timeout */
+
+	while (d->dhcp_state != DHCP_BOUND &&
+	       d->dhcp_state != DHCP_FAILED) {
+		ena_rx_poll_one(d);
+		uint64_t now;
+		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+		if (now >= deadline) {
+			d->dhcp_state = DHCP_FAILED;
+			break;
+		}
+	}
+	return d->dhcp_state == DHCP_BOUND;
+}
+
+/* ---- E6: STREAMS personality ---- */
+
+static int ena_wq_putp(queue_t *q, mblk_t *mp)
+{
+	(void)q;
+	if (!mp) return 0;
+	if (mp->b_datap->db_type != M_DATA) { freemsg(mp); return 0; }
+
+	unsigned plen = (unsigned)msgdsize(mp);
+	if (plen == 0 || plen > (unsigned)g_ena.nif.mtu) {
+		freemsg(mp); return -1;
+	}
+
+	if (!g_ena.arp_gw_have) {
+		ena_arp_send_request(&g_ena, g_ena.gateway);
+		freemsg(mp);
+		return 0;
+	}
+
+	uint8_t frame[ENA_ETH_HDR_LEN + 1500];
+	struct ena_ether_hdr *eh = (struct ena_ether_hdr *)frame;
+	kmemcpy(eh->dst, g_ena.arp_gw_mac, 6);
+	kmemcpy(eh->src, g_ena.mac, 6);
+	put_be16((uint8_t *)&eh->ethertype, ENA_ETHERTYPE_IPV4);
+
+	unsigned char *p = frame + ENA_ETH_HDR_LEN;
+	for (mblk_t *m = mp; m; m = m->b_cont) {
+		unsigned n = (unsigned)(m->b_wptr - m->b_rptr);
+		if (n) { kmemcpy(p, m->b_rptr, n); p += n; }
+	}
+	freemsg(mp);
+
+	return ena_eth_tx(&g_ena, frame, ENA_ETH_HDR_LEN + plen);
+}
+
+static int ena_rq_putp(queue_t *q, mblk_t *mp)
+{
+	return putnext(q, mp);
+}
+
+static int ena_qopen(queue_t *rq)
+{
+	(void)rq;
+	return 0;
+}
+
+static struct module_info ena_minfo = {
+	.mi_idnum  = 2001,
+	.mi_idname = "ena0",
+	.mi_minpsz = 0,
+	.mi_maxpsz = 1500,
+	.mi_hiwat  = 32768,
+	.mi_lowat  = 8192,
+};
+
+static struct qinit ena_rinit = {
+	.qi_putp  = ena_rq_putp,
+	.qi_qopen = ena_qopen,
+	.qi_minfo = &ena_minfo,
+};
+static struct qinit ena_winit = {
+	.qi_putp  = ena_wq_putp,
+	.qi_minfo = &ena_minfo,
+};
+static struct streamtab ena_streamtab = {
+	.st_rdinit = &ena_rinit,
+	.st_wrinit = &ena_winit,
+};
+
+/* ---- E7: IP wire-up ---- */
+
+static void wire_ena_into_ip(struct ena_dev *d)
+{
+	struct stdata *sd = stream_build_kernel(&ena_streamtab, "ena0_drv", 0);
+	if (!sd) {
+		kprintf("ena: stream_build_kernel failed\n");
+		return;
+	}
+	d->ena_sd = sd;
+
+	d->nif.name      = "eth0";
+	d->nif.ip        = d->ip;
+	d->nif.netmask   = d->netmask;
+	d->nif.mtu       = (d->max_mtu < 1500) ? d->max_mtu : 1500;
+	d->nif.streamtab = NULL;	/* pre-built stream via ip_attach_stream */
+	d->nif.tx        = NULL;
+	netif_register(&d->nif);
+
+	long muxid = ip_attach_stream(sd, &d->nif);
+	if (muxid <= 0) {
+		kprintf("ena: ip_attach_stream failed rc=%ld\n", muxid);
+		return;
+	}
+	kprintf("ena: linked under IP muxid=%ld\n", muxid);
 }
 
 /* ---- Probe + top-level init ---- */
@@ -848,10 +1382,6 @@ void ena_init(void)
 	mmu_map_device_1gb(bar0_pa);
 	d->regs = (volatile uint8_t *)(uintptr_t)bar0_pa;
 
-	/* Set up the MMIO read-less mechanism before any register reads so
-	 * that control-register reads (CAPS, DEV_STS) go through the DMA
-	 * path and are not affected by any direct-read stale-value quirks
-	 * in the Nitro ENA firmware. */
 	ena_mmio_read_init(d);
 
 	uint32_t ver  = ena_r32(d, ENA_REG_VERSION);
@@ -860,20 +1390,33 @@ void ena_init(void)
 	kprintf("ena: bar0 0x%lx  ver 0x%x  ctrl-ver 0x%x  sts 0x%x\n",
 		bar0_pa, ver, cver, sts);
 
-	if (ena_reset(d)               < 0) return;
-	if (ena_admin_init(d)          < 0) return;
-	if (ena_get_dev_attr(d)        < 0) return;
+	if (ena_reset(d)           < 0) return;
+	if (ena_admin_init(d)      < 0) return;
+	if (ena_get_dev_attr(d)    < 0) return;
+	if (ena_get_max_queues(d)  < 0) return;	/* E1 */
+	ena_get_llq(d);			        /* E1: failure is non-fatal */
+	ena_set_host_attr(d);		        /* E1: failure is non-fatal */
 	if (ena_create_io_q(d, &d->tx, 0) < 0) return;
 	if (ena_create_io_q(d, &d->rx, 1) < 0) return;
-	if (ena_rx_refill(d)           < 0) return;
+	if (ena_rx_refill_all(d)   < 0) return;
 
-	d->nif.name     = "eth0";
-	d->nif.ip       = 0;
-	d->nif.netmask  = 0;
-	d->nif.mtu      = (d->max_mtu < 1500) ? d->max_mtu : 1500;
-	d->nif.streamtab = NULL;
-	d->nif.tx       = ena_tx_one;
-	netif_register(&d->nif);
+	/* E5: DHCP (spin-polls RX CQ directly, no kthread yet) */
+	if (ena_dhcp_run(d)) {
+		unsigned nm_bits = 0;
+		uint32_t m = d->netmask;
+		while (m) { nm_bits += m & 1u; m >>= 1; }
+		kprintf("ena: DHCP bound %u.%u.%u.%u/%u gw %u.%u.%u.%u\n",
+			(d->ip >> 24) & 0xff, (d->ip >> 16) & 0xff,
+			(d->ip >>  8) & 0xff,  d->ip        & 0xff,
+			nm_bits,
+			(d->gateway >> 24) & 0xff, (d->gateway >> 16) & 0xff,
+			(d->gateway >>  8) & 0xff,  d->gateway        & 0xff);
+	} else {
+		kprintf("ena: DHCP failed -- no IP assigned\n");
+	}
+
+	/* E6+E7: STREAMS wire-up */
+	wire_ena_into_ip(d);
 
 	g_ena_init_ok = 1;
 	kprintf("ena: ready  mac %02x:%02x:%02x:%02x:%02x:%02x"
@@ -881,10 +1424,12 @@ void ena_init(void)
 		d->mac[0], d->mac[1], d->mac[2],
 		d->mac[3], d->mac[4], d->mac[5],
 		d->nif.mtu);
+
+	/* E4: start RX poll thread after IP is wired so ena_rx_dispatch
+	 * can safely putnext into the live stream. */
+	kthread_create("ena_rx", ena_rx_thread, d);
 }
 
-/* Returns 1 if an ENA NIC is present in the PCIe device list.
- * Used by kmain to suppress virtio_net_init on AWS Graviton. */
 int ena_present(void)
 {
 	return ena_find() != NULL;
