@@ -894,6 +894,13 @@ static int dhcp_run(void)
 	}
 	if (dhcp.state != DHCP_WAIT_ACK) {
 		kprintf("eth0: DHCP no OFFER -- using fallback\n");
+		/* Field diagnostic: tx used > 0 means the device consumed
+		 * our DISCOVER; rx used > last means replies landed but the
+		 * IRQ never drained them (GIC delivery problem -- see the
+		 * GICD_CTLR UEFI-handoff note in gic.c). */
+		kprintf("eth0: tx used=%u avail=%u  rx used=%u drained=%u\n",
+			g_eth0.tx.used->idx, g_eth0.tx.avail->idx,
+			g_eth0.rx.used->idx, g_eth0.rx.last_used);
 		goto out;
 	}
 

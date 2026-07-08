@@ -131,17 +131,33 @@ void gic_dist_init(void)
 		mmu_map_device_1gb(gic_redist_base);
 
 	if (acpi_present) {
-		/* UEFI already fully configured the GIC distributor:
-		 * ARE_NS=1, EnableGrp1NS=1, groups and priorities set.
-		 * On Nitro/Graviton any write to GICD_CTLR from non-secure
-		 * EL1 -- even setting ARE_NS=1 when it's already 1 -- is
-		 * treated as a security violation by the hypervisor and
-		 * causes a silent guest reset (no EL1 trap, no crash dump,
-		 * just watchdog reboot).  Same applies to the SPI
-		 * ICENABLER/IGROUPR sweep: UEFI already set these correctly,
-		 * and re-writing them from NS EL1 triggers the same trap.
-		 * Trust UEFI's config; gic_enable_irq() handles individual
-		 * enables when the driver needs them. */
+		/* UEFI configured the GIC distributor during boot services,
+		 * but EDK2's ArmGicDxe registers an ExitBootServices handler
+		 * that DISABLES the distributor on handoff (same cleanup that
+		 * sets GICR_WAKER.ProcessorSleep -- we observe WAKER=0x6 on
+		 * AAVMF).  With EnableGrp1NS clear no interrupt in the system
+		 * is ever signalled: no timer tick, no virtio IRQ, and every
+		 * kthread parked on sched_tick_wq sleeps forever.
+		 *
+		 * Re-enable via read-modify-write, and only when the bits are
+		 * actually missing: skipping the write when UEFI left the
+		 * distributor enabled keeps us clear of the (suspected)
+		 * Nitro sensitivity to redundant GICD_CTLR writes.  Note
+		 * Linux unconditionally rewrites GICD_CTLR on Graviton and
+		 * boots fine, so a needed write is safe.
+		 *
+		 * We do NOT redo the full SPI group/priority sweep here --
+		 * UEFI's per-SPI config survives ExitBootServices; only the
+		 * global enable is pulled.  gic_enable_irq() fully configures
+		 * any SPI a driver asks for (group/prio/route/enable). */
+		uint32_t ctlr = d_read(GICD_CTLR);
+		kprintf("gic: GICD_CTLR=0x%x (UEFI handoff)\n", ctlr);
+		uint32_t want = GICD_CTLR_ARE_NS | GICD_CTLR_ENGRP1_NS;
+		if ((ctlr & want) != want) {
+			d_write(GICD_CTLR, ctlr | want);
+			kprintf("gic: GICD_CTLR -> 0x%x (re-enabled Grp1NS)\n",
+				d_read(GICD_CTLR));
+		}
 		return;
 	}
 

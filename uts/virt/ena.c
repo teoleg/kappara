@@ -808,9 +808,14 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 		}
 	}
 	uint16_t cq_id = *(uint16_t *)(resp + 0);
-	/* cq_head_db_reg_offset is a u16 at resp[4..5] (polling mode;
-	 * only needed for interrupt mode but set it anyway). */
-	q->cq_db_off   = *(uint16_t *)(resp + 4);
+	/* CREATE_CQ response (ena_admin_acq_create_cq_resp_desc):
+	 *   [0..1]  cq_idx
+	 *   [2..3]  cq_actual_depth
+	 *   [4..7]  numa_node_register_offset
+	 *   [8..11] cq_head_db_register_offset (0 = no CQ doorbell)
+	 * Firmware usually leaves the CQ head doorbell at 0 -- polling
+	 * consumers don't need it.  Writers must guard on nonzero. */
+	q->cq_db_off   = *(uint32_t *)(resp + 8);
 
 	/* CREATE_SQ */
 	kmemset(&cmd, 0, sizeof(cmd));
@@ -836,9 +841,14 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 			return -1;
 		}
 	}
-	/* sq_doorbell_offset is a u32 at resp[8..11]; resp[4..7] is
-	 * llq_descriptors_offset (0 for host-memory placement). */
-	q->sq_db_off = *(uint32_t *)(resp + 8);
+	/* CREATE_SQ response (ena_admin_acq_create_sq_resp_desc):
+	 *   [0..1]  sq_idx
+	 *   [2..3]  reserved
+	 *   [4..7]  sq_doorbell_offset (byte offset from BAR0)
+	 *   [8..11] llq_descriptors_offset (0 for host-memory placement)
+	 * Verified on Nitro: reading resp+8 gave 0 ("tx sq_db=0x0"),
+	 * which sent every doorbell write to BAR0+0 = ENA_REG_VERSION. */
+	q->sq_db_off = *(uint32_t *)(resp + 4);
 	kprintf("ena: %s sq_db=0x%x cq_db=0x%x\n",
 		direction ? "rx" : "tx", q->sq_db_off, q->cq_db_off);
 	return 0;
@@ -908,7 +918,8 @@ static void ena_tx_drain(struct ena_dev *d)
 		}
 		q->cq_head++;
 		if (q->cq_head % q->depth == 0) q->cq_phase ^= 1;
-		w32(d->regs, q->cq_db_off, q->cq_head);
+		if (q->cq_db_off)
+			w32(d->regs, q->cq_db_off, q->cq_head);
 	}
 }
 
@@ -1226,7 +1237,8 @@ static int ena_rx_poll_one(struct ena_dev *d)
 
 	q->cq_head++;
 	if (q->cq_head % q->depth == 0) q->cq_phase ^= 1;
-	w32(d->regs, q->cq_db_off, q->cq_head);
+	if (q->cq_db_off)
+		w32(d->regs, q->cq_db_off, q->cq_head);
 
 	ena_rx_repost(d, slot);
 	return 1;
