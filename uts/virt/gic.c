@@ -236,8 +236,37 @@ void gic_enable_irq(unsigned intid)
 		r_write(cpu, GICR_ISENABLER0, 1u << intid);
 		r_write(cpu, GICR_IPRIORITYR(intid / 4), 0xa0a0a0a0u);
 	} else {
-		/* SPI: distributor. */
-		d_write(GICD_ISENABLER(intid / 32), 1u << (intid % 32));
+		/* SPI: distributor.
+		 * On the -kernel path gic_dist_init already set group +
+		 * priority for all SPIs; these writes are redundant but
+		 * harmless.  On the UEFI/ACPI path UEFI only configures
+		 * SPIs it knows about (timer, UART).  Dynamically-discovered
+		 * SPIs (e.g. virtio-net intid 78) come up in reset state:
+		 * group unknown, no route set.  Configure them here.
+		 *
+		 * Safety: on Nitro/Graviton writing GICD_IGROUPR from NS EL1
+		 * is a security violation.  That path never reaches here for
+		 * SPIs because ena_present() gates virtio_net_init(). */
+		unsigned reg  = intid / 32;
+		unsigned bit  = intid % 32;
+		unsigned preg = intid / 4;
+		unsigned pshift = (intid % 4) * 8;
+
+		/* Group 1 Non-Secure (read-modify-write to leave others alone). */
+		d_write(GICD_IGROUPR(reg),
+			d_read(GICD_IGROUPR(reg)) | (1u << bit));
+
+		/* Priority 0xa0 for this intid only. */
+		uint32_t pri = d_read(GICD_IPRIORITYR(preg));
+		pri = (pri & ~(0xffu << pshift)) | (0xa0u << pshift);
+		d_write(GICD_IPRIORITYR(preg), pri);
+
+		/* Route to CPU 0: GICD_IROUTER is 64-bit, write both halves. */
+		d_write(GICD_IROUTER(intid),     0);
+		d_write(GICD_IROUTER(intid) + 4, 0);
+
+		/* Enable. */
+		d_write(GICD_ISENABLER(reg), 1u << bit);
 	}
 }
 

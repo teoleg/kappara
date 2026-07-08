@@ -808,7 +808,9 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 		}
 	}
 	uint16_t cq_id = *(uint16_t *)(resp + 0);
-	q->cq_db_off   = *(uint32_t *)(resp + 8);
+	/* cq_head_db_reg_offset is a u16 at resp[4..5] (polling mode;
+	 * only needed for interrupt mode but set it anyway). */
+	q->cq_db_off   = *(uint16_t *)(resp + 4);
 
 	/* CREATE_SQ */
 	kmemset(&cmd, 0, sizeof(cmd));
@@ -834,7 +836,11 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 			return -1;
 		}
 	}
-	q->sq_db_off = *(uint32_t *)(resp + 4);
+	/* sq_doorbell_offset is a u32 at resp[8..11]; resp[4..7] is
+	 * llq_descriptors_offset (0 for host-memory placement). */
+	q->sq_db_off = *(uint32_t *)(resp + 8);
+	kprintf("ena: %s sq_db=0x%x cq_db=0x%x\n",
+		direction ? "rx" : "tx", q->sq_db_off, q->cq_db_off);
 	return 0;
 }
 
@@ -849,6 +855,8 @@ static int ena_rx_refill_all(struct ena_dev *d)
 		ring[i].length    = ENA_RX_BUF_BYTES;
 		ring[i].req_id    = (uint16_t)i;
 		ring[i].buff_addr = (uint64_t)(uintptr_t)b;
+		__asm__ volatile ("dc cvac, %0\n\t" "dsb sy\n\t"
+				  :: "r"(&ring[i]) : "memory");
 	}
 	d->rx.sq_tail = (uint16_t)d->rx.depth;
 	w32(d->regs, d->rx.sq_db_off, d->rx.sq_tail);
