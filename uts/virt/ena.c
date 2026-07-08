@@ -387,6 +387,12 @@ struct ena_dev {
 	uint32_t dhcp_offer_gw;
 	uint32_t dhcp_offer_server;
 
+	/* Field diagnostic: first frame received while DHCP was still
+	 * unbound that the filter did NOT consume.  Hexdumped on DHCP
+	 * failure so an AWS boot log shows what actually arrived. */
+	uint8_t  dbg_rx[48];
+	unsigned dbg_rx_len;
+
 	/* STREAMS */
 	struct stdata *ena_sd;	/* set by wire_ena_into_ip */
 	struct netif   nif;
@@ -1174,9 +1180,14 @@ static int dhcp_rx_filter(struct ena_dev *d,
 	if (d->dhcp_state == DHCP_BOUND || d->dhcp_state == DHCP_FAILED)
 		return 0;
 
-	/* Need at least Ethernet + IP + UDP + DHCP headers. */
-	unsigned min = ENA_ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN
-		     + sizeof(struct dhcp_pkt);
+	/* Need Ethernet + IP + UDP + the fixed BOOTP header through the
+	 * magic cookie (240 bytes).  Do NOT require the full 312-byte
+	 * options field: QEMU's slirp pads its replies out to the
+	 * maximum, but real servers -- the EC2 VPC DHCP responder in
+	 * particular -- send compact frames (~300 bytes total) carrying
+	 * only the options they need.  Requiring sizeof(struct
+	 * dhcp_pkt) here silently rejected every real OFFER. */
+	unsigned min = ENA_ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + 240;
 	if (len < min) return 0;
 
 	const uint8_t *ip  = frame + ENA_ETH_HDR_LEN;
@@ -1192,11 +1203,14 @@ static int dhcp_rx_filter(struct ena_dev *d,
 	if (__builtin_bswap32(dp->xid) != d->dhcp_xid) return 0;
 	if (dp->op != DHCP_OP_BOOTREPLY) return 0;
 
-	/* Parse options for DHCP message type. */
+	/* Parse options for DHCP message type.  Bound the walk by the
+	 * received frame, not the struct's full options capacity. */
 	uint8_t msg_type = 0;
 	uint32_t subnet = 0, router = 0, server = 0;
 	const uint8_t *o = dp->options;
-	const uint8_t *oend = dp->options + sizeof(dp->options);
+	const uint8_t *oend = frame + len;
+	if (oend > dp->options + sizeof(dp->options))
+		oend = dp->options + sizeof(dp->options);
 	while (o < oend && *o != DHCP_OPT_END) {
 		uint8_t code = *o++;
 		if (code == DHCP_OPT_PAD) continue;
@@ -1248,6 +1262,17 @@ static void ena_rx_dispatch(struct ena_dev *d,
 	if (len < ENA_ETH_HDR_LEN) return;
 	const struct ena_ether_hdr *eh = (const struct ena_ether_hdr *)frame;
 	uint16_t et = get_be16((const uint8_t *)&eh->ethertype);
+
+	/* Capture the first frame that arrives while DHCP is unbound.
+	 * If DHCP later fails, this is hexdumped -- either it's the
+	 * reply the filter mis-rejected (and the dump says why), or
+	 * it's ambient broadcast proving our DISCOVER never made it
+	 * out.  Consumed replies never print (DHCP succeeds). */
+	if ((d->dhcp_state == DHCP_WAIT_OFFER ||
+	     d->dhcp_state == DHCP_WAIT_ACK) && d->dbg_rx_len == 0) {
+		d->dbg_rx_len = len < sizeof(d->dbg_rx) ? len : sizeof(d->dbg_rx);
+		kmemcpy(d->dbg_rx, frame, d->dbg_rx_len);
+	}
 
 	if (et == ENA_ETHERTYPE_ARP) {
 		ena_arp_process(d, frame, len);
@@ -1318,28 +1343,56 @@ static void ena_rx_thread(void *arg)
 
 /* ---- E5: DHCP run ---- */
 
-static int ena_dhcp_run(struct ena_dev *d)
+/* Poll RX + reap TX until dhcp_state leaves `from_state` or `ms`
+ * elapses.  Returns 1 when the state moved on. */
+static int ena_dhcp_wait(struct ena_dev *d, int from_state, unsigned ms)
 {
-	d->dhcp_xid   = 0xd1a10001u;	/* fixed seed; fine for single NIC */
-	d->dhcp_state = DHCP_WAIT_OFFER;
-	dhcp_send(d, DHCP_MSG_DISCOVER, 0, 0);
-
 	uint64_t freq, start, deadline;
 	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
 	__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
-	deadline = start + freq * 3ULL;		/* 3-second timeout */
+	deadline = start + (freq / 1000ULL) * (uint64_t)ms;
 
-	while (d->dhcp_state != DHCP_BOUND &&
-	       d->dhcp_state != DHCP_FAILED) {
+	while (d->dhcp_state == from_state) {
 		ena_rx_poll_one(d);
-		kthread_yield();		/* let other threads run during wait */
+		ena_tx_drain(d);	/* reap bounce buffers + keep the
+					 * done-counter honest for the
+					 * failure diagnostic */
+		kthread_yield();
 		uint64_t now;
 		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
-		if (now >= deadline) {
-			d->dhcp_state = DHCP_FAILED;
-			break;
-		}
+		if (now >= deadline) return 0;
 	}
+	return 1;
+}
+
+static int ena_dhcp_run(struct ena_dev *d)
+{
+	d->dhcp_xid = 0xd1a10001u;	/* fixed seed; fine for single NIC */
+
+	/* DISCOVER, 3 attempts x 2 s.  The EC2 DHCP responder is fast
+	 * (<10 ms) but the first broadcast can be dropped while the NIC
+	 * settles after queue creation. */
+	for (int attempt = 0; attempt < 3; attempt++) {
+		d->dhcp_state = DHCP_WAIT_OFFER;
+		dhcp_send(d, DHCP_MSG_DISCOVER, 0, 0);
+		if (ena_dhcp_wait(d, DHCP_WAIT_OFFER, 2000))
+			break;
+	}
+	if (d->dhcp_state != DHCP_WAIT_ACK) {
+		d->dhcp_state = DHCP_FAILED;
+		return 0;
+	}
+
+	/* dhcp_rx_filter already sent REQUEST on the OFFER; wait for the
+	 * ACK, retransmitting the REQUEST on timeout. */
+	for (int attempt = 0; attempt < 3; attempt++) {
+		if (ena_dhcp_wait(d, DHCP_WAIT_ACK, 2000))
+			break;
+		dhcp_send(d, DHCP_MSG_REQUEST,
+			  d->dhcp_offer_ip, d->dhcp_offer_server);
+	}
+	if (d->dhcp_state != DHCP_BOUND)
+		d->dhcp_state = DHCP_FAILED;
 	return d->dhcp_state == DHCP_BOUND;
 }
 
@@ -1535,6 +1588,13 @@ void ena_init(void)
 		 * means replies arrived but the DHCP filter didn't match. */
 		kprintf("ena: tx sent=%u done=%u  rx got=%u\n",
 			d->tx.sq_tail, d->tx.cq_head, d->rx.cq_head);
+		if (d->dbg_rx_len) {
+			kprintf("ena: first unmatched rx (%u B):", d->dbg_rx_len);
+			for (unsigned i = 0; i < d->dbg_rx_len; i++)
+				kprintf("%s%02x", (i % 16) ? " " : "\n  ",
+					d->dbg_rx[i]);
+			kprintf("\n");
+		}
 	}
 }
 
