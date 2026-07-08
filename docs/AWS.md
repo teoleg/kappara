@@ -339,6 +339,15 @@ against `torvalds/linux drivers/net/ethernet/amazon/ena/`:
   presents as "doorbell rings, nothing happens".
 - RX completion (`ena_eth_io_rx_cdesc_base`): phase is
   status[24]; `length` at +4, `req_id` at +6.
+- DHCP reply sizes: QEMU slirp pads BOOTP replies to the full
+  312-byte options field; the EC2 VPC responder sends compact
+  frames (~300 bytes total).  The RX filter must only require the
+  fixed BOOTP header through the magic cookie (240 bytes past
+  UDP) and bound the options walk by the received length --
+  requiring `sizeof(struct dhcp_pkt)` silently rejects every real
+  OFFER while passing all slirp-based tests.  On DHCP failure the
+  driver prints tx sent/done + rx got and hexdumps the first
+  unmatched frame.
 
 Once the offsets are pinned, what remains for "real packet
 I/O" (not just queue creation):
