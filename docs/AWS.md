@@ -313,6 +313,19 @@ against `torvalds/linux drivers/net/ethernet/amazon/ena/`:
   AENQ=64B -- all verified.
 - ACQ phase bit: `flags` bit 0 (not `command` bit 12 as the
   original skeleton assumed).
+- CQ entry size differs per direction: TX completion is 2 words
+  (8 B), RX completion is 4 words (16 B).  `CREATE_CQ` must say
+  which one; the firmware rejects a TX SQ pointed at a 4-word CQ
+  with `RESOURCE_BUSY` (status 6).
+- `CREATE_SQ` response: `sq_doorbell_offset` is the u32 at
+  payload +4 (byte offset from BAR0).  Payload +8 is
+  `llq_descriptors_offset`, which reads 0 in host-memory mode --
+  misreading it sends every doorbell write to BAR0+0
+  (`ENA_REG_VERSION`) and the device never sees a single TX
+  descriptor (verified on Nitro: `tx sq_db=0x0`).
+- `CREATE_CQ` response: `cq_head_db_register_offset` is the u32
+  at payload +8 and is usually 0 (no CQ doorbell needed for a
+  polling consumer); the driver only writes it when nonzero.
 
 Once the offsets are pinned, what remains for "real packet
 I/O" (not just queue creation):

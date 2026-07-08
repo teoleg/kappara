@@ -1600,6 +1600,23 @@ this and resets the guest on the offending write.  `gic_dist_init()`
 must never write 0 to `GICD_CTLR` — only ever set bits (ARE_NS |
 ENGRP1_NS).
 
+**UEFI handoff disables the distributor.**  EDK2's `ArmGicDxe`
+registers an ExitBootServices handler that disables the distributor
+group enables and puts the redistributor to sleep
+(`GICR_WAKER = 0x6` observed under AAVMF) on handoff.  With
+`EnableGrp1NS` clear **no interrupt in the system fires** — no timer
+tick, no virtio IRQ — while the boot still appears to succeed because
+init is polling/yield-driven.  The visible symptoms are a
+non-interactive console (`uart_rx_main` parks on `sched_tick_wq`
+forever) and `DHCP no OFFER` (replies land in the RX used ring but
+the IRQ never drains them).  `gic_dist_init()` on the ACPI path
+therefore read-modify-writes `GICD_CTLR` to restore
+`ARE_NS | ENGRP1_NS`, skipping the write when UEFI already left them
+set (never writes 0 — see the constraint above).  Per-SPI config from
+UEFI survives handoff; `gic_enable_irq()` fully configures any SPI a
+driver asks for (group, priority 0xa0, `GICD_IROUTER` to CPU 0,
+enable).
+
 **Init sequence** (`gic_dist_init()` then per-CPU `gic_cpu_init()`):
 1. Set base addresses (ACPI or platform constant); map MMIO with
    `mmu_map_device_1gb` if address falls outside the pre-wired periph
