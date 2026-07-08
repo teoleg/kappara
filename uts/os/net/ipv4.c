@@ -461,6 +461,23 @@ static int ip_rput(queue_t *q, mblk_t *mp)
 		freemsg(mp);
 		return 0;
 	}
+	if (total < IP_HDR_LEN) {
+		kprintf("ip_rput: total_len %u < header\n", total);
+		freemsg(mp);
+		return 0;
+	}
+	/* Trim Ethernet trailing pad.  Real NICs pad short frames to the
+	 * 60-byte wire minimum (QEMU's slirp doesn't, so only real
+	 * networks hit this).  L4 checksums cover exactly total_len
+	 * bytes -- leaving the pad on makes every small TCP segment
+	 * (bare ACKs especially) fail software verification. */
+	if (total < len) {
+		mp->b_wptr = mp->b_rptr + total;
+		if (mp->b_cont) {
+			freemsg(mp->b_cont);
+			mp->b_cont = NULL;
+		}
+	}
 	if (ip_checksum(h, ihl_bytes) != 0) {
 		kprintf("ip_rput: checksum fail\n");
 		freemsg(mp);
