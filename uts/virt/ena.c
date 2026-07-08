@@ -199,11 +199,20 @@ struct ena_io_rx_desc {
 	uint64_t buff_addr;
 } __attribute__((packed));
 
+/* TX completion: 2 words (8 bytes). */
+struct ena_io_tx_cdesc {
+	uint16_t req_id;
+	uint8_t  status;
+	uint8_t  flags;		/* bit[0]=phase tag */
+	uint32_t sq_head_idx;	/* ignored by us */
+} __attribute__((packed));
+
+/* RX completion: 4 words (16 bytes). */
 struct ena_io_cdesc {
 	uint16_t req_id;
 	uint8_t  status;
 	uint8_t  flags;		/* bit[0]=phase tag */
-	uint16_t length;	/* RX: actual bytes received */
+	uint16_t length;	/* actual bytes received */
 	uint8_t  reserved[10];
 } __attribute__((packed));
 
@@ -783,7 +792,8 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 	cmd.common.opcode = ENA_ADMIN_OP_CREATE_CQ;
 	uint64_t cq_pa = (uint64_t)(uintptr_t)q->cq_pa;
 	cmd.payload[0] = 0;			/* cq_caps_1: polling mode */
-	cmd.payload[1] = 4;			/* cq_caps_2: 4 words = 16-byte entries */
+	/* TX cdesc = 2 words (8 B); RX cdesc = 4 words (16 B). */
+	cmd.payload[1] = direction ? 4 : 2;
 	*(uint16_t *)(cmd.payload + 2) = (uint16_t)depth;
 	*(uint32_t *)(cmd.payload + 4) = 0;	/* msix_vector = none */
 	*(uint32_t *)(cmd.payload + 8) = (uint32_t)cq_pa;
@@ -873,11 +883,11 @@ static uint32_t get_be32(const uint8_t *p)
 
 static void ena_tx_drain(struct ena_dev *d)
 {
-	struct ena_io_q    *q     = &d->tx;
-	struct ena_io_cdesc *cring = q->cq_pa;
+	struct ena_io_q        *q     = &d->tx;
+	struct ena_io_tx_cdesc *cring = q->cq_pa;
 
 	for (;;) {
-		struct ena_io_cdesc *c = &cring[q->cq_head % q->depth];
+		struct ena_io_tx_cdesc *c = &cring[q->cq_head % q->depth];
 		__asm__ volatile ("dc ivac, %0\n\t" "dsb sy\n\t"
 				  :: "r"(c) : "memory");
 		if ((c->flags & 1u) != q->cq_phase) break;
