@@ -326,6 +326,19 @@ against `torvalds/linux drivers/net/ethernet/amazon/ena/`:
 - `CREATE_CQ` response: `cq_head_db_register_offset` is the u32
   at payload +8 and is usually 0 (no CQ doorbell needed for a
   polling consumer); the driver only writes it when nonzero.
+- I/O descriptors follow `ena_eth_io_defs.h`, not a naive
+  packed-field guess.  TX descriptor is two control words:
+  `len_ctrl` ([15:0] length, [21:16] req_id_hi, [24] **phase**,
+  [26] first, [27] last, [28] comp_req) + `meta_ctrl`
+  ([26:22] req_id_lo; the low bits are offload knobs -- writing
+  req_id there sets random csum/TSO flags).  RX descriptor puts
+  phase/first/last/comp_req in a ctrl byte at offset 3 and
+  req_id at offset 4.  Both SQs carry a per-pass phase bit that
+  starts at 1 and flips on each ring wrap -- the device silently
+  ignores any descriptor whose phase doesn't match, which
+  presents as "doorbell rings, nothing happens".
+- RX completion (`ena_eth_io_rx_cdesc_base`): phase is
+  status[24]; `length` at +4, `req_id` at +6.
 
 Once the offsets are pinned, what remains for "real packet
 I/O" (not just queue creation):

@@ -502,10 +502,20 @@ int mmu_vmap_create(struct vm_map *vm)
 	 * L2 in. */
 	l0_va[0] = (uint64_t)(uintptr_t)l1 | D_VALID | D_TABLE;
 	l1_va[0] = (uint64_t)(uintptr_t)l2 | D_VALID | D_TABLE;
-	/* Inherit the peripheral 1 GB mapping at L1[1] from boot --
-	 * the kernel touches PL011 UART + GPIO + mailboxes through
-	 * here and would fault on switch otherwise. */
-	l1_va[1] = l1_table[1];
+	/* Inherit every boot L1 entry above the user GB.  User VA space
+	 * lives entirely under 1 GB (L1[0], the fresh per-process L2);
+	 * everything above is kernel identity territory: L1[1] is RAM +
+	 * peripherals at 0x40000000, and L1[2+] hold the 1 GB device
+	 * blocks mmu_map_device_1gb wires for ACPI-discovered MMIO.
+	 * AWS Nitro puts the NVMe/ENA BARs at 0x80000000 (L1[2]) --
+	 * inheriting only L1[1] left them unmapped in exec'd processes,
+	 * so the first syscall-path NVMe doorbell write from a user
+	 * thread (e.g. the mmap test writing /home) took an L1
+	 * translation fault at nvme_io_submit_and_wait+0x6c.  All
+	 * mmu_map_device_1gb callers run at platform init, before the
+	 * first exec, so a copy here stays current. */
+	for (int i = 1; i < ENTRIES_PER_TABLE; i++)
+		l1_va[i] = l1_table[i];
 
 	/* Inherit every high-mem L0[1+] entry the boot tables grew at
 	 * platform-init time (mmu_map_device_1gb populates these for

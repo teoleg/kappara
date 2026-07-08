@@ -27,15 +27,20 @@
  *       ena_streamtab, calls ip_attach_stream, registers the netif, then
  *       starts the ena_rx kthread.
  *
- * Cache maintenance (AArch64, non-coherent DMA on Nitro):
- *   TX: dc cvac + dsb sy on the buffer and the SQ descriptor before doorbell.
- *   RX CQ: dc ivac + dsb sy on the CQ entry before reading the phase bit.
- *   RX data: dc ivac + dsb sy on the buffer before reading received bytes.
- *   RX repost: dc cvac + dsb sy on the updated RX SQ descriptor.
+ * Cache maintenance (belt-and-braces; Graviton PCIe DMA is coherent):
+ *   TX: cache_clean_range on the buffer and SQ descriptor before doorbell.
+ *   RX CQ: cache_inval_range on the CQ entry before reading the phase bit.
+ *   RX data: cache_inval_range on the buffer before reading received bytes.
+ *   RX repost: cache_clean_range on the updated RX SQ descriptor.
+ *
+ * I/O descriptors carry a per-pass phase bit (TX len_ctrl[24], RX
+ * ctrl[0]) that must match the SQ's current phase or the device
+ * ignores the entry; phase starts at 1 and flips on each ring wrap.
  *
  * Register offsets and bit definitions cross-checked against:
  *   torvalds/linux drivers/net/ethernet/amazon/ena/ena_regs_defs.h
  *   torvalds/linux drivers/net/ethernet/amazon/ena/ena_admin_defs.h
+ *   torvalds/linux drivers/net/ethernet/amazon/ena/ena_eth_io_defs.h
  */
 
 #include <stddef.h>
@@ -177,44 +182,66 @@ struct ena_mmio_read_resp {
 	uint32_t reg_val;
 } __attribute__((packed));
 
-/* ---- I/O queue descriptors ---- */
+/* ---- I/O queue descriptors (ena_eth_io_defs.h layouts) ---- */
 
-#define ENA_TX_CTRL_FIRST	(1u << 7)
-#define ENA_TX_CTRL_LAST	(1u << 6)
-#define ENA_TX_CTRL_COMP_REQ	(1u << 5)
-
+/* TX submission descriptor: 16 bytes.
+ * len_ctrl:  [15:0] length  [21:16] req_id_hi  [23] meta_desc
+ *            [24] phase  [26] first  [27] last  [28] comp_req
+ * meta_ctrl: [26:22] req_id_lo; all other bits are offload knobs
+ *            (l3/l4 proto, csum enables) -- zero for raw frames. */
 struct ena_io_tx_desc {
+	uint32_t len_ctrl;
+	uint32_t meta_ctrl;
+	uint32_t buff_addr_lo;
+	uint32_t buff_addr_hi_hdr;	/* [15:0] addr_hi  [31:24] header_length */
+} __attribute__((packed));
+
+#define ENA_TX_DESC_PHASE	(1u << 24)
+#define ENA_TX_DESC_FIRST	(1u << 26)
+#define ENA_TX_DESC_LAST	(1u << 27)
+#define ENA_TX_DESC_COMP_REQ	(1u << 28)
+
+/* RX submission descriptor: 16 bytes.
+ * ctrl: [0] phase  [2] first  [3] last  [4] comp_req */
+struct ena_io_rx_desc {
 	uint16_t length;
 	uint8_t  reserved;
 	uint8_t  ctrl;
 	uint16_t req_id;
-	uint8_t  reserved2[2];
-	uint64_t buff_addr;
+	uint16_t reserved2;
+	uint32_t buff_addr_lo;
+	uint16_t buff_addr_hi;
+	uint16_t reserved3;
 } __attribute__((packed));
 
-struct ena_io_rx_desc {
-	uint16_t length;
-	uint16_t req_id;
-	uint8_t  reserved[4];
-	uint64_t buff_addr;
-} __attribute__((packed));
+#define ENA_RX_DESC_PHASE	0x01u
+#define ENA_RX_DESC_FIRST	0x04u
+#define ENA_RX_DESC_LAST	0x08u
+#define ENA_RX_DESC_COMP_REQ	0x10u
 
 /* TX completion: 2 words (8 bytes). */
 struct ena_io_tx_cdesc {
 	uint16_t req_id;
 	uint8_t  status;
 	uint8_t  flags;		/* bit[0]=phase tag */
-	uint32_t sq_head_idx;	/* ignored by us */
+	uint16_t sub_qid;
+	uint16_t sq_head_idx;	/* ignored by us */
 } __attribute__((packed));
 
-/* RX completion: 4 words (16 bytes). */
-struct ena_io_cdesc {
-	uint16_t req_id;
-	uint8_t  status;
-	uint8_t  flags;		/* bit[0]=phase tag */
+/* RX completion (ena_eth_io_rx_cdesc_base): 4 words (16 bytes).
+ * status: [24] phase  [26] first  [27] last; low bits are l3/l4
+ * proto + csum results, ignored for our raw-frame consumption. */
+struct ena_io_rx_cdesc {
+	uint32_t status;
 	uint16_t length;	/* actual bytes received */
-	uint8_t  reserved[10];
+	uint16_t req_id;
+	uint32_t hash;
+	uint16_t sub_qid;
+	uint8_t  offset;
+	uint8_t  reserved;
 } __attribute__((packed));
+
+#define ENA_RX_CDESC_PHASE	(1u << 24)
 
 /* ---- Ethernet + ARP ---- */
 
@@ -313,7 +340,6 @@ struct ena_io_q {
 	uint8_t  sq_phase;
 	uint32_t sq_db_off;
 	uint32_t cq_db_off;
-	uint16_t next_req_id;
 };
 
 struct ena_dev {
@@ -378,6 +404,28 @@ static uint32_t r32(volatile uint8_t *base, unsigned off)
 static void w32(volatile uint8_t *base, unsigned off, uint32_t v)
 {
 	*(volatile uint32_t *)(base + off) = v;
+}
+
+/* Cache maintenance over a full byte range, not just the first line.
+ * A single `dc cvac, x` covers one 64-byte line; a 590-byte DHCP
+ * frame needs the whole span cleaned or the device reads stale
+ * tails.  (PCIe DMA on Graviton is cache-coherent so these are
+ * belt-and-braces, but if they're here they must be correct.) */
+static void cache_clean_range(const void *p, unsigned len)
+{
+	uintptr_t a   = (uintptr_t)p & ~63UL;
+	uintptr_t end = (uintptr_t)p + len;
+	for (; a < end; a += 64)
+		__asm__ volatile ("dc cvac, %0" :: "r"(a) : "memory");
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+static void cache_inval_range(const void *p, unsigned len)
+{
+	uintptr_t a   = (uintptr_t)p & ~63UL;
+	uintptr_t end = (uintptr_t)p + len;
+	for (; a < end; a += 64)
+		__asm__ volatile ("dc ivac, %0" :: "r"(a) : "memory");
+	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
 /* ---- MMIO read-less mechanism ---- */
@@ -781,8 +829,8 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 	q->sq_tail     = 0;
 	q->cq_head     = 0;
 	q->cq_phase    = 1;
-	q->sq_phase    = 0;
-	q->next_req_id = 0;
+	q->sq_phase    = 1;	/* SQ descriptors carry a phase bit too;
+				 * pass 1 = phase 1, toggles on each wrap */
 
 	struct ena_admin_aq_entry cmd;
 	uint8_t resp[56];
@@ -854,21 +902,42 @@ static int ena_create_io_q(struct ena_dev *d, struct ena_io_q *q,
 	return 0;
 }
 
+/* Write one RX descriptor at the next SQ tail position, handing
+ * buffer `buf_slot` (index into rx_bufs) back to the device.
+ * Does NOT ring the doorbell -- callers batch that. */
+static void ena_rx_post(struct ena_dev *d, unsigned buf_slot)
+{
+	struct ena_io_q       *q    = &d->rx;
+	struct ena_io_rx_desc *ring = q->sq_pa;
+	struct ena_io_rx_desc *desc = &ring[q->sq_tail % q->depth];
+
+	desc->length       = ENA_RX_BUF_BYTES;
+	desc->reserved     = 0;
+	desc->ctrl         = (uint8_t)(ENA_RX_DESC_FIRST | ENA_RX_DESC_LAST
+	                             | ENA_RX_DESC_COMP_REQ
+	                             | (q->sq_phase & ENA_RX_DESC_PHASE));
+	desc->req_id       = (uint16_t)buf_slot;
+	desc->reserved2    = 0;
+	uint64_t pa        = (uint64_t)(uintptr_t)d->rx_bufs[buf_slot];
+	desc->buff_addr_lo = (uint32_t)pa;
+	desc->buff_addr_hi = (uint16_t)(pa >> 32);
+	desc->reserved3    = 0;
+
+	cache_clean_range(desc, sizeof(*desc));
+
+	q->sq_tail++;
+	if (q->sq_tail % q->depth == 0) q->sq_phase ^= 1;
+}
+
 /* Pre-fill the RX SQ with PMM-backed buffers. */
 static int ena_rx_refill_all(struct ena_dev *d)
 {
-	struct ena_io_rx_desc *ring = d->rx.sq_pa;
 	for (uint32_t i = 0; i < d->rx.depth; i++) {
 		void *b = pmm_alloc();
 		if (!b) return -1;
-		d->rx_bufs[i]     = b;
-		ring[i].length    = ENA_RX_BUF_BYTES;
-		ring[i].req_id    = (uint16_t)i;
-		ring[i].buff_addr = (uint64_t)(uintptr_t)b;
-		__asm__ volatile ("dc cvac, %0\n\t" "dsb sy\n\t"
-				  :: "r"(&ring[i]) : "memory");
+		d->rx_bufs[i] = b;
+		ena_rx_post(d, i);
 	}
-	d->rx.sq_tail = (uint16_t)d->rx.depth;
 	w32(d->regs, d->rx.sq_db_off, d->rx.sq_tail);
 	return 0;
 }
@@ -906,8 +975,7 @@ static void ena_tx_drain(struct ena_dev *d)
 
 	for (;;) {
 		struct ena_io_tx_cdesc *c = &cring[q->cq_head % q->depth];
-		__asm__ volatile ("dc ivac, %0\n\t" "dsb sy\n\t"
-				  :: "r"(c) : "memory");
+		cache_inval_range(c, sizeof(*c));
 		if ((c->flags & 1u) != q->cq_phase) break;
 
 		uint16_t rid = c->req_id;
@@ -930,24 +998,31 @@ static int ena_eth_tx(struct ena_dev *d, const void *frame, unsigned len)
 	void *buf = pmm_alloc();
 	if (!buf) return -1;
 	kmemcpy(buf, frame, len);
+	cache_clean_range(buf, len);
 
-	__asm__ volatile ("dc cvac, %0\n\t" "dsb sy\n\t" :: "r"(buf) : "memory");
-
-	struct ena_io_q     *q    = &d->tx;
-	uint16_t             rid  = q->next_req_id++;
-	unsigned             slot = rid % ENA_IOQ_DEPTH;
+	struct ena_io_q *q    = &d->tx;
+	unsigned         slot = q->sq_tail % q->depth;
+	uint16_t         rid  = (uint16_t)slot;	/* req_id == ring slot */
 	d->tx_bufs[slot] = buf;
 
+	/* req_id rides split across the two control words:
+	 * bits [10:5] -> len_ctrl[21:16], bits [4:0] -> meta_ctrl[26:22]. */
 	struct ena_io_tx_desc *ring = q->sq_pa;
-	struct ena_io_tx_desc *desc = &ring[q->sq_tail % q->depth];
-	desc->length    = (uint16_t)len;
-	desc->ctrl      = ENA_TX_CTRL_FIRST | ENA_TX_CTRL_LAST | ENA_TX_CTRL_COMP_REQ;
-	desc->req_id    = rid;
-	desc->buff_addr = (uint64_t)(uintptr_t)buf;
+	struct ena_io_tx_desc *desc = &ring[slot];
+	uint64_t pa = (uint64_t)(uintptr_t)buf;
+	desc->len_ctrl = (len & 0xffffu)
+	               | (((uint32_t)(rid >> 5) & 0x3fu) << 16)
+	               | (q->sq_phase ? ENA_TX_DESC_PHASE : 0)
+	               | ENA_TX_DESC_FIRST | ENA_TX_DESC_LAST
+	               | ENA_TX_DESC_COMP_REQ;
+	desc->meta_ctrl        = ((uint32_t)(rid & 0x1fu) << 22);
+	desc->buff_addr_lo     = (uint32_t)pa;
+	desc->buff_addr_hi_hdr = (uint32_t)((pa >> 32) & 0xffffu);
 
-	__asm__ volatile ("dc cvac, %0\n\t" "dsb sy\n\t" :: "r"(desc) : "memory");
+	cache_clean_range(desc, sizeof(*desc));
 
 	q->sq_tail++;
+	if (q->sq_tail % q->depth == 0) q->sq_phase ^= 1;
 	w32(d->regs, q->sq_db_off, q->sq_tail);
 
 	ena_tx_drain(d);
@@ -1199,30 +1274,16 @@ static void ena_rx_dispatch(struct ena_dev *d,
 	}
 }
 
-static void ena_rx_repost(struct ena_dev *d, unsigned slot)
-{
-	struct ena_io_rx_desc *ring = d->rx.sq_pa;
-	ring[slot].length    = ENA_RX_BUF_BYTES;
-	ring[slot].req_id    = (uint16_t)slot;
-	ring[slot].buff_addr = (uint64_t)(uintptr_t)d->rx_bufs[slot];
-
-	__asm__ volatile ("dc cvac, %0\n\t" "dsb sy\n\t"
-			  :: "r"(&ring[slot]) : "memory");
-
-	d->rx.sq_tail++;
-	w32(d->regs, d->rx.sq_db_off, d->rx.sq_tail);
-}
-
 /* Poll one RX CQ entry.  Returns 1 if a packet was processed, 0 if ring empty. */
 static int ena_rx_poll_one(struct ena_dev *d)
 {
-	struct ena_io_q     *q     = &d->rx;
-	struct ena_io_cdesc *cring = q->cq_pa;
-	struct ena_io_cdesc *c     = &cring[q->cq_head % q->depth];
+	struct ena_io_q        *q     = &d->rx;
+	struct ena_io_rx_cdesc *cring = q->cq_pa;
+	struct ena_io_rx_cdesc *c     = &cring[q->cq_head % q->depth];
 
-	__asm__ volatile ("dc ivac, %0\n\t" "dsb sy\n\t"
-			  :: "r"(c) : "memory");
-	if ((c->flags & 1u) != q->cq_phase) return 0;
+	cache_inval_range(c, sizeof(*c));
+	if (((c->status & ENA_RX_CDESC_PHASE) ? 1u : 0u) != q->cq_phase)
+		return 0;
 
 	uint16_t rid   = c->req_id;
 	uint16_t rxlen = c->length;
@@ -1230,8 +1291,7 @@ static int ena_rx_poll_one(struct ena_dev *d)
 	void    *buf   = d->rx_bufs[slot];
 
 	if (rxlen > 0 && rxlen <= ENA_RX_BUF_BYTES && buf) {
-		__asm__ volatile ("dc ivac, %0\n\t" "dsb sy\n\t"
-				  :: "r"(buf) : "memory");
+		cache_inval_range(buf, rxlen);
 		ena_rx_dispatch(d, (const uint8_t *)buf, rxlen);
 	}
 
@@ -1240,7 +1300,9 @@ static int ena_rx_poll_one(struct ena_dev *d)
 	if (q->cq_db_off)
 		w32(d->regs, q->cq_db_off, q->cq_head);
 
-	ena_rx_repost(d, slot);
+	/* Hand the buffer straight back to the device. */
+	ena_rx_post(d, slot);
+	w32(d->regs, q->sq_db_off, q->sq_tail);
 	return 1;
 }
 
@@ -1468,6 +1530,11 @@ void ena_init(void)
 		}
 	} else {
 		kprintf("ena: DHCP failed -- no IP assigned, network inactive\n");
+		/* Field diagnostic: tx done > 0 means the device consumed
+		 * our DISCOVER (TX descriptor format accepted); rx got > 0
+		 * means replies arrived but the DHCP filter didn't match. */
+		kprintf("ena: tx sent=%u done=%u  rx got=%u\n",
+			d->tx.sq_tail, d->tx.cq_head, d->rx.cq_head);
 	}
 }
 
