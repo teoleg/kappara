@@ -437,11 +437,9 @@ void kmain(void)
 	 * `-device nvme`).  Runs after kmem_init because the driver
 	 * pmm_alloc()s queue pages from a primed PMM. */
 	nvme_init();
-	/* AWS.md stage E: ENA network adapter.  No-op when no PCI
-	 * vendor 0x1d0f device 0xec20 is present (everything except
-	 * AWS Graviton).  BLIND IMPLEMENTATION -- see
-	 * include/kappara/arch/ena.h for the spec-verification caveat. */
-	ena_init();
+	/* ENA hardware probe moved: ena_init() now runs after ip_init() so
+	 * that ip_ctl_sd is live when wire_ena_into_ip calls ip_attach_stream.
+	 * ena_present() still works here (pure PCI scan, no side effects). */
 	exec_space_init();
 
 	/* Draw the boot splash now that everything else is up.  The FB
@@ -543,15 +541,18 @@ void kmain(void)
 	 * Virt has no mini-UART; it gets eth0 via virtio-net instead. */
 	slip_init();
 #else
-	/* Phase 2-3: probe virtio-mmio and attach eth0 to IP.  Skip on
-	 * AWS Graviton where ENA is the NIC and 0x0A000000 is not a valid
-	 * virtio-mmio region -- accessing it there can cause an external
-	 * abort.  Phase 5: spawn the telnet listener either way. */
+	/* AWS stage E / Phase 2-3: bring up eth0 under the IP mux.
+	 * Both paths run after ip_init so ip_ctl_sd is live when the
+	 * driver calls ip_attach_stream / I_LINK.
+	 * ENA: skip virtio-mmio; 0x0A000000 is not a valid region on
+	 * Graviton and an MMIO access there causes an external abort. */
 	{
 		extern void virtio_net_init(void);
 		extern void telnetd_init(void);
 		if (!ena_present())
 			virtio_net_init();
+		else
+			ena_init();
 		telnetd_init();
 	}
 #endif
