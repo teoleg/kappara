@@ -180,7 +180,16 @@ VA              Size    Purpose
 
 R6: each exec'd process owns its own vm_map (L0/L1/L2/L3 page
 tables) with EXEC_VA/EXEC_STACK_VA/EXEC_HEAP_VA mapped 4 KB at a
-time onto PMM-allocated pages.  No fixed slot pool; the number of
+time onto PMM-allocated pages.  User VA space lives entirely under
+1 GB (L1[0]); `mmu_vmap_create` inherits every boot L1 entry above
+it (L1[1] = RAM, L1[2+] = the 1 GB device blocks
+`mmu_map_device_1gb` wires for ACPI-discovered MMIO) plus every
+high-mem L0[1+] entry.  Both copies matter: AWS Nitro places the
+NVMe/ENA BARs at 0x80000000 (L1[2]) while local AAVMF places them
+at 0x8000000000 (L0[1]) -- missing either one means kernel code on
+a syscall path from an exec'd process data-aborts on the first
+MMIO doorbell write (seen as an L1 translation fault in
+`nvme_io_submit_and_wait` during the mmap test on Graviton).  No fixed slot pool; the number of
 concurrent processes is bounded only by PMM size (every exec
 consumes roughly 2 MB of stack + a few KB of code + L3/L2/L1/L0
 tables).  `sys_execve` allocates code pages while copying PT_LOAD
