@@ -65,6 +65,7 @@ KERNEL_OBJS := \
     $(BUILD)/uts/os/io/ldterm.o \
     $(BUILD)/uts/os/io/tty.o \
     $(BUILD)/uts/os/net/netif.o \
+    $(BUILD)/uts/os/net/arp.o \
     $(BUILD)/uts/os/net/ipv4.o \
     $(BUILD)/uts/os/net/icmp.o \
     $(BUILD)/uts/os/net/udp.o \

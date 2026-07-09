@@ -44,6 +44,7 @@
 #include "kappara/core/string.h"
 #include "kappara/io/streams.h"
 #include "kappara/io/stream_head.h"
+#include "kappara/net/arp.h"
 #include "kappara/net/ip.h"
 #include "kappara/net/netif.h"
 #include "kappara/proc/sched.h"
@@ -110,21 +111,6 @@ struct ether_hdr {
 #define ETHERTYPE_IPV4	0x0800
 #define ETHERTYPE_ARP	0x0806
 
-struct arp_pkt {
-	uint16_t hw_type;	/* 1 = Ethernet */
-	uint16_t proto_type;	/* 0x0800 IPv4 */
-	uint8_t  hw_len;	/* 6 */
-	uint8_t  proto_len;	/* 4 */
-	uint16_t opcode;	/* 1 = request, 2 = reply */
-	uint8_t  sender_mac[6];
-	uint8_t  sender_ip[4];
-	uint8_t  target_mac[6];
-	uint8_t  target_ip[4];
-} __attribute__((packed));
-
-#define ARP_REQUEST	1
-#define ARP_REPLY	2
-
 /* eth0's IPv4 config.  Until DHCP completes eth0_ip / NETMASK /
  * GATEWAY are zero (we listen for the DHCPOFFER as a raw-Ethernet
  * broadcast so we don't need an IP yet).  The compile-time fallbacks
@@ -140,10 +126,9 @@ static uint32_t eth0_gateway;
 #define FALLBACK_NETMASK	0xffffff00u	/* /24 */
 #define FALLBACK_GATEWAY	0x0a000202u	/* 10.0.2.2 */
 
-/* ARP cache: just the gateway entry for now.  Resolved lazily via
- * the first ARP request we send out. */
-static uint8_t arp_gw_mac[6];
-static int     arp_gw_have;
+/* ARP moved to the shared cache (uts/os/net/arp.c, /proc/arp).
+ * eth0_arpif carries our identity + raw TX into it. */
+static struct arpif eth0_arpif;
 
 /* Forward decls so rx_dispatch can hand IPv4 frames to the DHCP
  * filter before the IP layer comes up.  Definitions below. */
@@ -338,52 +323,12 @@ static void put_be16(uint8_t *p, uint16_t v)
 	p[0] = (uint8_t)(v >> 8);
 	p[1] = (uint8_t)(v & 0xff);
 }
-static uint16_t get_be16(const uint8_t *p)
+
+/* Trampoline so the shared ARP module can transmit raw frames. */
+static int eth0_arp_tx(void *cookie, const void *frame, unsigned len)
 {
-	return ((uint16_t)p[0] << 8) | p[1];
-}
-
-/* Build an ARP frame in `frame` and TX it.  out_op = ARP_REQUEST or
- * ARP_REPLY; out_dst_mac may be broadcast for requests, the requester
- * for replies; sender/target_ip are host-byte-order. */
-static void arp_send(int out_op, const uint8_t out_dst_mac[6],
-                     uint32_t sender_ip, uint32_t target_ip,
-                     const uint8_t target_mac[6])
-{
-	uint8_t frame[ETH_HDR_LEN + sizeof(struct arp_pkt)];
-	struct ether_hdr *eh = (struct ether_hdr *)frame;
-	kmemcpy(eh->dst, out_dst_mac, 6);
-	kmemcpy(eh->src, g_eth0.mac, 6);
-	eh->ethertype = (uint16_t)((ETHERTYPE_ARP & 0xff) << 8
-	                         | ((ETHERTYPE_ARP >> 8) & 0xff));
-
-	struct arp_pkt *a = (struct arp_pkt *)(frame + ETH_HDR_LEN);
-	put_be16((uint8_t *)&a->hw_type,    1);
-	put_be16((uint8_t *)&a->proto_type, ETHERTYPE_IPV4);
-	a->hw_len    = 6;
-	a->proto_len = 4;
-	put_be16((uint8_t *)&a->opcode, (uint16_t)out_op);
-	kmemcpy(a->sender_mac, g_eth0.mac, 6);
-	a->sender_ip[0] = (sender_ip >> 24) & 0xff;
-	a->sender_ip[1] = (sender_ip >> 16) & 0xff;
-	a->sender_ip[2] = (sender_ip >>  8) & 0xff;
-	a->sender_ip[3] = (sender_ip      ) & 0xff;
-	if (target_mac)
-		kmemcpy(a->target_mac, target_mac, 6);
-	else
-		kmemset(a->target_mac, 0, 6);
-	a->target_ip[0] = (target_ip >> 24) & 0xff;
-	a->target_ip[1] = (target_ip >> 16) & 0xff;
-	a->target_ip[2] = (target_ip >>  8) & 0xff;
-	a->target_ip[3] = (target_ip      ) & 0xff;
-
-	virtio_net_tx_bytes(frame, sizeof(frame));
-}
-
-static void arp_send_request(uint32_t target_ip)
-{
-	static const uint8_t bcast[6] = { 0xff,0xff,0xff,0xff,0xff,0xff };
-	arp_send(ARP_REQUEST, bcast, eth0_ip, target_ip, 0);
+	(void)cookie;
+	return virtio_net_tx_bytes(frame, len);
 }
 
 /* Forward declaration: queue_t to attach to RX delivery path. */
@@ -396,28 +341,8 @@ static void rx_dispatch(const uint8_t *frame, unsigned len)
 	uint16_t et = (uint16_t)(((eh->ethertype & 0xff) << 8)
 	                         | ((eh->ethertype >> 8) & 0xff));
 
-	if (et == ETHERTYPE_ARP && len >= ETH_HDR_LEN + sizeof(struct arp_pkt)) {
-		const struct arp_pkt *a =
-		    (const struct arp_pkt *)(frame + ETH_HDR_LEN);
-		uint16_t op = get_be16((const uint8_t *)&a->opcode);
-		uint32_t sip = ((uint32_t)a->sender_ip[0] << 24)
-		             | ((uint32_t)a->sender_ip[1] << 16)
-		             | ((uint32_t)a->sender_ip[2] <<  8)
-		             | ((uint32_t)a->sender_ip[3]      );
-		uint32_t tip = ((uint32_t)a->target_ip[0] << 24)
-		             | ((uint32_t)a->target_ip[1] << 16)
-		             | ((uint32_t)a->target_ip[2] <<  8)
-		             | ((uint32_t)a->target_ip[3]      );
-		if (op == ARP_REQUEST && tip == eth0_ip) {
-			arp_send(ARP_REPLY, a->sender_mac, eth0_ip,
-			         sip, a->sender_mac);
-		} else if (op == ARP_REPLY && sip == eth0_gateway) {
-			kmemcpy(arp_gw_mac, a->sender_mac, 6);
-			arp_gw_have = 1;
-			kprintf("eth0: gw %02x:%02x:%02x:%02x:%02x:%02x\n",
-			        arp_gw_mac[0], arp_gw_mac[1], arp_gw_mac[2],
-			        arp_gw_mac[3], arp_gw_mac[4], arp_gw_mac[5]);
-		}
+	if (et == ETHERTYPE_ARP) {
+		arp_input(&eth0_arpif, frame, len);
 		return;
 	}
 
@@ -493,17 +418,32 @@ static int eth0_wq_putp(queue_t *q, mblk_t *mp)
 		return -1;
 	}
 
-	if (!arp_gw_have) {
-		/* Trigger ARP and drop this packet -- the next packet
-		 * after the reply lands will succeed. */
-		arp_send_request(eth0_gateway);
-		freemsg(mp);
-		return 0;
+	/* Next hop: on-subnet destinations get ARPed directly, anything
+	 * else goes via the gateway.  The datagram's dst lives at bytes
+	 * 16..19 of the IP header (ip_wput builds it contiguously). */
+	uint8_t dmac[6];
+	{
+		const uint8_t *iph = mp->b_rptr;
+		uint32_t dst = ((uint32_t)iph[16] << 24) | ((uint32_t)iph[17] << 16)
+		             | ((uint32_t)iph[18] <<  8) |  (uint32_t)iph[19];
+		if (dst == 0xffffffffu) {
+			kmemset(dmac, 0xff, 6);
+		} else {
+			uint32_t nh = ((dst & eth0_netmask) ==
+			               (eth0_ip & eth0_netmask)) ? dst
+			                                          : eth0_gateway;
+			if (!arp_resolve(&eth0_arpif, nh, dmac)) {
+				/* Request is on the wire; drop this packet,
+				 * upper layers retransmit. */
+				freemsg(mp);
+				return 0;
+			}
+		}
 	}
 
 	uint8_t buf[ETH_HDR_LEN + 1500];
 	struct ether_hdr *eh = (struct ether_hdr *)buf;
-	kmemcpy(eh->dst, arp_gw_mac, 6);
+	kmemcpy(eh->dst, dmac, 6);
 	kmemcpy(eh->src, g_eth0.mac, 6);
 	eh->ethertype = (uint16_t)((ETHERTYPE_IPV4 & 0xff) << 8
 	                         | ((ETHERTYPE_IPV4 >> 8) & 0xff));
@@ -999,6 +939,16 @@ static int try_init_net(unsigned slot)
 		slot, g_eth0.intid,
 		g_eth0.mac[0], g_eth0.mac[1], g_eth0.mac[2],
 		g_eth0.mac[3], g_eth0.mac[4], g_eth0.mac[5]);
+
+	/* Shared ARP cache identity: valid before RX starts so
+	 * arp_input can learn from the first broadcast we see. */
+	eth0_nif.name     = "eth0";	/* re-set at netif_register; ARP
+					 * entries need it before that */
+	eth0_arpif.nif    = &eth0_nif;
+	eth0_arpif.mac    = g_eth0.mac;
+	eth0_arpif.tx     = eth0_arp_tx;
+	eth0_arpif.cookie = 0;
+	arp_ifattach(&eth0_arpif);
 
 	g_eth0.ready = 1;
 

@@ -48,6 +48,7 @@
 
 #include "kappara/arch/ena.h"
 #include "kappara/arch/mmu.h"
+#include "kappara/net/arp.h"
 #include "kappara/arch/pcie.h"
 #include "kappara/core/kmem.h"
 #include "kappara/core/pmm.h"
@@ -251,23 +252,9 @@ struct ena_ether_hdr {
 	uint16_t ethertype;	/* big-endian */
 } __attribute__((packed));
 
-struct ena_arp_pkt {
-	uint16_t hw_type;
-	uint16_t proto_type;
-	uint8_t  hw_len;
-	uint8_t  proto_len;
-	uint16_t opcode;
-	uint8_t  sender_mac[6];
-	uint8_t  sender_ip[4];
-	uint8_t  target_mac[6];
-	uint8_t  target_ip[4];
-} __attribute__((packed));
-
 #define ENA_ETH_HDR_LEN		14
 #define ENA_ETHERTYPE_IPV4	0x0800
 #define ENA_ETHERTYPE_ARP	0x0806
-#define ENA_ARP_REQUEST		1
-#define ENA_ARP_REPLY		2
 
 /* ---- DHCP structures ---- */
 
@@ -376,8 +363,9 @@ struct ena_dev {
 	uint32_t ip;
 	uint32_t netmask;
 	uint32_t gateway;
-	uint8_t  arp_gw_mac[6];
-	int      arp_gw_have;
+
+	/* Shared ARP cache identity (uts/os/net/arp.c, /proc/arp). */
+	struct arpif aif;
 
 	/* DHCP state machine */
 	int      dhcp_state;
@@ -1043,62 +1031,11 @@ static int ena_eth_tx(struct ena_dev *d, const void *frame, unsigned len)
 	return 0;
 }
 
-/* ---- E2: ARP ---- */
+/* ---- E2: ARP (shared cache trampoline) ---- */
 
-static void ena_arp_send(struct ena_dev *d, int op,
-			 const uint8_t dst_mac[6],
-			 uint32_t sender_ip, uint32_t target_ip,
-			 const uint8_t target_mac[6])
+static int ena_arp_tx(void *cookie, const void *frame, unsigned len)
 {
-	uint8_t frame[ENA_ETH_HDR_LEN + sizeof(struct ena_arp_pkt)];
-	struct ena_ether_hdr *eh = (struct ena_ether_hdr *)frame;
-	kmemcpy(eh->dst, dst_mac, 6);
-	kmemcpy(eh->src, d->mac, 6);
-	put_be16((uint8_t *)&eh->ethertype, ENA_ETHERTYPE_ARP);
-
-	struct ena_arp_pkt *a = (struct ena_arp_pkt *)(frame + ENA_ETH_HDR_LEN);
-	put_be16((uint8_t *)&a->hw_type,    1);
-	put_be16((uint8_t *)&a->proto_type, ENA_ETHERTYPE_IPV4);
-	a->hw_len    = 6;
-	a->proto_len = 4;
-	put_be16((uint8_t *)&a->opcode, (uint16_t)op);
-	kmemcpy(a->sender_mac, d->mac, 6);
-	put_be32(a->sender_ip, sender_ip);
-	if (target_mac)
-		kmemcpy(a->target_mac, target_mac, 6);
-	else
-		kmemset(a->target_mac, 0, 6);
-	put_be32(a->target_ip, target_ip);
-
-	ena_eth_tx(d, frame, sizeof(frame));
-}
-
-static void ena_arp_send_request(struct ena_dev *d, uint32_t target_ip)
-{
-	static const uint8_t bcast[6] = { 0xff,0xff,0xff,0xff,0xff,0xff };
-	ena_arp_send(d, ENA_ARP_REQUEST, bcast, d->ip, target_ip, NULL);
-}
-
-static void ena_arp_process(struct ena_dev *d,
-			    const uint8_t *frame, unsigned len)
-{
-	if (len < ENA_ETH_HDR_LEN + sizeof(struct ena_arp_pkt)) return;
-	const struct ena_arp_pkt *a =
-		(const struct ena_arp_pkt *)(frame + ENA_ETH_HDR_LEN);
-	uint16_t op  = get_be16((const uint8_t *)&a->opcode);
-	uint32_t sip = get_be32(a->sender_ip);
-	uint32_t tip = get_be32(a->target_ip);
-
-	if (op == ENA_ARP_REQUEST && tip == d->ip) {
-		ena_arp_send(d, ENA_ARP_REPLY, a->sender_mac,
-			     d->ip, sip, a->sender_mac);
-	} else if (op == ENA_ARP_REPLY && sip == d->gateway) {
-		kmemcpy(d->arp_gw_mac, a->sender_mac, 6);
-		d->arp_gw_have = 1;
-		kprintf("ena: gw mac %02x:%02x:%02x:%02x:%02x:%02x\n",
-			d->arp_gw_mac[0], d->arp_gw_mac[1], d->arp_gw_mac[2],
-			d->arp_gw_mac[3], d->arp_gw_mac[4], d->arp_gw_mac[5]);
-	}
+	return ena_eth_tx((struct ena_dev *)cookie, frame, len);
 }
 
 /* ---- E5: DHCP ---- */
@@ -1283,7 +1220,7 @@ static void ena_rx_dispatch(struct ena_dev *d,
 	}
 
 	if (et == ENA_ETHERTYPE_ARP) {
-		ena_arp_process(d, frame, len);
+		arp_input(&d->aif, frame, len);
 		return;
 	}
 
@@ -1417,15 +1354,31 @@ static int ena_wq_putp(queue_t *q, mblk_t *mp)
 		freemsg(mp); return -1;
 	}
 
-	if (!g_ena.arp_gw_have) {
-		ena_arp_send_request(&g_ena, g_ena.gateway);
-		freemsg(mp);
-		return 0;
+	/* Next hop: on-subnet destinations get ARPed directly, anything
+	 * else goes via the gateway.  Datagram dst is at IP header
+	 * bytes 16..19 (ip_wput builds the header contiguously). */
+	uint8_t dmac[6];
+	{
+		const uint8_t *iph = mp->b_rptr;
+		uint32_t dst = get_be32(iph + 16);
+		if (dst == 0xffffffffu) {
+			kmemset(dmac, 0xff, 6);
+		} else {
+			uint32_t nh = ((dst & g_ena.netmask) ==
+			               (g_ena.ip & g_ena.netmask)) ? dst
+			                                           : g_ena.gateway;
+			if (!arp_resolve(&g_ena.aif, nh, dmac)) {
+				/* Request on the wire; drop, upper layers
+				 * retransmit. */
+				freemsg(mp);
+				return 0;
+			}
+		}
 	}
 
 	uint8_t frame[ENA_ETH_HDR_LEN + 1500];
 	struct ena_ether_hdr *eh = (struct ena_ether_hdr *)frame;
-	kmemcpy(eh->dst, g_ena.arp_gw_mac, 6);
+	kmemcpy(eh->dst, dmac, 6);
 	kmemcpy(eh->src, g_ena.mac, 6);
 	put_be16((uint8_t *)&eh->ethertype, ENA_ETHERTYPE_IPV4);
 
@@ -1558,6 +1511,15 @@ void ena_init(void)
 	/* io_ready gates ena_eth_tx; must be set before DHCP so
 	 * dhcp_send can actually transmit DISCOVER/REQUEST frames. */
 	d->io_ready = 1;
+
+	/* Shared ARP cache identity: live before the first RX poll so
+	 * arp_input can learn from broadcasts during DHCP. */
+	d->nif.name  = "eth0";	/* re-set at netif_register */
+	d->aif.nif    = &d->nif;
+	d->aif.mac    = d->mac;
+	d->aif.tx     = ena_arp_tx;
+	d->aif.cookie = d;
+	arp_ifattach(&d->aif);
 
 	/* E5: DHCP (spin-polls RX CQ; kthread_yield lets other threads run).
 	 * wire_ena_into_ip requires ip_ctl_sd which is set by ip_init();
