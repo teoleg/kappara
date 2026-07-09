@@ -46,6 +46,7 @@
 #include "kappara/core/kmem.h"
 #include "kappara/net/ip.h"
 #include "kappara/net/netif.h"
+#include "kappara/net/sockio.h"
 #include "kappara/core/printk.h"
 #include "kappara/proc/sched.h"
 #include "kappara/io/stream_head.h"
@@ -108,6 +109,19 @@ static struct ip_lower *ip_route(uint32_t dst_ip)
 		if (!best || p >= best_prefix) {
 			best = l;
 			best_prefix = p;
+		}
+	}
+	/* Default route: no subnet matched -- fall back to the first
+	 * netif with a plumbed gateway (SIOCSIFGW).  This is what lets
+	 * replies reach off-subnet peers (an internet telnet client on
+	 * EC2); with only slirp's flat 10.0.2.0/24 it never mattered. */
+	if (!best) {
+		for (int i = 0; i < IP_MAX_LOWERS; i++) {
+			struct ip_lower *l = &ip_lowers[i];
+			if (l->qbot && l->nif && l->nif->gateway) {
+				best = l;
+				break;
+			}
 		}
 	}
 	return best;
@@ -328,6 +342,63 @@ static int ip_handle_bind(queue_t *q, mblk_t *mp)
 	return 0;
 }
 
+/* Interface plumbing (net/sockio.h): SIOCSIF* / SIOCGIF* arrive as
+ * M_IOCTL with a struct kifreq payload in b_cont.  This is how
+ * dhcpagent and ifconfig configure a netif at runtime -- the SVR4
+ * shape, ip answering ioctls on any stream it terminates. */
+static int ip_handle_ifreq(queue_t *q, mblk_t *mp)
+{
+	struct iocblk *ic  = (struct iocblk *)mp->b_rptr;
+	struct kifreq *ifr = NULL;
+	int ok = 0;
+
+	if (mp->b_cont &&
+	    (mp->b_cont->b_wptr - mp->b_cont->b_rptr)
+	        >= (int)sizeof(struct kifreq))
+		ifr = (struct kifreq *)mp->b_cont->b_rptr;
+
+	if (ifr) {
+		ifr->ifr_name[sizeof(ifr->ifr_name) - 1] = '\0';
+		struct netif *nif = netif_find(ifr->ifr_name);
+		if (nif) {
+			ok = 1;
+			switch (ic->ic_cmd) {
+			case SIOCSIFADDR:    nif->ip      = ifr->ifr_addr; break;
+			case SIOCSIFNETMASK: nif->netmask = ifr->ifr_addr; break;
+			case SIOCSIFGW:      nif->gateway = ifr->ifr_addr; break;
+			case SIOCGIFADDR:    ifr->ifr_addr = nif->ip;      break;
+			case SIOCGIFNETMASK: ifr->ifr_addr = nif->netmask; break;
+			case SIOCGIFGW:      ifr->ifr_addr = nif->gateway; break;
+			case SIOCGIFHWADDR:
+				if (nif->mac)
+					kmemcpy(ifr->ifr_mac, nif->mac, 6);
+				else
+					ok = 0;
+				break;
+			default:
+				ok = 0;
+			}
+			if (ok && (ic->ic_cmd == SIOCSIFADDR
+			        || ic->ic_cmd == SIOCSIFNETMASK
+			        || ic->ic_cmd == SIOCSIFGW))
+				kprintf("ip: %s %s %u.%u.%u.%u\n",
+					nif->name,
+					ic->ic_cmd == SIOCSIFADDR    ? "addr" :
+					ic->ic_cmd == SIOCSIFNETMASK ? "netmask"
+					                             : "gw",
+					(ifr->ifr_addr >> 24) & 0xff,
+					(ifr->ifr_addr >> 16) & 0xff,
+					(ifr->ifr_addr >>  8) & 0xff,
+					 ifr->ifr_addr        & 0xff);
+		}
+	}
+
+	ic->ic_error = ok ? 0 : -1;
+	mp->b_datap->db_type = ok ? M_IOCACK : M_IOCNAK;
+	putnext(OTHERQ(q), mp);
+	return 0;
+}
+
 static int ip_wput(queue_t *q, mblk_t *mp)
 {
 	if (!mp) return 0;
@@ -336,6 +407,8 @@ static int ip_wput(queue_t *q, mblk_t *mp)
 		struct iocblk *ic = (struct iocblk *)mp->b_rptr;
 		if (ic->ic_cmd == I_LINK || ic->ic_cmd == I_UNLINK)
 			return ip_handle_link(q, mp);
+		if ((ic->ic_cmd & 0xff00) == ('i' << 8))
+			return ip_handle_ifreq(q, mp);
 		ic->ic_error = -1;
 		mp->b_datap->db_type = M_IOCNAK;
 		putnext(OTHERQ(q), mp);

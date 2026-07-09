@@ -65,6 +65,7 @@
 #include "kappara/io/streams.h"
 #include "kappara/core/string.h"
 #include "kappara/io/termios.h"
+#include "kappara/net/sockio.h"
 #include "kappara/io/tty.h"
 #include "kappara/core/uaccess.h"
 #include "kappara/arch/uart.h"
@@ -1231,8 +1232,53 @@ static int strioctl_payload_size(int cmd)
 		return (int)sizeof(struct termios);
 	case TCFLSH:
 		return 0;
+	case SIOCSIFADDR:
+	case SIOCGIFADDR:
+	case SIOCSIFNETMASK:
+	case SIOCGIFNETMASK:
+	case SIOCSIFGW:
+	case SIOCGIFGW:
+	case SIOCGIFHWADDR:
+		return (int)sizeof(struct kifreq);
 	default:
 		return -1;
+	}
+}
+
+/* Does this command carry data from user INTO the kernel?  All the
+ * interface ioctls do -- even the G variants send the ifr_name down
+ * so IP knows which netif to answer for. */
+static int strioctl_copies_in(int cmd)
+{
+	switch (cmd) {
+	case TCSETA:
+	case TCSETAW:
+	case TCSETAF:
+	case SIOCSIFADDR:
+	case SIOCGIFADDR:
+	case SIOCSIFNETMASK:
+	case SIOCGIFNETMASK:
+	case SIOCSIFGW:
+	case SIOCGIFGW:
+	case SIOCGIFHWADDR:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+/* Does the response payload get copied back OUT to the user? */
+static int strioctl_copies_out(int cmd)
+{
+	switch (cmd) {
+	case TCGETA:
+	case SIOCGIFADDR:
+	case SIOCGIFNETMASK:
+	case SIOCGIFGW:
+	case SIOCGIFHWADDR:
+		return 1;
+	default:
+		return 0;
 	}
 }
 
@@ -1264,11 +1310,12 @@ static long strioctl(struct stdata *sd, int cmd, long arg)
 			freemsg(iocmp);
 			return -1;
 		}
-		/* TCSETA / TCSETAW / TCSETAF carry data IN -- copy from
+		/* SET-flavoured commands (and the SIOC G variants, which
+		 * still send ifr_name down) carry data IN -- copy from
 		 * user space (or kernel, for in-kernel callers).
-		 * TCGETA carries data OUT only -- the module fills it
-		 * on the way back. */
-		if (cmd == TCSETA || cmd == TCSETAW || cmd == TCSETAF) {
+		 * Pure-OUT commands get their payload filled by the
+		 * module on the way back. */
+		if (strioctl_copies_in(cmd)) {
 			if (syscall_from_user) {
 				if (copy_from_user(data->b_wptr,
 				                   (const void *)(uintptr_t)arg,
@@ -1312,7 +1359,7 @@ static long strioctl(struct stdata *sd, int cmd, long arg)
 	struct iocblk *ric = (struct iocblk *)resp->b_rptr;
 	if (resp->b_datap->db_type == M_IOCACK && ric->ic_error == 0) {
 		ret = 0;
-		if (cmd == TCGETA && resp->b_cont) {
+		if (strioctl_copies_out(cmd) && resp->b_cont) {
 			mblk_t *rdata = resp->b_cont;
 			size_t n = (size_t)(rdata->b_wptr - rdata->b_rptr);
 			if (n > (size_t)payload) n = (size_t)payload;

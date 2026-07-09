@@ -34,6 +34,13 @@ struct netif {
 	const char *name;	/* "lo0", "slip0", ... -- not freed; static */
 	uint32_t    ip;		/* host byte order, e.g. 127.0.0.1 = 0x7f000001 */
 	uint32_t    netmask;	/* host byte order, e.g. /8 = 0xff000000 */
+	uint32_t    gateway;	/* default next hop; 0 = none.  A netif
+				 * with a gateway is the default route:
+				 * ip_route falls back to it when no
+				 * subnet matches.  Plumbed at runtime
+				 * via SIOCSIFGW (net/sockio.h). */
+	const uint8_t *mac;	/* station address (6 B, driver-owned;
+				 * NULL for lo0/slip).  SIOCGIFHWADDR. */
 	unsigned    mtu;	/* bytes -- IP datagram cap */
 	/* The driver's STREAMS personality.  IP (the multiplexor) builds
 	 * a kernel stream from this and I_LINKs it underneath at boot.
@@ -49,6 +56,7 @@ struct netif {
 
 void          netif_register(struct netif *nif);
 struct netif *netif_route   (uint32_t dst_ip);
+struct netif *netif_find    (const char *name);
 
 /* Walk the registry in registration order (newest first).  cb returns
  * non-zero to stop iteration; netif_for_each returns that value. */

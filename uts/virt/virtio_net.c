@@ -129,6 +129,7 @@ static uint32_t eth0_gateway;
 /* ARP moved to the shared cache (uts/os/net/arp.c, /proc/arp).
  * eth0_arpif carries our identity + raw TX into it. */
 static struct arpif eth0_arpif;
+static struct netif eth0_nif;
 
 /* Forward decls so rx_dispatch can hand IPv4 frames to the DHCP
  * filter before the IP layer comes up.  Definitions below. */
@@ -429,9 +430,11 @@ static int eth0_wq_putp(queue_t *q, mblk_t *mp)
 		if (dst == 0xffffffffu) {
 			kmemset(dmac, 0xff, 6);
 		} else {
-			uint32_t nh = ((dst & eth0_netmask) ==
-			               (eth0_ip & eth0_netmask)) ? dst
-			                                          : eth0_gateway;
+			/* Addressing lives on the netif -- runtime plumbing
+			 * (SIOCSIF*) changes it there, not in driver fields. */
+			uint32_t nh = ((dst & eth0_nif.netmask) ==
+			               (eth0_nif.ip & eth0_nif.netmask)) ? dst
+			                                    : eth0_nif.gateway;
 			if (!arp_resolve(&eth0_arpif, nh, dmac)) {
 				/* Request is on the wire; drop this packet,
 				 * upper layers retransmit. */
@@ -494,8 +497,6 @@ struct streamtab eth0_streamtab = {
 	.st_rdinit = &eth0_rinit,
 	.st_wrinit = &eth0_winit,
 };
-
-static struct netif eth0_nif;
 
 /* ---- DHCP client (RFC 2131) ------------------------------------
  *
@@ -876,6 +877,8 @@ static void wire_eth0_into_ip(void)
 	eth0_nif.name     = "eth0";
 	eth0_nif.ip       = eth0_ip;
 	eth0_nif.netmask  = eth0_netmask;
+	eth0_nif.gateway  = eth0_gateway;
+	eth0_nif.mac      = g_eth0.mac;
 	eth0_nif.mtu      = 1500;
 	eth0_nif.streamtab = NULL;	/* using pre-built sd via attach */
 	eth0_nif.tx       = NULL;

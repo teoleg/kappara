@@ -231,6 +231,13 @@ static int udp_wq_putp(queue_t *q, mblk_t *mp)
 		return -1;
 	}
 
+	/* M_IOCTL passes through to IP below -- /dev/udp is the
+	 * canonical stream for interface plumbing ioctls (SIOCSIF*,
+	 * net/sockio.h), exactly how Solaris does it.  IP answers with
+	 * M_IOCACK/M_IOCNAK which udp_rq_putp passes back up. */
+	if (mp->b_datap->db_type == M_IOCTL)
+		return putnext(q, mp);
+
 	/* TPI primitives arrive as M_PROTO with a leading prim byte;
 	 * payload (if any) is in b_cont as M_DATA. */
 	if (mp->b_datap->db_type != M_PROTO) {
@@ -307,6 +314,12 @@ static int udp_rq_putp(queue_t *q, mblk_t *mp)
 		freemsg(mp);
 		return -1;
 	}
+
+	/* ioctl responses from IP go straight up to the stream head,
+	 * which rendezvouses them with the waiting strioctl caller. */
+	if (mp->b_datap->db_type == M_IOCACK
+	 || mp->b_datap->db_type == M_IOCNAK)
+		return putnext(q, mp);
 
 	/* Everything from IP is M_PROTO -- either bind/unbind ack
 	 * (handshake) or IP_T_UNITDATA_IND (inbound packet header +

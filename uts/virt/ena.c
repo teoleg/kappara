@@ -1364,9 +1364,12 @@ static int ena_wq_putp(queue_t *q, mblk_t *mp)
 		if (dst == 0xffffffffu) {
 			kmemset(dmac, 0xff, 6);
 		} else {
-			uint32_t nh = ((dst & g_ena.netmask) ==
-			               (g_ena.ip & g_ena.netmask)) ? dst
-			                                           : g_ena.gateway;
+			/* Addressing lives on the netif -- runtime plumbing
+			 * (SIOCSIF*) changes it there, not in driver fields. */
+			struct netif *nif = &g_ena.nif;
+			uint32_t nh = ((dst & nif->netmask) ==
+			               (nif->ip & nif->netmask)) ? dst
+			                                         : nif->gateway;
 			if (!arp_resolve(&g_ena.aif, nh, dmac)) {
 				/* Request on the wire; drop, upper layers
 				 * retransmit. */
@@ -1440,6 +1443,8 @@ static void wire_ena_into_ip(struct ena_dev *d)
 	d->nif.name      = "eth0";
 	d->nif.ip        = d->ip;
 	d->nif.netmask   = d->netmask;
+	d->nif.gateway   = d->gateway;
+	d->nif.mac       = d->mac;
 	d->nif.mtu       = (d->max_mtu < 1500) ? d->max_mtu : 1500;
 	d->nif.streamtab = NULL;	/* pre-built stream via ip_attach_stream */
 	d->nif.tx        = NULL;
