@@ -35,7 +35,7 @@
 
 #include "kappara/fs/blkdev.h"
 
-#define KFS_MAGIC	0x014b4653u	/* 'KFS\1' little-endian */
+#define KFS_MAGIC	0x024b4653u	/* 'KFS\2' -- v2: 19 B dirents */
 
 #define KFS_SUPER_BLOCK		0
 #define KFS_BITMAP_BLOCK	1
@@ -48,29 +48,45 @@ struct kfs_super {
 };
 
 /* Filesystem-wide name limit and per-dir-block entry cap.  Each
- * kfs_dirent is `KFS_NAME_MAX + 9` bytes (name + start_block + size
- * + type).  We pack as many as fit in one 512 B block, so the two
- * constants move together: 11 / 25 give 11*25 + 9*25 = 500 B used.
- * History: 24/14 → 16/18 → 12/21 → 11/22 → 11/25 as /usr/bin grew
- * (last bump shrank `type` from u32 to u8 since only one bit is
- * meaningful).  Longest name shipped is "tcpconnect" (10 + NUL). */
+ * kfs_dirent is `KFS_NAME_MAX + 8` bytes (name + start_block + size).
+ * We pack as many as fit in one 512 B block, so the two constants
+ * move together: 11 / 26 give 19*26 = 494 B used.
+ * History: 24/14 → 16/18 → 12/21 → 11/22 → 11/25 → 11/26 as
+ * /usr/bin grew (this bump folded the type byte into start_block's
+ * top bit -- a block number never needs 32 bits here).  Longest name
+ * shipped is "tcpconnect" (10 + NUL). */
 #define KFS_NAME_MAX	11
-#define KFS_DIRENTS	25
-
-#define KFS_TYPE_FILE	0
-#define KFS_TYPE_DIR	1
+#define KFS_DIRENTS	26
 
 /* Packed because KFS_NAME_MAX no longer needs to be 4-byte aligned --
- * the struct's on-disk layout is fixed at exactly KFS_NAME_MAX + 9
+ * the struct's on-disk layout is fixed at exactly KFS_NAME_MAX + 8
  * bytes so that the DIRENTS-per-block math matches the comments above. */
 struct kfs_dirent {
 	char		name[KFS_NAME_MAX];
-	uint32_t	start_block;	/* for files: first data block      */
-					/* for dirs:  block of the subdir's */
-					/*            own dirent table       */
+	uint32_t	start_block;	/* [30:0] for files: first data block */
+					/*        for dirs:  the subdir's own */
+					/*                   dirent table     */
+					/* [31]   set = directory             */
 	uint32_t	size_bytes;	/* file size in bytes; 0 for dirs   */
-	uint8_t		type;		/* KFS_TYPE_FILE / _DIR             */
 } __attribute__((packed));
+
+/* On-stack dirent-table buffers must cover a FULL block:
+ * bd_read_block / bd_write_block move exactly BLK_SIZE bytes, and
+ * KFS_DIRENTS * sizeof(kfs_dirent) = 494 < 512.  Declaring arrays
+ * with KFS_DIRENTS_ALLOC prevents an 18-byte stack overrun (found
+ * the hard way: x29 stamped with the superblock magic). */
+#define KFS_DIRENTS_ALLOC	(KFS_DIRENTS + 1)
+
+#define KFS_DE_DIR_BIT	0x80000000u
+
+static inline uint32_t kfs_de_start(const struct kfs_dirent *e)
+{
+	return e->start_block & ~KFS_DE_DIR_BIT;
+}
+static inline int kfs_de_isdir(const struct kfs_dirent *e)
+{
+	return (e->start_block & KFS_DE_DIR_BIT) != 0;
+}
 
 /* Each file is given a fixed number of contiguous blocks at mkimage
  * time so it has room to grow when written.  Real on-disk filesystems

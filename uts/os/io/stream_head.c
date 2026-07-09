@@ -822,6 +822,7 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name,
 	sd->sd_refs   = 1;
 	sd->sd_name   = name;
 	sd->sd_flags  = 0;
+	sd->sd_rd_tmo_ms = 0;
 	sd->sd_peer   = NULL;
 	sd->sd_minor  = minor;
 	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
@@ -1095,6 +1096,14 @@ static long stream_read(struct file *f, void *buf, size_t len)
 	 * before any new writer can acquire sq_lock and putq more
 	 * data. */
 	mblk_t *mp;
+	uint64_t rd_deadline = 0;
+	if (sd->sd_rd_tmo_ms) {
+		uint64_t freq, now;
+		__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+		rd_deadline = now + (freq / 1000ULL)
+		                  * (uint64_t)sd->sd_rd_tmo_ms;
+	}
 	unsigned long flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
 	for (;;) {
 		mp = getq(sd->sd_rq);
@@ -1114,11 +1123,33 @@ static long stream_read(struct file *f, void *buf, size_t len)
 			return -1;
 		  }
 		}
-		kthread_sleep_on_locked(&sd->sd_readwait, flags);
-		/* sleep_on_locked releases sq_lock as part of ctx_switch
-		 * save and restores our caller's IRQ state at the tail.
-		 * Re-acquire for the next loop iteration's getq. */
-		flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		if (rd_deadline) {
+			/* I_SRDTMO mode: park on the global tick wq and
+			 * re-check every tick instead of sleeping on
+			 * sd_readwait indefinitely.  A writer's wake to
+			 * sd_readwait is not lost -- the queue gets
+			 * re-checked on the next 10 ms tick, which is fine
+			 * for the retransmit-timer callers this exists
+			 * for (dhcpagent). */
+			uint64_t now;
+			__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+			if (now >= rd_deadline) {
+				spin_unlock_irq_restore(
+					&sd->sd_readwait.sq_lock, flags);
+				return -1;	/* timed out */
+			}
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
+			                        flags);
+			kthread_sleep_on(&sched_tick_wq);
+			flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		} else {
+			kthread_sleep_on_locked(&sd->sd_readwait, flags);
+			/* sleep_on_locked releases sq_lock as part of
+			 * ctx_switch save and restores our caller's IRQ
+			 * state at the tail.  Re-acquire for the next loop
+			 * iteration's getq. */
+			flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		}
 		{ struct kthread *me = curthread;
 		  if (me && (me->sig_pending & SIG_FATAL_MASK)) {
 			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
@@ -1390,6 +1421,12 @@ static long stream_ioctl(struct file *f, int cmd, long arg)
 		return do_ilink(sd, (int)arg);
 	case I_UNLINK:
 		return do_iunlink(sd, (int)arg);
+	case I_SRDTMO:
+		/* Kappara-local read timeout (ms); poll(2) stand-in for
+		 * daemons like dhcpagent that must retransmit.  0 restores
+		 * the default block-forever. */
+		sd->sd_rd_tmo_ms = (unsigned)arg;
+		return 0;
 	default:
 		/* Everything else flows down the stream as M_IOCTL.  The
 		 * module or driver that owns the command (TCGETA on
@@ -1609,6 +1646,7 @@ static struct stdata *pipe_end(const char *name)
 	sd->sd_refs   = 1;
 	sd->sd_name   = name;
 	sd->sd_flags  = 0;
+	sd->sd_rd_tmo_ms = 0;
 	sd->sd_peer   = NULL;
 	sd->sd_minor  = 0;	/* pipes have no minor */
 	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;

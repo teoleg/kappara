@@ -49,6 +49,7 @@
 #include "kappara/arch/ena.h"
 #include "kappara/arch/mmu.h"
 #include "kappara/net/arp.h"
+#include "kappara/net/dl.h"
 #include "kappara/arch/pcie.h"
 #include "kappara/core/kmem.h"
 #include "kappara/core/pmm.h"
@@ -256,61 +257,6 @@ struct ena_ether_hdr {
 #define ENA_ETHERTYPE_IPV4	0x0800
 #define ENA_ETHERTYPE_ARP	0x0806
 
-/* ---- DHCP structures ---- */
-
-#define DHCP_OP_BOOTREQUEST	1
-#define DHCP_OP_BOOTREPLY	2
-#define DHCP_HTYPE_ETHER	1
-#define DHCP_HLEN_ETHER		6
-#define DHCP_MAGIC		0x63825363u
-
-#define DHCP_MSG_DISCOVER	1
-#define DHCP_MSG_OFFER		2
-#define DHCP_MSG_REQUEST	3
-#define DHCP_MSG_ACK		5
-
-#define DHCP_OPT_PAD		0
-#define DHCP_OPT_SUBNET		1
-#define DHCP_OPT_ROUTER		3
-#define DHCP_OPT_REQ_IP		50
-#define DHCP_OPT_MSG_TYPE	53
-#define DHCP_OPT_SERVER_ID	54
-#define DHCP_OPT_PARAM_LIST	55
-#define DHCP_OPT_END		255
-
-#define DHCP_CLIENT_PORT	68
-#define DHCP_SERVER_PORT	67
-#define IPPROTO_UDP		17
-#define IPV4_HDR_LEN		20
-#define UDP_HDR_LEN		8
-
-struct dhcp_pkt {
-	uint8_t  op;
-	uint8_t  htype;
-	uint8_t  hlen;
-	uint8_t  hops;
-	uint32_t xid;
-	uint16_t secs;
-	uint16_t flags;
-	uint32_t ciaddr;
-	uint32_t yiaddr;
-	uint32_t siaddr;
-	uint32_t giaddr;
-	uint8_t  chaddr[16];
-	uint8_t  sname[64];
-	uint8_t  file[128];
-	uint32_t magic;
-	uint8_t  options[312];
-} __attribute__((packed));
-
-enum {
-	DHCP_INIT,
-	DHCP_WAIT_OFFER,
-	DHCP_WAIT_ACK,
-	DHCP_BOUND,
-	DHCP_FAILED,
-};
-
 /* ---- Driver state ---- */
 
 #define ENA_AQ_DEPTH		32
@@ -359,27 +305,10 @@ struct ena_dev {
 
 	int      io_ready;		/* TX+RX rings set up; checked by ena_eth_tx */
 
-	/* Ethernet/IP addressing */
-	uint32_t ip;
-	uint32_t netmask;
-	uint32_t gateway;
-
 	/* Shared ARP cache identity (uts/os/net/arp.c, /proc/arp). */
 	struct arpif aif;
-
-	/* DHCP state machine */
-	int      dhcp_state;
-	uint32_t dhcp_xid;
-	uint32_t dhcp_offer_ip;
-	uint32_t dhcp_offer_netmask;
-	uint32_t dhcp_offer_gw;
-	uint32_t dhcp_offer_server;
-
-	/* Field diagnostic: first frame received while DHCP was still
-	 * unbound that the filter did NOT consume.  Hexdumped on DHCP
-	 * failure so an AWS boot log shows what actually arrived. */
-	uint8_t  dbg_rx[48];
-	unsigned dbg_rx_len;
+	/* Raw datalink handle (/dev/eth0, uts/os/net/dl.c). */
+	struct dlif *dl;
 
 	/* STREAMS */
 	struct stdata *ena_sd;	/* set by wire_ena_into_ip */
@@ -943,13 +872,6 @@ static void put_be16(uint8_t *p, uint16_t v)
 	p[0] = (uint8_t)(v >> 8);
 	p[1] = (uint8_t)(v & 0xff);
 }
-static void put_be32(uint8_t *p, uint32_t v)
-{
-	p[0] = (uint8_t)(v >> 24);
-	p[1] = (uint8_t)(v >> 16);
-	p[2] = (uint8_t)(v >>  8);
-	p[3] = (uint8_t) v;
-}
 static uint16_t get_be16(const uint8_t *p)
 {
 	return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
@@ -1038,167 +960,6 @@ static int ena_arp_tx(void *cookie, const void *frame, unsigned len)
 	return ena_eth_tx((struct ena_dev *)cookie, frame, len);
 }
 
-/* ---- E5: DHCP ---- */
-
-static uint16_t dhcp_udp_checksum(uint32_t src_ip, uint32_t dst_ip,
-				  const uint8_t *udp, unsigned udp_len)
-{
-	uint32_t sum = 0;
-	sum += (src_ip >> 16) & 0xffff;
-	sum += src_ip & 0xffff;
-	sum += (dst_ip >> 16) & 0xffff;
-	sum += dst_ip & 0xffff;
-	sum += IPPROTO_UDP;
-	sum += udp_len;
-	for (unsigned i = 0; i + 1 < udp_len; i += 2)
-		sum += ((uint16_t)udp[i] << 8) | udp[i + 1];
-	if (udp_len & 1)
-		sum += (uint16_t)udp[udp_len - 1] << 8;
-	while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
-	return (uint16_t)~sum;
-}
-
-static void dhcp_send(struct ena_dev *d, uint8_t msg_type,
-		      uint32_t req_ip, uint32_t server_id)
-{
-	uint8_t frame[ENA_ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN
-		      + sizeof(struct dhcp_pkt)];
-	kmemset(frame, 0, sizeof(frame));
-
-	struct ena_ether_hdr *eh = (struct ena_ether_hdr *)frame;
-	kmemset(eh->dst, 0xff, 6);
-	kmemcpy(eh->src, d->mac, 6);
-	put_be16((uint8_t *)&eh->ethertype, ENA_ETHERTYPE_IPV4);
-
-	uint8_t *ip = frame + ENA_ETH_HDR_LEN;
-	unsigned ip_total = IPV4_HDR_LEN + UDP_HDR_LEN + sizeof(struct dhcp_pkt);
-	ip[0] = 0x45;
-	ip[1] = 0;
-	put_be16(ip + 2, (uint16_t)ip_total);
-	put_be16(ip + 4, d->dhcp_xid & 0xffff);
-	put_be16(ip + 6, 0);
-	ip[8] = 64;
-	ip[9] = IPPROTO_UDP;
-	/* src = 0.0.0.0, dst = 255.255.255.255 */
-	put_be32(ip + 12, 0);
-	put_be32(ip + 16, 0xffffffff);
-	uint16_t iphdr_csum = ip_checksum(ip, IPV4_HDR_LEN);
-	put_be16(ip + 10, iphdr_csum);
-
-	uint8_t *udp = ip + IPV4_HDR_LEN;
-	put_be16(udp + 0, DHCP_CLIENT_PORT);
-	put_be16(udp + 2, DHCP_SERVER_PORT);
-	unsigned udp_total = UDP_HDR_LEN + sizeof(struct dhcp_pkt);
-	put_be16(udp + 4, (uint16_t)udp_total);
-
-	struct dhcp_pkt *dp = (struct dhcp_pkt *)(udp + UDP_HDR_LEN);
-	dp->op    = DHCP_OP_BOOTREQUEST;
-	dp->htype = DHCP_HTYPE_ETHER;
-	dp->hlen  = DHCP_HLEN_ETHER;
-	dp->xid   = (uint32_t)__builtin_bswap32(d->dhcp_xid);
-	dp->flags = (uint16_t)((0x80 << 8) | 0x00);  /* broadcast flag BE */
-	kmemcpy(dp->chaddr, d->mac, 6);
-	dp->magic = (uint32_t)__builtin_bswap32(DHCP_MAGIC);
-
-	uint8_t *opt = dp->options;
-	*opt++ = DHCP_OPT_MSG_TYPE;  *opt++ = 1; *opt++ = msg_type;
-	if (msg_type == DHCP_MSG_REQUEST) {
-		*opt++ = DHCP_OPT_REQ_IP;  *opt++ = 4;
-		put_be32(opt, req_ip); opt += 4;
-		*opt++ = DHCP_OPT_SERVER_ID; *opt++ = 4;
-		put_be32(opt, server_id); opt += 4;
-	}
-	*opt++ = DHCP_OPT_PARAM_LIST; *opt++ = 2;
-	*opt++ = DHCP_OPT_SUBNET; *opt++ = DHCP_OPT_ROUTER;
-	*opt++ = DHCP_OPT_END;
-
-	uint16_t udp_csum = dhcp_udp_checksum(0, 0xffffffff, udp, udp_total);
-	put_be16(udp + 6, udp_csum);
-
-	ena_eth_tx(d, frame, sizeof(frame));
-}
-
-/* Returns 1 if this frame was consumed by the DHCP state machine. */
-static int dhcp_rx_filter(struct ena_dev *d,
-			  const uint8_t *frame, unsigned len)
-{
-	if (d->dhcp_state == DHCP_BOUND || d->dhcp_state == DHCP_FAILED)
-		return 0;
-
-	/* Need Ethernet + IP + UDP + the fixed BOOTP header through the
-	 * magic cookie (240 bytes).  Do NOT require the full 312-byte
-	 * options field: QEMU's slirp pads its replies out to the
-	 * maximum, but real servers -- the EC2 VPC DHCP responder in
-	 * particular -- send compact frames (~300 bytes total) carrying
-	 * only the options they need.  Requiring sizeof(struct
-	 * dhcp_pkt) here silently rejected every real OFFER. */
-	unsigned min = ENA_ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + 240;
-	if (len < min) return 0;
-
-	const uint8_t *ip  = frame + ENA_ETH_HDR_LEN;
-	if ((ip[0] & 0xf0) != 0x40) return 0;
-	if (ip[9] != IPPROTO_UDP) return 0;
-
-	const uint8_t *udp = ip + IPV4_HDR_LEN;
-	if (get_be16(udp + 2) != DHCP_CLIENT_PORT) return 0;
-
-	const struct dhcp_pkt *dp =
-		(const struct dhcp_pkt *)(udp + UDP_HDR_LEN);
-	if (__builtin_bswap32(dp->magic) != DHCP_MAGIC) return 0;
-	if (__builtin_bswap32(dp->xid) != d->dhcp_xid) return 0;
-	if (dp->op != DHCP_OP_BOOTREPLY) return 0;
-
-	/* Parse options for DHCP message type.  Bound the walk by the
-	 * received frame, not the struct's full options capacity. */
-	uint8_t msg_type = 0;
-	uint32_t subnet = 0, router = 0, server = 0;
-	const uint8_t *o = dp->options;
-	const uint8_t *oend = frame + len;
-	if (oend > dp->options + sizeof(dp->options))
-		oend = dp->options + sizeof(dp->options);
-	while (o < oend && *o != DHCP_OPT_END) {
-		uint8_t code = *o++;
-		if (code == DHCP_OPT_PAD) continue;
-		if (o >= oend) break;
-		uint8_t olen = *o++;
-		if (o + olen > oend) break;
-		if (code == DHCP_OPT_MSG_TYPE && olen >= 1)
-			msg_type = o[0];
-		else if (code == DHCP_OPT_SUBNET && olen >= 4)
-			subnet = get_be32(o);
-		else if (code == DHCP_OPT_ROUTER && olen >= 4)
-			router = get_be32(o);
-		else if (code == DHCP_OPT_SERVER_ID && olen >= 4)
-			server = get_be32(o);
-		o += olen;
-	}
-
-	uint32_t offered_ip = __builtin_bswap32(dp->yiaddr);
-
-	if (msg_type == DHCP_MSG_OFFER &&
-	    d->dhcp_state == DHCP_WAIT_OFFER) {
-		d->dhcp_offer_ip      = offered_ip;
-		d->dhcp_offer_netmask = subnet ? subnet : 0xffffff00u;
-		d->dhcp_offer_gw      = router;
-		d->dhcp_offer_server  = server;
-		d->dhcp_state         = DHCP_WAIT_ACK;
-		dhcp_send(d, DHCP_MSG_REQUEST,
-			  d->dhcp_offer_ip, d->dhcp_offer_server);
-		return 1;
-	}
-
-	if (msg_type == DHCP_MSG_ACK &&
-	    d->dhcp_state == DHCP_WAIT_ACK) {
-		d->ip       = offered_ip ? offered_ip : d->dhcp_offer_ip;
-		d->netmask  = subnet ? subnet : d->dhcp_offer_netmask;
-		d->gateway  = router ? router : d->dhcp_offer_gw;
-		d->dhcp_state = DHCP_BOUND;
-		return 1;
-	}
-
-	return 1;
-}
-
 /* ---- E4: RX path ---- */
 
 static void ena_rx_dispatch(struct ena_dev *d,
@@ -1208,16 +969,8 @@ static void ena_rx_dispatch(struct ena_dev *d,
 	const struct ena_ether_hdr *eh = (const struct ena_ether_hdr *)frame;
 	uint16_t et = get_be16((const uint8_t *)&eh->ethertype);
 
-	/* Capture the first frame that arrives while DHCP is unbound.
-	 * If DHCP later fails, this is hexdumped -- either it's the
-	 * reply the filter mis-rejected (and the dump says why), or
-	 * it's ambient broadcast proving our DISCOVER never made it
-	 * out.  Consumed replies never print (DHCP succeeds). */
-	if ((d->dhcp_state == DHCP_WAIT_OFFER ||
-	     d->dhcp_state == DHCP_WAIT_ACK) && d->dbg_rx_len == 0) {
-		d->dbg_rx_len = len < sizeof(d->dbg_rx) ? len : sizeof(d->dbg_rx);
-		kmemcpy(d->dbg_rx, frame, d->dbg_rx_len);
-	}
+	/* Raw datalink tap: dhcpagent and friends see every frame. */
+	dl_input(d->dl, frame, len);
 
 	if (et == ENA_ETHERTYPE_ARP) {
 		arp_input(&d->aif, frame, len);
@@ -1225,8 +978,6 @@ static void ena_rx_dispatch(struct ena_dev *d,
 	}
 
 	if (et != ENA_ETHERTYPE_IPV4) return;
-
-	if (dhcp_rx_filter(d, frame, len)) return;
 
 	if (d->ena_sd && d->ena_sd->sd_drv_rq) {
 		unsigned plen = len - ENA_ETH_HDR_LEN;
@@ -1284,61 +1035,6 @@ static void ena_rx_thread(void *arg)
 		while (ena_rx_poll_one(d)) drained++;
 		if (!drained) kthread_yield();
 	}
-}
-
-/* ---- E5: DHCP run ---- */
-
-/* Poll RX + reap TX until dhcp_state leaves `from_state` or `ms`
- * elapses.  Returns 1 when the state moved on. */
-static int ena_dhcp_wait(struct ena_dev *d, int from_state, unsigned ms)
-{
-	uint64_t freq, start, deadline;
-	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
-	__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
-	deadline = start + (freq / 1000ULL) * (uint64_t)ms;
-
-	while (d->dhcp_state == from_state) {
-		ena_rx_poll_one(d);
-		ena_tx_drain(d);	/* reap bounce buffers + keep the
-					 * done-counter honest for the
-					 * failure diagnostic */
-		kthread_yield();
-		uint64_t now;
-		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
-		if (now >= deadline) return 0;
-	}
-	return 1;
-}
-
-static int ena_dhcp_run(struct ena_dev *d)
-{
-	d->dhcp_xid = 0xd1a10001u;	/* fixed seed; fine for single NIC */
-
-	/* DISCOVER, 3 attempts x 2 s.  The EC2 DHCP responder is fast
-	 * (<10 ms) but the first broadcast can be dropped while the NIC
-	 * settles after queue creation. */
-	for (int attempt = 0; attempt < 3; attempt++) {
-		d->dhcp_state = DHCP_WAIT_OFFER;
-		dhcp_send(d, DHCP_MSG_DISCOVER, 0, 0);
-		if (ena_dhcp_wait(d, DHCP_WAIT_OFFER, 2000))
-			break;
-	}
-	if (d->dhcp_state != DHCP_WAIT_ACK) {
-		d->dhcp_state = DHCP_FAILED;
-		return 0;
-	}
-
-	/* dhcp_rx_filter already sent REQUEST on the OFFER; wait for the
-	 * ACK, retransmitting the REQUEST on timeout. */
-	for (int attempt = 0; attempt < 3; attempt++) {
-		if (ena_dhcp_wait(d, DHCP_WAIT_ACK, 2000))
-			break;
-		dhcp_send(d, DHCP_MSG_REQUEST,
-			  d->dhcp_offer_ip, d->dhcp_offer_server);
-	}
-	if (d->dhcp_state != DHCP_BOUND)
-		d->dhcp_state = DHCP_FAILED;
-	return d->dhcp_state == DHCP_BOUND;
 }
 
 /* ---- E6: STREAMS personality ---- */
@@ -1441,9 +1137,9 @@ static void wire_ena_into_ip(struct ena_dev *d)
 	d->ena_sd = sd;
 
 	d->nif.name      = "eth0";
-	d->nif.ip        = d->ip;
-	d->nif.netmask   = d->netmask;
-	d->nif.gateway   = d->gateway;
+	d->nif.ip        = 0;		/* plumbed later by dhcpagent */
+	d->nif.netmask   = 0;
+	d->nif.gateway   = 0;
 	d->nif.mac       = d->mac;
 	d->nif.mtu       = (d->max_mtu < 1500) ? d->max_mtu : 1500;
 	d->nif.streamtab = NULL;	/* pre-built stream via ip_attach_stream */
@@ -1513,12 +1209,11 @@ void ena_init(void)
 	if (ena_create_io_q(d, &d->rx, 1) < 0) return;
 	if (ena_rx_refill_all(d)   < 0) return;
 
-	/* io_ready gates ena_eth_tx; must be set before DHCP so
-	 * dhcp_send can actually transmit DISCOVER/REQUEST frames. */
+	/* io_ready gates ena_eth_tx. */
 	d->io_ready = 1;
 
 	/* Shared ARP cache identity: live before the first RX poll so
-	 * arp_input can learn from broadcasts during DHCP. */
+	 * arp_input can learn from broadcasts. */
 	d->nif.name  = "eth0";	/* re-set at netif_register */
 	d->aif.nif    = &d->nif;
 	d->aif.mac    = d->mac;
@@ -1526,50 +1221,24 @@ void ena_init(void)
 	d->aif.cookie = d;
 	arp_ifattach(&d->aif);
 
-	/* E5: DHCP (spin-polls RX CQ; kthread_yield lets other threads run).
-	 * wire_ena_into_ip requires ip_ctl_sd which is set by ip_init();
-	 * ip_init() runs after us in main.c -- guard on DHCP success so
-	 * we don't attempt wire-up before ip_ctl_sd exists. */
-	if (ena_dhcp_run(d)) {
-		unsigned nm_bits = 0;
-		uint32_t m = d->netmask;
-		while (m) { nm_bits += m & 1u; m >>= 1; }
-		kprintf("ena: DHCP bound %u.%u.%u.%u/%u gw %u.%u.%u.%u\n",
-			(d->ip >> 24) & 0xff, (d->ip >> 16) & 0xff,
-			(d->ip >>  8) & 0xff,  d->ip        & 0xff,
-			nm_bits,
-			(d->gateway >> 24) & 0xff, (d->gateway >> 16) & 0xff,
-			(d->gateway >>  8) & 0xff,  d->gateway        & 0xff);
+	/* Raw datalink device for userland (dhcpagent). */
+	d->dl = dl_register("eth0", d->mac,
+	                    (d->max_mtu < 1500) ? d->max_mtu : 1500,
+	                    ena_arp_tx, d);
 
-		/* E6+E7: STREAMS wire-up (requires ip_ctl_sd from ip_init).
-		 * When ena_init is called before ip_init, ip_attach_stream
-		 * returns -1 safely; the caller (main.c's PLATFORM_VIRT block)
-		 * should call ena_streams_attach() again after ip_init. */
-		wire_ena_into_ip(d);
-		if (d->ena_sd) {
-			g_ena_init_ok = 1;
-			kprintf("ena: ready  mac %02x:%02x:%02x:%02x:%02x:%02x"
-				"  mtu %u  eth0 linked\n",
-				d->mac[0], d->mac[1], d->mac[2],
-				d->mac[3], d->mac[4], d->mac[5],
-				d->nif.mtu);
-			/* E4: start RX poll thread only after IP is wired */
-			kthread_create("ena_rx", ena_rx_thread, d);
-		}
-	} else {
-		kprintf("ena: DHCP failed -- no IP assigned, network inactive\n");
-		/* Field diagnostic: tx done > 0 means the device consumed
-		 * our DISCOVER (TX descriptor format accepted); rx got > 0
-		 * means replies arrived but the DHCP filter didn't match. */
-		kprintf("ena: tx sent=%u done=%u  rx got=%u\n",
-			d->tx.sq_tail, d->tx.cq_head, d->rx.cq_head);
-		if (d->dbg_rx_len) {
-			kprintf("ena: first unmatched rx (%u B):", d->dbg_rx_len);
-			for (unsigned i = 0; i < d->dbg_rx_len; i++)
-				kprintf("%s%02x", (i % 16) ? " " : "\n  ",
-					d->dbg_rx[i]);
-			kprintf("\n");
-		}
+	/* Wire eth0 under the IP mux UNPLUMBED (ip = 0): dhcpagent runs
+	 * the lease exchange over /dev/eth0 from userland and plumbs the
+	 * result via SIOCSIF* (docs/DLPI.md).  ena_init runs after
+	 * ip_init, so ip_ctl_sd is live. */
+	wire_ena_into_ip(d);
+	if (d->ena_sd) {
+		g_ena_init_ok = 1;
+		kprintf("ena: ready  mac %02x:%02x:%02x:%02x:%02x:%02x"
+			"  mtu %u  eth0 linked (unplumbed)\n",
+			d->mac[0], d->mac[1], d->mac[2],
+			d->mac[3], d->mac[4], d->mac[5],
+			d->nif.mtu);
+		kthread_create("ena_rx", ena_rx_thread, d);
 	}
 }
 

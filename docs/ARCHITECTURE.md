@@ -178,6 +178,21 @@ VA              Size    Purpose
                         slot per process.)
 ```
 
+## Network bring-up (DLPI shape)
+
+Since docs/DLPI.md landed, network configuration is userland-driven,
+the Solaris way: drivers register their netif UNPLUMBED (ip=0) and a
+raw datalink cdev (`/dev/eth0`, mini-DLPI: DL_INFO/DL_BIND over
+putmsg/getmsg, then raw M_DATA frames).  init spawns
+`/usr/bin/dhcpagent`, which runs the DHCP exchange over the raw
+datalink and plumbs the lease with SIOCSIF* ioctls on /dev/udp
+(answered by the IP multiplexor's wput).  `ip_route()` treats a
+netif with a plumbed gateway as the default route.  ARP lives in a
+shared kernel cache (`uts/os/net/arp.c`, `/proc/arp`): drivers call
+`arp_input` on RX and `arp_resolve` per TX packet (on-subnet dst
+directly, off-subnet via the gateway).  `I_SRDTMO` is a
+kappara-local stream-head read timeout standing in for poll(2).
+
 R6: each exec'd process owns its own vm_map (L0/L1/L2/L3 page
 tables) with EXEC_VA/EXEC_STACK_VA/EXEC_HEAP_VA mapped 4 KB at a
 time onto PMM-allocated pages.  User VA space lives entirely under

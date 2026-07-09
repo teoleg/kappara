@@ -929,6 +929,8 @@ extern char echo_blob_start[];
 extern char echo_blob_end[];
 extern char uptime_blob_start[];
 extern char uptime_blob_end[];
+extern char dhcpagent_blob_start[];
+extern char dhcpagent_blob_end[];
 extern char nm_blob_start[];
 extern char nm_blob_end[];
 extern char ldd_blob_start[];
@@ -1072,6 +1074,7 @@ void exec_space_init(void)
 		PAY("host",       host_blob_start,       host_blob_end),
 		PAY("mount",      mount_blob_start,      mount_blob_end),
 		PAY("more",       more_blob_start,       more_blob_end),
+		PAY("dhcpagent",  dhcpagent_blob_start,  dhcpagent_blob_end),
 	};
 #undef PAY
 	const unsigned n_usrbin = sizeof(usrbin_payloads) / sizeof(usrbin_payloads[0]);

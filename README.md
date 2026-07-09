@@ -102,7 +102,10 @@ make test       # smoke-ftp + smoke-sdk + smoke-linux + smoke-linux-mmap
 | `uts/virt/acpi.c`              | Walk RSDP → XSDT → MADT/MCFG/GTDT/FADT (AWS.md stage C)           |
 | `uts/virt/pcie.c`              | ECAM bus enumeration; identifies AWS ENA + NVMe (AWS.md stage D)  |
 | `uts/virt/nvme.c`              | NVMe 1.4 block driver (polled, 512 B LBAs) (AWS.md stage F)       |
-| `uts/virt/ena.c`               | ENA network driver skeleton (AWS.md stage E, **byte-level constants unverified**) |
+| `uts/virt/ena.c`               | ENA network driver (AWS Nitro; verified on Graviton)              |
+| `uts/os/net/arp.c`             | Shared ARP cache (/proc/arp)                                      |
+| `uts/os/net/dl.c`              | Raw datalink provider (/dev/eth0, mini-DLPI)                      |
+| `cmd/dhcpagent.c`              | Userland DHCP client over raw datalink (docs/DLPI.md)             |
 | `/home` on NVMe                | When a controller is present, `/home` is mounted off `nvme0n1` and persists across reboots (AWS.md stage F.1) |
 | `tools/pad_pe.py`              | Pad `kernel.img` to PE SizeOfImage so EDK II accepts the load     |
 | `uts/os/core/pmm.c`            | 4 KB-page freelist allocator (spinlocked for SMP)                 |
@@ -147,6 +150,7 @@ make test       # smoke-ftp + smoke-sdk + smoke-linux + smoke-linux-mmap
 | `/proc/ftrace`    | Ring dump (read); `on`/`off`/`reset` (write)                   |
 | `/proc/cpuload`   | Per-CPU load + idle ratio                                      |
 | `/proc/netif`     | Registered network interfaces + IP/netmask                     |
+| `/proc/arp`       | ARP cache: IP, MAC, interface, age                             |
 | `/proc/slip`      | slip0 byte/frame counters                                      |
 | `/proc/tcp`       | TCB table: state, ports, srtt, cwnd, ...                       |
 | `/proc/acpi`      | ACPI RSDP / GIC bases / CPU MPIDRs / PCIe ECAM / timer GSIVs   |

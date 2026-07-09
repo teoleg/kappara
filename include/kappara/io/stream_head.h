@@ -64,6 +64,10 @@ struct stdata {
 	int		 sd_refs;
 	const char	*sd_name;
 	unsigned	 sd_flags;	/* SD_EOF / future SD_ERR etc.   */
+	unsigned	 sd_rd_tmo_ms;	/* I_SRDTMO read timeout; 0 = block
+					 * forever (default).  Kappara-local:
+					 * SVR4 would use poll(2), which we
+					 * don't have.  See docs/DLPI.md. */
 	struct stdata	*sd_peer;	/* pipe peer; non-NULL only for
 					 * the two ends of a sys_pipe.    */
 	struct wait_queue sd_readwait;	/* readers blocked on empty sd_rq */
@@ -171,6 +175,8 @@ extern struct file_ops stream_fops;
 #define I_LIST		3	/* arg = char* buffer; fills with names */
 #define I_LINK		4	/* arg = lower fd; returns muxid > 0    */
 #define I_UNLINK	5	/* arg = muxid                          */
+#define I_SRDTMO	6	/* arg = read timeout in ms; 0 = block
+				 * (kappara-local -- stands in for poll) */
 
 /*
  * SVR4 linkblk -- payload of the M_IOCTL{I_LINK} message sent down

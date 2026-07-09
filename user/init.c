@@ -1764,13 +1764,22 @@ void _start(long my_tty)
 		cwrite(banner);
 	}
 
-	/* Launch ftpd as a sibling process once -- only from tty0 so we
-	 * get exactly one daemon regardless of how many user-init threads
-	 * are spawned.  kappara's sys_execve creates a fresh process from
-	 * the ELF and returns; we keep running the shell here.  Fire-and-
-	 * forget: if /usr/bin/ftpd is missing on a stripped image, the
-	 * shell still comes up. */
+	/* Launch the boot daemons as sibling processes once -- only from
+	 * tty0 so we get exactly one of each regardless of how many
+	 * user-init threads are spawned.  kappara's sys_execve creates a
+	 * fresh process from the ELF and returns; we keep running the
+	 * shell here.  Fire-and-forget: a stripped image missing either
+	 * binary still boots to a shell.
+	 *
+	 * dhcpagent first: it owns bringing eth0 up (raw datalink lease
+	 * exchange + SIOCSIF* plumb -- see docs/DLPI.md).  ftpd/telnetd
+	 * bind 0.0.0.0 and start answering once the address is plumbed,
+	 * so strict ordering isn't required, just polite. */
 	if (my_tty == 0) {
+		const char *dhcp_argv0 = "/usr/bin/dhcpagent";
+		const char *dhcp_argv[] = { dhcp_argv0, 0 };
+		(void)sys_execve(dhcp_argv0, dhcp_argv);
+
 		const char *argv0 = "/usr/bin/ftpd";
 		const char *argv[] = { argv0, 0 };
 		(void)sys_execve(argv0, argv);

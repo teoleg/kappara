@@ -104,7 +104,7 @@ static int regfile_open(struct file *f)
 	if (f->f_flags & O_TRUNC) {
 		struct kfs_file *kf = c->kf;
 		kf->size_bytes = 0;
-		struct kfs_dirent dir[KFS_DIRENTS];
+		struct kfs_dirent dir[KFS_DIRENTS_ALLOC];
 		if (bd_read_block(kf->bd, kf->dir_block, dir) == 0) {
 			dir[kf->dirent_idx].size_bytes = 0;
 			bd_write_block(kf->bd, kf->dir_block, dir);
@@ -192,7 +192,7 @@ static long regfile_write(struct file *f, const void *buf, size_t len)
 	if (c->pos > kf->size_bytes) {
 		kf->size_bytes = c->pos;
 		/* Push the new size back to the directory entry on disk. */
-		struct kfs_dirent dir[KFS_DIRENTS];
+		struct kfs_dirent dir[KFS_DIRENTS_ALLOC];
 		if (bd_read_block(kf->bd, kf->dir_block, dir) == 0) {
 			dir[kf->dirent_idx].size_bytes = kf->size_bytes;
 			bd_write_block(kf->bd, kf->dir_block, dir);
@@ -403,7 +403,7 @@ static int kfs_dir_creat(struct inode *dir, const char *name)
 	if (!d) return -1;
 	struct block_device *bd = d->bd;
 
-	struct kfs_dirent dir_blk[KFS_DIRENTS];
+	struct kfs_dirent dir_blk[KFS_DIRENTS_ALLOC];
 	if (bd_read_block(bd, d->dir_block, dir_blk) < 0) return -1;
 
 	int slot = kfs_dir_find_slot(dir_blk, name);
@@ -415,9 +415,8 @@ static int kfs_dir_creat(struct inode *dir, const char *name)
 	for (size_t i = 0; i < KFS_NAME_MAX; i++) dir_blk[slot].name[i] = 0;
 	for (size_t i = 0; name[i] && i < KFS_NAME_MAX - 1; i++)
 		dir_blk[slot].name[i] = name[i];
-	dir_blk[slot].start_block = start;
+	dir_blk[slot].start_block = start;	/* dir bit clear = file */
 	dir_blk[slot].size_bytes  = 0;
-	dir_blk[slot].type        = KFS_TYPE_FILE;
 	if (bd_write_block(bd, d->dir_block, dir_blk) < 0) return -1;
 
 	struct kfs_file *kf = kmalloc(sizeof(*kf));
@@ -443,7 +442,7 @@ static int kfs_dir_mkdir(struct inode *dir, const char *name)
 	if (!d) return -1;
 	struct block_device *bd = d->bd;
 
-	struct kfs_dirent dir_blk[KFS_DIRENTS];
+	struct kfs_dirent dir_blk[KFS_DIRENTS_ALLOC];
 	if (bd_read_block(bd, d->dir_block, dir_blk) < 0) return -1;
 
 	int slot = kfs_dir_find_slot(dir_blk, name);
@@ -455,9 +454,8 @@ static int kfs_dir_mkdir(struct inode *dir, const char *name)
 	for (size_t i = 0; i < KFS_NAME_MAX; i++) dir_blk[slot].name[i] = 0;
 	for (size_t i = 0; name[i] && i < KFS_NAME_MAX - 1; i++)
 		dir_blk[slot].name[i] = name[i];
-	dir_blk[slot].start_block = subblk;
+	dir_blk[slot].start_block = subblk | KFS_DE_DIR_BIT;
 	dir_blk[slot].size_bytes  = 0;
-	dir_blk[slot].type        = KFS_TYPE_DIR;
 	if (bd_write_block(bd, d->dir_block, dir_blk) < 0) return -1;
 
 	/* Hook into VFS: a new directory dentry whose i_fops route
@@ -507,7 +505,7 @@ static int kfs_dir_unlink(struct inode *dir, const char *name)
 	if (!d) return -1;
 	struct block_device *bd = d->bd;
 
-	struct kfs_dirent dir_blk[KFS_DIRENTS];
+	struct kfs_dirent dir_blk[KFS_DIRENTS_ALLOC];
 	if (bd_read_block(bd, d->dir_block, dir_blk) < 0) return -1;
 	int slot = kfs_dir_find_named(dir_blk, name);
 	if (slot < 0) {
@@ -515,17 +513,16 @@ static int kfs_dir_unlink(struct inode *dir, const char *name)
 			name, d->dir_block);
 		return -1;
 	}
-	if (dir_blk[slot].type != KFS_TYPE_FILE) {
+	if (kfs_de_isdir(&dir_blk[slot])) {
 		kprintf("kfs_unlink: '%s' is not a regular file\n", name);
 		return -1;
 	}
 	/* Reclaim the file's data blocks via the bitmap, then clear the
 	 * dirent (name[0]=0 marks empty). */
-	uint32_t reclaim_start = dir_blk[slot].start_block;
+	uint32_t reclaim_start = kfs_de_start(&dir_blk[slot]);
 	for (size_t i = 0; i < KFS_NAME_MAX; i++) dir_blk[slot].name[i] = 0;
 	dir_blk[slot].start_block = 0;
 	dir_blk[slot].size_bytes  = 0;
-	dir_blk[slot].type        = 0;
 	if (bd_write_block(bd, d->dir_block, dir_blk) < 0) return -1;
 	if (reclaim_start) kfs_free_blocks(bd, reclaim_start, KFS_BLOCKS_PER_FILE);
 
@@ -541,20 +538,20 @@ static int kfs_dir_rmdir(struct inode *dir, const char *name)
 	if (!d) return -1;
 	struct block_device *bd = d->bd;
 
-	struct kfs_dirent dir_blk[KFS_DIRENTS];
+	struct kfs_dirent dir_blk[KFS_DIRENTS_ALLOC];
 	if (bd_read_block(bd, d->dir_block, dir_blk) < 0) return -1;
 	int slot = kfs_dir_find_named(dir_blk, name);
 	if (slot < 0) {
 		kprintf("kfs_rmdir: '%s' not found\n", name);
 		return -1;
 	}
-	if (dir_blk[slot].type != KFS_TYPE_DIR) {
+	if (!kfs_de_isdir(&dir_blk[slot])) {
 		kprintf("kfs_rmdir: '%s' is not a directory\n", name);
 		return -1;
 	}
 	/* Refuse to remove a non-empty dir. */
-	struct kfs_dirent sub[KFS_DIRENTS];
-	uint32_t sub_block = dir_blk[slot].start_block;
+	struct kfs_dirent sub[KFS_DIRENTS_ALLOC];
+	uint32_t sub_block = kfs_de_start(&dir_blk[slot]);
 	if (bd_read_block(bd, sub_block, sub) < 0) return -1;
 	for (unsigned i = 0; i < KFS_DIRENTS; i++) {
 		if (sub[i].name[0] != '\0') {
@@ -566,7 +563,6 @@ static int kfs_dir_rmdir(struct inode *dir, const char *name)
 	for (size_t i = 0; i < KFS_NAME_MAX; i++) dir_blk[slot].name[i] = 0;
 	dir_blk[slot].start_block = 0;
 	dir_blk[slot].size_bytes  = 0;
-	dir_blk[slot].type        = 0;
 	if (bd_write_block(bd, d->dir_block, dir_blk) < 0) return -1;
 	kfs_free_blocks(bd, sub_block, 1);
 
@@ -619,7 +615,7 @@ void kfs_mkimage(struct block_device *bd,
 	sb.num_files = n_payloads;
 	bd_write_block(bd, KFS_SUPER_BLOCK, &sb);
 
-	struct kfs_dirent dir[KFS_DIRENTS];
+	struct kfs_dirent dir[KFS_DIRENTS_ALLOC];
 	kmemset(dir, 0, sizeof(dir));
 
 	/*
@@ -638,9 +634,8 @@ void kfs_mkimage(struct block_device *bd,
 			nlen++;
 		}
 		dir[i].name[nlen]    = '\0';
-		dir[i].start_block   = cur_block;
+		dir[i].start_block   = cur_block;	/* dir bit clear */
 		dir[i].size_bytes    = p->size;
-		dir[i].type          = KFS_TYPE_FILE;
 
 		const unsigned char *src = (const unsigned char *)p->data;
 		uint32_t             rem = p->size;
@@ -676,7 +671,7 @@ static void kfs_mount_dir(struct block_device *bd,
 			  uint32_t dir_block,
 			  struct dentry *vfs_parent)
 {
-	struct kfs_dirent dir[KFS_DIRENTS];
+	struct kfs_dirent dir[KFS_DIRENTS_ALLOC];
 	if (bd_read_block(bd, dir_block, dir) < 0)
 		return;
 
@@ -687,22 +682,22 @@ static void kfs_mount_dir(struct block_device *bd,
 		char *nm = kfs_dup_name(dir[i].name);
 		if (!nm) continue;
 
-		if (dir[i].type == KFS_TYPE_DIR) {
+		if (kfs_de_isdir(&dir[i])) {
 			struct kfs_dir *sub = kmalloc(sizeof(*sub));
 			if (!sub) { kfree(nm); continue; }
 			struct dentry *sd = vfs_mkdir(vfs_parent, nm);
 			if (!sd) { kfree(nm); kfree(sub); continue; }
 			sub->bd        = bd;
-			sub->dir_block = dir[i].start_block;
+			sub->dir_block = kfs_de_start(&dir[i]);
 			sub->dentry    = sd;
 			sd->d_inode->i_fops    = &kfs_dir_fops;
 			sd->d_inode->i_private = sub;
-			kfs_mount_dir(bd, dir[i].start_block, sd);
+			kfs_mount_dir(bd, kfs_de_start(&dir[i]), sd);
 		} else {
 			struct kfs_file *kf = kmalloc(sizeof(*kf));
 			if (!kf) { kfree(nm); continue; }
 			kf->bd           = bd;
-			kf->start_block  = dir[i].start_block;
+			kf->start_block  = kfs_de_start(&dir[i]);
 			kf->size_bytes   = dir[i].size_bytes;
 			kf->alloc_blocks = KFS_BLOCKS_PER_FILE;
 			kf->dir_block    = dir_block;

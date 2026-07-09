@@ -216,11 +216,38 @@ NAME    FLAGS  MTU     IP              NETMASK
 lo0     UP      1500  127.0.0.1       255.0.0.0
 ```
 
-Read-only.  There's no `ifconfig lo0 up` because every netif is
-statically registered at boot — nothing to mutate.  When SLIP and
-Ethernet drivers land with runtime-configurable IP/MTU, write-side
-ioctls (or a `/dev/dlpi`-shaped control stream) become the place to
-add mutation.
+The read side is this file; mutation goes through the SIOCSIF*
+ioctls (`kappara/net/sockio.h`) carried as M_IOCTL down `/dev/udp`
+to the IP multiplexor — `ifconfig eth0 <ip> [netmask <m>] [gw <g>]`
+drives them, and `dhcpagent` plumbs the DHCP lease the same way at
+boot (docs/DLPI.md).
+
+### /proc/arp
+
+One row per live entry in the shared ARP cache (`uts/os/net/arp.c`,
+`arp_for_each` snapshot).  Columns: IPv4 address, learned MAC,
+interface, seconds since learned/refreshed.  Entries are served
+stale after 300 s but re-requested in the background; a MAC change
+for a cached IP is logged to the console (`arp: <ip> moved ...`).
+Solaris equivalent: `arp -a`.
+
+```
+kappara:/# cat /proc/arp
+IP               MAC                IF     AGE
+10.0.2.2         52:55:0a:00:02:02  eth0      4s
+```
+
+### /dev/eth0 (raw datalink, mini-DLPI)
+
+Not a /proc entry but registered dynamically alongside: each
+Ethernet driver calls `dl_register`, creating a raw datalink cdev.
+Open it, do the `DL_INFO_REQ`/`DL_BIND_REQ` handshake over
+putmsg/getmsg (`kappara/net/dlpi.h`), then read/write complete
+Ethernet frames.  `DL_BIND_REQ.dl_sap` filters by ethertype
+(0 = everything — a two-line tcpdump).  `dhcpagent` is the primary
+consumer.  `I_SRDTMO` (kappara-local ioctl) arms a read timeout in
+ms on any stream — the poll(2) stand-in that lets dhcpagent
+retransmit.
 
 ### /proc/tcp
 

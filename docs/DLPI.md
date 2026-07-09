@@ -1,6 +1,7 @@
 # DLPI datalink access, userland dhcpagent, and the ARP module
 
-Status: design accepted; staged implementation in progress.
+Status: implemented (stages 1-5 landed); lease renewal and a
+real route table remain future work.
 
 ## Why
 
@@ -142,6 +143,16 @@ IP wire-up now happen unconditionally at init).
 
 ## Limitations / future work
 
+- **I_SRDTMO**: dhcpagent needs read timeouts to retransmit and
+  kappara has no poll(2).  `ioctl(fd, I_SRDTMO, ms)` arms a
+  stream-head read timeout (0 restores block-forever); the timed
+  wait parks on the scheduler tick queue and re-checks each 10 ms
+  tick.  Kappara-local divergence, retired when poll lands.
+- **kfs 11/26 dirents**: shipping dhcpagent pushed /usr/bin past
+  the 25-entries-per-block cap; the dirent type byte folded into
+  start_block bit 31 (19 B entries, 26 per block) and KFS_MAGIC
+  bumped to 0x024b4653 -- old /home images reformat on first
+  mount rather than misparse.
 - **Lease renewal**: dhcpagent exits after plumbing; no T1/T2
   timers.  Acceptable on EC2 (a VPC private IP is bound to the ENI
   for the instance lifetime) and slirp (static).  Needs a
