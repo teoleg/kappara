@@ -150,6 +150,19 @@ points at the peer's read queue instead of a driver, so the stack
 walk stops after the head.  `[EOF]` shows up when `SD_EOF` is set
 (peer closed; M_HANGUP was processed).
 
+`[linked under <name>]` marks a lower stream I_LINKed beneath a
+multiplexor: its driver-side read chain was rewired into the mux
+and no longer reaches its own head.  The stack column still shows
+the stream's own composition (its stdata + head survive as the
+kernel-side handle holding the reference), which is why `eth0_drv`
+and `lo0` look free-standing without the tag:
+
+```
+  eth0_drv   refs= 1  stack: strhead -> eth0  [linked under ip_ctl]
+  lo0        refs= 1  stack: strhead -> lo0   [linked under ip_ctl]
+  ip_ctl     refs= 1  stack: strhead -> ip
+```
+
 You can correlate this with `lsl /dev` and `lsl /proc` — every chrdev
 inode under those is *potentially* an open here, but only the ones
 someone has called `sys_open` on (or which the pipe constructor

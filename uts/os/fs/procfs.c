@@ -252,6 +252,23 @@ static void stream_one_registered(const char *name, struct streamtab *st,
 	pb_putc(&stream_pb, '\n');
 }
 
+/* A lower stream I_LINKed under a multiplexor has its driver-side
+ * read queue rewired away from its own head and into the mux's
+ * driver rq.  Resolve which open stream owns that queue so the
+ * listing can say "[linked under ip_ctl]" instead of leaving the
+ * lower looking like a free-standing stream. */
+struct mux_owner_find {
+	queue_t    *target;
+	const char *name;
+};
+
+static void mux_owner_cb(struct stdata *sd, void *arg)
+{
+	struct mux_owner_find *f = arg;
+	if (!f->name && sd->sd_drv_rq == f->target)
+		f->name = sd->sd_name ? sd->sd_name : "?";
+}
+
 /* Walk one open stream's write-side queue stack from the head down,
  * stopping at the driver pair (which ends the chain for normal
  * streams; for pipes there's no driver, so we stop after the head). */
@@ -278,6 +295,25 @@ static void stream_one_open(struct stdata *sd, void *arg)
 	}
 	if (sd->sd_flags & SD_EOF) pb_str(&stream_pb, "  [EOF]");
 	if (sd->sd_peer)           pb_str(&stream_pb, "  [pipe]");
+	/* I_LINKed lower: the read chain from the driver rq no longer
+	 * reaches this stream's own head (modules in between are fine
+	 * -- the chain still terminates at sd_rq for a normal stream). */
+	if (sd->sd_drv_rq && sd->sd_rq) {
+		queue_t *q = sd->sd_drv_rq;
+		int hops = 0;
+		while (q && q != sd->sd_rq && hops++ < 8)
+			q = q->q_next;
+		if (q != sd->sd_rq && sd->sd_drv_rq->q_next) {
+			struct mux_owner_find f = {
+				.target = sd->sd_drv_rq->q_next,
+				.name   = NULL,
+			};
+			streams_for_each_open(mux_owner_cb, &f);
+			pb_str(&stream_pb, "  [linked under ");
+			pb_str(&stream_pb, f.name ? f.name : "mux");
+			pb_putc(&stream_pb, ']');
+		}
+	}
 	pb_putc(&stream_pb, '\n');
 }
 
