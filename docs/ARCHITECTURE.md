@@ -178,41 +178,6 @@ VA              Size    Purpose
                         slot per process.)
 ```
 
-R6: each exec'd process owns its own vm_map (L0/L1/L2/L3 page
-tables) with EXEC_VA/EXEC_STACK_VA/EXEC_HEAP_VA mapped 4 KB at a
-time onto PMM-allocated pages.  User VA space lives entirely under
-1 GB (L1[0]); `mmu_vmap_create` inherits every boot L1 entry above
-it (L1[1] = RAM, L1[2+] = the 1 GB device blocks
-`mmu_map_device_1gb` wires for ACPI-discovered MMIO) plus every
-high-mem L0[1+] entry.  Both copies matter: AWS Nitro places the
-NVMe/ENA BARs at 0x80000000 (L1[2]) while local AAVMF places them
-at 0x8000000000 (L0[1]) -- missing either one means kernel code on
-a syscall path from an exec'd process data-aborts on the first
-MMIO doorbell write (seen as an L1 translation fault in
-`nvme_io_submit_and_wait` during the mmap test on Graviton).  No fixed slot pool; the number of
-concurrent processes is bounded only by PMM size (every exec
-consumes roughly 2 MB of stack + a few KB of code + L3/L2/L1/L0
-tables).  `sys_execve` allocates code pages while copying PT_LOAD
-bytes and the full 2 MB stack range upfront.  `sys_fork` walks the
-parent's L3 tables and allocates a fresh PMM page for each
-already-mapped user page, kmemcpying parent->child before installing
-the mapping in the child's L3.  Same EL0 VAs, different physical
-pages -- real Unix fork semantics.  `vm_map_put` -> `mmu_vmap_destroy`
-walks the L3 tables and `pmm_free`'s every user page on the last
-reference.
-
-`sys_brk` lives in the kernel's per-process `vm_map.heap_brk`.
-Growing the break allocates PMM pages and installs 4 KB mappings;
-shrinking unmaps + frees them.  malloc and friends just call
-`brk(0)` / `brk(addr)` as before; the libc layer is unchanged.
-
-The init window (USER_VA at 0x10000000) is still mapped once at
-boot as a single shared 2 MB block (all four init shells share
-`user_storage`).  fork is only available to exec'd processes; init
-shells trying to fork get rejected.  Only one exec'd program runs at
-a time per shell (the shell calls `sys_wait` before accepting the
-next command).
-
 ### ELF loader (sys_execve)
 
 `sys_execve_impl` in `uts/os/user.c`:
@@ -720,6 +685,56 @@ at all."
 │   slip0 (UART, future)                                  │
 └─────────────────────────────────────────────────────────┘
 ```
+
+### Network bring-up (DLPI shape)
+
+Since docs/DLPI.md landed, network configuration is userland-driven,
+the Solaris way: drivers register their netif UNPLUMBED (ip=0) and a
+raw datalink cdev (`/dev/eth0`, mini-DLPI: DL_INFO/DL_BIND over
+putmsg/getmsg, then raw M_DATA frames).  init spawns
+`/usr/bin/dhcpagent`, which runs the DHCP exchange over the raw
+datalink and plumbs the lease with SIOCSIF* ioctls on /dev/udp
+(answered by the IP multiplexor's wput).  `ip_route()` treats a
+netif with a plumbed gateway as the default route.  ARP lives in a
+shared kernel cache (`uts/os/net/arp.c`, `/proc/arp`): drivers call
+`arp_input` on RX and `arp_resolve` per TX packet (on-subnet dst
+directly, off-subnet via the gateway).  `I_SRDTMO` is a
+kappara-local stream-head read timeout standing in for poll(2).
+
+R6: each exec'd process owns its own vm_map (L0/L1/L2/L3 page
+tables) with EXEC_VA/EXEC_STACK_VA/EXEC_HEAP_VA mapped 4 KB at a
+time onto PMM-allocated pages.  User VA space lives entirely under
+1 GB (L1[0]); `mmu_vmap_create` inherits every boot L1 entry above
+it (L1[1] = RAM, L1[2+] = the 1 GB device blocks
+`mmu_map_device_1gb` wires for ACPI-discovered MMIO) plus every
+high-mem L0[1+] entry.  Both copies matter: AWS Nitro places the
+NVMe/ENA BARs at 0x80000000 (L1[2]) while local AAVMF places them
+at 0x8000000000 (L0[1]) -- missing either one means kernel code on
+a syscall path from an exec'd process data-aborts on the first
+MMIO doorbell write (seen as an L1 translation fault in
+`nvme_io_submit_and_wait` during the mmap test on Graviton).  No fixed slot pool; the number of
+concurrent processes is bounded only by PMM size (every exec
+consumes roughly 2 MB of stack + a few KB of code + L3/L2/L1/L0
+tables).  `sys_execve` allocates code pages while copying PT_LOAD
+bytes and the full 2 MB stack range upfront.  `sys_fork` walks the
+parent's L3 tables and allocates a fresh PMM page for each
+already-mapped user page, kmemcpying parent->child before installing
+the mapping in the child's L3.  Same EL0 VAs, different physical
+pages -- real Unix fork semantics.  `vm_map_put` -> `mmu_vmap_destroy`
+walks the L3 tables and `pmm_free`'s every user page on the last
+reference.
+
+`sys_brk` lives in the kernel's per-process `vm_map.heap_brk`.
+Growing the break allocates PMM pages and installs 4 KB mappings;
+shrinking unmaps + frees them.  malloc and friends just call
+`brk(0)` / `brk(addr)` as before; the libc layer is unchanged.
+
+The init window (USER_VA at 0x10000000) is still mapped once at
+boot as a single shared 2 MB block (all four init shells share
+`user_storage`).  fork is only available to exec'd processes; init
+shells trying to fork get rejected.  Only one exec'd program runs at
+a time per shell (the shell calls `sys_wait` before accepting the
+next command).
 
 ### IP M_PROTO primitives
 

@@ -25,6 +25,7 @@ struct strbuf {
 #define I_LIST		3	/* arg = char* buffer        */
 #define I_LINK		4	/* arg = lower stream fd     */
 #define I_UNLINK	5	/* arg = muxid               */
+#define I_SRDTMO	6	/* arg = read timeout ms; 0 = block */
 
 int putmsg(int fd, const struct strbuf *ctl,
            const struct strbuf *data, int flags);

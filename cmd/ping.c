@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stropts.h>
 #include <unistd.h>
 #include "kappara/net/icmp.h"
 
@@ -90,6 +91,12 @@ int main(int argc, char **argv)
 		puts("ping: cannot open /dev/icmp");
 		return 1;
 	}
+
+	/* 3 s reply timeout.  Without this a single lost echo (e.g. the
+	 * first packet dropped on an ARP-cache miss) parks the read
+	 * forever -- the "no reply (timeout)" branch below could never
+	 * actually fire before I_SRDTMO existed. */
+	ioctl(fd, I_SRDTMO, 3000);
 
 	uint32_t s = dst;
 	printf("PING %u.%u.%u.%u\n",

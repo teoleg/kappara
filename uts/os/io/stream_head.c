@@ -65,6 +65,7 @@
 #include "kappara/io/streams.h"
 #include "kappara/core/string.h"
 #include "kappara/io/termios.h"
+#include "kappara/net/sockio.h"
 #include "kappara/io/tty.h"
 #include "kappara/core/uaccess.h"
 #include "kappara/arch/uart.h"
@@ -821,6 +822,7 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name,
 	sd->sd_refs   = 1;
 	sd->sd_name   = name;
 	sd->sd_flags  = 0;
+	sd->sd_rd_tmo_ms = 0;
 	sd->sd_peer   = NULL;
 	sd->sd_minor  = minor;
 	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
@@ -1094,6 +1096,14 @@ static long stream_read(struct file *f, void *buf, size_t len)
 	 * before any new writer can acquire sq_lock and putq more
 	 * data. */
 	mblk_t *mp;
+	uint64_t rd_deadline = 0;
+	if (sd->sd_rd_tmo_ms) {
+		uint64_t freq, now;
+		__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+		rd_deadline = now + (freq / 1000ULL)
+		                  * (uint64_t)sd->sd_rd_tmo_ms;
+	}
 	unsigned long flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
 	for (;;) {
 		mp = getq(sd->sd_rq);
@@ -1113,11 +1123,33 @@ static long stream_read(struct file *f, void *buf, size_t len)
 			return -1;
 		  }
 		}
-		kthread_sleep_on_locked(&sd->sd_readwait, flags);
-		/* sleep_on_locked releases sq_lock as part of ctx_switch
-		 * save and restores our caller's IRQ state at the tail.
-		 * Re-acquire for the next loop iteration's getq. */
-		flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		if (rd_deadline) {
+			/* I_SRDTMO mode: park on the global tick wq and
+			 * re-check every tick instead of sleeping on
+			 * sd_readwait indefinitely.  A writer's wake to
+			 * sd_readwait is not lost -- the queue gets
+			 * re-checked on the next 10 ms tick, which is fine
+			 * for the retransmit-timer callers this exists
+			 * for (dhcpagent). */
+			uint64_t now;
+			__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+			if (now >= rd_deadline) {
+				spin_unlock_irq_restore(
+					&sd->sd_readwait.sq_lock, flags);
+				return -1;	/* timed out */
+			}
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
+			                        flags);
+			kthread_sleep_on(&sched_tick_wq);
+			flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		} else {
+			kthread_sleep_on_locked(&sd->sd_readwait, flags);
+			/* sleep_on_locked releases sq_lock as part of
+			 * ctx_switch save and restores our caller's IRQ
+			 * state at the tail.  Re-acquire for the next loop
+			 * iteration's getq. */
+			flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		}
 		{ struct kthread *me = curthread;
 		  if (me && (me->sig_pending & SIG_FATAL_MASK)) {
 			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
@@ -1231,8 +1263,53 @@ static int strioctl_payload_size(int cmd)
 		return (int)sizeof(struct termios);
 	case TCFLSH:
 		return 0;
+	case SIOCSIFADDR:
+	case SIOCGIFADDR:
+	case SIOCSIFNETMASK:
+	case SIOCGIFNETMASK:
+	case SIOCSIFGW:
+	case SIOCGIFGW:
+	case SIOCGIFHWADDR:
+		return (int)sizeof(struct kifreq);
 	default:
 		return -1;
+	}
+}
+
+/* Does this command carry data from user INTO the kernel?  All the
+ * interface ioctls do -- even the G variants send the ifr_name down
+ * so IP knows which netif to answer for. */
+static int strioctl_copies_in(int cmd)
+{
+	switch (cmd) {
+	case TCSETA:
+	case TCSETAW:
+	case TCSETAF:
+	case SIOCSIFADDR:
+	case SIOCGIFADDR:
+	case SIOCSIFNETMASK:
+	case SIOCGIFNETMASK:
+	case SIOCSIFGW:
+	case SIOCGIFGW:
+	case SIOCGIFHWADDR:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+/* Does the response payload get copied back OUT to the user? */
+static int strioctl_copies_out(int cmd)
+{
+	switch (cmd) {
+	case TCGETA:
+	case SIOCGIFADDR:
+	case SIOCGIFNETMASK:
+	case SIOCGIFGW:
+	case SIOCGIFHWADDR:
+		return 1;
+	default:
+		return 0;
 	}
 }
 
@@ -1264,11 +1341,12 @@ static long strioctl(struct stdata *sd, int cmd, long arg)
 			freemsg(iocmp);
 			return -1;
 		}
-		/* TCSETA / TCSETAW / TCSETAF carry data IN -- copy from
+		/* SET-flavoured commands (and the SIOC G variants, which
+		 * still send ifr_name down) carry data IN -- copy from
 		 * user space (or kernel, for in-kernel callers).
-		 * TCGETA carries data OUT only -- the module fills it
-		 * on the way back. */
-		if (cmd == TCSETA || cmd == TCSETAW || cmd == TCSETAF) {
+		 * Pure-OUT commands get their payload filled by the
+		 * module on the way back. */
+		if (strioctl_copies_in(cmd)) {
 			if (syscall_from_user) {
 				if (copy_from_user(data->b_wptr,
 				                   (const void *)(uintptr_t)arg,
@@ -1312,7 +1390,7 @@ static long strioctl(struct stdata *sd, int cmd, long arg)
 	struct iocblk *ric = (struct iocblk *)resp->b_rptr;
 	if (resp->b_datap->db_type == M_IOCACK && ric->ic_error == 0) {
 		ret = 0;
-		if (cmd == TCGETA && resp->b_cont) {
+		if (strioctl_copies_out(cmd) && resp->b_cont) {
 			mblk_t *rdata = resp->b_cont;
 			size_t n = (size_t)(rdata->b_wptr - rdata->b_rptr);
 			if (n > (size_t)payload) n = (size_t)payload;
@@ -1343,6 +1421,12 @@ static long stream_ioctl(struct file *f, int cmd, long arg)
 		return do_ilink(sd, (int)arg);
 	case I_UNLINK:
 		return do_iunlink(sd, (int)arg);
+	case I_SRDTMO:
+		/* Kappara-local read timeout (ms); poll(2) stand-in for
+		 * daemons like dhcpagent that must retransmit.  0 restores
+		 * the default block-forever. */
+		sd->sd_rd_tmo_ms = (unsigned)arg;
+		return 0;
 	default:
 		/* Everything else flows down the stream as M_IOCTL.  The
 		 * module or driver that owns the command (TCGETA on
@@ -1562,6 +1646,7 @@ static struct stdata *pipe_end(const char *name)
 	sd->sd_refs   = 1;
 	sd->sd_name   = name;
 	sd->sd_flags  = 0;
+	sd->sd_rd_tmo_ms = 0;
 	sd->sd_peer   = NULL;
 	sd->sd_minor  = 0;	/* pipes have no minor */
 	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;

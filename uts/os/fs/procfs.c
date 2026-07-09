@@ -35,6 +35,7 @@
 #include "kappara/io/cdevsw.h"
 #include "kappara/core/ftrace.h"
 #include "kappara/core/kmem.h"
+#include "kappara/net/arp.h"
 #include "kappara/net/netif.h"
 #include "kappara/net/slip.h"
 #include "kappara/net/tcp.h"
@@ -372,6 +373,48 @@ static int proc_netif_qopen(queue_t *q)
 	       "NAME    FLAGS  MTU     IP              NETMASK\n");
 	netif_for_each(netif_one_row, &netif_pb);
 	pb_flush_to_q(&netif_pb, q);
+	return 0;
+}
+
+/* ---- /proc/arp ----------------------------------------------------- */
+/*
+ * One row per live ARP cache entry.  Columns:
+ *   IP       dotted-quad of the resolved host
+ *   MAC      station address learned from the last REQUEST/REPLY
+ *   IF       interface the entry was learned on
+ *   AGE      seconds since learned/refreshed (arp.c serves entries
+ *            older than 300 s but re-requests in the background)
+ *
+ * Solaris equivalent: `arp -a` / `netstat -p`.
+ */
+
+static struct procbuf arp_pb;
+
+static int arp_one_row(const struct arp_view *v, void *arg)
+{
+	struct procbuf *b = arg;
+	size_t before = b->len;
+	pb_dotted_quad(b, v->ip);
+	while ((b->len - before) < 17) pb_putc(b, ' ');
+	for (int i = 0; i < 6; i++) {
+		static const char hex[] = "0123456789abcdef";
+		if (i) pb_putc(b, ':');
+		pb_putc(b, hex[v->mac[i] >> 4]);
+		pb_putc(b, hex[v->mac[i] & 0xf]);
+	}
+	pb_str(b, "  ");
+	pb_pad_str(b, v->ifname, 6);
+	pb_pad_dec(b, v->age_s, 5);
+	pb_str(b, "s\n");
+	return 0;
+}
+
+static int proc_arp_qopen(queue_t *q)
+{
+	pb_reset(&arp_pb);
+	pb_str(&arp_pb, "IP               MAC                IF     AGE\n");
+	arp_for_each(arp_one_row, &arp_pb);
+	pb_flush_to_q(&arp_pb, q);
 	return 0;
 }
 
@@ -805,6 +848,7 @@ PROC_DRIVER(procpci,  proc_pci_qopen);
 PROC_DRIVER(procefi,  proc_efi_qopen);
 PROC_DRIVER(procnvme,   proc_nvme_qopen);
 PROC_DRIVER(procmounts, proc_mounts_qopen);
+PROC_DRIVER(procarp,    proc_arp_qopen);
 
 /* ---- /proc/ftrace --------------------------------------------------- */
 
@@ -890,6 +934,7 @@ void proc_init(void)
 	cdev_register(CDEV_MAJ_PROC_EFI,    "proc-efi",    &procefi_streamtab);
 	cdev_register(CDEV_MAJ_PROC_NVME,   "proc-nvme",   &procnvme_streamtab);
 	cdev_register(CDEV_MAJ_PROC_MOUNTS, "proc-mounts", &procmounts_streamtab);
+	cdev_register(CDEV_MAJ_PROC_ARP,    "proc-arp",    &procarp_streamtab);
 
 	struct dentry *proc = vfs_mkdir(vfs_root(), "proc");
 	vfs_mknod_chrdev(proc, "ps",       MKDEV(CDEV_MAJ_PROC_PS,     0));
@@ -906,4 +951,5 @@ void proc_init(void)
 	vfs_mknod_chrdev(proc, "efi",      MKDEV(CDEV_MAJ_PROC_EFI,    0));
 	vfs_mknod_chrdev(proc, "nvme",     MKDEV(CDEV_MAJ_PROC_NVME,   0));
 	vfs_mknod_chrdev(proc, "mounts",   MKDEV(CDEV_MAJ_PROC_MOUNTS, 0));
+	vfs_mknod_chrdev(proc, "arp",      MKDEV(CDEV_MAJ_PROC_ARP,    0));
 }

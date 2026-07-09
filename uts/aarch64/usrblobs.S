@@ -242,3 +242,10 @@ libdltest_blob_end:
 more_blob_start:
 	.incbin "build/cmd/more.elf"
 more_blob_end:
+
+	.section ".rodata.dhcpagent_blob","a",%progbits
+	.global dhcpagent_blob_start
+	.global dhcpagent_blob_end
+dhcpagent_blob_start:
+	.incbin "build/cmd/dhcpagent.elf"
+dhcpagent_blob_end:

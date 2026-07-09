@@ -63,7 +63,8 @@ unrecognised command.  Source lives in `cmd/`.
 |-------------------------|---------------------------------------------------------|
 | `ps`                    | Read and display `/proc/ps` (thread list with TID/state/name). |
 | `ping [ip] [count]`     | Send ICMP echo requests via `/dev/icmp`.  Default target `127.0.0.1`, count 4. |
-| `ifconfig`              | Dump `/proc/netif` (one row per registered netif).      |
+| `ifconfig`              | Show interfaces; `ifconfig eth0 <ip> [netmask <m>] [gw <g>]` plumbs one (SIOCSIF* over /dev/udp). |
+| `dhcpagent`             | Userland DHCP client over /dev/eth0 raw datalink; spawned by init at boot, plumbs the lease, exits. |
 | `netstat`               | Dump `/proc/netif` + `/proc/slip` + `/proc/tcp`.        |
 | `test <name>`           | Run one selftest (see subcommand list below).  `test all` runs every test, `test` with no args prints the list. |
 | `tcpconnect <ip> <port>`| Userland TCP dial-out via SVR4 STREAMS / TPI.  See [FTPD.md](FTPD.md) step 1 for the motivation. |

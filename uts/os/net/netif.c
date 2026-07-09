@@ -64,6 +64,17 @@ struct netif *netif_route(uint32_t dst_ip)
 	return best;
 }
 
+struct netif *netif_find(const char *name)
+{
+	if (!name) return 0;
+	for (struct netif *n = netif_list; n; n = n->next) {
+		const char *a = n->name, *b = name;
+		while (*a && *a == *b) { a++; b++; }
+		if (*a == '\0' && *b == '\0') return n;
+	}
+	return 0;
+}
+
 int netif_for_each(int (*cb)(struct netif *nif, void *arg), void *arg)
 {
 	for (struct netif *n = netif_list; n; n = n->next) {
