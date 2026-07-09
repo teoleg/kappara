@@ -339,7 +339,10 @@ against `torvalds/linux drivers/net/ethernet/amazon/ena/`:
   presents as "doorbell rings, nothing happens".
 - RX completion (`ena_eth_io_rx_cdesc_base`): phase is
   status[24]; `length` at +4, `req_id` at +6.
-- DHCP reply sizes: QEMU slirp pads BOOTP replies to the full
+- DHCP message sizes cut both ways.  TX: RFC 2131 requires a
+  DHCP message be at least 300 octets -- the EC2 VPC responder
+  silently drops shorter DISCOVERs (slirp accepts anything), so
+  clients must pad.  RX: QEMU slirp pads BOOTP replies to the full
   312-byte options field; the EC2 VPC responder sends compact
   frames (~300 bytes total).  The RX filter must only require the
   fixed BOOTP header through the magic cookie (240 bytes past
