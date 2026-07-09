@@ -1004,6 +1004,14 @@ static int ena_eth_tx(struct ena_dev *d, const void *frame, unsigned len)
 	void *buf = pmm_alloc();
 	if (!buf) return -1;
 	kmemcpy(buf, frame, len);
+	/* Pad to the 60-byte Ethernet minimum (64 with FCS).  ARP
+	 * replies are 42 bytes bare; short frames may be dropped by
+	 * the device or fabric, and the EC2 reachability prober never
+	 * hears us -- instance status sticks at "initializing". */
+	if (len < 60) {
+		kmemset((uint8_t *)buf + len, 0, 60 - len);
+		len = 60;
+	}
 	cache_clean_range(buf, len);
 
 	struct ena_io_q *q    = &d->tx;

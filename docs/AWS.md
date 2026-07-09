@@ -348,6 +348,13 @@ against `torvalds/linux drivers/net/ethernet/amazon/ena/`:
   OFFER while passing all slirp-based tests.  On DHCP failure the
   driver prints tx sent/done + rx got and hexdumps the first
   unmatched frame.
+- Ethernet minimum frame: real networks pad short frames to 60
+  bytes on RX (slirp doesn't), so `ip_rput` must trim the mblk to
+  the IP `total_len` before L4 checksum verification or every
+  bare TCP ACK "fails checksum".  On TX, `ena_eth_tx` pads short
+  frames (42-byte ARP replies) to 60 bytes -- the EC2 instance
+  reachability check is an ARP probe, and unanswered probes keep
+  instance status stuck at "initializing".
 
 Once the offsets are pinned, what remains for "real packet
 I/O" (not just queue creation):
