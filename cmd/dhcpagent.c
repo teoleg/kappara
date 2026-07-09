@@ -20,9 +20,13 @@
  * Lease renewal (T1/T2) is future work -- an EC2 VPC address is
  * bound to the ENI for the instance lifetime, and slirp is static.
  *
- * Frame-size notes learned on EC2 (docs/AWS.md): real servers send
- * compact replies -- require only the fixed BOOTP header through
- * the magic cookie and bound option parsing by the received length.
+ * Frame-size notes learned on EC2 (docs/AWS.md), both directions:
+ * RX -- real servers send compact replies, so require only the
+ * fixed BOOTP header through the magic cookie and bound option
+ * parsing by the received length.  TX -- real servers REQUIRE the
+ * RFC 2131 300-octet minimum message size and silently drop
+ * shorter DISCOVERs; slirp accepts anything, so only AWS catches
+ * either mistake.
  */
 
 #include <stdint.h>
@@ -106,6 +110,14 @@ static unsigned build_dhcp(uint8_t *f, uint8_t msg,
 	*o++ = OPT_PARAMS; *o++ = 2; *o++ = OPT_SUBNET; *o++ = OPT_ROUTER;
 	*o++ = OPT_END;
 	unsigned blen = (unsigned)(o - b);
+	/* RFC 2131: a DHCP message must be at least 300 octets (BOOTP
+	 * heritage).  The EC2 VPC responder silently ignores shorter
+	 * DISCOVERs; slirp doesn't care, so local tests never catch
+	 * this.  The old in-kernel client always sent the full padded
+	 * struct, which is why it worked on AWS.  Pad (zeros are
+	 * already there from the memset). */
+	if (blen < 300)
+		blen = 300;
 
 	/* UDP */
 	uint8_t *u = f + ETH_HDR_LEN + IPV4_HDR_LEN;
