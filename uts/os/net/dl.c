@@ -249,27 +249,27 @@ void dl_input(struct dlif *d, const void *frame, unsigned len)
 	const uint8_t *f = frame;
 	uint32_t ethertype = ((uint32_t)f[12] << 8) | f[13];
 
-	/* Snapshot matching queues under the lock; deliver outside. */
-	queue_t *targets[DL_MAX_OPENS];
-	int      nt = 0;
+	/* Deliver UNDER dl_lock: dl_qclose takes the same lock before
+	 * the stream head tears the queue pair down, so a concurrent
+	 * close on another CPU can't free the queues between our
+	 * used-check and the putnext (use-after-free otherwise).
+	 * Lock order: dl_lock -> kmem (allocb) -> sd_readwait
+	 * (sh_rq_putp); nothing takes dl_lock while holding either. */
 	unsigned long fl = spin_lock_irq_save(&dl_lock);
 	for (int i = 0; i < DL_MAX_OPENS; i++) {
 		struct dl_open *o = &d->opens[i];
-		if (o->used && o->drv_rq
-		    && (o->sap == 0 || o->sap == ethertype))
-			targets[nt++] = o->drv_rq;
-	}
-	spin_unlock_irq_restore(&dl_lock, fl);
-
-	for (int i = 0; i < nt; i++) {
+		if (!o->used || !o->drv_rq
+		    || (o->sap != 0 && o->sap != ethertype))
+			continue;
 		mblk_t *mp = allocb(len, 0);
-		if (!mp) return;
+		if (!mp) break;
 		kmemcpy(mp->b_wptr, frame, len);
 		mp->b_wptr += len;
 		mp->b_datap->db_type = M_DATA;
-		if (targets[i]->q_next)
-			putnext(targets[i], mp);
+		if (o->drv_rq->q_next)
+			putnext(o->drv_rq, mp);
 		else
 			freemsg(mp);
 	}
+	spin_unlock_irq_restore(&dl_lock, fl);
 }
