@@ -184,6 +184,15 @@ static const uint8_t telnet_iac_init[] = {
  * across two TCP segments. */
 struct iac_filter {
 	enum { IAC_NORMAL, IAC_SAW_IAC, IAC_SAW_VERB, IAC_IN_SB } state;
+	uint8_t verb;		/* which verb led into IAC_SAW_VERB */
+	/* RFC 854 requires refusing options we don't implement --
+	 * staying silent leaves real clients (netkit telnet) parked in
+	 * local-echo linemode waiting for an answer to WILL NAWS /
+	 * TTYPE / LINEMODE, so keystrokes never reach us: exactly
+	 * "prompt reprints but commands do nothing".  Refusals are
+	 * queued here and flushed by the session loop. */
+	uint8_t reply[30];
+	int     nreply;
 };
 
 static int iac_strip(struct iac_filter *f, const char *in, int len,
@@ -212,7 +221,21 @@ static int iac_strip(struct iac_filter *f, const char *in, int len,
 			}
 			break;
 		case IAC_SAW_VERB:
-			/* Skip the option byte that follows the verb. */
+			/* Option byte after the verb: answer it.  We only
+			 * implement ECHO + SUPPGA; refuse everything else so
+			 * the client settles into char-at-a-time mode. */
+			if (f->verb == TWILL && c != TOPT_SUPPGA
+			    && f->nreply + 3 <= (int)sizeof(f->reply)) {
+				f->reply[f->nreply++] = TIAC;
+				f->reply[f->nreply++] = TDONT;
+				f->reply[f->nreply++] = c;
+			} else if (f->verb == TDO && c != TOPT_ECHO
+			        && c != TOPT_SUPPGA
+			        && f->nreply + 3 <= (int)sizeof(f->reply)) {
+				f->reply[f->nreply++] = TIAC;
+				f->reply[f->nreply++] = TWONT;
+				f->reply[f->nreply++] = c;
+			}
 			f->state = IAC_NORMAL;
 			break;
 		case IAC_IN_SB:
@@ -244,12 +267,26 @@ static int telnet_session(struct stdata *R)
 
 	struct iac_filter iacf = { .state = IAC_NORMAL };
 	int why;
+	int dbg_chunks = 0;
 	for (;;) {
 		char buf[64];
 		char clean[64];
 		int n = wait_data(R, buf, sizeof(buf));
 		if (n <= 0) { why = n; break; }
+		/* Field diagnostic: hexdump the first few RX chunks per
+		 * session to the serial console -- shows exactly which
+		 * option volleys a real client sends. */
+		if (dbg_chunks < 3) {
+			dbg_chunks++;
+			kprintf("telnetd: rx[%d]", n);
+			for (int i = 0; i < n && i < 24; i++)
+				kprintf(" %02x", (unsigned char)buf[i]);
+			kprintf("\n");
+		}
+		iacf.nreply = 0;
 		int m = iac_strip(&iacf, buf, n, clean);
+		if (iacf.nreply)
+			send_data(R, (const char *)iacf.reply, iacf.nreply);
 		for (int i = 0; i < m; i++)
 			tty_remote_feed_byte(TELNET_REMOTE_TTY,
 			                     (unsigned char)clean[i]);
