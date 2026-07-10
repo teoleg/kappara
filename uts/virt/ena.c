@@ -1050,34 +1050,12 @@ static int ena_wq_putp(queue_t *q, mblk_t *mp)
 		freemsg(mp); return -1;
 	}
 
-	/* Next hop: on-subnet destinations get ARPed directly, anything
-	 * else goes via the gateway.  Datagram dst is at IP header
-	 * bytes 16..19 (ip_wput builds the header contiguously). */
-	uint8_t dmac[6];
-	{
-		const uint8_t *iph = mp->b_rptr;
-		uint32_t dst = get_be32(iph + 16);
-		if (dst == 0xffffffffu) {
-			kmemset(dmac, 0xff, 6);
-		} else {
-			/* Addressing lives on the netif -- runtime plumbing
-			 * (SIOCSIF*) changes it there, not in driver fields. */
-			struct netif *nif = &g_ena.nif;
-			uint32_t nh = ((dst & nif->netmask) ==
-			               (nif->ip & nif->netmask)) ? dst
-			                                         : nif->gateway;
-			if (!arp_resolve(&g_ena.aif, nh, dmac)) {
-				/* Request on the wire; drop, upper layers
-				 * retransmit. */
-				freemsg(mp);
-				return 0;
-			}
-		}
-	}
-
+	/* Build the frame first (dst MAC blank), then resolve: on an
+	 * ARP miss the frame parks in the shared hold queue and goes
+	 * out when the reply lands, so first packets are never lost. */
 	uint8_t frame[ENA_ETH_HDR_LEN + 1500];
 	struct ena_ether_hdr *eh = (struct ena_ether_hdr *)frame;
-	kmemcpy(eh->dst, dmac, 6);
+	kmemset(eh->dst, 0, 6);
 	kmemcpy(eh->src, g_ena.mac, 6);
 	put_be16((uint8_t *)&eh->ethertype, ENA_ETHERTYPE_IPV4);
 
@@ -1087,6 +1065,25 @@ static int ena_wq_putp(queue_t *q, mblk_t *mp)
 		if (n) { kmemcpy(p, m->b_rptr, n); p += n; }
 	}
 	freemsg(mp);
+
+	/* Next hop: on-subnet destinations get ARPed directly, anything
+	 * else goes via the gateway (netif fields -- runtime plumbing
+	 * changes them there).  IP dst lives at header bytes 16..19. */
+	{
+		const uint8_t *iph = frame + ENA_ETH_HDR_LEN;
+		uint32_t dst = get_be32(iph + 16);
+		if (dst == 0xffffffffu) {
+			kmemset(eh->dst, 0xff, 6);
+		} else {
+			struct netif *nif = &g_ena.nif;
+			uint32_t nh = ((dst & nif->netmask) ==
+			               (nif->ip & nif->netmask)) ? dst
+			                                         : nif->gateway;
+			if (!arp_resolve_hold(&g_ena.aif, nh, frame,
+			                      ENA_ETH_HDR_LEN + plen))
+				return 0;	/* parked; arp transmits it */
+		}
+	}
 
 	return ena_eth_tx(&g_ena, frame, ENA_ETH_HDR_LEN + plen);
 }

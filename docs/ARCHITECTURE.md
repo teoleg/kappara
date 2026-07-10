@@ -449,6 +449,28 @@ MAJOR(rdev) to find the streamtab and build a stream around it.  No
 Linux-style "f_ops on every inode" — drivers live in cdevsw, not on
 the inode.
 
+### Clone devices (clone(7))
+
+`/dev/tcp`, `/dev/udp`, `/dev/icmp`, `/dev/loop`, `/dev/klog`,
+`/dev/ksyms` and every `/proc` snapshot are **clone nodes**: their
+major is `CDEV_MAJ_CLONE` and their minor names the target driver.
+Opening one allocates a fresh minor on the target (framework-side
+bitmap in `cdev_entry` -- SVR4 lets the driver's qopen pick, our
+documented divergence keeps `qi_qopen` one-arg) and builds a fresh
+stream, so every open is an independent instance: concurrent
+`cat /proc/ps` readers each get their own one-shot snapshot,
+every TCP client its own TPI instance.  The minor returns to the
+bitmap on last close.
+
+Non-clone devices get the SVR4 default: opens of the same
+(major, minor) **share one stream**, refcounted -- init's three
+opens of `/dev/ttyN` are one stream with `refs=3` (this
+generalized the old tty-only special case out of existence).
+`CDEV_OPEN_EXCL` opts a driver out: `/dev/eth0`'s node names the
+device, so per-open fresh streams stand in for `DL_ATTACH`.
+
+`/proc/streams` shows the resolved `dev=major,minor` per stream.
+
 ### Multiplexors (I_LINK / I_UNLINK)
 
 A STREAMS multiplexor is a driver that talks to **multiple lower

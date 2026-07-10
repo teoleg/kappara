@@ -280,6 +280,12 @@ static void stream_one_open(struct stdata *sd, void *arg)
 	pb_pad_str(&stream_pb, name, 10);
 	pb_str(&stream_pb, " refs=");
 	pb_pad_dec(&stream_pb, sd->sd_refs, 2);
+	if (sd->sd_major) {
+		pb_str(&stream_pb, " dev=");
+		pb_pad_dec(&stream_pb, sd->sd_major, 0);
+		pb_putc(&stream_pb, ',');
+		pb_pad_dec(&stream_pb, sd->sd_minor, 0);
+	}
 	pb_str(&stream_pb, "  stack:");
 	/* Walk wq downward.  Each q's qinfo->minfo gives a module
 	 * name.  Pipes (sd_drv_wq == NULL) just show the head; their
@@ -973,19 +979,19 @@ void proc_init(void)
 	cdev_register(CDEV_MAJ_PROC_ARP,    "proc-arp",    &procarp_streamtab);
 
 	struct dentry *proc = vfs_mkdir(vfs_root(), "proc");
-	vfs_mknod_chrdev(proc, "ps",       MKDEV(CDEV_MAJ_PROC_PS,     0));
-	vfs_mknod_chrdev(proc, "meminfo",  MKDEV(CDEV_MAJ_PROC_MEM,    0));
-	vfs_mknod_chrdev(proc, "slabinfo", MKDEV(CDEV_MAJ_PROC_SLAB,   0));
-	vfs_mknod_chrdev(proc, "streams",  MKDEV(CDEV_MAJ_PROC_STREAM, 0));
-	vfs_mknod_chrdev(proc, "ftrace",   MKDEV(CDEV_MAJ_PROC_FTRACE, 0));
-	vfs_mknod_chrdev(proc, "cpuload",  MKDEV(CDEV_MAJ_PROC_CPU,    0));
-	vfs_mknod_chrdev(proc, "netif",    MKDEV(CDEV_MAJ_PROC_NETIF,  0));
-	vfs_mknod_chrdev(proc, "slip",     MKDEV(CDEV_MAJ_PROC_SLIP,   0));
-	vfs_mknod_chrdev(proc, "tcp",      MKDEV(CDEV_MAJ_PROC_TCP,    0));
-	vfs_mknod_chrdev(proc, "acpi",     MKDEV(CDEV_MAJ_PROC_ACPI,   0));
-	vfs_mknod_chrdev(proc, "pci",      MKDEV(CDEV_MAJ_PROC_PCI,    0));
-	vfs_mknod_chrdev(proc, "efi",      MKDEV(CDEV_MAJ_PROC_EFI,    0));
-	vfs_mknod_chrdev(proc, "nvme",     MKDEV(CDEV_MAJ_PROC_NVME,   0));
-	vfs_mknod_chrdev(proc, "mounts",   MKDEV(CDEV_MAJ_PROC_MOUNTS, 0));
-	vfs_mknod_chrdev(proc, "arp",      MKDEV(CDEV_MAJ_PROC_ARP,    0));
+	vfs_mknod_chrdev(proc, "ps",        MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_PS));
+	vfs_mknod_chrdev(proc, "meminfo",   MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_MEM));
+	vfs_mknod_chrdev(proc, "slabinfo",  MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_SLAB));
+	vfs_mknod_chrdev(proc, "streams",   MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_STREAM));
+	vfs_mknod_chrdev(proc, "ftrace",    MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_FTRACE));
+	vfs_mknod_chrdev(proc, "cpuload",   MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_CPU));
+	vfs_mknod_chrdev(proc, "netif",     MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_NETIF));
+	vfs_mknod_chrdev(proc, "slip",      MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_SLIP));
+	vfs_mknod_chrdev(proc, "tcp",       MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_TCP));
+	vfs_mknod_chrdev(proc, "acpi",      MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_ACPI));
+	vfs_mknod_chrdev(proc, "pci",       MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_PCI));
+	vfs_mknod_chrdev(proc, "efi",       MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_EFI));
+	vfs_mknod_chrdev(proc, "nvme",      MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_NVME));
+	vfs_mknod_chrdev(proc, "mounts",    MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_MOUNTS));
+	vfs_mknod_chrdev(proc, "arp",       MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_PROC_ARP));
 }

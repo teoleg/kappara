@@ -389,34 +389,12 @@ static int eth0_wq_putp(queue_t *q, mblk_t *mp)
 		return -1;
 	}
 
-	/* Next hop: on-subnet destinations get ARPed directly, anything
-	 * else goes via the gateway.  The datagram's dst lives at bytes
-	 * 16..19 of the IP header (ip_wput builds it contiguously). */
-	uint8_t dmac[6];
-	{
-		const uint8_t *iph = mp->b_rptr;
-		uint32_t dst = ((uint32_t)iph[16] << 24) | ((uint32_t)iph[17] << 16)
-		             | ((uint32_t)iph[18] <<  8) |  (uint32_t)iph[19];
-		if (dst == 0xffffffffu) {
-			kmemset(dmac, 0xff, 6);
-		} else {
-			/* Addressing lives on the netif -- runtime plumbing
-			 * (SIOCSIF*) changes it there, not in driver fields. */
-			uint32_t nh = ((dst & eth0_nif.netmask) ==
-			               (eth0_nif.ip & eth0_nif.netmask)) ? dst
-			                                    : eth0_nif.gateway;
-			if (!arp_resolve(&eth0_arpif, nh, dmac)) {
-				/* Request is on the wire; drop this packet,
-				 * upper layers retransmit. */
-				freemsg(mp);
-				return 0;
-			}
-		}
-	}
-
+	/* Build the frame first (dst MAC blank), then resolve: on an
+	 * ARP miss the frame parks in the shared hold queue and goes
+	 * out when the reply lands, so first packets are never lost. */
 	uint8_t buf[ETH_HDR_LEN + 1500];
 	struct ether_hdr *eh = (struct ether_hdr *)buf;
-	kmemcpy(eh->dst, dmac, 6);
+	kmemset(eh->dst, 0, 6);
 	kmemcpy(eh->src, g_eth0.mac, 6);
 	eh->ethertype = (uint16_t)((ETHERTYPE_IPV4 & 0xff) << 8
 	                         | ((ETHERTYPE_IPV4 >> 8) & 0xff));
@@ -429,6 +407,23 @@ static int eth0_wq_putp(queue_t *q, mblk_t *mp)
 		p += n;
 	}
 	freemsg(mp);
+
+	/* Next hop: on-subnet destinations get ARPed directly, anything
+	 * else goes via the gateway (netif fields -- runtime plumbing
+	 * changes them there).  IP dst lives at header bytes 16..19. */
+	const uint8_t *iph = buf + ETH_HDR_LEN;
+	uint32_t dst = ((uint32_t)iph[16] << 24) | ((uint32_t)iph[17] << 16)
+	             | ((uint32_t)iph[18] <<  8) |  (uint32_t)iph[19];
+	if (dst == 0xffffffffu) {
+		kmemset(eh->dst, 0xff, 6);
+	} else {
+		uint32_t nh = ((dst & eth0_nif.netmask) ==
+		               (eth0_nif.ip & eth0_nif.netmask)) ? dst
+		                                    : eth0_nif.gateway;
+		if (!arp_resolve_hold(&eth0_arpif, nh, buf,
+		                      ETH_HDR_LEN + plen))
+			return 0;	/* parked; arp transmits it */
+	}
 
 	virtio_net_tx_bytes(buf, ETH_HDR_LEN + plen);
 	return 0;

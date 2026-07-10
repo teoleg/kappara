@@ -369,6 +369,8 @@ static int ip_handle_ifreq(queue_t *q, mblk_t *mp)
 			case SIOCGIFADDR:    ifr->ifr_addr = nif->ip;      break;
 			case SIOCGIFNETMASK: ifr->ifr_addr = nif->netmask; break;
 			case SIOCGIFGW:      ifr->ifr_addr = nif->gateway; break;
+			case SIOCSIFDNS:     nif->dns = ifr->ifr_addr;     break;
+			case SIOCGIFDNS:     ifr->ifr_addr = nif->dns;     break;
 			case SIOCGIFHWADDR:
 				if (nif->mac)
 					kmemcpy(ifr->ifr_mac, nif->mac, 6);
@@ -380,7 +382,8 @@ static int ip_handle_ifreq(queue_t *q, mblk_t *mp)
 			}
 			if (ok && (ic->ic_cmd == SIOCSIFADDR
 			        || ic->ic_cmd == SIOCSIFNETMASK
-			        || ic->ic_cmd == SIOCSIFGW))
+			        || ic->ic_cmd == SIOCSIFGW
+			        || ic->ic_cmd == SIOCSIFDNS))
 				kprintf("ip: %s %s %u.%u.%u.%u\n",
 					nif->name,
 					ic->ic_cmd == SIOCSIFADDR    ? "addr" :

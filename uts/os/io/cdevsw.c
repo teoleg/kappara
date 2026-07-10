@@ -39,3 +39,27 @@ struct cdev_entry *cdev_lookup(unsigned major)
 	if (!cdevsw[major].streamtab) return NULL;
 	return &cdevsw[major];
 }
+
+void cdev_set_flags(unsigned major, unsigned flags)
+{
+	if (major < CDEV_MAX)
+		cdevsw[major].flags = flags;
+}
+
+int cdev_minor_alloc(unsigned major)
+{
+	if (major >= CDEV_MAX) return -1;
+	for (unsigned m = 0; m < 64; m++) {
+		if (!(cdevsw[major].minors & (1ULL << m))) {
+			cdevsw[major].minors |= 1ULL << m;
+			return (int)m;
+		}
+	}
+	return -1;
+}
+
+void cdev_minor_free(unsigned major, unsigned minor)
+{
+	if (major < CDEV_MAX && minor < 64)
+		cdevsw[major].minors &= ~(1ULL << minor);
+}

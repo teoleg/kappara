@@ -825,6 +825,8 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name,
 	sd->sd_rd_tmo_ms = 0;
 	sd->sd_peer   = NULL;
 	sd->sd_minor  = minor;
+	sd->sd_major  = 0;	/* stream_open stamps the resolved major */
+	sd->sd_cloned = 0;
 	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
 	sd->sd_ioc_wq   = (struct wait_queue)WAIT_QUEUE_INIT;
 	sd->sd_ioc_response = NULL;
@@ -873,68 +875,75 @@ static struct stdata *stream_build(struct streamtab *drv_st, const char *name,
 
 static int stream_open(struct file *f)
 {
-	/* SVR4 cdev open: dev_t -> major -> cdevsw[] -> streamtab. */
-	struct cdev_entry *cdev = cdev_lookup(MAJOR(f->f_inode->i_rdev));
+	/* SVR4 cdev open: dev_t -> major -> cdevsw[] -> streamtab.
+	 *
+	 * Clone devices (SVR4 clone(7)): a node whose major is
+	 * CDEV_MAJ_CLONE names its target driver in the MINOR.  Every
+	 * open of such a node allocates a fresh minor on the target and
+	 * builds a fresh stream -- /dev/tcp, /dev/udp and the one-shot
+	 * /proc snapshots work this way.  (Divergence from SVR4: the
+	 * framework allocates the minor rather than the driver's qopen,
+	 * which keeps qi_qopen a one-arg function.)
+	 *
+	 * Non-clone devices get the SVR4 default: opens of the same
+	 * (major, minor) share ONE stream, refcounted -- this is what
+	 * makes init's three opens of /dev/ttyN one stream, generalized
+	 * from the old tty-only special case.  CDEV_OPEN_EXCL opts a
+	 * driver out (dl: the node names the device, so per-open fresh
+	 * streams stand in for DL_ATTACH). */
+	unsigned major = MAJOR(f->f_inode->i_rdev);
+	unsigned minor = MINOR(f->f_inode->i_rdev);
+	int      cloned = 0;
+
+	if (major == CDEV_MAJ_CLONE) {
+		major  = minor;
+		cloned = 1;
+	}
+
+	struct cdev_entry *cdev = cdev_lookup(major);
 	if (!cdev || !cdev->streamtab) {
-		kprintf("stream_open: no driver at major %u\n",
-			MAJOR(f->f_inode->i_rdev));
+		kprintf("stream_open: no driver at major %u\n", major);
 		return -1;
 	}
 
-	/* Multi-minor tty driver: multiple opens of the same /dev/ttyN
-	 * share ONE stdata so all readers of the tty see the same
-	 * stream-head queue and uart_rx_main only has to know about
-	 * one sink per minor.  Bump sd_refs on every subsequent open;
-	 * stream_close decrements and tears down on the last close. */
-	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_TTY) {
-		struct queue *drq = tty_drv_rq((int)MINOR(f->f_inode->i_rdev));
-		if (drq) {
-			struct stdata *existing = drq->q_ptr;
-			/* drv_rq's q_ptr is &tty_minor[minor] after the
-			 * driver's qopen; the tty_minor->sd backref is
-			 * the actual stdata we want to share. */
-			if (existing) {
-				/* tty_drv_rq already returns NULL when sd
-				 * is NULL, so existing is the tty_minor;
-				 * fetch sd through it. */
-				struct stdata *sd =
-				    ((struct tty_minor *)existing)->sd;
-				if (sd) {
-					sd->sd_refs++;
-					f->f_private = sd;
-					return 0;
-				}
+	if (cloned) {
+		int m = cdev_minor_alloc(major);
+		if (m < 0) {
+			kprintf("stream_open: clone minors exhausted (%s)\n",
+				cdev->name);
+			return -1;
+		}
+		minor = (unsigned)m;
+	} else if (!(cdev->flags & CDEV_OPEN_EXCL)) {
+		/* Share an already-open stream on the same device. */
+		for (struct stdata *sd = all_open_streams; sd;
+		     sd = sd->sd_all_next) {
+			if (sd->sd_major == major && sd->sd_minor == minor
+			    && sd->sd_refs > 0) {
+				sd->sd_refs++;
+				f->f_private = sd;
+				return 0;
 			}
 		}
 	}
 
-	struct stdata *sd = stream_build(cdev->streamtab, cdev->name,
-					 MINOR(f->f_inode->i_rdev));
-	if (!sd)
+	struct stdata *sd = stream_build(cdev->streamtab, cdev->name, minor);
+	if (!sd) {
+		if (cloned) cdev_minor_free(major, minor);
 		return -1;
+	}
+	sd->sd_major  = major;
+	sd->sd_cloned = cloned;
 
-	/* Auto-push the SVR4 line discipline onto every tty open.  In
-	 * Solaris this is what the autopush database (sad(7D)) drives
-	 * per-device; phase 4 hardcodes "ldterm on tty" because tty
-	 * is the only multi-cooking driver we have.  The push happens
-	 * AFTER stream_build so the driver's qi_qopen has already
-	 * wired its per-minor state via q_ptr -- ldterm pushes above
-	 * it without disturbing that. */
-	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_TTY)
+	/* Auto-push per resolved driver -- kappara's hardcoded stand-in
+	 * for the Solaris autopush database (sad(7D)). */
+	if (major == CDEV_MAJ_TTY)
 		(void)do_ipush(sd, "ldterm");
-	/* /dev/icmp's cdev streamtab is ip_streamtab -- so opening it
-	 * gets a stream with IP at the bottom.  Autopush the icmp
-	 * module on top so the user-visible stream is icmp-over-ip.
-	 * Same shape as tty / ldterm. */
-	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_ICMP)
+	if (major == CDEV_MAJ_ICMP)
 		(void)do_ipush(sd, "icmp");
-	/* Same shape for /dev/udp: ip_streamtab at the bottom, udp
-	 * module autopushed on top.  User-visible stream is udp-over-ip
-	 * with TPI primitives via putmsg/getmsg. */
-	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_UDP)
+	if (major == CDEV_MAJ_UDP)
 		(void)do_ipush(sd, "udp");
-	/* And /dev/tcp: ip_streamtab + autopushed tcp module. */
-	if (MAJOR(f->f_inode->i_rdev) == CDEV_MAJ_TCP)
+	if (major == CDEV_MAJ_TCP)
 		(void)do_ipush(sd, "tcp");
 
 	f->f_private = sd;
@@ -978,6 +987,10 @@ static int stream_close(struct file *f)
 	f->f_private = NULL;
 	if (--sd->sd_refs > 0)
 		return 0;
+
+	/* Clone opens hand their minor back for reuse. */
+	if (sd->sd_cloned)
+		cdev_minor_free(sd->sd_major, sd->sd_minor);
 
 	/* Don't leave uart_rx pointing at a stream we're about to
 	 * free.  In practice init never closes /dev/console, so this
@@ -1269,6 +1282,8 @@ static int strioctl_payload_size(int cmd)
 	case SIOCGIFNETMASK:
 	case SIOCSIFGW:
 	case SIOCGIFGW:
+	case SIOCSIFDNS:
+	case SIOCGIFDNS:
 	case SIOCGIFHWADDR:
 		return (int)sizeof(struct kifreq);
 	default:
@@ -1291,6 +1306,8 @@ static int strioctl_copies_in(int cmd)
 	case SIOCGIFNETMASK:
 	case SIOCSIFGW:
 	case SIOCGIFGW:
+	case SIOCSIFDNS:
+	case SIOCGIFDNS:
 	case SIOCGIFHWADDR:
 		return 1;
 	default:
@@ -1306,6 +1323,7 @@ static int strioctl_copies_out(int cmd)
 	case SIOCGIFADDR:
 	case SIOCGIFNETMASK:
 	case SIOCGIFGW:
+	case SIOCGIFDNS:
 	case SIOCGIFHWADDR:
 		return 1;
 	default:
@@ -1494,6 +1512,16 @@ static long stream_getmsg(struct file *f, struct strbuf *ctl,
 	 * fatal error.  T_TCP_BIND_REQ from cmd/tcpconnect.c was the
 	 * canonical victim. */
 	mblk_t *mp;
+	uint64_t gm_deadline = 0;
+	if (sd->sd_rd_tmo_ms) {
+		/* I_SRDTMO applies to getmsg too -- TPI clients (host's
+		 * DNS lookup) block here, not in stream_read. */
+		uint64_t freq, now;
+		__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+		gm_deadline = now + (freq / 1000ULL)
+		                  * (uint64_t)sd->sd_rd_tmo_ms;
+	}
 	unsigned long wflags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
 	for (;;) {
 		mp = getq(sd->sd_rq);
@@ -1510,8 +1538,23 @@ static long stream_getmsg(struct file *f, struct strbuf *ctl,
 			return -1;
 		  }
 		}
-		kthread_sleep_on_locked(&sd->sd_readwait, wflags);
-		wflags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		if (gm_deadline) {
+			/* Same tick-parked timed wait as stream_read. */
+			uint64_t now;
+			__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+			if (now >= gm_deadline) {
+				spin_unlock_irq_restore(
+					&sd->sd_readwait.sq_lock, wflags);
+				return -1;	/* timed out */
+			}
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
+			                        wflags);
+			kthread_sleep_on(&sched_tick_wq);
+			wflags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		} else {
+			kthread_sleep_on_locked(&sd->sd_readwait, wflags);
+			wflags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		}
 	}
 	spin_unlock_irq_restore(&sd->sd_readwait.sq_lock, wflags);
 
@@ -1649,6 +1692,8 @@ static struct stdata *pipe_end(const char *name)
 	sd->sd_rd_tmo_ms = 0;
 	sd->sd_peer   = NULL;
 	sd->sd_minor  = 0;	/* pipes have no minor */
+	sd->sd_major  = 0;
+	sd->sd_cloned = 0;
 	sd->sd_readwait = (struct wait_queue)WAIT_QUEUE_INIT;
 	sd->sd_ioc_wq   = (struct wait_queue)WAIT_QUEUE_INIT;
 	sd->sd_ioc_response = NULL;
@@ -2169,6 +2214,11 @@ void streams_head_init(void)
 	 * open stream and don't need a major; we register them here
 	 * anyway so /dev/upper and /dev/delay are openable too -- handy
 	 * for testing the module logic in isolation. */
+	/* The clone driver's slot exists so vfs_mknod_chrdev accepts
+	 * clone nodes; its streamtab is never opened -- stream_open
+	 * resolves the target major before touching it.  null's table
+	 * is the placeholder. */
+	cdev_register(CDEV_MAJ_CLONE,   "clone",   &null_streamtab);
 	cdev_register(CDEV_MAJ_LOOP,    "loop",    &loop_streamtab);
 	cdev_register(CDEV_MAJ_NULL,    "null",    &null_streamtab);
 	cdev_register(CDEV_MAJ_CONSOLE, "console", &console_streamtab);
@@ -2184,11 +2234,11 @@ void streams_head_init(void)
 	 * looks up cdevsw[MAJOR(rdev)] to find the streamtab; the
 	 * inode no longer holds the driver pointer directly. */
 	struct dentry *dev = vfs_mkdir(vfs_root(), "dev");
-	vfs_mknod_chrdev(dev, "loop",    MKDEV(CDEV_MAJ_LOOP,    0));
+	vfs_mknod_chrdev(dev, "loop",    MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_LOOP));
 	vfs_mknod_chrdev(dev, "null",    MKDEV(CDEV_MAJ_NULL,    0));
 	vfs_mknod_chrdev(dev, "console", MKDEV(CDEV_MAJ_CONSOLE, 0));
-	vfs_mknod_chrdev(dev, "klog",    MKDEV(CDEV_MAJ_KLOG,    0));
-	vfs_mknod_chrdev(dev, "ksyms",   MKDEV(CDEV_MAJ_KSYMS,   0));
+	vfs_mknod_chrdev(dev, "klog",    MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_KLOG));
+	vfs_mknod_chrdev(dev, "ksyms",   MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_KSYMS));
 #ifdef __aarch64__
 	vfs_mknod_chrdev(dev, "fbcon",   MKDEV(CDEV_MAJ_FBCON,   0));
 #endif
@@ -2228,9 +2278,11 @@ void streams_head_init(void)
 	 * stream to IP.  slip_init (in main.c, after ip_init) builds
 	 * the actual stream and I_LINKs it under IP. */
 	slip_module_init();
-	vfs_mknod_chrdev(dev, "icmp", MKDEV(CDEV_MAJ_ICMP,  0));
-	vfs_mknod_chrdev(dev, "udp",  MKDEV(CDEV_MAJ_UDP,   0));
-	vfs_mknod_chrdev(dev, "tcp",  MKDEV(CDEV_MAJ_TCP,   0));
+	/* Clone nodes (SVR4 clone(7)): minor = target major; every
+	 * open mints a fresh stream + minor on the target driver. */
+	vfs_mknod_chrdev(dev, "icmp", MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_ICMP));
+	vfs_mknod_chrdev(dev, "udp",  MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_UDP));
+	vfs_mknod_chrdev(dev, "tcp",  MKDEV(CDEV_MAJ_CLONE, CDEV_MAJ_TCP));
 
 	kprintf("stream_head: registered modules:");
 	for (struct stmod_entry *e = registry; e; e = e->next)

@@ -55,6 +55,7 @@
 #define OPT_PAD		0
 #define OPT_SUBNET	1
 #define OPT_ROUTER	3
+#define OPT_DNS		6
 #define OPT_REQ_IP	50
 #define OPT_MSG_TYPE	53
 #define OPT_SERVER_ID	54
@@ -67,7 +68,7 @@
 static uint8_t  our_mac[6];
 static uint32_t xid = 0xd1a10001u;
 
-static uint32_t offer_ip, offer_mask, offer_gw, offer_server;
+static uint32_t offer_ip, offer_mask, offer_gw, offer_server, offer_dns;
 
 static void be16(uint8_t *p, uint16_t v) { p[0] = v >> 8; p[1] = v; }
 static void be32(uint8_t *p, uint32_t v)
@@ -107,7 +108,8 @@ static unsigned build_dhcp(uint8_t *f, uint8_t msg,
 		*o++ = OPT_REQ_IP;    *o++ = 4; be32(o, req_ip);  o += 4;
 		*o++ = OPT_SERVER_ID; *o++ = 4; be32(o, server);  o += 4;
 	}
-	*o++ = OPT_PARAMS; *o++ = 2; *o++ = OPT_SUBNET; *o++ = OPT_ROUTER;
+	*o++ = OPT_PARAMS; *o++ = 3;
+	*o++ = OPT_SUBNET; *o++ = OPT_ROUTER; *o++ = OPT_DNS;
 	*o++ = OPT_END;
 	unsigned blen = (unsigned)(o - b);
 	/* RFC 2131: a DHCP message must be at least 300 octets (BOOTP
@@ -183,6 +185,7 @@ static int parse_reply(const uint8_t *f, unsigned len)
 		if      (code == OPT_MSG_TYPE  && olen >= 1) msg    = o[0];
 		else if (code == OPT_SUBNET    && olen >= 4) mask   = rd32(o);
 		else if (code == OPT_ROUTER    && olen >= 4) gw     = rd32(o);
+		else if (code == OPT_DNS       && olen >= 4) offer_dns = rd32(o);
 		else if (code == OPT_SERVER_ID && olen >= 4) server = rd32(o);
 		o += olen;
 	}
@@ -233,6 +236,10 @@ static int plumb(const char *ifname,
 	if (ioctl(fd, SIOCSIFNETMASK, (long)&ifr) < 0) rc = -1;
 	ifr.ifr_addr = gw;
 	if (ioctl(fd, SIOCSIFGW, (long)&ifr) < 0)      rc = -1;
+	if (offer_dns) {
+		ifr.ifr_addr = offer_dns;
+		(void)ioctl(fd, SIOCSIFDNS, (long)&ifr);
+	}
 	close(fd);
 	return rc;
 }
@@ -301,6 +308,7 @@ int main(int argc, char **argv)
 		offer_ip   = 0x0a00020fu;	/* 10.0.2.15 */
 		offer_mask = 0xffffff00u;
 		offer_gw   = 0x0a000202u;	/* 10.0.2.2  */
+		offer_dns  = 0x0a000203u;	/* 10.0.2.3 (slirp DNS) */
 		printf("dhcpagent: no DHCP -- fallback 10.0.2.15/24\n");
 	}
 	if (!offer_mask) offer_mask = 0xffffff00u;

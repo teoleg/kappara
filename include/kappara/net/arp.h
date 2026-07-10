@@ -36,10 +36,16 @@ void arp_ifattach(struct arpif *aif);
  * ethertype 0x0806. */
 void arp_input(struct arpif *aif, const uint8_t *frame, unsigned len);
 
-/* Resolve `ip` to a MAC.  Returns 1 and fills mac_out on a cache
- * hit; on a miss broadcasts an ARP REQUEST and returns 0 (caller
- * drops its packet; upper layers retransmit). */
-int arp_resolve(struct arpif *aif, uint32_t ip, uint8_t mac_out[6]);
+/* Resolve the next hop for a fully-built Ethernet frame whose dst
+ * MAC (frame[0..5]) is still blank.  On a cache hit: writes the MAC
+ * into the frame and returns 1 -- caller transmits.  On a miss:
+ * parks the frame in a hold slot, broadcasts an ARP REQUEST, and
+ * returns 0 -- the module transmits the held frame itself when the
+ * reply arrives (classic BSD one-packet hold queue).  Without the
+ * hold, the first packet to every new destination was silently
+ * dropped, which one-shot clients (DNS lookups) never recover from. */
+int arp_resolve_hold(struct arpif *aif, uint32_t ip,
+                     uint8_t *frame, unsigned len);
 
 /* /proc/arp snapshot support. */
 struct arp_view {
