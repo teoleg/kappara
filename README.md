@@ -5,8 +5,14 @@
 
 A small SVR4-flavored Unix-like operating system for AArch64.  Develops on
 QEMU `virt` (`qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72`)
-and is on the runway to boot on AWS Graviton (EC2 EFI / UEFI) via the
-staged transition described in `docs/AWS.md`.
+and **runs on AWS Graviton**: the AMI built by `make ami` boots real EC2
+instances via Nitro UEFI, brings eth0 up on the ENA adapter with a DHCP
+lease from the VPC, answers the EC2 reachability checks, serves telnet
+from the internet, and persists `/home` on an NVMe EBS volume across
+reboots.  `docs/AWS.md` records the staged transition (and every
+emulator-vs-real-hardware trap met along the way: GIC state at
+ExitBootServices, ENA descriptor formats, RFC 2131 minimum message
+sizes, Ethernet minimum frame padding).
 
 The same `build/kernel.img` boots two ways:
 
@@ -25,9 +31,15 @@ Drivers are discovered via `cdevsw[major]`.  Inode lifecycle follows vnode
 persistent handlers, sigmask, sigaction).  Numbering is POSIX
 (SIGTERM=15, SIGKILL=9, ...).
 
-Networking is a STREAMS multiplexor: `/dev/ip` is the mux, ICMP / UDP /
-TCP are pushable modules above it, lo0 / virtio-net / SLIP are stream
-drivers underneath.  TCP is the RFC 793 full state graph (LISTEN through
+Networking is a STREAMS multiplexor: ip is the mux, ICMP / UDP / TCP are
+pushable modules above it, lo0 / virtio-net / ENA / SLIP are stream
+drivers I_LINKed underneath.  Network configuration is userland-driven,
+the Solaris way: drivers are dumb datalinks exposing a mini-DLPI raw
+device (`/dev/eth0`), a userland `dhcpagent` runs the lease exchange
+over raw frames and plumbs the result with `SIOCSIF*` ioctls, ARP lives
+in a shared kernel cache (`/proc/arp`, with a BSD-style one-packet hold
+queue), and `/dev/tcp` & friends are SVR4 clone devices -- every open
+mints its own minor and stream.  See `docs/DLPI.md`.  TCP is the RFC 793 full state graph (LISTEN through
 TIME_WAIT) with a multi-accept backlog, RFC 6298 RTT estimation,
 exponential-backoff retransmit, and real receive-window advertisement
 driven by STREAMS backpressure.  See `docs/ARCHITECTURE.md` for the TCP
