@@ -6,18 +6,17 @@
  * for the A record, parses the answer section, prints any IPv4
  * addresses it finds.
  *
- * Doesn't read /etc/resolv.conf -- kappara has no such file yet,
- * and on SLIRP the answer is always 10.0.2.3 anyway.  When we
- * grow real DNS infrastructure (resolv.conf, libc gethostbyname,
- * caching), this command becomes the thinnest possible client
- * over it.
+ * Server selection: SIOCGIFDNS on eth0 (plumbed by dhcpagent from
+ * DHCP option 6 -- kappara's resolv.conf stand-in), falling back
+ * to SLIRP's 10.0.2.3 when nothing is plumbed.
+ *
+ * Reliability: I_SRDTMO arms a 3 s reply timeout and the query is
+ * retried twice -- UDP to a fresh destination loses the first
+ * packet to the ARP exchange on a cold cache, and DNS over UDP is
+ * lossy by design anyway.
  *
  * Limitations on purpose:
  *   - A-records only.  No AAAA / CNAME chasing / SRV / MX.
- *   - Single-server, single-shot.  No retry, no timeout from us;
- *     getmsg blocks until the kernel UDP path delivers the
- *     T_UNITDATA_IND (which on user-mode QEMU is fast or hung,
- *     not slow).
  *   - Names up to 255 bytes (DNS protocol max).
  */
 
@@ -27,10 +26,23 @@
 #include <string.h>
 #include <stropts.h>
 
+#include "kappara/net/sockio.h"
 #include "kappara/net/udp.h"
 
-#define DNS_SERVER_IP   0x0A000203u	/* 10.0.2.3 (SLIRP forwarder)   */
+#define DNS_FALLBACK_IP 0x0A000203u	/* 10.0.2.3 (SLIRP forwarder)   */
 #define DNS_SERVER_PORT 53
+
+/* DNS server plumbed by dhcpagent (option 6); fallback for rigs
+ * with no lease. */
+static uint32_t dns_server(int udp_fd)
+{
+	struct kifreq ifr;
+	memset(&ifr, 0, sizeof(ifr));
+	strcpy(ifr.ifr_name, "eth0");
+	if (ioctl(udp_fd, SIOCGIFDNS, (long)&ifr) == 0 && ifr.ifr_addr)
+		return ifr.ifr_addr;
+	return DNS_FALLBACK_IP;
+}
 
 /* RFC 1035 §4.1.1: 12-byte header. */
 struct dns_hdr {
@@ -159,29 +171,37 @@ int main(int argc, char **argv)
 	put_u16(&p, 1);			/* QCLASS = IN */
 	int plen = (int)(p - pkt);
 
-	/* Send to 10.0.2.3:53. */
+	/* 3 s reply timeout; 3 attempts.  First packet to a fresh
+	 * destination can be lost to the cold-cache ARP exchange. */
+	ioctl(fd, I_SRDTMO, 3000);
+
 	struct t_unitdata_req ureq = {
 		.prim = T_UNITDATA_REQ,
-		.dst_ip = DNS_SERVER_IP, .dst_port = DNS_SERVER_PORT,
+		.dst_ip = dns_server(fd), .dst_port = DNS_SERVER_PORT,
 	};
-	struct strbuf uctl = { .maxlen = 0,
-	                       .len = sizeof(ureq), .buf = &ureq };
-	struct strbuf udat = { .maxlen = 0,
-	                       .len = plen, .buf = pkt };
-	if (putmsg(fd, &uctl, &udat, 0) < 0) {
-		write(2, "host: send failed\n", 18); close(fd); return 1;
-	}
-
-	/* Wait for the reply. */
 	struct t_unitdata_ind ind;
 	uint8_t rbuf[600];
 	struct strbuf rctl = { .maxlen = sizeof(ind),
 	                       .len = 0, .buf = &ind };
 	struct strbuf rdat = { .maxlen = sizeof(rbuf),
 	                       .len = 0, .buf = rbuf };
-	int rflags = 0;
-	if (getmsg(fd, &rctl, &rdat, &rflags) < 0) {
-		write(2, "host: recv failed\n", 18); close(fd); return 1;
+	int got = -1;
+	for (int attempt = 0; attempt < 3 && got < 0; attempt++) {
+		struct strbuf uctl = { .maxlen = 0,
+		                       .len = sizeof(ureq), .buf = &ureq };
+		struct strbuf udat = { .maxlen = 0,
+		                       .len = plen, .buf = pkt };
+		if (putmsg(fd, &uctl, &udat, 0) < 0) {
+			write(2, "host: send failed\n", 18);
+			close(fd); return 1;
+		}
+		int rflags = 0;
+		rctl.len = rdat.len = 0;
+		got = (int)getmsg(fd, &rctl, &rdat, &rflags);
+	}
+	if (got < 0) {
+		write(2, "host: no reply (timeout)\n", 25);
+		close(fd); return 1;
 	}
 	close(fd);
 

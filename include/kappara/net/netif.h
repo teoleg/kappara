@@ -41,6 +41,9 @@ struct netif {
 				 * via SIOCSIFGW (net/sockio.h). */
 	const uint8_t *mac;	/* station address (6 B, driver-owned;
 				 * NULL for lo0/slip).  SIOCGIFHWADDR. */
+	uint32_t    dns;	/* DNS server (SIOCSIFDNS, plumbed by
+				 * dhcpagent from option 6); 0 = none.
+				 * resolv.conf stand-in. */
 	unsigned    mtu;	/* bytes -- IP datagram cap */
 	/* The driver's STREAMS personality.  IP (the multiplexor) builds
 	 * a kernel stream from this and I_LINKs it underneath at boot.

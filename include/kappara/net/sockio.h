@@ -32,5 +32,9 @@ struct kifreq {
 #define SIOCSIFGW	(('i' << 8) | 40)	/* set default gateway */
 #define SIOCGIFGW	(('i' << 8) | 41)	/* get default gateway */
 #define SIOCGIFHWADDR	(('i' << 8) | 42)	/* get MAC */
+#define SIOCSIFDNS	(('i' << 8) | 43)	/* set DNS server (kappara-
+						 * local: resolv.conf stand-in
+						 * until /etc is writable) */
+#define SIOCGIFDNS	(('i' << 8) | 44)	/* get DNS server */
 
 #endif

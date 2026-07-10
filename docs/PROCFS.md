@@ -150,6 +150,12 @@ points at the peer's read queue instead of a driver, so the stack
 walk stops after the head.  `[EOF]` shows up when `SD_EOF` is set
 (peer closed; M_HANGUP was processed).
 
+Every `/proc` entry is a **clone node** (see ARCHITECTURE.md,
+"Clone devices"): each open mints a fresh stream + minor on the
+target driver, so concurrent readers get independent one-shot
+snapshots.  Open-stream rows in `/proc/streams` show the resolved
+device as `dev=major,minor`.
+
 `[linked under <name>]` marks a lower stream I_LINKed beneath a
 multiplexor: its driver-side read chain was rewired into the mux
 and no longer reaches its own head.  The stack column still shows

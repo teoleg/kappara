@@ -65,9 +65,13 @@ struct arp_entry { uint32_t ip; uint8_t mac[6]; const char *ifname;
   REQUEST) -> cache insert/update.  A MAC *change* for a cached IP
   is logged (`arp: 172.31.0.1 moved a:b:c -> d:e:f`) -- visibility
   when a VPC router fails over.
-- `arp_resolve(arpif, ip, mac_out)` -- cache hit returns 1; miss
-  broadcasts a REQUEST and returns 0 (caller drops the packet;
-  retransmission is the upper layer's problem, same as classic BSD).
+- `arp_resolve_hold(arpif, ip, frame, len)` -- cache hit writes the
+  MAC into the frame and returns 1 (caller transmits); miss parks
+  the frame in a one-packet hold queue (classic BSD), broadcasts a
+  REQUEST, and transmits the held frame itself when the reply
+  lands.  First packets to new destinations are never lost -- the
+  drop-and-let-upper-layers-retransmit shape hung one-shot UDP
+  clients (host's DNS query).
 - Entries age: older than 300 s -> re-request on next resolve.
   `/proc/arp` shows `IP  MAC  IF  AGE  STATE`.
 

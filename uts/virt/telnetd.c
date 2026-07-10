@@ -226,7 +226,9 @@ static int iac_strip(struct iac_filter *f, const char *in, int len,
 
 /* ---- Per-connection session ------------------------------------ */
 
-static void telnet_session(struct stdata *R)
+/* Returns wait_data's final status: 0 = peer ORDREL'd (graceful),
+ * -1 = peer reset / vanished. */
+static int telnet_session(struct stdata *R)
 {
 	send_data(R, TELNET_BANNER, kstrlen(TELNET_BANNER));
 	send_data(R, (const char *)telnet_iac_init, sizeof(telnet_iac_init));
@@ -241,11 +243,12 @@ static void telnet_session(struct stdata *R)
 	tty_remote_feed_byte(TELNET_REMOTE_TTY, '\r');
 
 	struct iac_filter iacf = { .state = IAC_NORMAL };
+	int why;
 	for (;;) {
 		char buf[64];
 		char clean[64];
 		int n = wait_data(R, buf, sizeof(buf));
-		if (n <= 0) break;
+		if (n <= 0) { why = n; break; }
 		int m = iac_strip(&iacf, buf, n, clean);
 		for (int i = 0; i < m; i++)
 			tty_remote_feed_byte(TELNET_REMOTE_TTY,
@@ -253,6 +256,7 @@ static void telnet_session(struct stdata *R)
 	}
 
 	tty_set_output_hook(TELNET_REMOTE_TTY, 0, 0);
+	return why;
 }
 
 /* ---- Listener kthread ------------------------------------------ */
@@ -307,12 +311,29 @@ static void telnetd_main(void *arg)
 			stream_destroy_kernel(R);
 			continue;
 		}
-		telnet_session(R);
+		int why = telnet_session(R);
 
-		/* Graceful close. */
-		struct t_tcp_ordrel_req oq = { .prim = T_TCP_ORDREL_REQ };
-		put_prim(R, &oq, sizeof(oq));
-		(void)wait_prim(R, T_TCP_ORDREL_IND);
+		/* Close-out.  The session only ends because the PEER acted:
+		 * why == 0 means it ORDREL'd (wait_data consumed the
+		 * ORDREL_IND), why < 0 means it reset.  Waiting here for a
+		 * second ORDREL_IND -- the old code -- wedged telnetd
+		 * forever after the first peer-closed session, holding the
+		 * dead TCB and never accepting again.  On EC2 an internet
+		 * port scanner closes port 23 within seconds of boot, so
+		 * telnetd was wedged before the first human ever connected:
+		 * later telnets "connect" into the listen backlog but no
+		 * one accepts or bridges them.
+		 *
+		 * Graceful half: answer the peer's FIN with ours, give the
+		 * final ACK ~200 ms to land (LAST_ACK -> CLOSED) so the
+		 * destroy below tears down a CLOSED tcb instead of
+		 * RST-ing out of LAST_ACK. */
+		if (why == 0) {
+			struct t_tcp_ordrel_req oq = { .prim = T_TCP_ORDREL_REQ };
+			put_prim(R, &oq, sizeof(oq));
+			for (int t = 0; t < 20; t++)
+				kthread_sleep_on(&sched_tick_wq);
+		}
 		stream_destroy_kernel(R);
 
 		kprintf("telnetd: session ended\n");

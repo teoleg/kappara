@@ -79,12 +79,23 @@ typedef uint32_t dev_t;
 #define CDEV_MAJ_KSYMS		27	/* /dev/ksyms -- kernel symbol table   */
 #define CDEV_MAJ_PROC_ARP	28	/* /proc/arp  -- ARP cache             */
 #define CDEV_MAJ_DL		29	/* /dev/eth0 -- raw datalink (mini-DLPI) */
+#define CDEV_MAJ_CLONE		30	/* SVR4 clone driver: a node with this
+					 * major names its TARGET driver in the
+					 * minor; every open allocates a fresh
+					 * minor on the target.  /dev/tcp etc.
+					 * are clone nodes. */
 
 #define CDEV_MAX		32
+
+#define CDEV_OPEN_EXCL	0x1	/* every open builds a fresh stream even
+				 * on a non-clone node (dl: the node names
+				 * the device, DL_ATTACH-less divergence) */
 
 struct cdev_entry {
 	const char         *name;	/* for /dev mknod + diagnostics */
 	struct streamtab   *streamtab;	/* STREAMS driver entry points  */
+	unsigned            flags;	/* CDEV_OPEN_EXCL */
+	uint64_t            minors;	/* clone-minor bitmap (64 per major) */
 };
 
 /* Install `st` at cdevsw[major].  Returns 0 on success, -1 if the
@@ -98,5 +109,11 @@ int                cdev_register(unsigned major, const char *name,
 /* Return the cdev_entry for `major`, or NULL.  Used by the VFS open
  * path to find the streamtab for a chrdev inode. */
 struct cdev_entry *cdev_lookup(unsigned major);
+void cdev_set_flags(unsigned major, unsigned flags);
+/* Clone-minor allocation: framework-side (SVR4 lets the driver pick
+ * in its qopen; centralizing it here is the documented divergence
+ * that keeps qi_qopen a one-arg function). */
+int  cdev_minor_alloc(unsigned major);	/* -1 when exhausted */
+void cdev_minor_free(unsigned major, unsigned minor);
 
 #endif

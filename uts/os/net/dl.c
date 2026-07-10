@@ -232,8 +232,13 @@ struct dlif *dl_register(const char *name, const uint8_t *mac, unsigned mtu,
 	d->cookie = cookie;
 	d->minor  = dl_ndevs;
 
-	if (dl_ndevs == 0)
+	if (dl_ndevs == 0) {
 		cdev_register(CDEV_MAJ_DL, "dl", &dl_streamtab);
+		/* Non-clone by design: the /dev node names the DEVICE
+		 * (eth0 vs eth1) so the minor is meaningful.  EXCL keeps
+		 * per-open fresh streams -- our DL_ATTACH stand-in. */
+		cdev_set_flags(CDEV_MAJ_DL, CDEV_OPEN_EXCL);
+	}
 	dl_ndevs++;
 
 	struct dentry *dev = vfs_lookup("/dev");

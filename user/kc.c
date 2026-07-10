@@ -287,6 +287,7 @@ static int kc_parse_line(const char *buf, int off, int cap, struct kc_ent *e)
 	char t = buf[off];
 	e->type = (t == 'd') ? 'd'
 	        : (t == 'c') ? 'c'
+	        : (t == 'b') ? 'b'
 	        : (t == 'r') ? 'r'
 	        : '?';
 
@@ -308,18 +309,18 @@ static int kc_parse_line(const char *buf, int off, int cap, struct kc_ent *e)
 		return (eol < cap) ? eol + 1 : eol;
 	}
 
-	/* Parse size: digits-only in the metadata, ignore commas / letters.
-	 * For chrdev "MMMM,NNN" we deliberately drop the major and use
-	 * the minor part -- callers don't actually look at e->size for
-	 * type=='c', so this just keeps the value bounded. */
-	long sz = 0;
+	/* Parse size: digits-only in the metadata.  Device rows carry
+	 * "MMMM,NNN" (major,minor) instead of a byte count; keep both
+	 * halves, encoded (major << 16) | minor, so the renderers can
+	 * show the real dev_t instead of a bogus "0". */
+	long sz = 0, maj = 0;
 	int  has_comma = 0;
 	for (int k = off + 1; k < last_sp; k++) {
 		char c = buf[k];
 		if (c >= '0' && c <= '9') sz = sz * 10 + (c - '0');
-		else if (c == ',')        { has_comma = 1; sz = 0; }
+		else if (c == ',')        { has_comma = 1; maj = sz; sz = 0; }
 	}
-	e->size = has_comma ? 0 : sz;
+	e->size = has_comma ? ((maj << 16) | (sz & 0xffff)) : sz;
 
 	/* Copy name = buf[last_sp+1 .. eol). */
 	int i = 0;
@@ -412,9 +413,23 @@ static void kc_render_cell(int panel_idx, int row, int row_in_panel)
 		/* "DIR" right-aligned in 11 cells */
 		kc_pad_spaces(8);
 		cwrite("DIR");
-	} else if (e->type == 'c') {
-		kc_pad_spaces(7);
-		cwrite("CHAR");
+	} else if (e->type == 'c' || e->type == 'b') {
+		/* device numbers "M,N" right-aligned in 11 cells */
+		char dv[16];
+		long maj = (e->size >> 16) & 0xffff, min = e->size & 0xffff;
+		int  n = 0;
+		{ char t[8]; int i = 0;
+		  if (maj == 0) t[i++] = '0';
+		  while (maj) { t[i++] = (char)('0' + maj % 10); maj /= 10; }
+		  while (i--) dv[n++] = t[i]; }
+		dv[n++] = ',';
+		{ char t[8]; int i = 0;
+		  if (min == 0) t[i++] = '0';
+		  while (min) { t[i++] = (char)('0' + min % 10); min /= 10; }
+		  while (i--) dv[n++] = t[i]; }
+		dv[n] = '\0';
+		kc_pad_spaces(11 - n);
+		cwrite(dv);
 	} else {
 		cputc(' ');
 		kc_print_size(e->size, 10);
@@ -792,6 +807,8 @@ static void kc_render_status(void)
 		cwrite("(directory)");
 	} else if (e->type == 'c') {
 		cwrite("(char device)");
+	} else if (e->type == 'b') {
+		cwrite("(block device)");
 	} else {
 		kc_print_size(e->size, 0);
 		cwrite(" bytes");

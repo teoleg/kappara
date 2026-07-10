@@ -56,6 +56,23 @@ struct arp_entry {
 static struct arp_entry arp_cache[ARP_CACHE_SIZE];
 static spinlock_t       arp_lock = SPINLOCK_INIT;
 
+/* One-packet hold queue (classic BSD): a frame waiting on an
+ * unresolved next hop parks here and is transmitted from arp_input
+ * when the REPLY lands.  A few slots cover concurrent first-packets
+ * to distinct destinations; a second packet to the SAME pending IP
+ * overwrites the held one (newest wins, matching BSD). */
+#define ARP_HOLD_SLOTS	4
+#define ARP_HOLD_MAX	1520
+
+struct arp_hold {
+	uint32_t      ip;	/* 0 = free */
+	unsigned      len;
+	struct arpif *aif;
+	uint64_t      stamp;
+	uint8_t       frame[ARP_HOLD_MAX];
+};
+static struct arp_hold arp_holds[ARP_HOLD_SLOTS];
+
 static uint64_t now_ticks(void)
 {
 	uint64_t v;
@@ -89,6 +106,8 @@ static uint32_t get_be32(const uint8_t *p)
 	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
 	     | ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
 }
+
+static void arp_hold_flush(uint32_t ip, const uint8_t mac[6]);
 
 void arp_ifattach(struct arpif *aif)
 {
@@ -194,27 +213,71 @@ void arp_input(struct arpif *aif, const uint8_t *frame, unsigned len)
 	/* Learn the sender from both requests and replies (a
 	 * gratuitous REQUEST is how peers announce a MAC change). */
 	arp_learn(sip, a->sender_mac, ifname);
+	arp_hold_flush(sip, a->sender_mac);
 
 	if (op == ARP_OP_REQUEST && aif->nif && tip == aif->nif->ip
 	    && aif->nif->ip != 0)
 		arp_tx(aif, ARP_OP_REPLY, a->sender_mac, sip, a->sender_mac);
 }
 
-int arp_resolve(struct arpif *aif, uint32_t ip, uint8_t mac_out[6])
+int arp_resolve_hold(struct arpif *aif, uint32_t ip,
+                     uint8_t *frame, unsigned len)
 {
 	static const uint8_t bcast[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+	uint8_t mac[6];
 	int stale = 0;
 
-	if (!ip) return 0;
-	if (arp_lookup(ip, mac_out, &stale)) {
+	if (!ip || len < 14) return 0;
+	if (arp_lookup(ip, mac, &stale)) {
+		kmemcpy(frame, mac, 6);
 		/* Serve stale entries but refresh in the background so
 		 * a router failover converges without dropping flows. */
 		if (stale)
 			arp_tx(aif, ARP_OP_REQUEST, bcast, ip, 0);
 		return 1;
 	}
+
+	/* Miss: park the frame, then ask.  Slot choice: same-IP slot
+	 * (newest packet wins), else a free one, else the oldest. */
+	if (len <= ARP_HOLD_MAX) {
+		unsigned long f = spin_lock_irq_save(&arp_lock);
+		struct arp_hold *h = 0, *oldest = &arp_holds[0];
+		for (int i = 0; i < ARP_HOLD_SLOTS; i++) {
+			struct arp_hold *c = &arp_holds[i];
+			if (c->ip == ip) { h = c; break; }
+			if (!c->ip) { if (!h) h = c; continue; }
+			if (c->stamp < oldest->stamp) oldest = c;
+		}
+		if (!h) h = oldest;
+		h->ip    = ip;
+		h->len   = len;
+		h->aif   = aif;
+		h->stamp = now_ticks();
+		kmemcpy(h->frame, frame, len);
+		spin_unlock_irq_restore(&arp_lock, f);
+	}
 	arp_tx(aif, ARP_OP_REQUEST, bcast, ip, 0);
 	return 0;
+}
+
+/* A mapping for `ip` just arrived: transmit any held frame.  Runs
+ * under arp_lock (same rationale as dl_input's under-lock delivery:
+ * the slot can't be re-claimed mid-flight).  Lock order:
+ * arp_lock -> driver tx (pmm/kmem inside); nothing takes arp_lock
+ * while holding those. */
+static void arp_hold_flush(uint32_t ip, const uint8_t mac[6])
+{
+	unsigned long f = spin_lock_irq_save(&arp_lock);
+	for (int i = 0; i < ARP_HOLD_SLOTS; i++) {
+		struct arp_hold *h = &arp_holds[i];
+		if (h->ip != ip) continue;
+		kmemcpy(h->frame, mac, 6);
+		if (h->aif && h->aif->tx)
+			h->aif->tx(h->aif->cookie, h->frame, h->len);
+		h->ip  = 0;
+		h->len = 0;
+	}
+	spin_unlock_irq_restore(&arp_lock, f);
 }
 
 int arp_for_each(int (*cb)(const struct arp_view *v, void *arg), void *arg)
