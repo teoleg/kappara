@@ -1,15 +1,15 @@
+/* cmd/ps.c -- list running threads (reads /proc/ps).
+ * `ps -` prints without the plain-language preamble. */
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 int main(int argc, char **argv)
 {
-    (void)argc; (void)argv;
-    char buf[1024];
-    int fd = open("/proc/ps", 0);
-    if (fd < 0) { puts("ps: cannot open /proc/ps"); return 1; }
-    ssize_t n;
-    while ((n = read(fd, buf, sizeof(buf))) > 0)
-        write(1, buf, (size_t)n);
-    close(fd);
-    return 0;
+	int strip = (argc > 1 && strcmp(argv[1], "-") == 0);
+	if (proc_cat("/proc/ps", strip) < 0) {
+		puts("ps: cannot open /proc/ps");
+		return 1;
+	}
+	return 0;
 }

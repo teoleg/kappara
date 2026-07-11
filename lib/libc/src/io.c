@@ -155,3 +155,41 @@ char *getcwd(char *buf, size_t cap)
 }
 /* _exit lives in stdlib.c -- shared by exit() and the direct
  * _exit() callers.  Don't duplicate it here. */
+
+/* Dump a file to stdout in 1 KB chunks.  When strip_preamble is set,
+ * lines beginning with "# " are dropped -- that's the format the
+ * kernel /proc entries use for their plain-language explanatory
+ * header, so `<cmd> -` gives the bare data for scripts / experts.
+ * Returns 0 on success, -1 if the file could not be opened. */
+int proc_cat(const char *path, int strip_preamble)
+{
+    int fd = open(path, 0);
+    if (fd < 0) return -1;
+    char buf[1024];
+    int  at_bol = 1;      /* at beginning of a line */
+    int  skipping = 0;    /* currently inside a dropped "# ..." line */
+    long n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        long start = 0;
+        for (long i = 0; i < n; i++) {
+            if (at_bol) {
+                /* Decide this line's fate from its first char.  A
+                 * "# " line is dropped only when stripping. */
+                skipping = strip_preamble && buf[i] == '#';
+                at_bol = 0;
+                if (skipping) start = i + 1; /* skip from here */
+            }
+            if (buf[i] == '\n') {
+                if (!skipping)
+                    write(1, buf + start, (size_t)(i - start + 1));
+                start = i + 1;
+                at_bol = 1;
+                skipping = 0;
+            }
+        }
+        if (!skipping && start < n)
+            write(1, buf + start, (size_t)(n - start));
+    }
+    close(fd);
+    return 0;
+}

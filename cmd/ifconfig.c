@@ -54,18 +54,12 @@ static void ifr_init(struct kifreq *ifr, const char *name)
 	}
 }
 
-static int show_all(void)
+static int show_all(int strip)
 {
-	int fd = open("/proc/netif", 0);
-	if (fd < 0) {
+	if (proc_cat("/proc/netif", strip) < 0) {
 		puts("ifconfig: cannot open /proc/netif");
 		return 1;
 	}
-	char buf[1024];
-	ssize_t n;
-	while ((n = read(fd, buf, sizeof(buf))) > 0)
-		write(1, buf, (size_t)n);
-	close(fd);
 	return 0;
 }
 
@@ -122,7 +116,9 @@ static int set_one(int fd, const char *name, int cmd, const char *val)
 int main(int argc, char **argv)
 {
 	if (argc < 2)
-		return show_all();
+		return show_all(0);
+	if (argv[1][0] == '-' && argv[1][1] == '\0')
+		return show_all(1);
 
 	int fd = open("/dev/udp", 0);
 	if (fd < 0) {

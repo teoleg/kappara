@@ -8,6 +8,10 @@ entries, and the notable /dev nodes.  It is written as several
 `cwrite` calls because a single write of the full text would
 exceed allocb's 2 KB cap and silently print nothing.
 
+The `/proc`-reading commands (`cat`, `ps`, `netstat`, `ifconfig`,
+`mount`) accept a leading `-` that strips each entry's educational
+`# ` preamble -- `cat - /proc/tcp`, `ps -` -- for bare data.
+
 `ksh` is the userspace shell, running at EL0.  The kernel spawns one
 instance per `/dev/ttyN` (4 by default), so there's a separate shell
 PID waiting on each virtual console: `user-init-0` on tty0,

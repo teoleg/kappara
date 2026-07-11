@@ -9,6 +9,14 @@ text and the snapshot is followed by an `M_HANGUP` so the next
 
 The same pattern powers `/dev/klog`: opening it replays the boot log.
 
+Each `/proc` entry opens with a plain-language `# ` preamble
+explaining, for a reader new to computer internals, what the file
+represents.  The commands that read `/proc` -- `cat`, `ps`,
+`netstat`, `ifconfig`, `mount` -- take a `-` flag that strips the
+preamble for bare, script-friendly output: `cat - /proc/ps`,
+`ps -`, `netstat -`.  The kernel always emits the header; the `-`
+flag filters `# ` lines in the reader (`proc_cat` in libc).
+
 ## /dev — drivers
 
 | Path           | Major | Description                                   |
