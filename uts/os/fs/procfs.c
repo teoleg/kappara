@@ -408,8 +408,23 @@ static int proc_cpu_qopen(queue_t *q)
 	    "CURRENT.  DISPQ is how many ready threads are queued waiting\n"
 	    "for that core -- a high number on one core means work isn't\n"
 	    "spread evenly.");
+	/* State the online-vs-hardware split up front: kappara runs
+	 * single-core on the virt/AWS build (SMP secondary bring-up is
+	 * compiled out), so a machine the firmware reports as N cores
+	 * shows only the 1 core kappara is actually scheduling on.  This
+	 * line makes that a stated fact rather than a mystery. */
+	unsigned online = sched_ncpu();
+	pb_str(&cpu_pb, "cores online: ");
+	pb_pad_dec(&cpu_pb, online, 0);
+	if (acpi_present && acpi_nr_cpus) {
+		pb_str(&cpu_pb, "  (hardware reports ");
+		pb_pad_dec(&cpu_pb, acpi_nr_cpus, 0);
+		pb_str(&cpu_pb, "; kappara schedules on one)");
+	}
+	pb_str(&cpu_pb, "\n\n");
+
 	pb_str(&cpu_pb, "CPU  STATE  DISPQ  CURRENT\n");
-	for (unsigned i = 0; i < sched_ncpu(); i++) {
+	for (unsigned i = 0; i < online; i++) {
 		struct sched_cpu_info info;
 		sched_get_cpu_info(i, &info);
 		pb_pad_dec(&cpu_pb, info.cpu_id, 3);
