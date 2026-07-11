@@ -1,5 +1,13 @@
 # ksh — kappara shell reference
 
+`help` opens with a short statement of what kappara is (an
+educational, from-scratch SVR4-flavored Unix for future software
+engineers, pulling the best ideas from the UNIX family tree) and
+then lists every builtin, the networking commands, the /proc
+entries, and the notable /dev nodes.  It is written as several
+`cwrite` calls because a single write of the full text would
+exceed allocb's 2 KB cap and silently print nothing.
+
 `ksh` is the userspace shell, running at EL0.  The kernel spawns one
 instance per `/dev/ttyN` (4 by default), so there's a separate shell
 PID waiting on each virtual console: `user-init-0` on tty0,

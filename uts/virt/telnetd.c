@@ -57,6 +57,14 @@ static mblk_t *wait_next_mblk(struct stdata *sd)
 {
 	unsigned long flags =
 	    spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+	uint64_t deadline = 0;
+	if (sd->sd_rd_tmo_ms) {
+		uint64_t freq, now;
+		__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+		__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+		deadline = now + (freq / 1000ULL)
+		               * (uint64_t)sd->sd_rd_tmo_ms;
+	}
 	for (;;) {
 		mblk_t *mp = getq(sd->sd_rq);
 		if (mp) {
@@ -69,8 +77,26 @@ static mblk_t *wait_next_mblk(struct stdata *sd)
 			                        flags);
 			return 0;
 		}
-		kthread_sleep_on_locked(&sd->sd_readwait, flags);
-		flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		if (deadline) {
+			/* I_SRDTMO-style bounded wait: a half-open SYN
+			 * scan must not park the accept loop forever
+			 * while the listen backlog fills with real
+			 * clients. */
+			uint64_t now;
+			__asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+			if (now >= deadline) {
+				spin_unlock_irq_restore(
+					&sd->sd_readwait.sq_lock, flags);
+				return 0;
+			}
+			spin_unlock_irq_restore(&sd->sd_readwait.sq_lock,
+			                        flags);
+			kthread_sleep_on(&sched_tick_wq);
+			flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		} else {
+			kthread_sleep_on_locked(&sd->sd_readwait, flags);
+			flags = spin_lock_irq_save(&sd->sd_readwait.sq_lock);
+		}
 	}
 }
 
@@ -354,7 +380,16 @@ static void telnetd_main(void *arg)
 			continue;
 		}
 
-		if (wait_prim(R, T_TCP_CONN_CON) < 0) {
+		R->sd_rd_tmo_ms = 10000;	/* half-open scan guard */
+		int con = wait_prim(R, T_TCP_CONN_CON);
+		R->sd_rd_tmo_ms = 0;
+		if (con < 0) {
+			/* Peer never completed the handshake (SYN scan) or
+			 * reset.  Tear the child down (qclose RSTs out of
+			 * SYN_RECEIVED and frees the TCB) and keep
+			 * accepting -- the backlog is full of real
+			 * clients behind this ghost. */
+			kprintf("telnetd: handshake timeout, dropping\n");
 			stream_destroy_kernel(R);
 			continue;
 		}
