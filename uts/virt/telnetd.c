@@ -193,6 +193,11 @@ struct iac_filter {
 	 * queued here and flushed by the session loop. */
 	uint8_t reply[30];
 	int     nreply;
+	int     last_cr;	/* NVT: a NUL right after CR is padding
+				 * ("CR NUL" == bare carriage return) and
+				 * must be dropped -- stored into the
+				 * shell's line buffer it silently
+				 * empty-strings every following command. */
 };
 
 static int iac_strip(struct iac_filter *f, const char *in, int len,
@@ -204,6 +209,11 @@ static int iac_strip(struct iac_filter *f, const char *in, int len,
 		switch (f->state) {
 		case IAC_NORMAL:
 			if (c == TIAC) { f->state = IAC_SAW_IAC; break; }
+			if (c == 0x00 && f->last_cr) {
+				f->last_cr = 0;	/* swallow CR-NUL's NUL */
+				break;
+			}
+			f->last_cr = (c == 0x0d);
 			out[op++] = (char)c;
 			break;
 		case IAC_SAW_IAC:
