@@ -1046,7 +1046,7 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 		uint16_t want = tcp_checksum(src_ip, dst_ip, h, len);
 		h->checksum = saved;
 		if (want != ntohs16(saved)) {
-			kprintf("tcp: checksum fail\n");
+			net_drop_counts.tcp_badcsum++;
 			freemsg(body);
 			return;
 		}

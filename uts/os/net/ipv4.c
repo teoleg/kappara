@@ -55,6 +55,15 @@
 
 static uint16_t ip_id_next;
 
+/* RX drop counters.  A public-facing interface gets scanned around
+ * the clock; a correct stack silently drops malformed segments.
+ * We MUST NOT kprintf per bad packet -- that's a log-flood DoS and
+ * floods the console (the "tcp: checksum fail" spam observed on a
+ * live EC2 box).  Count instead; surface in /proc/tcp.  These are
+ * plain increments off the RX kthread -- a lost count under a race
+ * is irrelevant for a diagnostic tally. */
+struct net_drops net_drop_counts;
+
 uint16_t ip_checksum(const void *buf, unsigned len)
 {
 	const uint8_t *p = (const uint8_t *)buf;
@@ -514,31 +523,31 @@ static int ip_rput(queue_t *q, mblk_t *mp)
 	}
 	unsigned len = (unsigned)(mp->b_wptr - mp->b_rptr);
 	if (len < IP_HDR_LEN) {
-		kprintf("ip_rput: runt %u\n", len);
+		net_drop_counts.ip_runt++;
 		freemsg(mp);
 		return 0;
 	}
 
 	struct ip_hdr *h = (struct ip_hdr *)mp->b_rptr;
 	if ((h->ver_ihl >> 4) != 4) {
-		kprintf("ip_rput: not IPv4 (ver_ihl=0x%x)\n", h->ver_ihl);
+		net_drop_counts.ip_badver++;
 		freemsg(mp);
 		return 0;
 	}
 	unsigned ihl_bytes = (unsigned)((h->ver_ihl & 0xf) * 4);
 	if (ihl_bytes < IP_HDR_LEN || ihl_bytes > len) {
-		kprintf("ip_rput: bad IHL %u\n", ihl_bytes);
+		net_drop_counts.ip_badihl++;
 		freemsg(mp);
 		return 0;
 	}
 	uint16_t total = ntohs16(h->total_len);
 	if (total > len) {
-		kprintf("ip_rput: total_len %u > buf %u\n", total, len);
+		net_drop_counts.ip_badlen++;
 		freemsg(mp);
 		return 0;
 	}
 	if (total < IP_HDR_LEN) {
-		kprintf("ip_rput: total_len %u < header\n", total);
+		net_drop_counts.ip_badlen++;
 		freemsg(mp);
 		return 0;
 	}
@@ -555,7 +564,7 @@ static int ip_rput(queue_t *q, mblk_t *mp)
 		}
 	}
 	if (ip_checksum(h, ihl_bytes) != 0) {
-		kprintf("ip_rput: checksum fail\n");
+		net_drop_counts.ip_badcsum++;
 		freemsg(mp);
 		return 0;
 	}
