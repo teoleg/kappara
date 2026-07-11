@@ -13,27 +13,16 @@
  */
 
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 int main(int argc, char **argv)
 {
-	(void)argv;
-	if (argc > 1) {
-		write(2, "usage: mount\n", 13);
-		write(2, "(runtime mount/unmount not implemented yet)\n", 44);
-		return 1;
-	}
-	int fd = open("/proc/mounts", 0);
-	if (fd < 0) {
+	int strip = (argc > 1 && argv[1][0] == '-'
+	             && argv[1][1] == '\0');
+	if (proc_cat("/proc/mounts", strip) < 0) {
 		write(2, "mount: cannot open /proc/mounts\n", 32);
 		return 1;
 	}
-	char buf[256];
-	for (;;) {
-		long n = read(fd, buf, sizeof(buf));
-		if (n <= 0) break;
-		write(1, buf, (size_t)n);
-	}
-	close(fd);
 	return 0;
 }

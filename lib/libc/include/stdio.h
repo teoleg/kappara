@@ -61,6 +61,8 @@ void   clearerr(FILE *f);
 #define SEEK_CUR 1
 #define SEEK_END 2
 
+int proc_cat(const char *path, int strip_preamble);
+
 #define EOF (-1)
 
 #endif

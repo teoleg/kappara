@@ -264,9 +264,21 @@ uint32_t sched_idle_mask(void)
 	return cpu_idle_mask;
 }
 
+/* Number of cores actually ONLINE (brought up + participating in the
+ * scheduler), NOT the compile-time KSCHED_NCPU table size.  A slot is
+ * online once its idle thread is installed -- cpu0 in sched_init, each
+ * secondary in sched_secondary_init.  On the virt/AWS build the SMP
+ * secondary bring-up is compiled out, so this is 1; without this,
+ * /proc/cpuload printed KSCHED_NCPU phantom rows for cores that were
+ * never started (all reading as "CPU 0 BUSY ?").  Online cores are
+ * contiguous from index 0 (cpu0 first, secondaries in order), so a
+ * plain 0..n loop over sched_get_cpu_info stays correct. */
 unsigned sched_ncpu(void)
 {
-	return KSCHED_NCPU;
+	unsigned n = 0;
+	for (unsigned i = 0; i < KSCHED_NCPU; i++)
+		if (cpus[i].cpu_idle) n++;
+	return n ? n : 1;	/* cpu0 is always up by the time this runs */
 }
 
 void sched_get_cpu_info(unsigned i, struct sched_cpu_info *out)

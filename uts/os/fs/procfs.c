@@ -73,6 +73,22 @@ static void pb_str(struct procbuf *b, const char *s)
 	while (*s) pb_putc(b, *s++);
 }
 
+/* Emit a plain-language "what am I looking at?" preamble.  Each
+ * source line is prefixed with "# " so the explanation reads as a
+ * comment block above the machine data -- these /proc files double
+ * as a self-guided tour of how the computer works underneath, aimed
+ * at a reader who has never seen an OS internals term before.  The
+ * blank line after it separates prose from the table. */
+static void pb_about(struct procbuf *b, const char *s)
+{
+	pb_str(b, "# ");
+	for (; *s; s++) {
+		pb_putc(b, *s);
+		if (*s == '\n' && s[1]) pb_str(b, "# ");
+	}
+	pb_str(b, "\n\n");
+}
+
 static void pb_pad_str(struct procbuf *b, const char *s, int width)
 {
 	int n = 0;
@@ -145,6 +161,17 @@ static struct procbuf ps_pb;
 static int proc_ps_qopen(queue_t *q)
 {
 	pb_reset(&ps_pb);
+	pb_about(&ps_pb,
+	    "ps -- the list of programs the computer is running right now.\n"
+	    "A running program is called a 'thread'.  The CPU can only do\n"
+	    "one thing at a time per core, so the system switches between\n"
+	    "threads dozens of times a second -- too fast to see -- giving\n"
+	    "the illusion they all run at once.\n"
+	    "  TID   = a unique number naming each thread\n"
+	    "  STATE = RUN (on a CPU now), READY (waiting its turn),\n"
+	    "          BLOCK (asleep until something it needs happens)\n"
+	    "  PRI   = priority: higher numbers get picked first\n"
+	    "  CL    = class: SYS = kernel's own threads, TS = your programs");
 	pb_str(&ps_pb, "  TID  STATE  PRI  CL   NAME\n");
 	for (unsigned tid = 0; tid < kthread_max_tid(); tid++) {
 		struct kthread *t = kthread_at(tid);
@@ -178,6 +205,14 @@ static struct procbuf mem_pb;
 static int proc_mem_qopen(queue_t *q)
 {
 	pb_reset(&mem_pb);
+	pb_about(&mem_pb,
+	    "meminfo -- how the computer's memory (RAM) is being used.\n"
+	    "RAM is the fast scratch space where running programs and\n"
+	    "their data live; it is handed out in fixed 4096-byte chunks\n"
+	    "called 'pages'.  'free' pages are unused and available.\n"
+	    "The 'slab' numbers track a finer allocator the kernel uses\n"
+	    "for many small objects so it doesn't waste a whole page on\n"
+	    "each.  Watch these across a workload to spot memory leaks.");
 
 	size_t free_pages = pmm_free_count();
 	pb_str(&mem_pb, "pmm_free_pages:  ");
@@ -211,6 +246,13 @@ static struct procbuf slab_pb;
 static int proc_slab_qopen(queue_t *q)
 {
 	pb_reset(&slab_pb);
+	pb_about(&slab_pb,
+	    "slabinfo -- a detailed breakdown of the small-object memory\n"
+	    "allocator.  Rather than carve RAM fresh every time, the\n"
+	    "kernel keeps pools ('caches') of same-sized slots and reuses\n"
+	    "them, which is much faster.  Each row is one pool: how big\n"
+	    "its objects are, how many are in use vs free, and how much\n"
+	    "total RAM it holds.  This is the plumbing behind 'meminfo'.");
 	pb_str(&slab_pb,
 	       "NAME           OBJSZ   USED   FREE  TOTAL  SLABS    KB\n");
 	unsigned long total_slabs = 0;
@@ -326,6 +368,14 @@ static void stream_one_open(struct stdata *sd, void *arg)
 static int proc_stream_qopen(queue_t *q)
 {
 	pb_reset(&stream_pb);
+	pb_about(&stream_pb,
+	    "streams -- how data flows between programs and hardware.\n"
+	    "Every keystroke, network packet, or file byte travels through\n"
+	    "a 'stream': a stack of small processing stages plugged\n"
+	    "together like pipe segments (this is the classic Unix STREAMS\n"
+	    "design).  The first list is the stages available to plug in;\n"
+	    "the second is every stream currently open, shown top (nearest\n"
+	    "the program) to bottom (nearest the device).");
 	pb_str(&stream_pb, "registered modules/drivers:\n");
 	streams_for_each(stream_one_registered, NULL);
 	pb_str(&stream_pb, "\nopen streams:\n");
@@ -350,8 +400,31 @@ static struct procbuf cpu_pb;
 static int proc_cpu_qopen(queue_t *q)
 {
 	pb_reset(&cpu_pb);
+	pb_about(&cpu_pb,
+	    "cpuload -- what each processor core is doing this instant.\n"
+	    "A modern chip has several independent 'cores', each able to\n"
+	    "run one thread at a time.  IDLE means a core has no work and\n"
+	    "is resting; BUSY means it is running the thread named under\n"
+	    "CURRENT.  DISPQ is how many ready threads are queued waiting\n"
+	    "for that core -- a high number on one core means work isn't\n"
+	    "spread evenly.");
+	/* State the online-vs-hardware split up front: kappara runs
+	 * single-core on the virt/AWS build (SMP secondary bring-up is
+	 * compiled out), so a machine the firmware reports as N cores
+	 * shows only the 1 core kappara is actually scheduling on.  This
+	 * line makes that a stated fact rather than a mystery. */
+	unsigned online = sched_ncpu();
+	pb_str(&cpu_pb, "cores online: ");
+	pb_pad_dec(&cpu_pb, online, 0);
+	if (acpi_present && acpi_nr_cpus) {
+		pb_str(&cpu_pb, "  (hardware reports ");
+		pb_pad_dec(&cpu_pb, acpi_nr_cpus, 0);
+		pb_str(&cpu_pb, "; kappara schedules on one)");
+	}
+	pb_str(&cpu_pb, "\n\n");
+
 	pb_str(&cpu_pb, "CPU  STATE  DISPQ  CURRENT\n");
-	for (unsigned i = 0; i < sched_ncpu(); i++) {
+	for (unsigned i = 0; i < online; i++) {
 		struct sched_cpu_info info;
 		sched_get_cpu_info(i, &info);
 		pb_pad_dec(&cpu_pb, info.cpu_id, 3);
@@ -411,6 +484,15 @@ static int netif_one_row(struct netif *nif, void *arg)
 static int proc_netif_qopen(queue_t *q)
 {
 	pb_reset(&netif_pb);
+	pb_about(&netif_pb,
+	    "netif -- the network connections this computer has.\n"
+	    "Each row is a 'network interface': a doorway for data to\n"
+	    "leave and enter the machine.  'lo0' is the loopback -- a\n"
+	    "fake internal one the computer uses to talk to itself.\n"
+	    "'eth0' is the real network card.  The IP address is this\n"
+	    "machine's identity on the network; the netmask says which\n"
+	    "other addresses count as 'local' neighbours; MTU is the\n"
+	    "biggest chunk of data it will send in one piece.");
 	pb_str(&netif_pb,
 	       "NAME    FLAGS  MTU     IP              NETMASK\n");
 	netif_for_each(netif_one_row, &netif_pb);
@@ -454,6 +536,14 @@ static int arp_one_row(const struct arp_view *v, void *arg)
 static int proc_arp_qopen(queue_t *q)
 {
 	pb_reset(&arp_pb);
+	pb_about(&arp_pb,
+	    "arp -- the local network address book.\n"
+	    "On the internet, machines are named by IP address, but the\n"
+	    "actual cable/wifi hardware delivers to a different, permanent\n"
+	    "number burned into each network card: the MAC address.  ARP\n"
+	    "is the lookup that maps 'the IP I want to reach' to 'the MAC\n"
+	    "to hand the data to'.  Each row is one learned mapping; AGE\n"
+	    "is how many seconds ago we confirmed it.");
 	pb_str(&arp_pb, "IP               MAC                IF     AGE\n");
 	arp_for_each(arp_one_row, &arp_pb);
 	pb_flush_to_q(&arp_pb, q);
@@ -523,6 +613,15 @@ static void tcp_one_row(const struct tcp_tcb_view *v, void *arg)
 static int proc_tcp_qopen(queue_t *q)
 {
 	pb_reset(&tcp_pb);
+	pb_about(&tcp_pb,
+	    "tcp -- the active network conversations.\n"
+	    "TCP is the rulebook that turns the network's unreliable\n"
+	    "stream of packets into a dependable two-way pipe (it powers\n"
+	    "web pages, telnet, file transfers).  Each row is one\n"
+	    "conversation.  LISTEN means a program is waiting for callers\n"
+	    "on that port number (a port is like a numbered mailbox);\n"
+	    "ESTABLISHED is a live connection.  The other states are steps\n"
+	    "in politely opening or closing a connection.");
 	pb_str(&tcp_pb, "STATE         LPORT  PEER             EXTRAS\n");
 	tcp_for_each_tcb(tcp_one_row, &tcp_pb);
 	pb_flush_to_q(&tcp_pb, q);
@@ -541,6 +640,14 @@ static struct procbuf slip_pb;
 static int proc_slip_qopen(queue_t *q)
 {
 	pb_reset(&slip_pb);
+	pb_about(&slip_pb,
+	    "slip -- a network link that runs over a plain serial cable.\n"
+	    "SLIP (Serial Line IP) is one of the oldest ways to carry\n"
+	    "internet traffic: it squeezes network packets down a simple\n"
+	    "two-wire serial port, the kind older computers used for\n"
+	    "modems and terminals.  These counters tally how many bytes\n"
+	    "and frames have crossed it.  On this machine it is usually\n"
+	    "idle -- the fast network card (eth0) carries real traffic.");
 	pb_str(&slip_pb, "iface:  slip0  (mini-UART at 0x3F215040)\n");
 	pb_str(&slip_pb, "rx_bytes_total:  ");
 	pb_pad_dec(&slip_pb, slip_rx_byte_count(), 8); pb_putc(&slip_pb, '\n');
@@ -577,6 +684,14 @@ static struct procbuf acpi_pb;
 static int proc_acpi_qopen(queue_t *q)
 {
 	pb_reset(&acpi_pb);
+	pb_about(&acpi_pb,
+	    "acpi -- the hardware description the firmware handed us.\n"
+	    "When a computer powers on, its built-in firmware inventories\n"
+	    "the hardware -- how many CPUs, where the interrupt controller\n"
+	    "lives, where the PCI slots are -- and leaves the answers in\n"
+	    "memory as ACPI tables.  The operating system reads them to\n"
+	    "learn the shape of the machine it woke up on, instead of\n"
+	    "guessing.  These lines are the summary of what we found.");
 	if (!acpi_present) {
 		pb_str(&acpi_pb, "acpi: not present (booted via -kernel)\n");
 		pb_flush_to_q(&acpi_pb, q);
@@ -637,6 +752,14 @@ static struct procbuf pci_pb;
 static int proc_pci_qopen(queue_t *q)
 {
 	pb_reset(&pci_pb);
+	pb_about(&pci_pb,
+	    "pci -- the expansion devices plugged into the machine.\n"
+	    "PCIe is the high-speed bus that connects add-on hardware --\n"
+	    "network cards, disk controllers, graphics -- to the CPU.\n"
+	    "Every device announces itself with a vendor number, a device\n"
+	    "number, and a 'class' saying what kind of thing it is.  Each\n"
+	    "row here is one device the system discovered while scanning\n"
+	    "that bus at startup.");
 	if (pci_nr_devs == 0) {
 		pb_str(&pci_pb,
 		       "pcie: no devices enumerated "
@@ -708,6 +831,14 @@ static struct procbuf efi_pb;
 static int proc_efi_qopen(queue_t *q)
 {
 	pb_reset(&efi_pb);
+	pb_about(&efi_pb,
+	    "efi -- the map of physical memory the firmware gave us.\n"
+	    "Before the operating system starts, the firmware (UEFI) has\n"
+	    "already claimed some regions of RAM for itself and marks\n"
+	    "which are free, which are reserved, and which hold boot data.\n"
+	    "This memory map is the OS's ground truth for which RAM it is\n"
+	    "allowed to use.  Each row is one region: where it starts, how\n"
+	    "big it is, and what it is reserved for.");
 	if (!efi_memmap_buf || !efi_memmap_size ||
 	    !efi_memmap_descriptor_size) {
 		pb_str(&efi_pb,
@@ -750,6 +881,14 @@ static int proc_nvme_qopen(queue_t *q)
 	nvme_get_info(&info);
 
 	pb_reset(&nvme_pb);
+	pb_about(&nvme_pb,
+	    "nvme -- the solid-state disk and how it is organised.\n"
+	    "NVMe is the modern, fast way CPUs talk to flash storage (SSDs).\n"
+	    "Unlike RAM, a disk keeps its contents after the power is off,\n"
+	    "so it is where files are stored permanently.  A disk is\n"
+	    "addressed as a long row of equal-sized blocks (usually 512\n"
+	    "bytes each); these lines report the model, total block count,\n"
+	    "and where this machine's persistent /home folder lives on it.");
 	if (!info.present) {
 		pb_str(&nvme_pb,
 		       "nvme: no controller (no PCI class 0x0108 found)\n");
@@ -833,6 +972,13 @@ static int mount_row(struct block_device *bd, struct dentry *mp, void *arg)
 static int proc_mounts_qopen(queue_t *q)
 {
 	pb_reset(&mounts_pb);
+	pb_about(&mounts_pb,
+	    "mounts -- where each storage area appears in the file tree.\n"
+	    "Unix presents all storage as one big tree of folders starting\n"
+	    "at '/'.  A physical disk or in-memory area is 'mounted' onto\n"
+	    "a folder, so its files appear there.  Each row says which\n"
+	    "device is attached at which folder, and what format\n"
+	    "(filesystem) its data is stored in.");
 	pb_str(&mounts_pb, "DEVICE     MOUNTPOINT     FSTYPE\n");
 	kfs_for_each_mount(mount_row, &mounts_pb);
 	pb_flush_to_q(&mounts_pb, q);

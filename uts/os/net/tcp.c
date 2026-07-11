@@ -318,6 +318,89 @@ static struct tcp_tcb *tcp_tcb_from_fd(int fd)
 	return NULL;
 }
 
+static uint16_t tcp_checksum(uint32_t src_ip, uint32_t dst_ip,
+			     const void *seg, unsigned seg_len);
+
+/* Is any TCB a listener (or bound) on `port`?  Used to decide
+ * whether an inbound SYN lands on a real service or a closed port. */
+static int tcp_port_has_listener(uint16_t port)
+{
+	for (int i = 0; i < TCP_MAX_TCBS; i++) {
+		struct tcp_tcb *t = tcp_tcb_table[i];
+		if (t && t->local_port == port
+		    && (t->state == TCPS_LISTEN || t->state == TCPS_BOUND))
+			return 1;
+	}
+	return 0;
+}
+
+/* The lowest listener port currently bound; 0 if none.  IP fans every
+ * TCP segment out to every bound upper, so an orphan SYN (to a closed
+ * port) is seen by all of them.  We designate the lowest-port listener
+ * as the sole closed-port RST responder so exactly one RST goes out
+ * instead of one per listener. */
+static uint16_t tcp_min_listener_port(void)
+{
+	uint16_t min = 0;
+	for (int i = 0; i < TCP_MAX_TCBS; i++) {
+		struct tcp_tcb *t = tcp_tcb_table[i];
+		if (t && t->state == TCPS_LISTEN
+		    && (min == 0 || t->local_port < min))
+			min = t->local_port;
+	}
+	return min;
+}
+
+/* RFC 793 §3.4: reset a segment aimed at a closed port.  No TCB is
+ * involved -- we craft the RST straight from the incoming header's
+ * addressing.  Rules: if the segment carried an ACK, our RST takes
+ * SEQ = seg.ACK and no ACK flag; otherwise SEQ = 0 with the ACK flag
+ * set and ACK = seg.SEQ + segment_length (SYN and FIN each count 1).
+ * This is what turns a scan of a closed port into an immediate
+ * "connection refused" instead of a silent black-hole timeout. */
+static void tcp_rst_closed(uint32_t src_ip, uint32_t dst_ip,
+			   const struct tcp_hdr *ih, unsigned iseg_len)
+{
+	/* Never reset a reset -- RFC 793, avoids RST ping-pong. */
+	if (ih->flags & TCP_FLAG_RST) return;
+
+	unsigned ihl = (unsigned)((ih->data_off >> 4) * 4);
+	unsigned dlen = (iseg_len > ihl) ? (iseg_len - ihl) : 0;
+	uint32_t iseq = ntohl32(ih->seq);
+	uint32_t iack = ntohl32(ih->ack);
+	uint32_t ctl  = ((ih->flags & TCP_FLAG_SYN) ? 1u : 0u)
+	              + ((ih->flags & TCP_FLAG_FIN) ? 1u : 0u);
+
+	mblk_t *mp = allocb(IP_HDR_LEN + TCP_HDR_LEN_MIN, 0);
+	if (!mp) return;
+	mp->b_rptr += IP_HDR_LEN;
+	mp->b_wptr  = mp->b_rptr;
+
+	struct tcp_hdr *h = (struct tcp_hdr *)mp->b_wptr;
+	h->src_port = ih->dst_port;	/* swap: reply from the dst port */
+	h->dst_port = ih->src_port;
+	if (ih->flags & TCP_FLAG_ACK) {
+		h->seq   = htonl32(iack);
+		h->ack   = 0;
+		h->flags = TCP_FLAG_RST;
+	} else {
+		h->seq   = 0;
+		h->ack   = htonl32(iseq + dlen + ctl);
+		h->flags = TCP_FLAG_RST | TCP_FLAG_ACK;
+	}
+	h->data_off = (TCP_HDR_LEN_MIN / 4) << 4;
+	h->window   = 0;
+	h->checksum = 0;
+	h->urg_ptr  = 0;
+	mp->b_wptr += TCP_HDR_LEN_MIN;
+
+	/* Our source is the segment's destination (us); peer is src_ip. */
+	uint16_t cs = tcp_checksum(dst_ip, src_ip, h, TCP_HDR_LEN_MIN);
+	h->checksum = htons16(cs);
+
+	ip_send(src_ip, IPPROTO_TCP, mp);
+}
+
 /* Arm / cancel the retransmit timer.  Arming records `pending_flags`
  * so the kthread knows what to re-send.  Cancelling sets
  * rto_expires=0; called when an ACK covers our outstanding seq. */
@@ -978,6 +1061,18 @@ static void tcp_input_segment(queue_t *q, struct tcp_tcb *s,
 	/* Port filter -- IP multicasts to all proto=TCP binds; each
 	 * endpoint accepts only its own. */
 	if (dport != s->local_port) {
+		/* Not ours.  If NO listener owns this port, it's a
+		 * closed-port connection attempt -- RFC 793 says answer
+		 * with a RST ("connection refused") instead of the silent
+		 * black hole that leaves scanners (and legit clients)
+		 * hanging.  Emit exactly once: only the lowest-port
+		 * listener plays responder, since every listener sees this
+		 * fanned-out copy. */
+		if ((flags & TCP_FLAG_SYN) && !(flags & TCP_FLAG_RST)
+		    && s->state == TCPS_LISTEN
+		    && s->local_port == tcp_min_listener_port()
+		    && !tcp_port_has_listener(dport))
+			tcp_rst_closed(src_ip, dst_ip, h, len);
 		freemsg(body);
 		return;
 	}

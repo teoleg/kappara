@@ -970,6 +970,17 @@ since both sides already FIN'd.  LAST_ACK still sends RST if the
 user closes before our final ACK lands -- otherwise the peer's
 unACK'd FIN would retransmit into the void.
 
+Closed-port RST (RFC 793 §3.4).  IP fans every TCP segment out to
+every bound upper, so a SYN to a port with no listener is seen by
+all listeners and dropped by each on the port-filter mismatch --
+historically a silent black hole.  `tcp_input_segment` now answers
+it: on a SYN whose dst port has no LISTEN/BOUND TCB, it emits a
+RST crafted directly from the incoming header (`tcp_rst_closed`,
+no TCB needed) so the peer gets "connection refused" immediately
+instead of timing out.  Exactly one RST goes out -- only the
+lowest-port listener plays responder, since every listener sees
+the fanned-out copy.  A RST is never sent in reply to a RST.
+
 T1j congestion control (RFC 5681).  Three new TCB fields drive the
 shape:
 
