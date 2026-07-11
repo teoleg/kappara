@@ -629,6 +629,18 @@ static void kc_render_info(void)
 			off = kc_info_emit_str(off, " entries in parent\n");
 		} else if (e->type == 'c') {
 			off = kc_info_emit_str(off, "  Type: character device\n");
+			off = kc_info_emit_str(off, "  Dev:  ");
+			off = kc_info_emit_dec(off, (e->size >> 16) & 0xffff);
+			off = kc_info_emit_str(off, ",");
+			off = kc_info_emit_dec(off, e->size & 0xffff);
+			off = kc_info_emit_nl(off);
+		} else if (e->type == 'b') {
+			off = kc_info_emit_str(off, "  Type: block device\n");
+			off = kc_info_emit_str(off, "  Dev:  ");
+			off = kc_info_emit_dec(off, (e->size >> 16) & 0xffff);
+			off = kc_info_emit_str(off, ",");
+			off = kc_info_emit_dec(off, e->size & 0xffff);
+			off = kc_info_emit_nl(off);
 		} else if (e->type == 'r') {
 			off = kc_info_emit_str(off, "  Type: regular file\n");
 			off = kc_info_emit_str(off, "  Size: ");
