@@ -57,6 +57,20 @@ struct ip_hdr {
  * Used for the IPv4 header AND the ICMP body; same algorithm for both. */
 uint16_t ip_checksum(const void *buf, unsigned len);
 
+/* Network RX drop tallies (see ipv4.c).  Bumped instead of logging
+ * per bad packet; /proc/tcp prints them.  Public interfaces see a
+ * steady trickle from internet scanners -- rising counts here are
+ * normal, not a fault. */
+struct net_drops {
+	unsigned long ip_runt;      /* shorter than an IP header       */
+	unsigned long ip_badver;    /* not IPv4                        */
+	unsigned long ip_badihl;    /* bad header length               */
+	unsigned long ip_badlen;    /* total_len inconsistent          */
+	unsigned long ip_badcsum;   /* IP header checksum mismatch     */
+	unsigned long tcp_badcsum;  /* TCP checksum mismatch           */
+};
+extern struct net_drops net_drop_counts;
+
 /* Endianness helpers.  AArch64 is little-endian; "network byte order"
  * is big-endian.  These are constexpr-friendly so callers can use them
  * in initialisers if they want. */

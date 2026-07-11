@@ -36,6 +36,7 @@
 #include "kappara/core/ftrace.h"
 #include "kappara/core/kmem.h"
 #include "kappara/net/arp.h"
+#include "kappara/net/ip.h"
 #include "kappara/net/netif.h"
 #include "kappara/net/slip.h"
 #include "kappara/net/tcp.h"
@@ -624,6 +625,25 @@ static int proc_tcp_qopen(queue_t *q)
 	    "in politely opening or closing a connection.");
 	pb_str(&tcp_pb, "STATE         LPORT  PEER             EXTRAS\n");
 	tcp_for_each_tcb(tcp_one_row, &tcp_pb);
+
+	/* RX drop tallies.  A public interface is scanned constantly, so
+	 * a steady trickle here is normal internet background noise, not
+	 * a bug -- these packets are silently dropped (the kernel counts
+	 * rather than logging each one, which would flood the console). */
+	pb_str(&tcp_pb, "\nrx drops:  ip_runt=");
+	pb_pad_dec(&tcp_pb, net_drop_counts.ip_runt, 0);
+	pb_str(&tcp_pb, " ip_badver=");
+	pb_pad_dec(&tcp_pb, net_drop_counts.ip_badver, 0);
+	pb_str(&tcp_pb, " ip_badihl=");
+	pb_pad_dec(&tcp_pb, net_drop_counts.ip_badihl, 0);
+	pb_str(&tcp_pb, " ip_badlen=");
+	pb_pad_dec(&tcp_pb, net_drop_counts.ip_badlen, 0);
+	pb_str(&tcp_pb, "\n           ip_badcsum=");
+	pb_pad_dec(&tcp_pb, net_drop_counts.ip_badcsum, 0);
+	pb_str(&tcp_pb, " tcp_badcsum=");
+	pb_pad_dec(&tcp_pb, net_drop_counts.tcp_badcsum, 0);
+	pb_putc(&tcp_pb, '\n');
+
 	pb_flush_to_q(&tcp_pb, q);
 	return 0;
 }
